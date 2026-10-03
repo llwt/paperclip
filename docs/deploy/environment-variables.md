@@ -26,6 +26,8 @@ All environment variables that Paperclip uses for server configuration.
 | `PAPERCLIP_RUNNER_REMOTE_CODEX_PATH` | (unset) | Optional host-local path to a Codex executable built for the remote target OS and architecture. For remote Codex-backed runners, Paperclip stages and verifies this executable beside `paperclip-runnerd`. |
 | `PAPERCLIP_RUNNER_REMOTE_CODEX_NPM_SPEC` | (unset) | Optional pinned npm package spec (for example, `@openai/codex@0.156.0`) installed inside each fresh remote lease when its Codex harness is not baked into the sandbox image. Mutually exclusive with `PAPERCLIP_RUNNER_REMOTE_CODEX_PATH`; Paperclip verifies the installed executable before starting `runnerd`. |
 | `PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH` | `/opt/paperclip-runner/provider-pack` in Docker; otherwise unset | Host-local path to the immutable provider pack built by `pnpm --filter @paperclipai/paperclip-runner build:provider-pack`. Stamped standard Docker images include the pack; downstream compositions and the `cloud` target inherit it. Unstamped local Docker builds skip pack generation. The pack includes its target-built Node 24.11+ runtime, locked production dependencies, OpenCode proxy/executable, and ACPX sidecar. Remote OpenCode and ACPX fail closed without it. A preinstalled pack is accepted only when its complete digested manifest matches this build-owned pack; otherwise Paperclip stages this pack into the sandbox. |
+| `PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MS` | `10000` | Time budget in milliseconds for a tool call through the MCP gateway when the caller supplies no timeout. Agents calling `tools/call` always get this value. See [MCP gateway tool timeouts](#mcp-gateway-tool-timeouts). |
+| `PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MAX_MS` | `60000` | Upper limit in milliseconds for a caller-supplied tool call timeout. Raised to the default budget when set lower. See [MCP gateway tool timeouts](#mcp-gateway-tool-timeouts). |
 | `PAPERCLIP_HIDDEN_SETTINGS` | (unset) | Comma-separated settings surfaces to hide from the UI and floor at the API, for operators hosting Paperclip for others (managed cloud, internal shared server). See [Hiding settings surfaces](#hiding-settings-surfaces). |
 | `PAPERCLIP_SETTING_DEFAULTS` | (unset) | JSON object replacing the schema default of selected instance settings, for hosting operators. See [Operator setting defaults](#operator-setting-defaults). |
 
@@ -79,6 +81,26 @@ The Daytona environment editor's **Configure image** action can create this
 image without a separate container registry: install the executables in its
 setup sandbox, finish setup, and Paperclip captures and promotes the resulting
 Daytona snapshot for future leases.
+
+### MCP gateway tool timeouts
+
+`PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MS` (default `10000`) is the time budget
+for a tool call that carries no timeout of its own. The MCP `tools/call` route
+has no per-call timeout, so this is the budget every agent tool call gets.
+Raise it when a remote tool legitimately takes longer than 10 seconds.
+
+`PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MAX_MS` (default `60000`) caps a timeout
+that a caller does supply. The cap never drops below the default budget: if it
+is set lower, the default budget is used as the cap.
+
+Both values are whole positive numbers of milliseconds. Anything else (empty,
+`0`, a negative or fractional number, exponent notation such as `1e5`, or
+trailing text such as `120000ms`) is ignored and the built-in value is used.
+Values above `2147483647` (the largest delay a Node.js timer accepts) are
+reduced to that bound.
+
+Approved executions (a tool call that runs after its action request is
+approved) keep a fixed 60 second budget. Neither variable changes it.
 
 ### Hiding settings surfaces
 
