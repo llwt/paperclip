@@ -5673,14 +5673,11 @@ export function createToolGatewayService(
     return body;
   }
 
-  function malformedRemoteMcpResponse(
-    details: Record<string, unknown> = {},
-  ): ToolGatewayHttpError {
+  function malformedRemoteMcpResponse(): ToolGatewayHttpError {
     return new ToolGatewayHttpError(
       502,
       "Remote MCP server returned a malformed tools/call response",
       "remote_mcp_malformed_response",
-      details,
     );
   }
 
@@ -6319,21 +6316,16 @@ export function createToolGatewayService(
       );
       return { result, headerSummary, execution };
     } catch (error) {
-      if (error instanceof McpHttpResponseError && error.reason === "malformed_response") {
-        // The server answered, just not with a response for this request.
-        // Report the shape of what it sent (no message content) and leave
-        // the connection health alone, as for any other malformed result.
-        throw malformedRemoteMcpResponse({
-          connectionId: connection.id, catalogEntryId: entry.id,
-          responseSummary: error.summary ?? null, execution,
-        });
-      }
       if (error instanceof McpHttpResponseError) {
         const failure = error.reason === "too_large" ? responseTooLargeError()
+          : error.reason === "malformed_response" ? malformedRemoteMcpResponse()
           : new ToolGatewayHttpError(502, "Remote MCP server returned invalid JSON", "mcp_remote_invalid_json");
         await markRemoteConnectionHealth(connection, "error", failure.message);
         throw new ToolGatewayHttpError(failure.status, failure.message, failure.reasonCode, {
-          connectionId: connection.id, catalogEntryId: entry.id, execution,
+          connectionId: connection.id, catalogEntryId: entry.id,
+          // The shape of what the server sent instead (no message content).
+          ...(error.reason === "malformed_response" ? { responseSummary: error.summary ?? null } : {}),
+          execution,
         });
       }
       if (error instanceof RailwayError) {
