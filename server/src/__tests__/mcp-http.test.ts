@@ -142,7 +142,8 @@ describe("readMcpHttpResponse", () => {
     expect(error.reason).toBe("malformed_response");
     expect(error.summary).toEqual({
       eventCount: 3,
-      methods: ["notifications/progress", "notifications/message"],
+      skippedEventCount: 0,
+      methods: { "notifications/progress": 2, "notifications/message": 1 },
       sawId: false,
       sawResponse: false,
     });
@@ -152,11 +153,58 @@ describe("readMcpHttpResponse", () => {
   it("reports a response that carries a different ID", async () => {
     const error = await readMcpHttpResponse(sse({ jsonrpc: "2.0", id: 7, result: {} }), "req-1").catch((caught) => caught);
     expect(error.reason).toBe("malformed_response");
-    expect(error.summary).toEqual({ eventCount: 1, methods: [], sawId: true, sawResponse: true });
+    expect(error.summary).toEqual({ eventCount: 1, skippedEventCount: 0, methods: {}, sawId: true, sawResponse: true });
   });
 
-  it("rejects a data event that is not JSON", async () => {
-    const response = new Response("data: not json\n\n", { headers: { "content-type": "text/event-stream" } });
+  it("never echoes a method name the server made up", async () => {
+    const marker = "SECRET-MARKER";
+    const hostile = [
+      `leak ${marker} {"token":"abc"}`,
+      // Valid protocol prefixes must not make the rest of the name reportable.
+      `notifications/progress/${marker}`,
+      `notifications/${marker}/list_changed`,
+      `notifications/message ${marker}`,
+      `ping${marker}`,
+      "__proto__",
+      "constructor",
+    ].map((method) => ({ jsonrpc: "2.0", method, params: {} }));
+    const nonString = { jsonrpc: "2.0", method: { text: marker } };
+    const error = await readMcpHttpResponse(sse(progress, ...hostile, nonString), "req-1").catch((caught) => caught);
+    expect(error.reason).toBe("malformed_response");
+    expect(error.summary).toEqual({
+      eventCount: 9,
+      skippedEventCount: 0,
+      methods: { "notifications/progress": 1, other: 8 },
+      sawId: false,
+      sawResponse: false,
+    });
+    expect(JSON.stringify(error.summary)).not.toContain(marker);
+    expect(Object.keys(error.summary.methods)).toEqual(["notifications/progress", "other"]);
+  });
+
+  it("skips a data event that is not JSON and returns the result after it", async () => {
+    const body = `data: not json\n\nevent: message\ndata: ${JSON.stringify(result)}\n\n`;
+    const response = new Response(body, { headers: { "content-type": "text/event-stream" } });
+    await expect(readMcpHttpResponse(response, "req-1")).resolves.toEqual(result);
+  });
+
+  it("fails as malformed, counting skipped events, when a stream has only non-JSON events", async () => {
+    const body = `data: keep-alive private text\n\ndata: ${JSON.stringify(progress)}\n\ndata: {broken\n\n`;
+    const response = new Response(body, { headers: { "content-type": "text/event-stream" } });
+    const error = await readMcpHttpResponse(response, "req-1").catch((caught) => caught);
+    expect(error.reason).toBe("malformed_response");
+    expect(error.summary).toEqual({
+      eventCount: 1,
+      skippedEventCount: 2,
+      methods: { "notifications/progress": 1 },
+      sawId: false,
+      sawResponse: false,
+    });
+    expect(JSON.stringify(error.summary)).not.toContain("private text");
+  });
+
+  it("still rejects a plain JSON body that is not JSON", async () => {
+    const response = new Response("not json", { headers: { "content-type": "application/json" } });
     await expect(readMcpHttpResponse(response, "req-1")).rejects.toMatchObject({ reason: "invalid_json" });
   });
 });

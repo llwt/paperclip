@@ -6081,6 +6081,8 @@ export function createToolGatewayService(
             execution,
           });
         }
+        // Only a plain (non-stream) body that is not JSON reaches this point;
+        // non-JSON stream events are skipped by readMcpHttpResponse.
         await markRemoteConnectionHealth(
           connection,
           "error",

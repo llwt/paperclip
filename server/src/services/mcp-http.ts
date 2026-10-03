@@ -20,12 +20,36 @@ export const MCP_PROTOCOL_VERSION = "2025-06-18";
  * Carries counts, JSON-RPC method names and flags only: never params, results,
  * error bodies or message IDs.
  */
+/** Shape of a response stream that had no message for the request. It must
+ * stay free of server-supplied text: counts, flags and fixed labels only. */
 export type McpHttpResponseSummary = {
   eventCount: number;
-  methods: string[];
+  /** Non-JSON SSE `data:` events that were skipped. */
+  skippedEventCount: number;
+  /** Message count per label. Keys come from KNOWN_MCP_METHOD_LABELS or are
+   * "other"; a method name sent by the server is never copied here. */
+  methods: Record<string, number>;
   sawId: boolean;
   sawResponse: boolean;
 };
+
+// Methods a server may send on a response stream (MCP 2025-06-18). Matched
+// exactly: a name that only starts like one of these is counted as "other".
+const KNOWN_MCP_METHOD_LABELS: ReadonlySet<string> = new Set([
+  "notifications/progress",
+  "notifications/message",
+  "notifications/cancelled",
+  "notifications/tools/list_changed",
+  "notifications/resources/list_changed",
+  "notifications/resources/updated",
+  "notifications/prompts/list_changed",
+  "notifications/roots/list_changed",
+  "elicitation/create",
+  "sampling/createMessage",
+  "roots/list",
+  "ping",
+]);
+const OTHER_MCP_METHOD_LABEL = "other";
 
 export class McpHttpResponseError extends Error {
   constructor(
@@ -190,9 +214,6 @@ export function parseMcpHttpResponseBody(bodyText: string, contentType: string |
   throw new SyntaxError("MCP SSE response contained no data events");
 }
 
-const MAX_SUMMARY_METHODS = 20;
-const MAX_SUMMARY_METHOD_LENGTH = 100;
-
 /** Read until the response for this request arrives, without waiting for an SSE
  * connection to close. Notifications and responses for other IDs are ignored. */
 export async function readMcpHttpResponse(
@@ -215,7 +236,7 @@ export async function readMcpHttpResponse(
   const decoder = new TextDecoder();
   let buffer = "";
   let bytes = 0;
-  const summary: McpHttpResponseSummary = { eventCount: 0, methods: [], sawId: false, sawResponse: false };
+  const summary: McpHttpResponseSummary = { eventCount: 0, skippedEventCount: 0, methods: {}, sawId: false, sawResponse: false };
   const parse = (text: string): unknown => {
     try { return JSON.parse(text); }
     catch { throw new McpHttpResponseError("invalid_json", "MCP response contained invalid JSON"); }
@@ -227,9 +248,11 @@ export async function readMcpHttpResponse(
     if (record.id === requestId && ("result" in record || "error" in record)) return record;
     if ("id" in record) summary.sawId = true;
     if ("result" in record || "error" in record) summary.sawResponse = true;
-    if (typeof record.method === "string") {
-      const method = record.method.slice(0, MAX_SUMMARY_METHOD_LENGTH);
-      if (!summary.methods.includes(method) && summary.methods.length < MAX_SUMMARY_METHODS) summary.methods.push(method);
+    if ("method" in record) {
+      const label = typeof record.method === "string" && KNOWN_MCP_METHOD_LABELS.has(record.method)
+        ? record.method
+        : OTHER_MCP_METHOD_LABEL;
+      summary.methods[label] = (summary.methods[label] ?? 0) + 1;
     }
     if ("method" in record && "id" in record) await options.onRequest?.(record);
     return undefined;
@@ -237,7 +260,18 @@ export async function readMcpHttpResponse(
   const event = async (value: string) => {
     const data = value.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).replace(/^ /, "")).join("\n");
     if (!data) return undefined;
-    return inspect(parse(data));
+    // Differs from upstream v2026.1001.0, which fails the whole call on a
+    // non-JSON event. Skip it and keep reading, as parseMcpHttpResponseBody
+    // does, so a stray keep-alive or comment-like event before the result does
+    // not fail the call (and, in the gateway, mark the connection errored).
+    // Keep this when porting to a newer base.
+    let message: unknown;
+    try { message = JSON.parse(data); }
+    catch {
+      summary.skippedEventCount += 1;
+      return undefined;
+    }
+    return inspect(message);
   };
   try {
     while (true) {
