@@ -6235,11 +6235,10 @@ export function createToolGatewayService(
       }
       if (payloadRecord.error !== undefined) {
         const errorRecord = asRecord(payloadRecord.error);
-        await markRemoteConnectionHealth(
-          connection,
-          "error",
-          "Remote MCP server returned a JSON-RPC error.",
-        );
+        // The server answered over MCP and rejected this one request (unknown
+        // tool, invalid arguments, a tool-level failure). That says nothing
+        // about the connection, so leave its health alone; marking it errored
+        // would hide every other tool of the connection until the next sweep.
         throw new ToolGatewayHttpError(
           502,
           "Remote MCP server returned an error",
@@ -6308,11 +6307,11 @@ export function createToolGatewayService(
         );
       }
       if (error instanceof Error && error.name === "AbortError") {
-        await markRemoteConnectionHealth(
-          connection,
-          "error",
-          "Remote MCP tool call timed out.",
-        );
+        // One slow tool exceeding its budget is not evidence that the
+        // connection is down. Leave the health untouched so the connection's
+        // other tools stay listed and callable; a server that is really
+        // unreachable is still caught by the fetch-failure branch below and by
+        // the periodic health sweep.
         throw new ToolGatewayHttpError(
           504,
           "Remote MCP tool call timed out",
