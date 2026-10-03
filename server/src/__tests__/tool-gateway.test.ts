@@ -5654,4 +5654,29 @@ describe("tool gateway timeout configuration", () => {
       PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MAX_MS: "30000",
     })).toBe(90_000);
   });
+
+  it("requires the whole value to be a positive integer", () => {
+    for (const value of ["120000junk", "1e5", "1.5", "+120000", "0x10", "12 000"]) {
+      const env = {
+        PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MS: value,
+        PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MAX_MS: value,
+      };
+      expect(resolveToolTimeoutMs(undefined, env)).toBe(10_000);
+      expect(resolveToolTimeoutMs(300_000, env)).toBe(60_000);
+    }
+    expect(resolveToolTimeoutMs(undefined, { PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MS: " 45000 " })).toBe(45_000);
+  });
+
+  it("bounds configured values to the Node timer range", () => {
+    const timerMax = 2_147_483_647;
+    expect(resolveToolTimeoutMs(undefined, { PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MS: "2147483647" })).toBe(timerMax);
+    for (const value of ["2147483648", "9007199254740993", "9".repeat(400)]) {
+      expect(resolveToolTimeoutMs(undefined, { PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MS: value })).toBe(timerMax);
+      const cap = { PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MAX_MS: value };
+      expect(resolveToolTimeoutMs(undefined, cap)).toBe(10_000);
+      expect(resolveToolTimeoutMs(timerMax, cap)).toBe(timerMax);
+      expect(resolveToolTimeoutMs(timerMax + 1, cap)).toBe(timerMax);
+      expect(resolveToolTimeoutMs(Number.MAX_SAFE_INTEGER, cap)).toBe(timerMax);
+    }
+  });
 });

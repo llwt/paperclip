@@ -641,18 +641,32 @@ function gatewaySessionFromRow(
   };
 }
 
+// Node timers hold a signed 32-bit delay; anything larger fires after 1 ms.
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+// Stricter than positiveInt: the whole value must be a positive integer, so
+// "120000junk" or "1e5" fall back instead of being read as a prefix. Values
+// above the timer range are bounded to it rather than overflowing.
+function toolTimeoutEnvMs(value: string | undefined, fallback: number) {
+  const trimmed = value?.trim() ?? "";
+  if (!/^\d+$/.test(trimmed)) return fallback;
+  const parsed = Number(trimmed);
+  if (!(parsed > 0)) return fallback;
+  return Math.min(parsed, MAX_TIMER_DELAY_MS);
+}
+
 // Agents reach tools through the MCP `tools/call` route, which carries no
 // per-call timeout, so the default is the only budget they get. Operators can
 // raise it (and the cap applied to caller-supplied values) for slow remote
 // tools without a code change. The cap never drops below the default.
 export function toolTimeoutLimits(env: NodeJS.ProcessEnv = process.env) {
-  const defaultMs = positiveInt(
+  const defaultMs = toolTimeoutEnvMs(
     env.PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MS,
     DEFAULT_TOOL_TIMEOUT_MS,
   );
   const maxMs = Math.max(
     defaultMs,
-    positiveInt(
+    toolTimeoutEnvMs(
       env.PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MAX_MS,
       MAX_TOOL_TIMEOUT_MS,
     ),
@@ -7818,7 +7832,9 @@ export function createToolGatewayService(
     });
 
     try {
-      const executionTimeoutMs = timeoutMs(APPROVED_EXECUTION_TIMEOUT_MS);
+      // Fixed budget: the operator cap for caller-supplied timeouts must not
+      // shorten it, and ACTION_REQUEST_EXECUTION_WAIT_MS is tied to it.
+      const executionTimeoutMs = APPROVED_EXECUTION_TIMEOUT_MS;
       const result =
         tool.providerType === "mcp_remote_http"
           ? (
