@@ -89,6 +89,8 @@ import {
   initializeMcpHttpSession,
   mcpHttpRequestHeaders,
   parseMcpHttpResponseBody,
+  readMcpHttpResponse,
+  McpHttpResponseError,
 } from "./mcp-http.js";
 import {
   projectedConnectionHeaders,
@@ -5519,11 +5521,14 @@ export function createToolGatewayService(
     return body;
   }
 
-  function malformedRemoteMcpResponse(): ToolGatewayHttpError {
+  function malformedRemoteMcpResponse(
+    details: Record<string, unknown> = {},
+  ): ToolGatewayHttpError {
     return new ToolGatewayHttpError(
       502,
       "Remote MCP server returned a malformed tools/call response",
       "remote_mcp_malformed_response",
+      details,
     );
   }
 
@@ -6034,11 +6039,48 @@ export function createToolGatewayService(
       }
       let payload: unknown;
       try {
-        payload = parseMcpHttpResponseBody(
-          body,
-          response.headers.get("content-type"),
+        // Select the response for this request by ID. A server may stream
+        // notifications (progress, logging) or its own requests before the
+        // result; taking the first event would hand back one of those.
+        payload = await readMcpHttpResponse(
+          new Response(body, {
+            headers: {
+              "content-type":
+                response.headers.get("content-type") ?? "application/json",
+            },
+          }),
+          requestId,
+          {
+            maxBytes: MAX_REMOTE_MCP_RESPONSE_BYTES,
+            onRequest: async (message) => {
+              const request = extractMcpElicitationRequest(message);
+              if (request) {
+                await requestElicitationForRecordedToolCall({
+                  session,
+                  tool,
+                  invocationId,
+                  request,
+                });
+              }
+            },
+          },
         );
-      } catch {
+      } catch (error) {
+        if (error instanceof ToolGatewayHttpError) throw error;
+        if (
+          error instanceof McpHttpResponseError &&
+          error.reason === "malformed_response"
+        ) {
+          // The server answered, just not with a response for this request.
+          // Report the shape of what it sent (no message content) and leave
+          // the connection health alone, as for any other malformed result.
+          throw malformedRemoteMcpResponse({
+            connectionId: connection.id,
+            catalogEntryId: entry.id,
+            responseSummary: error.summary ?? null,
+            execution,
+          });
+        }
         await markRemoteConnectionHealth(
           connection,
           "error",

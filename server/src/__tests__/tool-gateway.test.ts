@@ -589,10 +589,10 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
 
   it("exposes a named gateway with scoped bearer-token auth and revocation", async () => {
     const company = await createCompany(db);
-    const remote = await startFakeRemoteMcpServer(async () => ({
+    const remote = await startFakeRemoteMcpServer(async ({ body }) => ({
       body: {
         jsonrpc: "2.0",
-        id: "test",
+        id: body?.id,
         result: { content: [{ type: "text", text: "read ok" }], structuredContent: { ok: true } },
       },
     }));
@@ -1131,10 +1131,10 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
 
   it("rate limits public named gateway session setup, discovery, and calls with redacted audits", async () => {
     const company = await createCompany(db);
-    const remote = await startFakeRemoteMcpServer(async () => ({
+    const remote = await startFakeRemoteMcpServer(async ({ body }) => ({
       body: {
         jsonrpc: "2.0",
-        id: "test",
+        id: body?.id,
         result: { content: [{ type: "text", text: "read ok" }], structuredContent: { ok: true } },
       },
     }));
@@ -1565,7 +1565,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
         if (upstreamCalls === 1) return new Response("unauthorized", { status: 401 });
         return new Response(JSON.stringify({
           jsonrpc: "2.0",
-          id: "fixture",
+          id: JSON.parse(String(init.body)).id,
           result: { content: [{ type: "text", text: "repo-a" }], structuredContent: { repositories: ["repo-a"] } },
         }), { status: 200, headers: { "content-type": "application/json" } });
       },
@@ -2837,6 +2837,113 @@ rl.on("line", (line) => {
         status: "completed",
         result: { content: "sse ok", data: { structuredContent: { via: "sse" }, transport: "mcp_http" } },
       });
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("returns the tools/call result when the stream carries notifications before it", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => {
+      const messages = [
+        { jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: "t", progress: 1 } },
+        { jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "working" } },
+        {
+          jsonrpc: "2.0",
+          id: fakeRequest.body?.id,
+          result: { content: [{ type: "text", text: "after notifications" }], structuredContent: { via: "sse" } },
+        },
+      ];
+      return {
+        headers: { "content-type": "text/event-stream" },
+        rawBody: messages.map((message) => `event: message\ndata: ${JSON.stringify(message)}\n\n`).join(""),
+      };
+    });
+    try {
+      await createRemoteMcpTool(db, company.id, {
+        applicationKey: "kv-demo",
+        connectionName: "KV Demo SSE Notifications",
+        toolName: "kv_set",
+        title: "Set KV value",
+        url: fake.url,
+        credentialRefs: [],
+        credentialSecretRefs: [],
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      const result = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: { key: "alpha", value: "one" },
+      });
+      expect(result).toMatchObject({
+        status: "completed",
+        result: { content: "after notifications", data: { structuredContent: { via: "sse" }, transport: "mcp_http" } },
+      });
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("fails a notification-only tools/call stream as malformed with a content-free summary", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer(() => {
+      const messages = [
+        { jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: "t", progress: 1 } },
+        { jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "private text" } },
+      ];
+      return {
+        headers: { "content-type": "text/event-stream" },
+        rawBody: messages.map((message) => `event: message\ndata: ${JSON.stringify(message)}\n\n`).join(""),
+      };
+    });
+    try {
+      await createRemoteMcpTool(db, company.id, {
+        applicationKey: "kv-demo",
+        connectionName: "KV Demo SSE Notifications Only",
+        toolName: "kv_set",
+        title: "Set KV value",
+        url: fake.url,
+        credentialRefs: [],
+        credentialSecretRefs: [],
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const connectedTool = (await gateway.listToolsForSession(session.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      const error = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: connectedTool!.name,
+        parameters: { key: "alpha", value: "one" },
+      }).catch((caught) => caught);
+      expect(error).toMatchObject({
+        reasonCode: "remote_mcp_malformed_response",
+        details: {
+          responseSummary: {
+            eventCount: 2,
+            methods: ["notifications/progress", "notifications/message"],
+            sawId: false,
+            sawResponse: false,
+          },
+          execution: { response: { httpStatus: 200, contentType: "text/event-stream" } },
+        },
+      });
+      expect(JSON.stringify(error.details.responseSummary)).not.toContain("private text");
+      // A malformed answer to one call must not hide the connection's tools.
+      expect((await gateway.listToolsForSession(session.token))
+        .some((tool) => tool.name === connectedTool!.name)).toBe(true);
     } finally {
       await fake.close();
     }
