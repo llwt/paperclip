@@ -4654,6 +4654,7 @@ rl.on("line", (line) => {
       expect(await connectionHealth(connection.id)).toBe("ok");
       expect((await gateway.listToolsForSession(session.token)).map((tool) => tool.name))
         .toEqual(expect.arrayContaining([slowTool, fastTool]));
+      expect((await call(fastTool)).result).toMatchObject({ content: "ok" });
 
       unauthorized = true;
       await call(fastTool).then(
