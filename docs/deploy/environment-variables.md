@@ -26,7 +26,7 @@ All environment variables that Paperclip uses for server configuration.
 | `PAPERCLIP_RUNNER_REMOTE_CODEX_PATH` | (unset) | Optional host-local path to a Codex executable built for the remote target OS and architecture. For remote Codex-backed runners, Paperclip stages and verifies this executable beside `paperclip-runnerd`. |
 | `PAPERCLIP_RUNNER_REMOTE_CODEX_NPM_SPEC` | (unset) | Optional pinned npm package spec (for example, `@openai/codex@0.156.0`) installed inside each fresh remote lease when its Codex harness is not baked into the sandbox image. Mutually exclusive with `PAPERCLIP_RUNNER_REMOTE_CODEX_PATH`; Paperclip verifies the installed executable before starting `runnerd`. |
 | `PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH` | `/opt/paperclip-runner/provider-pack` in Docker; otherwise unset | Host-local path to the immutable provider pack built by `pnpm --filter @paperclipai/paperclip-runner build:provider-pack`. Stamped standard Docker images include the pack; downstream compositions and the `cloud` target inherit it. Unstamped local Docker builds skip pack generation. The pack includes its target-built Node 24.11+ runtime, locked production dependencies, OpenCode proxy/executable, and ACPX sidecar. Remote OpenCode and ACPX fail closed without it. A preinstalled pack is accepted only when its complete digested manifest matches this build-owned pack; otherwise Paperclip stages this pack into the sandbox. |
-| `PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MS` | `10000` | Gateway default time budget in milliseconds for a tool call through the MCP gateway when the caller supplies no timeout, as with an agent's `tools/call`. A few providers set their own budget instead. See [MCP gateway tool timeouts](#mcp-gateway-tool-timeouts). |
+| `PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MS` | `10000` | Gateway default time budget in milliseconds for ordinary tool execution through the MCP gateway when the caller supplies no timeout. Some calls keep a budget of their own. See [MCP gateway tool timeouts](#mcp-gateway-tool-timeouts). |
 | `PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MAX_MS` | `60000` | Upper limit in milliseconds for a caller-supplied tool call timeout. Raised to the default budget when set lower. See [MCP gateway tool timeouts](#mcp-gateway-tool-timeouts). |
 | `PAPERCLIP_HIDDEN_SETTINGS` | (unset) | Comma-separated settings surfaces to hide from the UI and floor at the API, for operators hosting Paperclip for others (managed cloud, internal shared server). See [Hiding settings surfaces](#hiding-settings-surfaces). |
 | `PAPERCLIP_SETTING_DEFAULTS` | (unset) | JSON object replacing the schema default of selected instance settings, for hosting operators. See [Operator setting defaults](#operator-setting-defaults). |
@@ -84,19 +84,28 @@ Daytona snapshot for future leases.
 
 ### MCP gateway tool timeouts
 
-`PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MS` (default `10000`) is the gateway's
-default time budget for a tool call that carries no timeout of its own. The
-MCP `tools/call` route has no per-call timeout, so an agent tool call gets
-this default unless one of the provider budgets below replaces it. Raise it
-when a remote tool legitimately takes longer than 10 seconds.
+`PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MS` (default `10000`) sets the gateway's
+default time budget for ordinary tool execution: the gateway applies it when
+it runs a tool and the caller supplied no timeout. The MCP `tools/call` route
+passes no per-call timeout, so a tool that an agent runs that way starts from
+this default. Raise it when a remote tool legitimately takes longer than 10
+seconds.
 
-Some providers keep a budget of their own, which this variable does not change:
+The variable does not change a budget that is set somewhere else. Known cases:
 
 - Railway `run-command`, called without a timeout, gets the command's
   `timeoutSeconds` (default 30) plus 10 seconds, at most 60 seconds.
 - Cognee Cloud tools, called without a timeout, get 60 seconds.
 - Browser Use tools are not timed by the gateway. Each request to the Browser
   Use API has a 25 second limit instead.
+- The resource and prompt helper tools (`paperclip_list_resources`,
+  `paperclip_read_resource`, `paperclip_list_prompts` and
+  `paperclip_get_prompt`) are not ordinary tool execution, even though an agent
+  reaches them through `tools/call`, and this variable does not govern them.
+  Each local stdio connection they query gets a fixed 10 seconds, and a remote
+  connection is bound by the remote HTTP transport's own limits. The MCP
+  `resources/list`, `resources/read`, `prompts/list` and `prompts/get` methods
+  behave the same way.
 
 `PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MAX_MS` (default `60000`) caps a timeout
 that a caller does supply. The cap never drops below the default budget: if it
