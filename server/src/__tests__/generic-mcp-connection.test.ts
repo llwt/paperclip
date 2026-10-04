@@ -93,6 +93,13 @@ type FixtureOptions = {
   resourceMetadataUrl?: string | null;
   /** `false` serves no authorization-server metadata at all. */
   authorizationServerMetadata?: false;
+  /**
+   * The resource document names the MCP origin as its authorization server,
+   * but that server's metadata declares `ISSUER`, so the RFC 8414 issuer check
+   * refuses the pairing. The metadata is served at the MCP origin's root
+   * well-known address only.
+   */
+  mismatchedIssuer?: boolean;
   /** Advertise Client ID Metadata Document support on the authorization server. */
   cimd?: boolean;
   /** Advertise a dynamic client registration endpoint. */
@@ -222,7 +229,10 @@ function installMcpOAuthFixture(options: FixtureOptions = {}) {
     }
 
     if (resourceMetadataUrl && href === resourceMetadataUrl) {
-      return jsonResponse({ resource: MCP_URL, authorization_servers: [ISSUER] });
+      return jsonResponse({
+        resource: MCP_URL,
+        authorization_servers: [options.mismatchedIssuer ? MCP_ORIGIN : ISSUER],
+      });
     }
 
     // RFC 8414 inserts the well-known segment before the issuer path; OIDC
@@ -230,7 +240,9 @@ function installMcpOAuthFixture(options: FixtureOptions = {}) {
     // for so both discovery orders are covered.
     const rfc8414Url = `${MCP_ORIGIN}/.well-known/oauth-authorization-server/tenant/acme`;
     const oidcSuffixUrl = `${ISSUER}/.well-known/oauth-authorization-server`;
-    const servedMetadataUrl = options.wellKnownStyle === "oidc-suffix" ? oidcSuffixUrl : rfc8414Url;
+    const servedMetadataUrl = options.mismatchedIssuer
+      ? `${MCP_ORIGIN}/.well-known/oauth-authorization-server`
+      : options.wellKnownStyle === "oidc-suffix" ? oidcSuffixUrl : rfc8414Url;
     if (href === servedMetadataUrl && options.authorizationServerMetadata !== false) {
       return jsonResponse(authorizationServerMetadata());
     }
@@ -1091,6 +1103,26 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
 
     expect(connected.auth).toMatchObject({ kind: "oauth", issuer: ISSUER, resource: MCP_URL });
     expect(fixture.requestsTo("/gateway/resource-metadata").length).toBeGreaterThan(0);
+  });
+
+  it("falls back to the well-known addresses when the renamed challenge leads to a refused issuer", async () => {
+    // The hinted resource document names an authorization server whose
+    // metadata declares another issuer, so the hinted path is refused. The MCP
+    // host still serves usable metadata at its own well-known address.
+    const fixture = installMcpOAuthFixture({
+      auth: "oauth",
+      challengeHeader: "x-amzn-remapped-www-authenticate",
+      mismatchedIssuer: true,
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture remapped mismatched issuer" });
+
+    expect(connected.auth).toMatchObject({ kind: "oauth", resource: MCP_URL });
+    expect(fixture.requestsTo("/.well-known/oauth-protected-resource/mcp").length).toBeGreaterThan(0);
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(connection!.authKind).toBe("oauth");
   });
 
   it("discovers OAuth for a personal URL connection before its user grant exists", async () => {

@@ -6889,13 +6889,19 @@ export function toolAccessService(
         !challenged && connection.authKind === "none";
       if (response.status === 401 && (challenged || probeWithoutChallenge)) {
         // AWS API Gateway renames the challenge to `x-amzn-remapped-*`. On the
-        // URL-only probe it is read as a hint for the metadata address only.
+        // URL-only probe it is read as a hint for the metadata address only,
+        // and the well-known addresses are still tried when the hint fails.
+        const remapped = response.headers.get(
+          "x-amzn-remapped-www-authenticate",
+        );
         const endpoints = challenged
           ? await discoverOAuthEndpoints(connection, authenticate)
-          : await discoverOAuthEndpoints(
-              connection,
-              response.headers.get("x-amzn-remapped-www-authenticate"),
-            ).catch(() => null);
+          : ((remapped
+              ? await discoverOAuthEndpoints(connection, remapped).catch(
+                  () => null,
+                )
+              : null) ??
+            (await discoverOAuthEndpoints(connection).catch(() => null)));
         if (endpoints) {
           const nextConfig = {
             ...connection.config,
