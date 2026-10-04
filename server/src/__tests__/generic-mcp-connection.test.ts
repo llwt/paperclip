@@ -91,6 +91,8 @@ type FixtureOptions = {
    * discovery finds nothing. Defaults to the RFC 9728 well-known address.
    */
   resourceMetadataUrl?: string | null;
+  /** `false` serves no authorization-server metadata at all. */
+  authorizationServerMetadata?: false;
   /** Advertise Client ID Metadata Document support on the authorization server. */
   cimd?: boolean;
   /** Advertise a dynamic client registration endpoint. */
@@ -229,7 +231,9 @@ function installMcpOAuthFixture(options: FixtureOptions = {}) {
     const rfc8414Url = `${MCP_ORIGIN}/.well-known/oauth-authorization-server/tenant/acme`;
     const oidcSuffixUrl = `${ISSUER}/.well-known/oauth-authorization-server`;
     const servedMetadataUrl = options.wellKnownStyle === "oidc-suffix" ? oidcSuffixUrl : rfc8414Url;
-    if (href === servedMetadataUrl) return jsonResponse(authorizationServerMetadata());
+    if (href === servedMetadataUrl && options.authorizationServerMetadata !== false) {
+      return jsonResponse(authorizationServerMetadata());
+    }
 
     if (href === `${ISSUER}/register` && method === "POST") {
       if (options.registrationFailure) {
@@ -996,6 +1000,79 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     expect(failure).toMatchObject({ message: "Remote app returned HTTP 401" });
     expect((failure as { details?: { code?: string } }).details?.code).not.toBe("oauth_challenge");
     expect(fixture.requestsTo("/.well-known/oauth-protected-resource/mcp")).toHaveLength(0);
+  });
+
+  it("does not turn a rejected key into a sign-in offer when the gateway renames the challenge", async () => {
+    // Same as above, but the 401 carries the renamed AWS challenge. That header
+    // is only a hint for a URL-only connection; it must not replace a key.
+    const fixture = installMcpOAuthFixture({
+      auth: "header",
+      requiredHeader: { name: "Authorization", value: "Bearer fixture-key-123" },
+      challengeHeader: "x-amzn-remapped-www-authenticate",
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    const failure = await service
+      .connectGalleryApp(company.id, {
+        link: MCP_URL,
+        name: "Fixture wrong key remapped",
+        authMode: "bearer",
+        credentialValues: { "credentials.authorization": "wrong-key" },
+      })
+      .catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ message: "Remote app returned HTTP 401" });
+    expect((failure as { details?: { code?: string } }).details?.code).not.toBe("oauth_challenge");
+    expect(fixture.requestsTo("/.well-known/oauth-protected-resource/mcp")).toHaveLength(0);
+    expect(fixture.requestsTo("/.well-known/oauth-authorization-server/tenant/acme")).toHaveLength(0);
+    const rows = await db.select().from(toolConnections).where(eq(toolConnections.companyId, company.id));
+    expect(rows.filter((row) => row.authKind === "oauth")).toHaveLength(0);
+  });
+
+  it.each([
+    ["a bare 401", null],
+    ["the renamed AWS challenge", "x-amzn-remapped-www-authenticate"],
+  ])("keeps the plain HTTP 401 error when discovery is refused behind %s", async (_label, challengeHeader) => {
+    // The metadata advertises an unsafe token endpoint, so discovery throws.
+    // Without a real `WWW-Authenticate` that refusal must not surface: the
+    // operator never asked for sign-in, so the answer stays the plain 401.
+    const fixture = installMcpOAuthFixture({
+      auth: "oauth",
+      challengeHeader,
+      tokenEndpoint: "http://evil.fixture.test/token",
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    const failure = await service
+      .connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture refused discovery" })
+      .catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ message: "Remote app returned HTTP 401" });
+    expect((failure as { details?: { code?: string } }).details?.code).not.toBe("oauth_challenge");
+    expect(fixture.requestsTo("/.well-known/oauth-protected-resource/mcp").length).toBeGreaterThan(0);
+    const rows = await db.select().from(toolConnections).where(eq(toolConnections.companyId, company.id));
+    expect(rows.filter((row) => row.authKind === "oauth")).toHaveLength(0);
+  });
+
+  it("keeps the plain HTTP 401 error when the renamed challenge points at no usable metadata", async () => {
+    // The hint resolves, but no authorization-server metadata is served behind
+    // it, so discovery finds no endpoints and there is nothing to sign in to.
+    installMcpOAuthFixture({
+      auth: "oauth",
+      challengeHeader: "x-amzn-remapped-www-authenticate",
+      authorizationServerMetadata: false,
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    const failure = await service
+      .connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture remapped no endpoints" })
+      .catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ message: "Remote app returned HTTP 401" });
+    expect((failure as { details?: { code?: string } }).details?.code).not.toBe("oauth_challenge");
   });
 
   it("reads the challenge AWS API Gateway renames to x-amzn-remapped-www-authenticate", async () => {

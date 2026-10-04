@@ -6879,22 +6879,23 @@ export function toolAccessService(
       }
     }
     if (!response.ok) {
-      // AWS API Gateway renames the challenge to `x-amzn-remapped-*`, so a
-      // server behind it answers 401 with no `WWW-Authenticate` at all.
-      const authenticate =
-        response.headers.get("www-authenticate") ??
-        response.headers.get("x-amzn-remapped-www-authenticate") ??
-        "";
+      const authenticate = response.headers.get("www-authenticate") ?? "";
       const challenged = /bearer|oauth|authorization/i.test(authenticate);
-      // A URL-only connection that gets a bare 401 may still publish OAuth
-      // metadata at the well-known addresses. Only that case probes without a
-      // challenge: a connection the operator gave a key to keeps the plain 401.
+      // A URL-only connection that gets a 401 with no usable challenge may
+      // still publish OAuth metadata at the well-known addresses. Only that
+      // case probes without a challenge: a connection the operator gave a key
+      // or another authentication type to keeps the plain 401.
       const probeWithoutChallenge =
         !challenged && connection.authKind === "none";
       if (response.status === 401 && (challenged || probeWithoutChallenge)) {
+        // AWS API Gateway renames the challenge to `x-amzn-remapped-*`. On the
+        // URL-only probe it is read as a hint for the metadata address only.
         const endpoints = challenged
           ? await discoverOAuthEndpoints(connection, authenticate)
-          : await discoverOAuthEndpoints(connection).catch(() => null);
+          : await discoverOAuthEndpoints(
+              connection,
+              response.headers.get("x-amzn-remapped-www-authenticate"),
+            ).catch(() => null);
         if (endpoints) {
           const nextConfig = {
             ...connection.config,
