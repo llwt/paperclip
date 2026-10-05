@@ -4479,6 +4479,16 @@ rl.on("line", (line) => {
       expect(slowTool).toBeTruthy();
 
       // Same shape as the MCP `tools/call` route: no per-call timeoutMs.
+      vi.stubEnv("PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MS", "5000");
+      const result = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: slowTool!.name,
+        parameters: { key: "alpha", value: "one" },
+      });
+      expect(result.result).toMatchObject({ content: "ok" });
+
+      // The timed-out call goes last so the test does not depend on the
+      // connection health after a timeout.
       vi.stubEnv("PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MS", "20");
       await gateway.executeTool({
         sessionToken: session.token,
@@ -4490,14 +4500,6 @@ rl.on("line", (line) => {
         },
         (error) => expectGatewayError(error, 504, "tool_timeout"),
       );
-
-      vi.stubEnv("PAPERCLIP_MCP_GATEWAY_TOOL_TIMEOUT_MS", "5000");
-      const result = await gateway.executeTool({
-        sessionToken: session.token,
-        tool: slowTool!.name,
-        parameters: { key: "alpha", value: "one" },
-      });
-      expect(result.result).toMatchObject({ content: "ok" });
     } finally {
       vi.unstubAllEnvs();
       await fake.close();
