@@ -198,6 +198,10 @@ vi.mock("../lib/paste-normalization", () => ({
   pasteNormalizationPlugin: () => ({}),
 }));
 
+vi.mock("../lib/quote-exit", () => ({
+  quoteExitPlugin: () => ({}),
+}));
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
