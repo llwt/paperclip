@@ -6880,14 +6880,28 @@ export function toolAccessService(
     }
     if (!response.ok) {
       const authenticate = response.headers.get("www-authenticate") ?? "";
-      if (
-        response.status === 401 &&
-        /bearer|oauth|authorization/i.test(authenticate)
-      ) {
-        const endpoints = await discoverOAuthEndpoints(
-          connection,
-          authenticate,
+      const challenged = /bearer|oauth|authorization/i.test(authenticate);
+      // A URL-only connection that gets a 401 with no usable challenge may
+      // still publish OAuth metadata at the well-known addresses. Only that
+      // case probes without a challenge: a connection the operator gave a key
+      // or another authentication type to keeps the plain 401.
+      const probeWithoutChallenge =
+        !challenged && connection.authKind === "none";
+      if (response.status === 401 && (challenged || probeWithoutChallenge)) {
+        // AWS API Gateway renames the challenge to `x-amzn-remapped-*`. On the
+        // URL-only probe it is read as a hint for the metadata address only,
+        // and the well-known addresses are still tried when the hint fails.
+        const remapped = response.headers.get(
+          "x-amzn-remapped-www-authenticate",
         );
+        const endpoints = challenged
+          ? await discoverOAuthEndpoints(connection, authenticate)
+          : ((remapped
+              ? await discoverOAuthEndpoints(connection, remapped).catch(
+                  () => null,
+                )
+              : null) ??
+            (await discoverOAuthEndpoints(connection).catch(() => null)));
         if (endpoints) {
           const nextConfig = {
             ...connection.config,
@@ -6924,13 +6938,15 @@ export function toolAccessService(
             })
             .where(eq(toolConnections.id, connection.id));
         }
-        throw new HttpError(502, "This app needs you to sign in.", {
-          code: "oauth_challenge",
-          status: response.status,
-          setupUrl: connectionSetupUrl(connection),
-          reconnectUrl: connectionReconnectUrl(connection),
-          oauthSupported: Boolean(endpoints),
-        });
+        if (challenged || endpoints) {
+          throw new HttpError(502, "This app needs you to sign in.", {
+            code: "oauth_challenge",
+            status: response.status,
+            setupUrl: connectionSetupUrl(connection),
+            reconnectUrl: connectionReconnectUrl(connection),
+            oauthSupported: Boolean(endpoints),
+          });
+        }
       }
       throw new HttpError(502, `Remote app returned HTTP ${response.status}`, {
         status: response.status,
