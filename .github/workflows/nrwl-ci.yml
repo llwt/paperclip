@@ -47,10 +47,13 @@ jobs:
       - name: Build
         run: pnpm build
 
-  # Together these lanes run exactly the suites of `pnpm test:run` (the general
-  # groups plus the serialized server suites), split with the same shard flags
-  # upstream's pr-trusted.yml uses. The server vitest config pins maxWorkers to
-  # 1, so one unsplit job would take the sum of all lanes.
+  # Together these lanes run the suites of `pnpm test:run` (the general groups
+  # plus the serialized server suites), split with the same shard flags
+  # upstream's pr-trusted.yml uses. The server shards only select
+  # server/src/**/*.test.ts, so the "server other" lane runs every other test
+  # file of the server project (today server/scripts/**/*.test.mjs), which the
+  # unsharded run includes. The server vitest config pins maxWorkers to 1, so
+  # one unsplit job would take the sum of all lanes.
   test:
     name: Tests (${{ matrix.label }})
     runs-on: ubuntu-latest
@@ -74,6 +77,11 @@ jobs:
           - label: server 5/5
             script: test:run:general
             args: --group general-server --shard-index 4 --shard-count 5
+          - label: server other
+            command: >-
+              pnpm run preflight:workspace-links &&
+              NODE_ENV=test pnpm exec vitest run --project @paperclipai/server
+              --exclude '**/dist/**' --exclude 'src/**/*.test.ts'
           - label: workspaces-a 1/2
             script: test:run:general
             args: --group general-workspaces-a --shard-index 0 --shard-count 2
@@ -120,7 +128,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Run tests
-        run: pnpm ${{ matrix.script }} -- ${{ matrix.args }}
+        run: ${{ matrix.command || format('pnpm {0} -- {1}', matrix.script, matrix.args) }}
 
   # Single check to require on nrwl-main. There is no red test baseline: any
   # failing lane fails the gate.

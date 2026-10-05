@@ -80,8 +80,10 @@ git merge --no-ff <tag>
 `.github/workflows/nrwl-ci.yml` runs on every pull request into `nrwl-main`, on
 GitHub-hosted runners: `pnpm install --frozen-lockfile`, `pnpm typecheck`,
 `pnpm build`, and the suites of `pnpm test:run` split into parallel lanes with
-upstream's own shard flags. The `nrwl-ci` check is green only when every lane
-passed.
+upstream's own shard flags. Upstream's server shards only select
+`server/src/**/*.test.ts`, so one extra lane ("server other") runs the rest of
+the server project's test files (`server/scripts/**/*.test.mjs`). The `nrwl-ci`
+check is green only when every lane passed.
 
 `.github/workflows/pr.yml` is upstream's and calls upstream's reusable
 workflow at upstream `master` (`pr-trusted.yml@master`). It is left untouched
