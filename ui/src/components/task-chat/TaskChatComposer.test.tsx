@@ -150,6 +150,10 @@ vi.mock("../../lib/paste-normalization", () => ({
   pasteNormalizationPlugin: () => ({}),
 }));
 
+vi.mock("../../lib/quote-exit", () => ({
+  quoteExitPlugin: () => ({}),
+}));
+
 const SLASH_HREF = buildSkillMentionHref("skill-1", "deploy");
 
 vi.mock("../../context/EditorAutocompleteContext", () => ({
