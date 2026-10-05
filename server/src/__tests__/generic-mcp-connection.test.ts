@@ -92,6 +92,11 @@ type FixtureOptions = {
    */
   challengeHeader?: string | null;
   /**
+   * Extra parameters appended to the challenge, such as direct
+   * `authorization_uri` and `token_uri` endpoint hints.
+   */
+  challengeParams?: string;
+  /**
    * Where protected-resource metadata is served. `null` serves none, so
    * discovery finds nothing. Defaults to the RFC 9728 well-known address.
    */
@@ -157,14 +162,19 @@ function jsonResponse(payload: unknown, status = 200): Response {
 function unauthorizedMcpResponse(
   resourceMetadataUrl: string | null,
   challengeHeader: string | null = "www-authenticate",
+  challengeParams?: string,
 ): Response {
+  const params = [
+    resourceMetadataUrl ? `resource_metadata="${resourceMetadataUrl}"` : null,
+    challengeParams ?? null,
+  ].filter(Boolean);
   return {
     ok: false,
     status: 401,
     headers: {
       get: (name: string) =>
-        challengeHeader && resourceMetadataUrl && name.toLowerCase() === challengeHeader
-          ? `Bearer resource_metadata="${resourceMetadataUrl}"`
+        challengeHeader && params.length > 0 && name.toLowerCase() === challengeHeader
+          ? `Bearer ${params.join(", ")}`
           : null,
     },
     text: async () => "",
@@ -197,7 +207,7 @@ function installMcpOAuthFixture(options: FixtureOptions = {}) {
     options.resourceMetadataUrl === undefined
       ? `${MCP_ORIGIN}/.well-known/oauth-protected-resource/mcp`
       : options.resourceMetadataUrl;
-  const unauthorized = () => unauthorizedMcpResponse(resourceMetadataUrl, options.challengeHeader);
+  const unauthorized = () => unauthorizedMcpResponse(resourceMetadataUrl, options.challengeHeader, options.challengeParams);
 
   const authorizationServerMetadata = () => ({
     issuer: ISSUER,
@@ -1208,6 +1218,51 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
 
     expect(failure).toMatchObject({ message: "Remote app returned HTTP 401" });
     expect((failure as { details?: { code?: string } }).details?.code).not.toBe("oauth_challenge");
+  });
+
+  it("does not take sign-in endpoints from the renamed challenge when no metadata is published", async () => {
+    // The renamed header is only a hint for the metadata address. Endpoints it
+    // names directly were never checked against published metadata, so a
+    // server that publishes none keeps the plain 401.
+    const fixture = installMcpOAuthFixture({
+      auth: "oauth",
+      challengeHeader: "x-amzn-remapped-www-authenticate",
+      challengeParams: `authorization_uri="${ISSUER}/authorize", token_uri="${ISSUER}/token"`,
+      resourceMetadataUrl: null,
+      authorizationServerMetadata: false,
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    const failure = await service
+      .connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture remapped direct endpoints" })
+      .catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ message: "Remote app returned HTTP 401" });
+    expect((failure as { details?: { code?: string } }).details?.code).not.toBe("oauth_challenge");
+    expect(fixture.requestsTo("/.well-known/oauth-protected-resource/mcp").length).toBeGreaterThan(0);
+    const rows = await db.select().from(toolConnections).where(eq(toolConnections.companyId, company.id));
+    expect(rows.filter((row) => row.authKind === "oauth")).toHaveLength(0);
+  });
+
+  it("uses the published metadata rather than endpoints named in the renamed challenge", async () => {
+    const fixture = installMcpOAuthFixture({
+      auth: "oauth",
+      challengeHeader: "x-amzn-remapped-www-authenticate",
+      challengeParams:
+        'authorization_uri="https://hinted.fixture.test/authorize", token_uri="https://hinted.fixture.test/token"',
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture remapped hinted endpoints" });
+
+    expect(connected.auth).toMatchObject({ kind: "oauth", issuer: ISSUER, resource: MCP_URL });
+    expect(fixture.requestsTo("/.well-known/oauth-protected-resource/mcp").length).toBeGreaterThan(0);
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(connection!.config).toMatchObject({
+      oauth: { authorizationUrl: `${ISSUER}/authorize`, tokenUrl: `${ISSUER}/token` },
+    });
   });
 
   it("reads the challenge AWS API Gateway renames to x-amzn-remapped-www-authenticate", async () => {
