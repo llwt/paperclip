@@ -174,6 +174,61 @@ describe("buildDeskShelves", () => {
   it("returns no shelves for an empty desk", () => {
     expect(buildDeskShelves([], NOW)).toEqual([]);
   });
+
+  describe("sort order", () => {
+    const items = [
+      buildItem({ id: "today-early", createdAt: "2026-07-09T02:00:00Z" }),
+      buildItem({ id: "today-late", createdAt: "2026-07-09T11:00:00Z" }),
+      buildItem({ id: "earlier-old", createdAt: "2026-06-20T09:00:00Z" }),
+      buildItem({ id: "earlier-recent", createdAt: "2026-07-05T09:00:00Z" }),
+    ];
+    const idsByShelf = (shelves: ReturnType<typeof buildDeskShelves>) =>
+      Object.fromEntries(shelves.map((s) => [s.key, s.items.map((i) => i.id)]));
+
+    it("defaults to newest first, matching an explicit 'newest'", () => {
+      expect(buildDeskShelves(items, NOW)).toEqual(buildDeskShelves(items, NOW, "newest"));
+      expect(idsByShelf(buildDeskShelves(items, NOW, "newest"))).toEqual({
+        "desk:new-today": ["today-late", "today-early"],
+        "desk:earlier": ["earlier-recent", "earlier-old"],
+      });
+    });
+
+    it("flips the order inside each shelf for 'oldest' without reordering or re-bucketing shelves", () => {
+      const shelves = buildDeskShelves(items, NOW, "oldest");
+      expect(shelves.map((s) => s.key)).toEqual(["desk:new-today", "desk:earlier"]);
+      expect(idsByShelf(shelves)).toEqual({
+        "desk:new-today": ["today-early", "today-late"],
+        "desk:earlier": ["earlier-old", "earlier-recent"],
+      });
+    });
+
+    it("breaks arrival ties by rank (lower rank wins) in both directions", () => {
+      const tied = [
+        buildItem({ id: "a", createdAt: todayIso, rank: 2 }),
+        buildItem({ id: "b", createdAt: todayIso, rank: 1 }),
+      ];
+      expect(buildDeskShelves(tied, NOW, "newest")[0]!.items.map((i) => i.id)).toEqual(["b", "a"]);
+      expect(buildDeskShelves(tied, NOW, "oldest")[0]!.items.map((i) => i.id)).toEqual(["b", "a"]);
+    });
+
+    it("keeps 'Decide now' deadline-first and applies the order among items sharing a deadline", () => {
+      const due = [
+        buildItem({ id: "due-early", decideBy: "today", createdAt: "2026-07-09T02:00:00Z" }),
+        buildItem({ id: "overdue", decideBy: "2026-07-01", createdAt: "2026-07-09T10:00:00Z" }),
+        buildItem({ id: "due-late", decideBy: "today", createdAt: "2026-07-09T11:00:00Z" }),
+      ];
+      expect(buildDeskShelves(due, NOW, "newest")[0]!.items.map((i) => i.id)).toEqual([
+        "overdue",
+        "due-late",
+        "due-early",
+      ]);
+      expect(buildDeskShelves(due, NOW, "oldest")[0]!.items.map((i) => i.id)).toEqual([
+        "overdue",
+        "due-early",
+        "due-late",
+      ]);
+    });
+  });
 });
 
 describe("attentionIsNewToday", () => {

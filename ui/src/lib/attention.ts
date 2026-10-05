@@ -348,22 +348,37 @@ export interface DeskShelf {
  *   • "New today"  — remaining items that surfaced today, newest arrival first.
  *   • "Earlier"    — remaining older arrivals, newest arrival first.
  *
+ * `sortOrder` is the toolbar's newest/oldest toggle. It never moves an item
+ * between shelves or reorders the shelves themselves; it only flips the arrival
+ * direction inside each one. "Decide now" stays deadline-first (most overdue on
+ * top) and applies the direction among items sharing a deadline. `rank` is the
+ * final tiebreaker in both directions.
+ *
  * A decide-now item is only ever on the "Decide now" shelf, so the three shelves
  * are disjoint and their sizes sum to `items.length`.
  */
-export function buildDeskShelves(items: AttentionItem[], now: number): DeskShelf[] {
+export function buildDeskShelves(
+  items: AttentionItem[],
+  now: number,
+  sortOrder: AttentionSortOrder = "newest",
+): DeskShelf[] {
+  const sign = sortOrder === "oldest" ? -1 : 1;
+  const byArrival = (a: AttentionItem, b: AttentionItem) =>
+    sign * (attentionArrivalTimestamp(b) - attentionArrivalTimestamp(a));
   const decideNow = items
     .filter((item) => attentionIsDecideNow(item, now))
     .sort((a, b) => {
       const [, aDeadline] = attentionDecideOrder(a, now);
       const [, bDeadline] = attentionDecideOrder(b, now);
       if (aDeadline !== bDeadline) return aDeadline - bDeadline;
+      const diff = byArrival(a, b);
+      if (diff !== 0) return diff;
       return a.rank - b.rank;
     });
   const rest = items
     .filter((item) => !attentionIsDecideNow(item, now))
     .sort((a, b) => {
-      const diff = attentionArrivalTimestamp(b) - attentionArrivalTimestamp(a);
+      const diff = byArrival(a, b);
       if (diff !== 0) return diff;
       return a.rank - b.rank;
     });
