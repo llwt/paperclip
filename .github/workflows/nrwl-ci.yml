@@ -49,11 +49,13 @@ jobs:
 
   # Together these lanes run the suites of `pnpm test:run` (the general groups
   # plus the serialized server suites), split with the same shard flags
-  # upstream's pr-trusted.yml uses. The server shards only select
-  # server/src/**/*.test.ts, so the "server other" lane runs every other test
-  # file of the server project (today server/scripts/**/*.test.mjs), which the
-  # unsharded run includes. The server vitest config pins maxWorkers to 1, so
-  # one unsplit job would take the sum of all lanes.
+  # upstream's pr-trusted.yml uses. The server shards pick files by path rules
+  # (general: server/src/**/*.test.ts minus route/authz names; serialized:
+  # route/authz names under server/src/__tests__ only), which leaves out some
+  # files the unsharded run includes. The "server other" lane runs exactly the
+  # server project test files that no shard selects, computed by
+  # scripts/nrwl-ci-server-other.mjs. The server vitest config pins maxWorkers
+  # to 1, so one unsplit job would take the sum of all lanes.
   test:
     name: Tests (${{ matrix.label }})
     runs-on: ubuntu-latest
@@ -80,8 +82,7 @@ jobs:
           - label: server other
             command: >-
               pnpm run preflight:workspace-links &&
-              NODE_ENV=test pnpm exec vitest run --project @paperclipai/server
-              --exclude '**/dist/**' --exclude 'src/**/*.test.ts'
+              node scripts/nrwl-ci-server-other.mjs
           - label: workspaces-a 1/2
             script: test:run:general
             args: --group general-workspaces-a --shard-index 0 --shard-count 2

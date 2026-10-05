@@ -7,7 +7,8 @@ and this fork is retired.
 
 - Mainline: `nrwl-main`. Installs pin a full commit SHA on it.
 - `master` is a pure mirror of upstream `master`. Never commit to it.
-- Fork-only files: this file and `.github/workflows/nrwl-ci.yml`. Everything
+- Fork-only files: this file, `.github/workflows/nrwl-ci.yml` and
+  `scripts/nrwl-ci-server-other.mjs`. Everything
   else is upstream code plus the patches listed below.
 
 ## Inventory of fork-only commits
@@ -27,7 +28,7 @@ against upstream `master` `1c07b5903` and the latest stable tag `v2026.1001.0`
 | `0fc5dd88b` | UI: remount the composer takeover card per pending input (fork PR #1) | Open upstream as paperclipai/paperclip#15121, no review yet | #15121 lands and that release is merged |
 | `200a198f0` | Tools: offer sign-in when a custom MCP server answers 401 without `WWW-Authenticate` (fork PR #2) | Not submitted. Port branch `fix/mcp-401-sign-in-without-challenge` (`cb19b98d4`) is ready | The upstream PR from that port branch lands and that release is merged |
 | fork PR #3, test commit | Tests: three test-call fixtures in `tool-access-service.test.ts` answer with the request ID. Needed by `0d78b3d67` | Identical change is in upstream `v2026.1001.0` | The `v2026.1001.0` merge |
-| fork PR #3, fork files | `FORK.md` and `.github/workflows/nrwl-ci.yml` | Fork-only by design, will not go upstream | The fork is retired |
+| fork PR #3, fork files | `FORK.md`, `.github/workflows/nrwl-ci.yml` and `scripts/nrwl-ci-server-other.mjs` | Fork-only by design, will not go upstream | The fork is retired |
 
 To refresh this table:
 
@@ -80,10 +81,12 @@ git merge --no-ff <tag>
 `.github/workflows/nrwl-ci.yml` runs on every pull request into `nrwl-main`, on
 GitHub-hosted runners: `pnpm install --frozen-lockfile`, `pnpm typecheck`,
 `pnpm build`, and the suites of `pnpm test:run` split into parallel lanes with
-upstream's own shard flags. Upstream's server shards only select
-`server/src/**/*.test.ts`, so one extra lane ("server other") runs the rest of
-the server project's test files (`server/scripts/**/*.test.mjs`). The `nrwl-ci`
-check is green only when every lane passed.
+upstream's own shard flags. Upstream's server shards pick files by path rules
+and miss a few that the unsharded run includes, so one extra lane ("server
+other") runs every server project test file that no shard selects. The list is
+computed by `scripts/nrwl-ci-server-other.mjs` (fork-only) from vitest's own
+collection minus the shards' dry-run selection; `--list` prints it. The
+`nrwl-ci` check is green only when every lane passed.
 
 `.github/workflows/pr.yml` is upstream's and calls upstream's reusable
 workflow at upstream `master` (`pr-trusted.yml@master`). It is left untouched
