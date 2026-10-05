@@ -117,8 +117,17 @@ trailing text such as `120000ms`) is ignored and the built-in value is used.
 Values above `2147483647` (the largest delay a Node.js timer accepts) are
 reduced to that bound.
 
-Approved executions (a tool call that runs after its action request is
-approved) keep a fixed 60 second budget. Neither variable changes it.
+For a tool call that needed approval, the budget depends on what runs the call
+once it is approved:
+
+- When Paperclip runs the call itself as part of accepting the approval (the
+  usual path for an agent's ask-first call), the call keeps a fixed 60 second
+  budget. Neither variable changes it.
+- When a later gateway call carries out the approved request by passing
+  `approvedActionRequestId`, it is timed like any other call: the timeout that
+  call supplies, up to the cap, or the default above when it supplies none.
+- When an ask-first call made from a connection's Test tab is approved, it
+  runs with no caller timeout, so it gets the default above.
 
 ### Hiding settings surfaces
 
