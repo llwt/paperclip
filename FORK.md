@@ -14,25 +14,20 @@ and this fork is retired.
 
 Base: upstream tag `v2026.916.0` (`dffc2b3ca`). Last refreshed 2026-10-05
 against upstream `master` `1c07b5903` and the latest stable tag `v2026.1001.0`
-(`8f8a0ab7e`). `nrwl-main` was 6 ahead and 342 behind upstream `master`, and 77
-behind `v2026.1001.0`.
+(`8f8a0ab7e`). `nrwl-main` (`200a198f0`) was 7 ahead and 342 behind upstream
+`master`, and 77 behind `v2026.1001.0`.
 
 | Commit | What | Upstream status | Drops out when |
 | --- | --- | --- | --- |
 | `d554c4789` | UI: composer stays available while pause state loads (upstream #13562) | Upstream's own `v2026.916.1` hotfix, not ours | Any merge of a later stable tag |
-| `25fcf9633` | Gateway: configurable tool timeout, connection stays listed after a tool timeout | Not submitted. Port branch `gateway-tool-timeout-upstream` (`4d6df5a79`) is ready | The upstream PR from the port branch lands |
+| `25fcf9633` | Gateway: configurable tool timeout, connection stays listed after a tool timeout | Not submitted. Port branch `gateway-tool-timeout-upstream` (`534d5ebd1`) is ready | The upstream PR from the port branch lands |
 | `669a157cb` | Gateway: approved execution budget stays fixed, timeout env values bounded | Not submitted. Same port branch | Same PR |
 | `0d78b3d67` | Gateway: pick the `tools/call` response by request ID, summarize the stream when none matches | Partly upstream: `v2026.1001.0` also selects by request ID. The stream summary is not upstream | Same PR, smaller after the `v2026.1001.0` merge |
 | `ba2e6f933` | Gateway: known method labels only, skip non-JSON stream events | Not submitted. Same port branch | Same PR |
 | `0fc5dd88b` | UI: remount the composer takeover card per pending input (fork PR #1) | Open upstream as paperclipai/paperclip#15121, no review yet | #15121 lands and that release is merged |
+| `200a198f0` | Tools: offer sign-in when a custom MCP server answers 401 without `WWW-Authenticate` (fork PR #2) | Not submitted. Port branch `fix/mcp-401-sign-in-without-challenge` (`cb19b98d4`) is ready | The upstream PR from that port branch lands and that release is merged |
 | fork PR #3, test commit | Tests: three test-call fixtures in `tool-access-service.test.ts` answer with the request ID. Needed by `0d78b3d67` | Identical change is in upstream `v2026.1001.0` | The `v2026.1001.0` merge |
 | fork PR #3, fork files | `FORK.md` and `.github/workflows/nrwl-ci.yml` | Fork-only by design, will not go upstream | The fork is retired |
-
-Not on `nrwl-main` yet:
-
-| Change | What | Upstream status |
-| --- | --- | --- |
-| fork PR #2 (draft, head `9444a6a1f`) | Tools: offer sign-in when a custom MCP server answers 401 without `WWW-Authenticate` | Not submitted, no port branch yet |
 
 To refresh this table:
 
@@ -89,7 +84,10 @@ upstream's own shard flags. The `nrwl-ci` check is green only when every lane
 passed.
 
 `.github/workflows/pr.yml` is upstream's and calls upstream's reusable
-workflow. It is left untouched so it never conflicts with an upstream merge.
+workflow at upstream `master` (`pr-trusted.yml@master`). It is left untouched
+so it never conflicts with an upstream merge. It does run on fork pull
+requests (it passed on fork PR #3), but its definition follows upstream
+`master`, not the code on `nrwl-main`, so it is extra signal and not the gate.
 
 **Red test baseline: empty.** No test is allowed to fail. The two tests that
 were red on `nrwl-main` (`tool-access-service.test.ts`, "executes allowed test
