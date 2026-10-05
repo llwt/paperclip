@@ -345,14 +345,15 @@ export interface DeskShelf {
  *   • "Decide now" — items with an explicit decide-by deadline due today/past,
  *     ordered by deadline. Omitted entirely when nothing has a due deadline, so
  *     the desk never leads with a shelf built on unset metadata.
- *   • "New today"  — remaining items that surfaced today, newest arrival first.
- *   • "Earlier"    — remaining older arrivals, newest arrival first.
+ *   • "New today"  — remaining items that surfaced today, most recent activity first.
+ *   • "Earlier"    — remaining older arrivals, most recent activity first.
  *
  * `sortOrder` is the toolbar's newest/oldest toggle. It never moves an item
- * between shelves or reorders the shelves themselves; it only flips the arrival
- * direction inside each one. "Decide now" stays deadline-first (most overdue on
- * top) and applies the direction among items sharing a deadline. `rank` is the
- * final tiebreaker in both directions.
+ * between shelves or reorders the shelves themselves (membership stays
+ * arrival-based); it only sets the direction inside each one, by activity time
+ * like the grouped views ({@link sortAttentionItems}). "Decide now" stays
+ * deadline-first (most overdue on top) and applies the direction among items
+ * sharing a deadline. `rank` is the final tiebreaker in both directions.
  *
  * A decide-now item is only ever on the "Decide now" shelf, so the three shelves
  * are disjoint and their sizes sum to `items.length`.
@@ -362,26 +363,14 @@ export function buildDeskShelves(
   now: number,
   sortOrder: AttentionSortOrder = "newest",
 ): DeskShelf[] {
-  const sign = sortOrder === "oldest" ? -1 : 1;
-  const byArrival = (a: AttentionItem, b: AttentionItem) =>
-    sign * (attentionArrivalTimestamp(b) - attentionArrivalTimestamp(a));
-  const decideNow = items
-    .filter((item) => attentionIsDecideNow(item, now))
-    .sort((a, b) => {
-      const [, aDeadline] = attentionDecideOrder(a, now);
-      const [, bDeadline] = attentionDecideOrder(b, now);
-      if (aDeadline !== bDeadline) return aDeadline - bDeadline;
-      const diff = byArrival(a, b);
-      if (diff !== 0) return diff;
-      return a.rank - b.rank;
-    });
-  const rest = items
-    .filter((item) => !attentionIsDecideNow(item, now))
-    .sort((a, b) => {
-      const diff = byArrival(a, b);
-      if (diff !== 0) return diff;
-      return a.rank - b.rank;
-    });
+  const decideNow = sortAttentionItems(
+    items.filter((item) => attentionIsDecideNow(item, now)),
+    sortOrder,
+  ).sort((a, b) => attentionDecideOrder(a, now)[1] - attentionDecideOrder(b, now)[1]);
+  const rest = sortAttentionItems(
+    items.filter((item) => !attentionIsDecideNow(item, now)),
+    sortOrder,
+  );
   const newToday = rest.filter((item) => attentionIsNewToday(item, now));
   const earlier = rest.filter((item) => !attentionIsNewToday(item, now));
 
@@ -390,11 +379,6 @@ export function buildDeskShelves(
   if (newToday.length > 0) shelves.push({ key: "desk:new-today", label: "New today", items: newToday });
   if (earlier.length > 0) shelves.push({ key: "desk:earlier", label: "Earlier", items: earlier });
   return shelves;
-}
-
-function attentionArrivalTimestamp(item: AttentionItem): number {
-  const ts = new Date(item.createdAt).getTime();
-  return Number.isFinite(ts) ? ts : 0;
 }
 
 // ---------------------------------------------------------------------------
