@@ -240,6 +240,10 @@ describe("managed install commands", () => {
     const order = runCommand.mock.calls.map(([file, args]) => `${file === process.execPath ? "node" : file} ${args[0] === "pnpm" ? args[1] : path.basename(args[0] ?? "")}`);
     expect(order.indexOf("bash prepare-server-ui-dist.sh")).toBeGreaterThan(order.indexOf("corepack install"));
     expect(order.indexOf("bash prepare-server-ui-dist.sh")).toBeLessThan(order.indexOf("node prepare-bundled-package.mjs"));
+    // The staged server keeps its prepack script, which fails outside the workspace.
+    const stagedPackCalls = runCommand.mock.calls.filter(([file, args]) => file === "npm" && args[0] === "pack" && args[1]?.includes("workspace-package-"));
+    expect(stagedPackCalls.length).toBeGreaterThan(0);
+    for (const [, args] of stagedPackCalls) expect(args).toContain("--ignore-scripts");
   });
 
   it("puts the checkout node_modules/.bin on the build PATH so ignore-scripts=true does not hide tsc", async () => {
