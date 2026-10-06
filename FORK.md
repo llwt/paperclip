@@ -6,8 +6,8 @@ inventory below, at which point the instance returns to plain upstream releases
 and this fork is retired.
 
 - Mainline: `nrwl-main`. Installs pin a full commit SHA on it. The branch is
-  protected: every change arrives through a pull request with a green `nrwl-ci`
-  (see "CI gate").
+  protected: GitHub rejects any commit that has no green `nrwl-ci`, and the
+  process sends every change through a pull request (see "CI gate").
 - `master` is a pure mirror of upstream `master`. Never commit to it.
 - Fork-only files: this file, `.github/workflows/nrwl-ci.yml` and
   `scripts/nrwl-ci-server-other.mjs`. Everything
@@ -59,8 +59,9 @@ gh pr view <number> -R paperclipai/paperclip        # each upstream PR
    needs Steven's go-ahead each time.
 6. **Every change goes through a fork pull request with a green `nrwl-ci`.**
    That covers fixes, upstream release merges, reverts and edits to this file.
-   Branch protection rejects a direct push to `nrwl-main`, for admins too (see
-   "CI gate").
+   Never push to `nrwl-main` directly. This is a process rule: branch
+   protection rejects a push of a commit that has no green `nrwl-ci`, for
+   admins too, but it does not require a pull request (see "CI gate").
 
 ## Taking upstream releases
 
@@ -74,9 +75,10 @@ git merge --no-ff <tag>
 ```
 
 - Push `merge/upstream-<tag>` to the fork and open a fork PR from it into
-  `nrwl-main`. Do not squash it. The release merge has no shortcut: pushing the
-  merge commit straight to `nrwl-main` is rejected, and the PR merges only once
-  `nrwl-ci` is green on its head.
+  `nrwl-main`. Do not squash it. The release merge has no shortcut: the merge
+  commit has no `nrwl-ci` result until a PR runs it, so GitHub rejects a push
+  of it straight to `nrwl-main`, and the PR merges only once `nrwl-ci` is green
+  on its head. Merge it through the PR, not by a push (rule 6).
 - Conflicts only appear in files the fork patched. Where a port branch exists
   for the file, take the port branch version, and keep the "Differs from
   upstream" comments.
@@ -133,9 +135,15 @@ What this means in practice:
 - A pull request into `nrwl-main` cannot be merged until `nrwl-ci` is green on
   its head commit. That holds for everyone, including the admin account all
   agents use. There is no admin override.
-- A direct push to `nrwl-main` is rejected, because the pushed commit has no
-  green `nrwl-ci`. The workflow runs only on pull requests into `nrwl-main`, so
-  the pull request is the only way to get that check.
+- A direct push to `nrwl-main` is rejected when the pushed commit has no green
+  `nrwl-ci`. The workflow runs only on pull requests into `nrwl-main`, so a
+  commit gets that check only as the head of a pull request.
+- Protection does not require a pull request (no required reviews, no push
+  restrictions, no rulesets). GitHub therefore accepts a direct push of a
+  commit that already has a green `nrwl-ci`, for example a fast-forward of
+  `nrwl-main` to the head of an up to date pull request. Do not do this: rule 6
+  makes the merged pull request the only allowed way in. That part is process,
+  not something GitHub enforces.
 - `nrwl-main` cannot be force pushed or deleted. To take a commit back, open a
   revert pull request.
 - `strict` is off: a pull request does not have to contain the latest
@@ -162,8 +170,8 @@ An install is a deployment. It is its own task, assigned by the Coordinator
 after Steven approves the SHA.
 
 1. The target is a full SHA on `nrwl-main` with a green `nrwl-ci` run. Never
-   install a branch name. A commit reaches `nrwl-main` only through a merged
-   pull request, so an install never involves a push to `nrwl-main`.
+   install a branch name. By rule 6 a commit reaches `nrwl-main` only through
+   a merged pull request, so an install never involves a push to `nrwl-main`.
 2. Record the current `sha` from `~/.paperclip/cli/install.json`. List the
    migrations the new commit adds: `git diff --stat <old> <new> -- packages/db/src/migrations`.
 3. Confirm a fresh database backup exists (`/api/health` reports
