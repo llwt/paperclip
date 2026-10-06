@@ -5,7 +5,9 @@ This fork exists only to run a few fixes on the Nrwl instance before upstream
 inventory below, at which point the instance returns to plain upstream releases
 and this fork is retired.
 
-- Mainline: `nrwl-main`. Installs pin a full commit SHA on it.
+- Mainline: `nrwl-main`. Installs pin a full commit SHA on it. The branch is
+  protected: every change arrives through a pull request with a green `nrwl-ci`
+  (see "CI gate").
 - `master` is a pure mirror of upstream `master`. Never commit to it.
 - Fork-only files: this file, `.github/workflows/nrwl-ci.yml` and
   `scripts/nrwl-ci-server-other.mjs`. Everything
@@ -55,6 +57,10 @@ gh pr view <number> -R paperclipai/paperclip        # each upstream PR
 4. **Merge commits only.** No rebase and no force push on `nrwl-main`.
 5. Posting to `paperclipai/paperclip` (PR, issue or comment) is external and
    needs Steven's go-ahead each time.
+6. **Every change goes through a fork pull request with a green `nrwl-ci`.**
+   That covers fixes, upstream release merges, reverts and edits to this file.
+   Branch protection rejects a direct push to `nrwl-main`, for admins too (see
+   "CI gate").
 
 ## Taking upstream releases
 
@@ -67,7 +73,10 @@ git switch -c merge/upstream-<tag> fork/nrwl-main
 git merge --no-ff <tag>
 ```
 
-- Open a fork PR from `merge/upstream-<tag>` into `nrwl-main`. Do not squash it.
+- Push `merge/upstream-<tag>` to the fork and open a fork PR from it into
+  `nrwl-main`. Do not squash it. The release merge has no shortcut: pushing the
+  merge commit straight to `nrwl-main` is rejected, and the PR merges only once
+  `nrwl-ci` is green on its head.
 - Conflicts only appear in files the fork patched. Where a port branch exists
   for the file, take the port branch version, and keep the "Differs from
   upstream" comments.
@@ -104,13 +113,57 @@ way upstream did in `v2026.1001.0`. If a test is ever red on a clean upstream
 tag, record it in a baseline file next to the workflow, make the gate "no
 failures outside the baseline", and never skip or delete the test.
 
+### Branch protection
+
+`nrwl-ci` is a required status check on `nrwl-main`, enforced by GitHub branch
+protection. Settings as of 2026-10-06:
+
+| Setting | Value |
+| --- | --- |
+| Required status checks | `nrwl-ci` only, pinned to GitHub Actions (app id 15368). It is the `gate` job of `nrwl-ci.yml` |
+| Branch up to date before merging (`strict`) | Off |
+| Enforced for admins (`enforce_admins`) | On |
+| Force pushes | Blocked |
+| Branch deletion | Blocked |
+| Required reviews | None |
+| Push restrictions | None |
+
+What this means in practice:
+
+- A pull request into `nrwl-main` cannot be merged until `nrwl-ci` is green on
+  its head commit. That holds for everyone, including the admin account all
+  agents use. There is no admin override.
+- A direct push to `nrwl-main` is rejected, because the pushed commit has no
+  green `nrwl-ci`. The workflow runs only on pull requests into `nrwl-main`, so
+  the pull request is the only way to get that check.
+- `nrwl-main` cannot be force pushed or deleted. To take a commit back, open a
+  revert pull request.
+- `strict` is off: a pull request does not have to contain the latest
+  `nrwl-main` to merge. Its `nrwl-ci` result is for the merge with the base as
+  it was when the run started.
+- Branch protection does not require a review. The independent review and
+  Steven's approval of the head SHA are process, not something GitHub enforces.
+- `master` has no part in this: the protection covers `nrwl-main` only.
+
+To inspect the live settings (read only):
+
+```sh
+gh api repos/llwt/paperclip/branches/nrwl-main/protection
+```
+
+If the output differs from the table, the table is stale: correct it in a pull
+request. Changing or removing the protection is a repository setting, not a
+routine step. It needs Steven's go-ahead each time, including a temporary
+change to get one merge through.
+
 ## Install
 
 An install is a deployment. It is its own task, assigned by the Coordinator
 after Steven approves the SHA.
 
 1. The target is a full SHA on `nrwl-main` with a green `nrwl-ci` run. Never
-   install a branch name.
+   install a branch name. A commit reaches `nrwl-main` only through a merged
+   pull request, so an install never involves a push to `nrwl-main`.
 2. Record the current `sha` from `~/.paperclip/cli/install.json`. List the
    migrations the new commit adds: `git diff --stat <old> <new> -- packages/db/src/migrations`.
 3. Confirm a fresh database backup exists (`/api/health` reports
@@ -127,6 +180,10 @@ after Steven approves the SHA.
 3. If the new build ran migrations, the old code may not work on the new
    schema. Rollback then also means restoring the database backup from install
    step 3.
+
+A rollback changes the installed build only. It does not move `nrwl-main`,
+which cannot be reset or force pushed. To take the bad commit off `nrwl-main`,
+open a revert pull request and wait for a green `nrwl-ci` like any other change.
 
 Not verified yet: whether `update --rollback` works for a git install, and
 whether `install` takes its own database backup the way `update` does. Test
