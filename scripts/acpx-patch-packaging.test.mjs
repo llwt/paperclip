@@ -21,6 +21,7 @@ import { bundledCliNpmDependencies } from "./cli-bundled-npm-dependencies.mjs";
 import {
   createBundledInstallManifest,
   materializePublishManifest,
+  readWorkspacePackageVersions,
   selectBundledDependencyPatches,
 } from "./prepare-bundled-package.mjs";
 
@@ -173,6 +174,19 @@ test("bundled package staging materializes workspace dependency versions", () =>
     caret: "^2026.723.0",
     tilde: "~2026.723.0",
   });
+});
+
+test("bundled package staging uses the real version of a workspace dependency that has its own", () => {
+  const workspaceVersions = readWorkspacePackageVersions();
+  const staged = materializePublishManifest(serverPackage, workspaceVersions);
+  const pluginSdkVersion = JSON.parse(
+    readFileSync(new URL("../packages/plugins/sdk/package.json", import.meta.url), "utf8"),
+  ).version;
+
+  assert.equal(serverPackage.dependencies["@paperclipai/plugin-sdk"], "workspace:*");
+  assert.equal(workspaceVersions["@paperclipai/plugin-sdk"], pluginSdkVersion);
+  assert.equal(staged.dependencies["@paperclipai/plugin-sdk"], pluginSdkVersion);
+  assert.equal(staged.dependencies["@paperclipai/shared"], workspaceVersions["@paperclipai/shared"]);
 });
 
 test("bundled package staging installs only dependencies included in the tarball", () => {
