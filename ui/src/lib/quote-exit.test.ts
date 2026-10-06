@@ -226,7 +226,10 @@ describe("quote exit", () => {
       expect(shape(editor)).toBe("p(intro) quote[p(quoted)] p(reply) p(after)");
     });
 
-    it("leaves a typed quote and keeps the reply out of it", () => {
+    // Existing behaviour, kept on purpose: a typed quote holds its text
+    // directly, so the first Enter already leaves it. Only loaded quotes
+    // continue on a non-empty line.
+    it("keeps the existing typed-quote behaviour: the first Enter leaves the quote", () => {
       const editor = createTestEditor();
       typeQuote(editor, "quoted");
 
