@@ -269,8 +269,13 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
   // through corepack, nothing puts it on PATH, so provision a shim into the staging dir.
   const pnpmShimDir = path.join(stagingRoot, "pnpm-bin");
   fs.mkdirSync(pnpmShimDir, { recursive: true, mode: 0o700 });
+  // pnpm leaves the workspace root node_modules/.bin off the script PATH when
+  // ignore-scripts=true is configured, so packages that rely on the root
+  // TypeScript (tsc) fail to build. Put it on PATH here; this runs no dependency
+  // lifecycle scripts and leaves the setting itself alone.
+  const workspaceBinDir = path.join(checkoutPath, "node_modules", ".bin");
   const buildEnv = (extra: NodeJS.ProcessEnv = {}) =>
-    gitBuildEnv({ PATH: [pnpmShimDir, process.env.PATH].filter(Boolean).join(path.delimiter), ...extra });
+    gitBuildEnv({ PATH: [pnpmShimDir, workspaceBinDir, process.env.PATH].filter(Boolean).join(path.delimiter), ...extra });
   try {
     await runGitHubCurl(["--fail", "--silent", "--show-error", "--location", "--output", archivePath, `https://codeload.github.com/${repo}/tar.gz/${sha}`], runCommand, { maxBuffer: 4 * 1024 * 1024 });
     await runCommand("tar", ["-xzf", archivePath, "--strip-components=1", "-C", checkoutPath], { maxBuffer: 4 * 1024 * 1024 });
@@ -278,6 +283,9 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    // The server package ships ui-dist, but only its prepack script builds it, and
+    // prepare-bundled-package.mjs stages the server without running prepack.
+    await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
     for (const [index, workspacePackage] of workspacePackages.entries()) {
