@@ -286,6 +286,17 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     // The server package ships ui-dist, but only its prepack script builds it, and
     // prepare-bundled-package.mjs stages the server without running prepack.
     await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    // Same for the skills directory those packages ship: scripts/release.sh copies
+    // it in by hand, so do the same here for the same three packages.
+    const skillsPath = path.join(checkoutPath, "skills");
+    if (fs.existsSync(skillsPath)) {
+      for (const packageDir of ["server", "packages/adapters/claude-local", "packages/adapters/codex-local"]) {
+        const packageSkillsPath = path.join(checkoutPath, packageDir, "skills");
+        if (!fs.existsSync(path.dirname(packageSkillsPath))) continue;
+        fs.rmSync(packageSkillsPath, { recursive: true, force: true });
+        fs.cpSync(skillsPath, packageSkillsPath, { recursive: true });
+      }
+    }
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
     for (const [index, workspacePackage] of workspacePackages.entries()) {
