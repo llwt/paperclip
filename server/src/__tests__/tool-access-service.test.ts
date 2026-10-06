@@ -3381,10 +3381,10 @@ describeEmbeddedPostgres("tool access service", () => {
       priority: 100,
       selectors: { connectionId: connection.id },
     });
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) =>
       mcpHttpResponse({
         jsonrpc: "2.0",
-        id: "paperclip-tool-test",
+        id: JSON.parse(String(init?.body)).id,
         result: { content: [{ type: "text", text: "sent" }] },
       }),
     );
@@ -3673,10 +3673,10 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(waiting.body.result).toBeUndefined();
 
     // 3. Approving from the review queue is what runs the parked test call.
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) =>
       mcpHttpResponse({
         jsonrpc: "2.0",
-        id: "paperclip-tool-test",
+        id: JSON.parse(String(init?.body)).id,
         result: { content: [{ type: "text", text: "sent" }] },
       }),
     );
@@ -3740,10 +3740,10 @@ describeEmbeddedPostgres("tool access service", () => {
       .send(body)
       .expect(200);
 
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) =>
       mcpHttpResponse({
         jsonrpc: "2.0",
-        id: "paperclip-tool-test",
+        id: JSON.parse(String(init?.body)).id,
         result: { content: [{ type: "text", text: "sent" }] },
       }),
     );
