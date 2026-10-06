@@ -27,7 +27,7 @@ against upstream `master` `1c07b5903` and the latest stable tag `v2026.1001.0`
 | `ba2e6f933` | Gateway: known method labels only, skip non-JSON stream events | Not submitted. Same port branch | Same PR |
 | `0fc5dd88b` | UI: remount the composer takeover card per pending input (fork PR #1) | Open upstream as paperclipai/paperclip#15121, no review yet | #15121 lands and that release is merged |
 | `200a198f0` | Tools: offer sign-in when a custom MCP server answers 401 without `WWW-Authenticate` (fork PR #2) | Not submitted. Port branch `fix/mcp-401-sign-in-without-challenge` (`cb19b98d4`) is ready | The upstream PR from that port branch lands and that release is merged |
-| fork PR #7 | CLI: `install --ref` builds `server/ui-dist`, copies `skills`, stages real workspace dependency versions, and works with `ignore-scripts=true` (see "Install") | Not submitted. Upstream `master` (`a1ab55a56`) has the same code. Port branch `nx-509-git-install-upstream` is ready, local only on chungus | The upstream PR from that port branch lands and that release is merged |
+| fork PR #7 | CLI: `install --ref` builds `server/ui-dist`, copies `skills`, stages real workspace dependency versions, and works with `ignore-scripts=true` (see "Install") | Not submitted. Upstream `master` (`a1ab55a56`) has the same code. Upstream issue #15026 and open upstream PR #13928 cover the staging faults, not the `ignore-scripts` ones. Port branch `nx-509-git-install-upstream` is ready, local only on chungus | The upstream PR from that port branch lands and that release is merged |
 | fork PR #3, test commit | Tests: three test-call fixtures in `tool-access-service.test.ts` answer with the request ID. Needed by `0d78b3d67` | Identical change is in upstream `v2026.1001.0` | The `v2026.1001.0` merge |
 | fork PR #3, fork files | `FORK.md`, `.github/workflows/nrwl-ci.yml` and `scripts/nrwl-ci-server-other.mjs` | Fork-only by design, will not go upstream | The fork is retired |
 
@@ -152,6 +152,9 @@ Facts about `install --ref` on this host (found on NX-449 and NX-509):
   The other install scripts npm skips in the payload (`esbuild`, `protobufjs`,
   `ssh2`, `cpu-features`) are not needed: read from their sources, not tested
   one by one.
+- The install does not depend on the setting either way: staged packages are
+  packed with `--ignore-scripts`, because their `prepack` script fails outside
+  the workspace. A full install with the setting off is not tested.
 - The build needs a Rust toolchain (`cargo`) on PATH for
   `packages/paperclip-runner`, besides Node and corepack.
 - The whole install takes about 5 minutes on chungus.
