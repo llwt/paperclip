@@ -81,6 +81,7 @@ const {
     reconcileTaskWatchdogs: vi.fn(async () => ({ triggered: 0 })),
     scanSilentActiveRuns: vi.fn(async () => ({ created: 0, escalated: 0 })),
     sweepStaleIssueLocks: vi.fn(async () => ({ cleared: 0 })),
+    sweepEndedTerminalRunLeases: vi.fn(async () => ({ checked: 0, released: 0, runIds: [] })),
     sweepPendingCleanupLeases: vi.fn(async () => ({ swept: 0, destroyed: 0, capped: 0 })),
     sweepExpiredRuntimeStatuses: vi.fn(() => 0),
     tickTimers: vi.fn(async () => ({ checked: 0, enqueued: 0, skipped: 0 })),
@@ -557,10 +558,12 @@ describe("startServer feedback export wiring", () => {
     try {
       await startServer();
       expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.sweepEndedTerminalRunLeases).toHaveBeenCalledTimes(1);
       expect(intervalCallback).not.toBeNull();
       intervalCallback?.();
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(2);
+      expect(heartbeatServiceMock.sweepEndedTerminalRunLeases).toHaveBeenCalledTimes(2);
       expect(retiredDetector).not.toHaveBeenCalled();
     } finally {
       delete (runtime as Partial<typeof runtime>).reconcileProductivityReviews;
