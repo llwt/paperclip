@@ -98,6 +98,11 @@ The variable does not change a budget that is set somewhere else. Known cases:
 - Cognee Cloud tools, called without a timeout, get 60 seconds.
 - Browser Use tools are not timed by the gateway. Each request to the Browser
   Use API has a 25 second limit instead.
+- Plugin tools run in a plugin worker, and the worker gives each call 30
+  seconds. A plugin tool that runs through the gateway gets the shorter of
+  that limit and the gateway budget, so raising this variable above 30 seconds
+  does not give a plugin tool more time. `POST /api/plugins/tools/execute`
+  applies the worker limit only.
 - The resource and prompt helper tools (`paperclip_list_resources`,
   `paperclip_read_resource`, `paperclip_list_prompts` and
   `paperclip_get_prompt`) are not ordinary tool execution, even though an agent
