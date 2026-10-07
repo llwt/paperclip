@@ -90,6 +90,8 @@ export async function initializeMcpHttpSession(input: {
   send: (init: RequestInit) => Promise<Response>;
   headers?: Record<string, string>;
   requestId: string;
+  /** Total deadline of the caller, see readMcpHttpResponse. */
+  signal?: AbortSignal;
 }): Promise<Record<string, string>> {
   const initializeResponse = await input.send({
     method: "POST",
@@ -115,8 +117,9 @@ export async function initializeMcpHttpSession(input: {
   }
   let payload: unknown;
   try {
-    payload = await readMcpHttpResponse(initializeResponse, `${input.requestId}-initialize`);
+    payload = await readMcpHttpResponse(initializeResponse, `${input.requestId}-initialize`, { signal: input.signal });
   } catch {
+    input.signal?.throwIfAborted();
     throw new McpHttpInitializationError("Remote MCP initialization returned an invalid response", "initialize", null);
   }
   const result = payload && typeof payload === "object" && "result" in payload
@@ -209,19 +212,38 @@ export function parseMcpHttpResponseBody(bodyText: string, contentType: string |
 }
 
 /** Read until the response for this request arrives, without waiting for an SSE
- * connection to close. Notifications and responses for other IDs are ignored. */
+ * connection to close. Notifications and responses for other IDs are ignored.
+ *
+ * `signal` is the caller's total deadline. Skipped events and notifications
+ * keep a stream alive without answering, and each chunk resets the transport's
+ * idle deadline, so a caller whose request carries no deadline of its own must
+ * pass one here. An abort rejects with the signal's reason and cancels the stream. */
 export async function readMcpHttpResponse(
   response: Response,
   requestId: string | number,
-  options: { maxBytes?: number; onRequest?: (message: Record<string, unknown>) => Promise<void> } = {},
+  options: { maxBytes?: number; signal?: AbortSignal; onRequest?: (message: Record<string, unknown>) => Promise<void> } = {},
 ): Promise<unknown> {
   const maxBytes = options.maxBytes ?? 8 * 1024 * 1024;
+  const signal = options.signal;
+  signal?.throwIfAborted();
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    if (!signal) return;
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  // The race below is the only consumer, so a late abort must not surface as an
+  // unhandled rejection.
+  aborted.catch(() => undefined);
+  const stopListening = () => { if (onAbort) signal?.removeEventListener("abort", onAbort); };
   const isStream = response.headers.get("content-type")?.toLowerCase().includes("text/event-stream");
   const reader = response.body?.getReader();
   // Injected HTTP transports can expose a buffered text response rather than a
   // Web ReadableStream. Keep the same size and message-ID checks for both forms.
   if (!reader) {
-    const body = await response.text();
+    let body: string;
+    try { body = await Promise.race([response.text(), aborted]); }
+    finally { stopListening(); }
     if (Buffer.byteLength(body, "utf8") > maxBytes) throw new McpHttpResponseError("too_large", "MCP response exceeded the size limit");
     return readMcpHttpResponse(new Response(body, {
       headers: { "content-type": response.headers.get("content-type") ?? "application/json" },
@@ -264,7 +286,7 @@ export async function readMcpHttpResponse(
   };
   try {
     while (true) {
-      const { value, done } = await reader.read();
+      const { value, done } = await Promise.race([reader.read(), aborted]);
       bytes += value?.byteLength ?? 0;
       if (bytes > maxBytes) throw new McpHttpResponseError("too_large", "MCP response exceeded the size limit");
       buffer += decoder.decode(value, { stream: !done });
@@ -284,6 +306,7 @@ export async function readMcpHttpResponse(
     if (result !== undefined) return result;
     throw new McpHttpResponseError("malformed_response", "MCP response did not contain the requested message ID", summary);
   } finally {
+    stopListening();
     await reader.cancel().catch(() => undefined);
     reader.releaseLock();
   }

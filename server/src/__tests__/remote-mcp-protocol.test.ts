@@ -36,6 +36,39 @@ describe("remote connector Streamable HTTP", () => {
     // A plain body has no later event to wait for, so it still fails.
     await expect(readMcpHttpResponse(new Response("not json", { headers: { "content-type": "application/json" } }), "call")).rejects.toMatchObject({ reason: "invalid_json" });
   });
+  it("stops at the caller's deadline when a stream stays alive without the response", async () => {
+    const deadline = new Error("deadline");
+    // Skipped events and notifications arrive, the response never does, and the stream stays open.
+    const open = stream(["data: keep-alive\n\n", event({ jsonrpc: "2.0", method: "notifications/progress", params: { progress: 1 } })], false);
+    const controller = new AbortController();
+    const pending = readMcpHttpResponse(open.response, "call", { signal: controller.signal });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(open.cancel).not.toHaveBeenCalled();
+    controller.abort(deadline);
+    await expect(pending).rejects.toBe(deadline);
+    expect(open.cancel).toHaveBeenCalledOnce();
+    // A deadline that already passed reads nothing.
+    const late = stream([event({ id: "call", result: {} })]);
+    await expect(readMcpHttpResponse(late.response, "call", { signal: controller.signal })).rejects.toBe(deadline);
+    // A buffered transport response obeys the same deadline.
+    const stalled = new AbortController();
+    const buffered = { headers: new Headers({ "content-type": "application/json" }), body: null, text: () => new Promise<string>(() => {}) } as unknown as Response;
+    const bufferedPending = readMcpHttpResponse(buffered, "call", { signal: stalled.signal });
+    stalled.abort(deadline);
+    await expect(bufferedPending).rejects.toBe(deadline);
+    // A signal that never fires changes nothing.
+    expect(await readMcpHttpResponse(stream(["data: keep-alive\n\n", event({ id: "call", result: {} })]).response, "call", { signal: new AbortController().signal })).toEqual({ id: "call", result: {} });
+  });
+  it("reports the caller's deadline, not an invalid response, when the handshake stream stays alive", async () => {
+    const deadline = new Error("deadline");
+    const controller = new AbortController();
+    const open = stream(["data: keep-alive\n\n"], false);
+    const pending = initializeMcpHttpSession({ requestId: "a", send: async () => open.response, signal: controller.signal });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    controller.abort(deadline);
+    await expect(pending).rejects.toBe(deadline);
+    expect(open.cancel).toHaveBeenCalledOnce();
+  });
   it("summarizes a stream without the requested response by counts only", async () => {
     const progress = { jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: "t", progress: 1 } };
     const logging = { jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "private text" } };
