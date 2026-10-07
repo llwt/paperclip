@@ -1,4 +1,5 @@
 import { isRemoteMcpConnectorMethod } from "../remote-mcp-connectors.js";
+import { oauthSignInSettingsInputSchema } from "../oauth-sign-in-settings.js";
 import { z } from "zod";
 import {
   CONNECTION_TOKEN_ISSUANCE_PATHS,
@@ -423,6 +424,8 @@ export const connectToolAppSchema = z.object({
   saveDraft: z.boolean().optional(),
   authMode: genericMcpAuthModeSchema.optional(),
   oauthClient: genericMcpOAuthClientSchema.optional(),
+  /** Fork-only (NX-617): localhost callback and requested scopes for a pasted URL. */
+  oauthSignIn: oauthSignInSettingsInputSchema.optional(),
   credentialSource: z.enum(["paperclip_vault", "vercel_connect"]).optional(),
   vercelConnect: z.object({ connector: z.string().trim().min(1).max(255) }).strict().optional(),
   /**

@@ -57,6 +57,8 @@ import { getActorInfo, assertBoard, assertCompanyAccess, assertInstanceAdmin, ge
 import { badRequest, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { accessService, logActivity, toolAccessPolicyService, toolAccessService, vercelConnectIntegrationStatus } from "../services/index.js";
 import { ToolGatewayHttpError, type ToolGatewayService } from "../services/tool-gateway.js";
+// Fork-only (llwt/paperclip, NX-617).
+import { loopbackOAuthCallbackRelayTarget } from "../services/tool-oauth-sign-in.js";
 import { RailwayError } from "../services/railway.js";
 import type { VercelConnectClient } from "../services/vercel-connect.js";
 import {
@@ -258,6 +260,8 @@ export function toolAccessRoutes(
     deploymentExposure?: DeploymentExposure;
     authPublicBaseUrl?: string | null;
     trustedLocalStdioRuntimeHost?: string | null;
+    /** Fork-only (NX-617): this server's listening port, for localhost sign-in. */
+    oauthLoopbackPort?: number | null;
     toolGateway?: ToolGatewayService;
     /** Test-only seams forwarded to the tool access service. */
     remoteHttpEndpointLookup?: NonNullable<Parameters<typeof toolAccessService>[1]>["remoteHttpEndpointLookup"];
@@ -1330,6 +1334,25 @@ function connectorEnrollmentPrincipal(req: Request): string {
   });
 
   router.get("/tools/oauth/callback", async (req, res) => {
+    // Differs from upstream (fork, NX-617): a callback that arrives on localhost
+    // without a session is sent on to the configured public address, where the
+    // session lives. Nothing is looked up or exchanged on this hop.
+    const relayTarget = loopbackOAuthCallbackRelayTarget({
+      actorType: req.actor.type,
+      path: req.originalUrl.split("?")[0] ?? "",
+      hostHeader: req.get("host"),
+      hasForwardedHost: req.get("x-forwarded-host") !== undefined,
+      publicBaseUrl: configuredPublicBaseUrl(),
+      query: req.query,
+    });
+    if (relayTarget) {
+      // Sent as a page, not as a `Location` header: the request log records
+      // response headers, and this address carries the code and the state.
+      res.set("Cache-Control", "no-store");
+      res.set("Referrer-Policy", "no-referrer");
+      res.type("html").send(oauthCallbackInterstitialHtml(relayTarget));
+      return;
+    }
     assertBoard(req);
     const state = typeof req.query.state === "string" ? req.query.state : "";
     const code = typeof req.query.code === "string" ? req.query.code : null;

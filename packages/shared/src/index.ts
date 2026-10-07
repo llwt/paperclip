@@ -2788,6 +2788,8 @@ export { configureRailwaySshSchema, type ConfigureRailwaySsh, type RailwaySshSet
 export * from "./announcements.js";
 
 export { REMOTE_MCP_CONNECTOR_METHODS, isRemoteMcpConnectorId, isRemoteMcpConnectorMethod, type RemoteMcpConnectorId } from "./remote-mcp-connectors.js";
+// Fork-only (llwt/paperclip, NX-617).
+export * from "./oauth-sign-in-settings.js";
 
 export { isRetiredComposioConnection, RETIRED_COMPOSIO_MESSAGE } from "./retired-composio.js";
 
