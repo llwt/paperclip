@@ -17,7 +17,11 @@ import { toolConnections, type Db } from "@paperclipai/db";
  * The one writer that owns the settings, the setup form's connect request,
  * passes its config through `ownedConnectionConfig`, which the wrapper leaves
  * alone. For a connection without the settings, a wrapped write stores exactly
- * the object it was given.
+ * the object it was given, minus those two keys if it carries them.
+ *
+ * Not covered: a `set` whose config value is a SQL expression, raw SQL, an
+ * upsert (`insert ... onConflictDoUpdate`) and any database handle that was
+ * not wrapped. Such a write has to preserve the settings itself.
  */
 
 const WRAPPED = Symbol("paperclip.oauthSignInPreservingDb");
@@ -26,11 +30,21 @@ function isPlainConfig(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value) && !is(value, SQL);
 }
 
-/** `nextConfig` with the two sign-in settings replaced by the row's current ones. */
+/**
+ * `nextConfig` with the two sign-in settings replaced by the row's current ones.
+ *
+ * The generic config schema accepts any JSON under `oauth`, so the expression
+ * branches on its type before it touches keys:
+ * - an object loses its own copies of the two keys and gets the row's, also
+ *   when the row has none (a stale write must not bring back cleared settings);
+ * - anything else (missing, JSON null, scalar, array) is stored unchanged when
+ *   the row has no settings, and replaced by an object holding just the row's
+ *   settings when it has.
+ */
 export function configKeepingLatestOAuthSignIn(nextConfig: Record<string, unknown>) {
   const next = sql`${JSON.stringify(nextConfig)}::jsonb`;
   const latest = sql`jsonb_strip_nulls(jsonb_build_object('loopbackRedirect', ${toolConnections.config} #> '{oauth,loopbackRedirect}', 'requestedScopes', ${toolConnections.config} #> '{oauth,requestedScopes}'))`;
-  return sql<Record<string, unknown>>`case when (${next} -> 'oauth') is null and ${latest} = '{}'::jsonb then ${next} else jsonb_set(${next}, '{oauth}', (coalesce(${next} -> 'oauth', '{}'::jsonb) - 'loopbackRedirect' - 'requestedScopes') || ${latest}) end`;
+  return sql<Record<string, unknown>>`case when jsonb_typeof(${next} -> 'oauth') = 'object' then jsonb_set(${next}, '{oauth}', ((${next} -> 'oauth') - 'loopbackRedirect' - 'requestedScopes') || ${latest}) when ${latest} = '{}'::jsonb then ${next} else jsonb_set(${next}, '{oauth}', ${latest}) end`;
 }
 
 /**

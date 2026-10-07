@@ -35,7 +35,7 @@ import {
   toolRuntimeSlots,
 } from "@paperclipai/db";
 import { eq, inArray } from "drizzle-orm";
-import { connectToolAppSchema, parseOAuthScopeList, readOAuthSignInSettings } from "@paperclipai/shared";
+import { connectToolAppSchema, parseOAuthScopeList, readOAuthSignInSettings, updateToolConnectionSchema } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -1839,6 +1839,114 @@ describeEmbeddedPostgres("localhost sign-in for a pasted MCP URL", () => {
             expect(row.transportConfig).toEqual(next);
           }
         }
+      });
+
+      // The generic config schema accepts any JSON under `oauth`, and the
+      // settings reader treats everything but an object as "off".
+      const ABSENT = Symbol("no oauth key");
+      const OAUTH_VALUES: Array<[string, unknown]> = [
+        ["missing", ABSENT],
+        ["JSON null", null],
+        ["false", false],
+        ["true", true],
+        ["a number", 7],
+        ["a string", "legacy"],
+        ["an empty array", []],
+        ["a non-empty array", ["a", { b: 1 }, null]],
+        ["an empty object", {}],
+        ["an object", { clientId: "c", scopes: ["a"], nested: { n: null } }],
+      ];
+      const NON_OBJECT_OAUTH_VALUES = OAUTH_VALUES.filter(([, value]) => typeof value !== "object" || value === null || Array.isArray(value));
+      const withOAuth = (config: Record<string, unknown>, oauth: unknown) => {
+        const { oauth: _dropped, ...rest } = config;
+        return oauth === ABSENT ? rest : { ...rest, oauth };
+      };
+
+      /** A connection whose two config columns hold `oauth` exactly as given, JSON null included. */
+      async function seedOAuthValue(oauth: unknown) {
+        const seeded = await seed(null);
+        const config = withOAuth(seeded.config, oauth);
+        await db.update(toolConnections).set({ config, transportConfig: config }).where(eq(toolConnections.id, seeded.id));
+        const row = await connectionRow(seeded.id);
+        expect(row.config).toEqual(config);
+        expect(row.transportConfig).toEqual(config);
+        return { id: seeded.id, config, service: toolAccessService(db) };
+      }
+
+      describe("with a connection whose oauth value is any JSON the schema accepts", () => {
+        it.each(OAUTH_VALUES)("a name-only edit through the service keeps oauth (%s) exactly, in both columns", async (_label, oauth) => {
+          const { id, config, service } = await seedOAuthValue(oauth);
+          const updated = await service.updateConnection(id, { name: "Name only" });
+          expect(updated.name).toBe("Name only");
+          const row = await connectionRow(id);
+          expect(row.config).toEqual(config);
+          expect(row.transportConfig).toEqual(config);
+        });
+
+        it.each(OAUTH_VALUES)("an explicit config update through the service stores oauth (%s) as sent, in both columns", async (_label, oauth) => {
+          // Seeded with an object, so the incoming value differs from the row's.
+          const { id, config, service } = await seedOAuthValue({ clientId: "before" });
+          const next = updateToolConnectionSchema.parse({ config: { ...withOAuth(config, oauth), marker: [1, null] } }).config!;
+          await service.updateConnection(id, { config: next });
+          let row = await connectionRow(id);
+          expect(row.config).toEqual(next);
+          expect(row.transportConfig).toEqual(next);
+
+          // Each column on its own value.
+          const transport = { ...next, marker: "transport" };
+          await service.updateConnection(id, { config: next, transportConfig: transport });
+          row = await connectionRow(id);
+          expect(row.config).toEqual(next);
+          expect(row.transportConfig).toEqual(transport);
+        });
+
+        it.each(NON_OBJECT_OAUTH_VALUES)("a write carrying oauth (%s) keeps the row's settings as an oauth object and every other field", async (_label, oauth) => {
+          const settings = { loopbackRedirect: true, requestedScopes: ["a", "b"] };
+          const { id, config, service } = await seedOAuthValue({ clientId: "c", ...settings });
+          const next = { ...withOAuth(config, oauth), marker: { kept: [false, null] } };
+          const expected = { ...next, oauth: settings };
+          await service.updateConnection(id, { config: next });
+          let row = await connectionRow(id);
+          expect(row.config).toEqual(expected);
+          expect(row.transportConfig).toEqual(expected);
+
+          // A write of the transport column only reads the settings from `config`.
+          const wrapped = withOAuthSignInPreservingWrites(db);
+          const transportOnly = withOAuth({ url: "t" }, oauth);
+          await wrapped.update(toolConnections).set({ transportConfig: transportOnly }).where(eq(toolConnections.id, id));
+          row = await connectionRow(id);
+          expect(row.config).toEqual(expected);
+          expect(row.transportConfig).toEqual({ url: "t", oauth: settings });
+        });
+
+        it.each(OAUTH_VALUES)("one setting on the row is kept alone over incoming oauth (%s)", async (_label, oauth) => {
+          for (const setting of [{ loopbackRedirect: true }, { requestedScopes: ["a"] }]) {
+            const { id, config, service } = await seedOAuthValue(setting);
+            const next = withOAuth(config, oauth);
+            await service.updateConnection(id, { config: next });
+            const incoming = oauth !== null && typeof oauth === "object" && !Array.isArray(oauth) ? oauth : {};
+            const expected = { ...next, oauth: { ...incoming, ...setting } };
+            const row = await connectionRow(id);
+            expect(row.config).toEqual(expected);
+            expect(row.transportConfig).toEqual(expected);
+          }
+        });
+
+        it.each(OAUTH_VALUES)("a stale write does not bring back settings cleared on a row whose oauth is now (%s)", async (_label, oauth) => {
+          const { id, config, service } = await seedOAuthValue(oauth);
+          const stale = { ...config, oauth: { clientId: "c", loopbackRedirect: true, requestedScopes: ["a"] } };
+          await service.updateConnection(id, { config: stale });
+          const expected = { ...config, oauth: { clientId: "c" } };
+          let row = await connectionRow(id);
+          expect(row.config).toEqual(expected);
+          expect(row.transportConfig).toEqual(expected);
+
+          const wrapped = withOAuthSignInPreservingWrites(db);
+          await wrapped.update(toolConnections).set({ transportConfig: { url: "t", oauth: { requestedScopes: ["a"] } } }).where(eq(toolConnections.id, id));
+          row = await connectionRow(id);
+          expect(row.config).toEqual(expected);
+          expect(row.transportConfig).toEqual({ url: "t", oauth: {} });
+        });
       });
 
       it("takes the two settings from the row, whatever the write carries", async () => {

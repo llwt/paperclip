@@ -84,12 +84,24 @@ How it works:
   `transportConfig` made through it, in or out of a transaction, takes the two
   settings from the row as it is at the moment of the update, not from the copy
   the operation read earlier. That covers client registration, start, callback,
-  renewal, catalog refresh, discovery and every later upstream addition without
-  a change at the write itself. Only the setup form's connect request and its
-  undo store a config as given (`ownedConnectionConfig`, four uses). The legacy
-  token backfill wraps its handle the same way. The callback also locks the
-  connection row and rechecks the attempt before it stores credentials. A test
-  asserts the wrap, the four owned writes and the absence of raw SQL updates.
+  renewal, catalog refresh and discovery without a change at the write itself.
+  Only the setup form's connect request and its undo store a config as given
+  (`ownedConnectionConfig`, four uses). The legacy token backfill wraps its
+  handle the same way. The callback also locks the connection row and rechecks
+  the attempt before it stores credentials. A test asserts the wrap, the four
+  owned writes and the absence of raw SQL updates.
+- The config schema accepts any JSON under `oauth`, and only an object can hold
+  the settings. A write whose `oauth` is an object loses its own copies of the
+  two keys and gets the row's, also when the row has none. A write whose
+  `oauth` is missing, JSON null, a scalar or an array is stored unchanged when
+  the row has no settings; when the row has settings, `oauth` becomes an object
+  holding just those settings and every other field is stored as written.
+- What the wrap does not cover: a `set` whose config value is a SQL expression,
+  raw SQL, an upsert (`insert ... onConflictDoUpdate`) and a database handle
+  that was not wrapped. None of these writes a connection's config today. A
+  write of that kind added by an upstream merge is not protected, so audit the
+  writers of `tool_connections.config` and `transportConfig` at every upstream
+  merge.
 - Not available for curated apps, Vercel-backed or brokered sign-ins.
 
 Files: `packages/shared/src/oauth-sign-in-settings.ts`,
