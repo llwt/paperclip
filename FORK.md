@@ -337,18 +337,26 @@ line into a procedure step without testing it first.
   point `~/.paperclip/cli/current` at the old payload directory, restart). It
   was prepared and not needed.
 
-### Do not use `paperclipai update` on this host
+### `paperclipai update` on this host
 
-**Read from source, not tested.** All three points come from
-`cli/src/commands/update.ts`; `update` was never run here.
+**Read from source, not tested.** All points come from `updateCommand` in
+`cli/src/commands/update.ts` at `98fa44c`; `update` was never run here.
 
-- `update` restarts the service through the same version check that fails for
-  `update --rollback`. In `update` a failed check triggers an automatic
-  rollback (`rollbackAfterServiceValidationFailure`), so it would most likely
-  undo itself and report a failure.
-- `update` installs an npm release of `paperclipai`, not a git ref. On this
-  host that would replace the fork build with a plain upstream one.
-- Use `install --repo llwt/paperclip --ref <sha>` for every change of build.
+- With the install as it is, `update` does nothing. `install.json` has
+  `source: git` and the full SHA as `ref`. For a git install whose `ref` is a
+  SHA, `update` prints "Git install is pinned at ..." and returns: no backup,
+  no new payload, no restart.
+- `update` does not switch a git install to an npm release. It only installs
+  from npm when the managed install came from npm.
+- The automatic rollback applies to a git install made from a moving ref (a
+  branch or tag name). There `update` resolves the ref, builds the new commit,
+  restarts the service and waits for the same version check that fails for
+  `update --rollback`. A failed check triggers
+  `rollbackAfterServiceValidationFailure`, so on this host that update would
+  most likely undo itself and report a failure. "Install" step 1 already
+  forbids installing a branch name; this is one more reason.
+- So `update` is not a way to change the build here. Use
+  `install --repo llwt/paperclip --ref <sha>` for every change of build.
 
 ### Restarts end running agent runs
 
@@ -407,5 +415,7 @@ It is a trial under review, not an accepted fix, and it has open defects:
 
 Until NX-597 is closed and this section is updated: check
 `systemctl --user show paperclipai.service -p KillMode` before a restart.
-With `control-group`, every running agent run ends. With `process`, runs are
-kept, but check each task that had a run for the two defects above.
+With `control-group`, every running agent run ends. With `process`, expect
+nothing beyond what the one trial showed: 4 `claude_local` runs were kept in
+one restart, each with the two defects above, and `codex_local` runs are
+untested. Check every task that had a run across the restart.
