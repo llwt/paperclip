@@ -6847,10 +6847,11 @@ export function toolAccessService(
         !challenged && connection.authKind === "none";
       if (response.status === 401 && (challenged || probeWithoutChallenge)) {
         // AWS API Gateway renames the challenge to `x-amzn-remapped-*`. On the
-        // URL-only probe it is read as a hint for the metadata address only,
-        // and the well-known addresses are still tried when the hint fails.
-        const remapped = response.headers.get(
-          "x-amzn-remapped-www-authenticate",
+        // URL-only probe it is read as a hint for the metadata address only:
+        // endpoints or scopes it names directly are dropped, and the
+        // well-known addresses are still tried when the hint fails.
+        const remapped = metadataOnlyChallenge(
+          response.headers.get("x-amzn-remapped-www-authenticate"),
         );
         const endpoints = challenged
           ? await discoverOAuthEndpoints(connection, authenticate)
@@ -8666,6 +8667,18 @@ export function toolAccessService(
       tokenUrl: params.token_uri ?? params.token_url ?? null,
       scope: params.scope ?? null,
     };
+  }
+
+  /**
+   * Reduces a challenge to its metadata address, so discovery has to find the
+   * endpoints in published metadata instead of taking them from the header.
+   */
+  function metadataOnlyChallenge(wwwAuthenticate: string | null): string | null {
+    const metadataUrl = wwwAuthenticate
+      ? challengeOAuthHints(wwwAuthenticate).metadataUrl
+      : null;
+    if (!metadataUrl || metadataUrl.includes('"')) return null;
+    return `Bearer resource_metadata="${metadataUrl}"`;
   }
 
   function oauthSecretRef(
