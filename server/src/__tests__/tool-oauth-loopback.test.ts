@@ -908,7 +908,12 @@ describeEmbeddedPostgres("localhost sign-in for a pasted MCP URL", () => {
       // Shaped like a localhost attempt, but never issued.
       loopbackOAuthState("forged-random", "fixture-client-1", SERVER_PORT)!,
       `${realState}x`,
+      // The real attempt with another port or client binding written into it:
+      // the state is looked up whole, so neither finds the attempt.
+      realState.replace(`lb2.${SERVER_PORT}.`, "lb2.4200."),
+      loopbackOAuthState(realState.split(".")[3]!, "another-client", SERVER_PORT)!,
     ]) {
+      expect(forged).not.toBe(realState);
       // The relay itself decides nothing about the state.
       const relayed = await request(localhostApp)
         .get("/api/tools/oauth/callback")
