@@ -25,6 +25,7 @@ import { AGENT_CHAT_DIRECTIVE, conversationReplay, isConversation, isConversatio
 import { getConversationConfirmationContext, type ConversationConfirmationContext } from "./conversation-confirmation-context.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasAcknowledgedNativeReassignmentStopIntent, hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
+import { decideTerminalRunLeaseRelease } from "./terminal-run-lease-release.js";
 import { legacyControllerBootId, legacyControllerClaim, renewLegacyControllerLease, hasLiveLegacyController, revokeExpiredLegacyController, watchLegacyControllerLease } from "./legacy-controller-lease.js";
 import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/paperclip-runner/index.js";
 import { hasRemoteTerminationReceipt, remoteExecutionHasStopped, remoteTerminationReceipt, stoppedRemoteCleanupScopes } from "./remote-execution-termination.js";
@@ -9558,6 +9559,11 @@ export function heartbeatService(
   const recovery = recoveryService(db, {
     enqueueWakeup,
     liveRunExecutions,
+    releaseLeasesForEndedTerminalRun: (run) =>
+      releaseEnvironmentLeasesForEndedTerminalRun({
+        runId: run.id,
+        companyId: run.companyId,
+      }),
     scheduleRecoveryRetry: async (runId) => {
       const [run] = await db
         .select()
@@ -10272,6 +10278,115 @@ export function heartbeatService(
       );
     }
     await acknowledgeRemoteStop(input.runId, input.companyId);
+  }
+
+  // A run ended by a recovery path (stale-lock sweep, cancel without a process
+  // handle after a restart) has no finalizer in this server, so its environment
+  // lease stays active and blocks every later wake on the task. Release it here
+  // once execution has verifiably ended. A lease whose process may still be
+  // alive is kept; the healing sweep below retries on a later tick.
+  const endedTerminalRunLeaseReleases = new Set<string>();
+  async function releaseEnvironmentLeasesForEndedTerminalRun(
+    input: { runId: string; companyId: string },
+    opts: { promote?: boolean } = {},
+  ): Promise<{ released: boolean; reason: string }> {
+    if (endedTerminalRunLeaseReleases.has(input.runId))
+      return { released: false, reason: "release_in_flight" };
+    endedTerminalRunLeaseReleases.add(input.runId);
+    try {
+      const decision = await decideTerminalRunLeaseRelease(db, input, {
+        hasLocalExecution: (runId) =>
+          liveRunExecutions.has(runId) || adapterExecutionControls.has(runId),
+      });
+      if (!decision.release) return { released: false, reason: decision.reason };
+      const run = decision.run;
+      await releaseEnvironmentLeasesForRun({
+        runId: run.id,
+        companyId: run.companyId,
+        agentId: run.agentId,
+        status: run.status,
+        failureReason: run.error ?? undefined,
+      });
+      // The release helper logs driver errors and resolves. Read the rows back.
+      const stillActive = await db
+        .select({ id: environmentLeases.id })
+        .from(environmentLeases)
+        .where(
+          and(
+            eq(environmentLeases.companyId, run.companyId),
+            eq(environmentLeases.heartbeatRunId, run.id),
+            eq(environmentLeases.status, "active"),
+          ),
+        );
+      if (stillActive.length > 0) {
+        logger.warn(
+          { runId: run.id, leaseIds: stillActive.map((lease) => lease.id) },
+          "environment lease of ended terminal run is still active after release; a later sweep retries",
+        );
+        return { released: false, reason: "release_incomplete" };
+      }
+      logger.warn(
+        { runId: run.id, runStatus: run.status, leaseIds: decision.leaseIds },
+        "released environment leases of terminal heartbeat run after its process ended",
+      );
+      if (opts.promote !== false) {
+        // Saved wakes were deferred behind the lease. Promote them through the
+        // normal release path, without a crash retry.
+        await releaseIssueExecutionAndPromote(run, {
+          suppressImmediateRecovery: true,
+        }).catch((err) => {
+          logger.warn(
+            { err, runId: run.id },
+            "failed to promote deferred wakes after releasing leases of ended terminal run",
+          );
+        });
+      }
+      return { released: true, reason: "released" };
+    } catch (err) {
+      logger.warn(
+        { err, runId: input.runId },
+        "failed to evaluate environment lease release for ended terminal run",
+      );
+      return { released: false, reason: "error" };
+    } finally {
+      endedTerminalRunLeaseReleases.delete(input.runId);
+    }
+  }
+
+  // Heals leases that an earlier build or an unknown ending path left active
+  // on a terminal run, and releases a kept run's lease after its process exits.
+  async function sweepEndedTerminalRunLeases() {
+    const result = { checked: 0, released: 0, runIds: [] as string[] };
+    const candidates = await db
+      .selectDistinct({
+        runId: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+      })
+      .from(environmentLeases)
+      .innerJoin(
+        heartbeatRuns,
+        and(
+          eq(heartbeatRuns.id, environmentLeases.heartbeatRunId),
+          eq(heartbeatRuns.companyId, environmentLeases.companyId),
+        ),
+      )
+      .where(
+        and(
+          eq(environmentLeases.status, "active"),
+          eq(environmentLeases.provider, "local"),
+          eq(heartbeatRuns.runtimeMode, "legacy"),
+          inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+        ),
+      );
+    for (const candidate of candidates) {
+      result.checked += 1;
+      const outcome = await releaseEnvironmentLeasesForEndedTerminalRun(candidate);
+      if (outcome.released) {
+        result.released += 1;
+        result.runIds.push(candidate.runId);
+      }
+    }
+    return result;
   }
 
   async function acknowledgeRemoteStop(runId: string, companyId: string) {
@@ -29579,6 +29694,14 @@ export function heartbeatService(
           message: options.eventMessage ?? "run cancelled",
           ...(options.eventPayload ? { payload: options.eventPayload } : {}),
         });
+        if (run.runtimeMode !== "native" && !running && !control) {
+          // No executor in this server will finalize the run (for example a
+          // process kept across a restart), so nothing else releases its lease.
+          await releaseEnvironmentLeasesForEndedTerminalRun(
+            { runId: cancelled.id, companyId: cancelled.companyId },
+            { promote: false },
+          );
+        }
         await releaseIssueExecutionAndPromote(cancelled, {
           suppressImmediateRecovery: options.suppressImmediateRecovery,
         });
@@ -30123,6 +30246,7 @@ export function heartbeatService(
     resumeExecutionWaitComments,
 
     sweepStaleIssueLocks,
+    sweepEndedTerminalRunLeases,
 
     reconcileResolvedDependencyWakes,
 
