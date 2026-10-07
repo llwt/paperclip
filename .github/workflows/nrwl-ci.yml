@@ -56,7 +56,13 @@ jobs:
   # server project test files that no shard selects, computed by
   # scripts/nrwl-ci-server-other.mjs. The server vitest config pins maxWorkers
   # to 1, so one unsplit job would take the sum of all lanes.
-  test:
+  #
+  # Do not name this job "test": the runner exports the job id as GITHUB_JOB,
+  # and the server's run failure report redacts inherited environment values
+  # from stack traces. With GITHUB_JOB=test, four tests in
+  # heartbeat-process-recovery.test.ts fail because the file name they look
+  # for in the stack is redacted.
+  suites:
     name: Tests (${{ matrix.label }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -82,6 +88,7 @@ jobs:
           - label: server other
             command: >-
               pnpm run preflight:workspace-links &&
+              pnpm --filter @paperclipai/plugin-sdk ensure-build-deps &&
               node scripts/nrwl-ci-server-other.mjs
           - label: workspaces-a 1/2
             script: test:run:general
@@ -136,7 +143,7 @@ jobs:
   gate:
     name: nrwl-ci
     if: ${{ always() }}
-    needs: [typecheck_build, test]
+    needs: [typecheck_build, suites]
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -144,7 +151,7 @@ jobs:
       - name: Fail if any lane failed
         env:
           TYPECHECK_BUILD_RESULT: ${{ needs.typecheck_build.result }}
-          TEST_RESULT: ${{ needs.test.result }}
+          TEST_RESULT: ${{ needs.suites.result }}
         run: |
           test "$TYPECHECK_BUILD_RESULT" = "success"
           test "$TEST_RESULT" = "success"
