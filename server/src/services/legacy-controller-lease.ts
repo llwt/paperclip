@@ -109,3 +109,21 @@ export function watchLegacyControllerLease(db: Db, run: Run, controller: AbortCo
   timer.unref();
   return { assertOwned, stop() { stopped = true; clearInterval(timer); clearTimeout(deadline); } };
 }
+
+/** Ownership check for a run that is already terminal. `hasLiveLegacyController`
+ * only matches a running row, so it cannot protect a controller that still
+ * finalizes a terminal run. A missing row or an unreadable expiry stays held. */
+export async function terminalLegacyControllerMayOwn(
+  db: Db,
+  run: Pick<Run, "id" | "companyId">,
+): Promise<boolean> {
+  const [row] = await db.select({
+    controllerBootId: heartbeatRuns.controllerBootId,
+    expired: sql<boolean | null>`${heartbeatRuns.controllerLeaseExpiresAt} <= clock_timestamp()`,
+  }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+  ));
+  if (!row) return true;
+  if (!row.controllerBootId) return false;
+  return row.expired !== true;
+}
