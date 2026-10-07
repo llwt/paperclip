@@ -49,10 +49,14 @@ import {
   nextOAuthSignInSettings,
   oauthScopesOutsideRequest,
   parseLoopbackOAuthState,
+  recheckOAuthSignIn,
   resolveGenericOAuthScopes,
 } from "../services/tool-oauth-sign-in.js";
 import { toolAccessRoutes } from "../routes/tool-access.js";
 import { errorHandler } from "../middleware/index.js";
+import { actorMiddleware } from "../middleware/auth.js";
+import { boardMutationGuard } from "../middleware/board-mutation-guard.js";
+import { privateHostnameGuard } from "../middleware/private-hostname-guard.js";
 import { createHttpLogger } from "../middleware/logger.js";
 import { HTTP_LOG_REDACT_PATHS } from "../middleware/http-log-redaction.js";
 
@@ -113,6 +117,32 @@ describe("localhost sign-in helpers", () => {
     expect(oauthScopesOutsideRequest("a  c c", ["a", "b"])).toEqual(["c"]);
     expect(oauthScopesOutsideRequest(["a", "d"], ["a"])).toEqual(["d"]);
     expect(oauthScopesOutsideRequest(undefined, ["a"])).toEqual([]);
+  });
+
+  it("rechecks an attempt against the connection as it is when credentials are stored", () => {
+    const base = {
+      latestOauth: {} as Record<string, unknown>,
+      startedWithOauth: {} as Record<string, unknown>,
+      attemptScopes: [] as string[],
+      loopbackAttempt: false,
+      grantedScope: "a b c" as unknown,
+    };
+    // No settings now: nothing to hold the attempt to, as before this change.
+    expect(recheckOAuthSignIn(base)).toBeNull();
+    const listed = { ...base, latestOauth: { requestedScopes: ["a", "b"] } };
+    expect(recheckOAuthSignIn({ ...listed, attemptScopes: ["a"], grantedScope: "a" })).toBeNull();
+    expect(recheckOAuthSignIn({ ...listed, attemptScopes: ["a"], grantedScope: undefined })).toBeNull();
+    expect(recheckOAuthSignIn({ ...listed, attemptScopes: [] })).toEqual({ kind: "changed" });
+    expect(recheckOAuthSignIn({ ...listed, attemptScopes: ["a", "c"] })).toEqual({ kind: "changed" });
+    expect(recheckOAuthSignIn({ ...listed, attemptScopes: ["a"], grantedScope: "a b" }))
+      .toEqual({ kind: "overgrant", scopes: ["b"] });
+    const loopback = { ...base, loopbackAttempt: true };
+    expect(recheckOAuthSignIn({ ...loopback, latestOauth: { clientId: "x" }, startedWithOauth: { clientId: "x" } })).toBeNull();
+    expect(recheckOAuthSignIn({ ...loopback, latestOauth: { clientId: "y" }, startedWithOauth: { clientId: "x" } })).toEqual({ kind: "changed" });
+    expect(recheckOAuthSignIn({ ...loopback, latestOauth: {}, startedWithOauth: { clientId: "x" } })).toEqual({ kind: "changed" });
+    expect(recheckOAuthSignIn({ ...loopback, latestOauth: { clientId: "y" }, startedWithOauth: {} })).toEqual({ kind: "changed" });
+    // A client the deployment preconfigured is in neither config.
+    expect(recheckOAuthSignIn(loopback)).toBeNull();
   });
 
   it("keeps stored settings when the form omits them and clears them on false or null", () => {
@@ -299,6 +329,15 @@ function installFixture(options: FixtureOptions = {}) {
   let accessToken: string | null = null;
   let registrations = 0;
   let refreshes = 0;
+  // Lets a test hold one request open and act while it is in flight.
+  const gates = new Map<string, { reached: () => void; released: Promise<void> }>();
+  const passGate = async (kind: string) => {
+    const gate = gates.get(kind);
+    if (!gate) return;
+    gates.delete(kind);
+    gate.reached();
+    await gate.released;
+  };
   const resourceMetadataUrl = `${MCP_ORIGIN}/.well-known/oauth-protected-resource/mcp`;
 
   vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
@@ -350,6 +389,7 @@ function installFixture(options: FixtureOptions = {}) {
       });
     }
     if (href === `${ISSUER}/register` && method === "POST") {
+      await passGate("register");
       registrations += 1;
       const requested = body as Record<string, unknown>;
       return jsonResponse({
@@ -364,6 +404,7 @@ function installFixture(options: FixtureOptions = {}) {
     if (href === `${ISSUER}/token` && method === "POST") {
       const form = body as URLSearchParams;
       if (form.get("grant_type") === "refresh_token") {
+        await passGate("refresh");
         refreshes += 1;
         accessToken = `fixture-access-${randomUUID()}`;
         return jsonResponse({
@@ -373,6 +414,7 @@ function installFixture(options: FixtureOptions = {}) {
           token_type: "Bearer",
         });
       }
+      await passGate("exchange");
       const issued = issuedCodes.get(form.get("code") ?? "");
       // A real authorization server refuses a code presented with another
       // callback or client than the one it was issued for.
@@ -393,6 +435,18 @@ function installFixture(options: FixtureOptions = {}) {
 
   return {
     requests,
+    /**
+     * Hold the next request of this kind open. `reached` resolves when the
+     * server is waiting on it; `release` lets it answer.
+     */
+    pauseNext(kind: "register" | "exchange" | "refresh") {
+      let reached!: () => void;
+      let release!: () => void;
+      const reachedPromise = new Promise<void>((resolve) => { reached = resolve; });
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      gates.set(kind, { reached, released });
+      return { reached: reachedPromise, release };
+    },
     issueCode(authorizationUrl: string) {
       const parsed = new URL(authorizationUrl);
       const code = `fixture-code-${randomUUID()}`;
@@ -1182,5 +1236,379 @@ describeEmbeddedPostgres("localhost sign-in for a pasted MCP URL", () => {
     expect(response.status, JSON.stringify(response.body)).toBe(422);
     expect(response.body.details).toMatchObject({ code: "oauth_loopback_redirect_unavailable" });
     await expect(db.select().from(toolOauthStates)).resolves.toHaveLength(0);
+  });
+
+  describe("settings changed while an OAuth operation is in flight", () => {
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+
+    async function setOAuth(connectionId: string, patch: Record<string, unknown>) {
+      const row = await connectionRow(connectionId);
+      const config = { ...row.config, oauth: { ...oauthOf(row), ...patch } };
+      await db.update(toolConnections).set({ config, transportConfig: config }).where(eq(toolConnections.id, connectionId));
+    }
+
+    async function startAttempt(input: { personal: boolean; oauthSignIn: Record<string, unknown> }) {
+      const service = toolAccessService(db, { oauthLoopbackPort: SERVER_PORT });
+      const connected = await service.connectGalleryApp(
+        company.id,
+        { link: MCP_URL, name: "In flight", oauthSignIn: input.oauthSignIn, ...(input.personal ? { grantKind: "user" as const } : {}) },
+        actor,
+      );
+      const start = await service.startOAuth(company.id, connected.connectionId, {
+        redirectUri: PUBLIC_REDIRECT_URI,
+        actor,
+        ...(input.personal ? { subjectUserId: actor.actorId } : {}),
+      });
+      return { service, connectionId: connected.connectionId, start };
+    }
+
+    let company!: Awaited<ReturnType<typeof createCompany>>;
+
+    async function storedCredentialCount(connectionId: string) {
+      const row = await connectionRow(connectionId);
+      const grants = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connectionId));
+      return row.credentialSecretRefs.length + grants.reduce((sum, grant) => sum + grant.credentialSecretRefs.length, 0);
+    }
+
+    it.each([
+      { path: "shared credential", personal: false },
+      { path: "personal grant", personal: true },
+    ])("does not let a callback paused at the token exchange accept a grant wider than a list narrowed meanwhile ($path)", async ({ personal }) => {
+      vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+      const fixture = installFixture();
+      company = await createCompany();
+      const { service, connectionId, start } = await startAttempt({
+        personal,
+        oauthSignIn: { requestedScopes: ["mcp:read", "mcp:write"] },
+      });
+      const paused = fixture.pauseNext("exchange");
+      const callback = service.completeOAuthCallback({
+        state: new URL(start.authorizationUrl).searchParams.get("state")!,
+        code: fixture.issueCode(start.authorizationUrl),
+        iss: ISSUER,
+        redirectUri: PUBLIC_REDIRECT_URI,
+        actor,
+      });
+      // The callback has read the settings and is waiting on the provider.
+      await paused.reached;
+      await setOAuth(connectionId, { requestedScopes: ["mcp:read"] });
+      paused.release();
+
+      await expect(callback).rejects.toMatchObject({ status: 409, details: { code: "oauth_sign_in_settings_changed" } });
+      // The exchange happened, and its wider grant was not stored.
+      expect(fixture.tokenRequests("authorization_code")).toHaveLength(1);
+      expect(await storedCredentialCount(connectionId)).toBe(0);
+      const row = await connectionRow(connectionId);
+      expect(row.status).toBe("draft");
+      expect(oauthOf(row).requestedScopes).toEqual(["mcp:read"]);
+    });
+
+    it.each([
+      { path: "shared credential", personal: false },
+      { path: "personal grant", personal: true },
+    ])("keeps settings saved during the token exchange when the attempt still fits them ($path)", async ({ personal }) => {
+      vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+      const fixture = installFixture();
+      company = await createCompany();
+      const { service, connectionId, start } = await startAttempt({ personal, oauthSignIn: { requestedScopes: ["mcp:read"] } });
+      const paused = fixture.pauseNext("exchange");
+      const callback = service.completeOAuthCallback({
+        state: new URL(start.authorizationUrl).searchParams.get("state")!,
+        code: fixture.issueCode(start.authorizationUrl),
+        iss: ISSUER,
+        redirectUri: PUBLIC_REDIRECT_URI,
+        actor,
+      });
+      await paused.reached;
+      await setOAuth(connectionId, { requestedScopes: ["mcp:read", "mcp:write"], loopbackRedirect: true });
+      paused.release();
+      await callback;
+
+      // The callback wrote the config it read before the exchange, except for
+      // the settings, which are the ones saved meanwhile.
+      const row = await connectionRow(connectionId);
+      expect(row.status).toBe("active");
+      expect(oauthOf(row)).toMatchObject({ requestedScopes: ["mcp:read", "mcp:write"], loopbackRedirect: true });
+      expect(oauthOf(row).connectedAt).toBeTruthy();
+      expect(row.transportConfig).toEqual(row.config);
+      expect(await storedCredentialCount(connectionId)).toBeGreaterThan(0);
+    });
+
+    it("drops settings cleared during the token exchange instead of writing its older copy back", async () => {
+      vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+      const fixture = installFixture();
+      company = await createCompany();
+      const { service, connectionId, start } = await startAttempt({ personal: false, oauthSignIn: { requestedScopes: ["mcp:read"] } });
+      const paused = fixture.pauseNext("exchange");
+      const callback = service.completeOAuthCallback({
+        state: new URL(start.authorizationUrl).searchParams.get("state")!,
+        code: fixture.issueCode(start.authorizationUrl),
+        iss: ISSUER,
+        redirectUri: PUBLIC_REDIRECT_URI,
+        actor,
+      });
+      await paused.reached;
+      const row = await connectionRow(connectionId);
+      const { requestedScopes: _cleared, ...withoutList } = oauthOf(row);
+      const config = { ...row.config, oauth: withoutList };
+      await db.update(toolConnections).set({ config, transportConfig: config }).where(eq(toolConnections.id, connectionId));
+      paused.release();
+      await callback;
+
+      const after = await connectionRow(connectionId);
+      expect(after.status).toBe("active");
+      expect(oauthOf(after)).not.toHaveProperty("requestedScopes");
+    });
+
+    it("does not store tokens of a localhost attempt whose client was replaced during the token exchange", async () => {
+      vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+      const fixture = installFixture();
+      company = await createCompany();
+      const { service, connectionId, start } = await startAttempt({ personal: false, oauthSignIn: { loopbackRedirect: true } });
+      const paused = fixture.pauseNext("exchange");
+      const callback = service.completeOAuthCallback({
+        state: new URL(start.authorizationUrl).searchParams.get("state")!,
+        code: fixture.issueCode(start.authorizationUrl),
+        iss: ISSUER,
+        redirectUri: PUBLIC_REDIRECT_URI,
+        actor,
+      });
+      await paused.reached;
+      await setOAuth(connectionId, { clientId: "client-of-a-later-start" });
+      paused.release();
+
+      await expect(callback).rejects.toMatchObject({ status: 409, details: { code: "oauth_sign_in_settings_changed" } });
+      expect(await storedCredentialCount(connectionId)).toBe(0);
+      expect(oauthOf(await connectionRow(connectionId)).clientId).toBe("client-of-a-later-start");
+    });
+
+    it("keeps settings saved while a sign-in start is registering its client", async () => {
+      vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+      const fixture = installFixture();
+      company = await createCompany();
+      const service = toolAccessService(db, { oauthLoopbackPort: SERVER_PORT });
+      // A localhost callback registers its client (the public callback would
+      // use the client metadata document and make no registration call).
+      const connected = await service.connectGalleryApp(
+        company.id,
+        { link: MCP_URL, name: "Start in flight", oauthSignIn: { loopbackRedirect: true } },
+        actor,
+      );
+      const paused = fixture.pauseNext("register");
+      const starting = service.startOAuth(company.id, connected.connectionId, { redirectUri: PUBLIC_REDIRECT_URI, actor });
+      await paused.reached;
+      await setOAuth(connected.connectionId, { requestedScopes: ["mcp:read"] });
+      paused.release();
+      const start = await starting;
+
+      // This start began without a scope list and finishes that way; both of
+      // its config writes (registration, then start) leave the new list be.
+      expect(new URL(start.authorizationUrl).searchParams.get("scope")).toBe(ADVERTISED_SCOPES.join(" "));
+      const row = await connectionRow(connected.connectionId);
+      expect(oauthOf(row)).toMatchObject({
+        requestedScopes: ["mcp:read"],
+        loopbackRedirect: true,
+        clientId: "fixture-client-1",
+        clientRedirectUri: LOOPBACK_REDIRECT_URI,
+      });
+      // And its attempt, wider than the list saved meanwhile, cannot complete.
+      await expect(service.completeOAuthCallback({
+        state: new URL(start.authorizationUrl).searchParams.get("state")!,
+        code: fixture.issueCode(start.authorizationUrl),
+        iss: ISSUER,
+        redirectUri: PUBLIC_REDIRECT_URI,
+        actor,
+      })).rejects.toMatchObject({ status: 409, details: { code: "oauth_sign_in_settings_changed" } });
+      expect(fixture.tokenRequests("authorization_code")).toHaveLength(0);
+    });
+
+    it("keeps settings saved while a renewal is in flight and still stores the replaced refresh token", async () => {
+      vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+      const fixture = installFixture();
+      company = await createCompany();
+      const { service, connectionId, start } = await startAttempt({ personal: false, oauthSignIn: { requestedScopes: ["mcp:read"] } });
+      await service.completeOAuthCallback({
+        state: new URL(start.authorizationUrl).searchParams.get("state")!,
+        code: fixture.issueCode(start.authorizationUrl),
+        iss: ISSUER,
+        redirectUri: PUBLIC_REDIRECT_URI,
+        actor,
+      });
+      await setOAuth(connectionId, { expiresAt: "2000-01-01T00:00:00.000Z" });
+
+      const paused = fixture.pauseNext("refresh");
+      const renewing = service.checkHealth(connectionId);
+      await paused.reached;
+      await setOAuth(connectionId, { requestedScopes: ["mcp:read", "mcp:write"], loopbackRedirect: true });
+      paused.release();
+      const health = await renewing;
+
+      expect(health.connection.healthStatus).toBe("ok");
+      const row = await connectionRow(connectionId);
+      expect(oauthOf(row)).toMatchObject({ requestedScopes: ["mcp:read", "mcp:write"], loopbackRedirect: true });
+      expect(oauthOf(row)).not.toHaveProperty("refreshLease");
+      expect(Date.parse(String(oauthOf(row).expiresAt))).toBeGreaterThan(Date.now());
+      const refreshRef = row.credentialSecretRefs.find((ref) => ref.configPath === "oauth.refresh_token")!;
+      const stored = await secretService(db).resolveSecretValue(company.id, refreshRef.secretId, "latest", {
+        consumerType: "tool_connection",
+        consumerId: connectionId,
+        configPath: "oauth.refresh_token",
+        actorType: "system",
+        actorId: null,
+      });
+      expect(stored).toBe("fixture-refresh-rotated-1");
+    });
+  });
+
+  describe("through the real hostname guard, session middleware and board mutation guard", () => {
+    const PUBLIC_HOST = "paperclip.fixture.test";
+    const SESSION_COOKIE = "paperclip-session=signed-in";
+
+    /**
+     * The middleware chain `createApp` mounts in front of the tool routes, in
+     * the same order, for an authenticated private deployment. The session
+     * resolver stands in for the auth library the way a browser would see it:
+     * the session cookie exists for the public host only.
+     */
+    function createDeployedApp(requestLogger?: express.RequestHandler) {
+      const app = express();
+      app.use(express.json());
+      if (requestLogger) app.use(requestLogger);
+      app.use(privateHostnameGuard({ enabled: true, allowedHostnames: [PUBLIC_HOST], bindHost: "127.0.0.1" }));
+      app.use(actorMiddleware(db, {
+        deploymentMode: "authenticated",
+        resolveSession: async (req) => {
+          const host = (req.headers.host ?? "").split(":")[0];
+          if (host !== PUBLIC_HOST || req.headers.cookie !== SESSION_COOKIE) return null;
+          return {
+            session: { id: "session-1", userId: "board-user" },
+            user: { id: "board-user", name: "Board User", email: "board@fixture.test" },
+          };
+        },
+      }));
+      const api = express.Router();
+      api.use(boardMutationGuard());
+      api.use(toolAccessRoutes(db, {
+        deploymentMode: "authenticated",
+        deploymentExposure: "private",
+        oauthLoopbackPort: SERVER_PORT,
+        remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
+        remoteHttpRequest: async (url, init) => fetch(url, init),
+      }));
+      app.use("/api", api);
+      app.use(errorHandler);
+      return app;
+    }
+
+    const onPublic = (app: express.Express, method: "get" | "post", path: string) =>
+      request(app)[method](path).set("Host", PUBLIC_HOST).set("Cookie", SESSION_COOKIE).set("Origin", PUBLIC_BASE_URL);
+
+    it("relays the session-less localhost callback, then completes on the public address with the session", async () => {
+      vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+      const fixture = installFixture();
+      const company = await createCompany();
+      const app = createDeployedApp();
+
+      // Start: a real session on the public address, through the mutation guard.
+      const connected = await onPublic(app, "post", `/api/companies/${company.id}/tools/apps/connect`)
+        .send({ link: MCP_URL, name: "Deployed", grantKind: "user", oauthSignIn: LOOPBACK_SETTINGS });
+      expect(connected.status, JSON.stringify(connected.body)).toBe(201);
+      const startUrl = connected.body.auth.startUrl as string;
+      expect(new URL(startUrl).searchParams.get("redirect_uri")).toBe(LOOPBACK_REDIRECT_URI);
+      const state = new URL(startUrl).searchParams.get("state")!;
+      const code = fixture.issueCode(startUrl);
+      const [stateRow] = await db.select().from(toolOauthStates).where(eq(toolOauthStates.state, state));
+      expect(stateRow).toMatchObject({ createdByActorId: "board-user", createdBySessionId: "session-1" });
+
+      // The provider sends the browser to localhost. The hostname guard lets
+      // localhost through, there is no session for it, and the relay answers.
+      const relayed = await request(app)
+        .get("/api/tools/oauth/callback")
+        .set("Host", `localhost:${SERVER_PORT}`)
+        .set("Accept", "text/html")
+        .set("Sec-Fetch-Site", "cross-site")
+        .set("Sec-Fetch-Mode", "navigate")
+        .query({ state, code, iss: ISSUER });
+      const location = relayedTo(relayed)!;
+      expect(location.origin + location.pathname).toBe(PUBLIC_REDIRECT_URI);
+      expect(fixture.tokenRequests("authorization_code")).toHaveLength(0);
+      await expect(db.select().from(toolOauthStates).where(eq(toolOauthStates.state, state))).resolves.toHaveLength(1);
+      const relayedPath = `${location.pathname}${location.search}`;
+
+      // The public hop needs the session: without the cookie nothing happens.
+      const withoutSession = await request(app).get(relayedPath).set("Host", PUBLIC_HOST).set("Accept", "text/html");
+      expect(withoutSession.status).toBe(403);
+      expect(relayedTo(withoutSession)).toBeNull();
+      expect(fixture.tokenRequests("authorization_code")).toHaveLength(0);
+
+      // With the session: the cross-site interstitial, then the exchange.
+      const interstitial = await onPublic(app, "get", relayedPath)
+        .set("Accept", "text/html")
+        .set("Sec-Fetch-Site", "cross-site")
+        .set("Sec-Fetch-Mode", "navigate");
+      expect(interstitial.status).toBe(200);
+      expect(interstitial.text).toContain("Finishing your connection");
+      expect(fixture.tokenRequests("authorization_code")).toHaveLength(0);
+      const completed = await onPublic(app, "get", relayedPath)
+        .set("Accept", "text/html")
+        .set("Sec-Fetch-Site", "same-origin")
+        .set("Sec-Fetch-Mode", "navigate");
+      expect(completed.status, completed.text).toBe(303);
+      const exchanges = fixture.tokenRequests("authorization_code");
+      expect(exchanges).toHaveLength(1);
+      expect(exchanges[0]!.get("redirect_uri")).toBe(LOOPBACK_REDIRECT_URI);
+      expect(await connectionRow(connected.body.connectionId)).toMatchObject({ status: "active" });
+      const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connected.body.connectionId));
+      expect(grant).toMatchObject({ kind: "user", subjectUserId: "board-user", status: "active" });
+    });
+
+    it("refuses forged hosts and forged states through the same chain", async () => {
+      vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+      const fixture = installFixture();
+      const company = await createCompany();
+      const app = createDeployedApp();
+      const connected = await onPublic(app, "post", `/api/companies/${company.id}/tools/apps/connect`)
+        .send({ link: MCP_URL, name: "Deployed forged", grantKind: "user", oauthSignIn: LOOPBACK_SETTINGS });
+      expect(connected.status, JSON.stringify(connected.body)).toBe(201);
+      const startUrl = connected.body.auth.startUrl as string;
+      const state = new URL(startUrl).searchParams.get("state")!;
+      const query = { state, code: fixture.issueCode(startUrl), iss: ISSUER };
+
+      // A host the deployment does not serve never reaches the handler.
+      for (const host of ["evil.example", "localhost.evil.example", "evil.example:3100"]) {
+        const response = await request(app).get("/api/tools/oauth/callback").set("Host", host).query(query);
+        expect(response.status, host).toBe(403);
+        expect(relayedTo(response), host).toBeNull();
+      }
+      // A session cookie sent to localhost is not a session there: still only a relay.
+      const cookieOnLocalhost = await request(app)
+        .get("/api/tools/oauth/callback")
+        .set("Host", `localhost:${SERVER_PORT}`)
+        .set("Cookie", SESSION_COOKIE)
+        .query(query);
+      expect(relayedTo(cookieOnLocalhost)!.origin).toBe(PUBLIC_BASE_URL);
+      // A proxy-forwarded localhost request is not relayed.
+      const forwarded = await request(app)
+        .get("/api/tools/oauth/callback")
+        .set("Host", `localhost:${SERVER_PORT}`)
+        .set("X-Forwarded-Host", "evil.example")
+        .query(query);
+      expect(relayedTo(forwarded)).toBeNull();
+      expect(forwarded.status).toBe(403);
+
+      // A forged state is relayed like any other and refused on the public
+      // address, with the session, before any exchange.
+      const forgedRelay = await request(app)
+        .get("/api/tools/oauth/callback")
+        .set("Host", `localhost:${SERVER_PORT}`)
+        .query({ ...query, state: loopbackOAuthState("forged", "fixture-client-1") });
+      const forgedLocation = relayedTo(forgedRelay)!;
+      const forged = await onPublic(app, "get", `${forgedLocation.pathname}${forgedLocation.search}`);
+      expect(forged.status).toBe(400);
+      expect(forged.body.error).toBe("Invalid or expired OAuth state");
+
+      expect(fixture.tokenRequests("authorization_code")).toHaveLength(0);
+      await expect(db.select().from(toolOauthStates).where(eq(toolOauthStates.state, state))).resolves.toHaveLength(1);
+    });
   });
 });

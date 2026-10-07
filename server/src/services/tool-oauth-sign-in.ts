@@ -84,6 +84,42 @@ export function oauthScopesOutsideRequest(granted: unknown, requested: string[])
   return [...new Set(grantedScopes.filter((scope) => !requested.includes(scope)))];
 }
 
+/**
+ * Does a sign-in that is about to store its credentials still fit the
+ * connection as it is now? `latestOauth` is read under a row lock;
+ * `startedWithOauth` is what the callback read before the token exchange.
+ */
+export function recheckOAuthSignIn(input: {
+  latestOauth: Record<string, unknown>;
+  startedWithOauth: Record<string, unknown>;
+  attemptScopes: string[];
+  loopbackAttempt: boolean;
+  grantedScope: unknown;
+}): { kind: "changed" } | { kind: "overgrant"; scopes: string[] } | null {
+  const latest = readOAuthSignInSettings(input.latestOauth);
+  if (latest.requestedScopes) {
+    // An attempt wider than the list as it is now must not complete.
+    if (
+      input.attemptScopes.length === 0 ||
+      input.attemptScopes.some((scope) => !latest.requestedScopes!.includes(scope))
+    ) {
+      return { kind: "changed" };
+    }
+    const outside = oauthScopesOutsideRequest(input.grantedScope, input.attemptScopes);
+    if (outside.length > 0) return { kind: "overgrant", scopes: outside };
+  }
+  if (input.loopbackAttempt) {
+    // The code was exchanged for the client the callback read. If the stored
+    // client moved meanwhile, these tokens belong to a replaced registration.
+    const startedWith = input.startedWithOauth.clientId;
+    const now = input.latestOauth.clientId;
+    if (typeof startedWith === "string" ? startedWith !== now : typeof now === "string") {
+      return { kind: "changed" };
+    }
+  }
+  return null;
+}
+
 /*
  * A sign-in started with the localhost switch on carries that fact in its own
  * `state` value: `lb1.<client binding>.<random>`. The state is the primary key

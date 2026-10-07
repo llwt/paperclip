@@ -74,6 +74,13 @@ How it works:
   collide with upstream's later migration numbers on the next release merge.
 - With a scope list, a caller can only narrow it, the list is stored as the
   connection's scopes, and a grant wider than the request is not saved.
+- The settings belong to the setup form. Every OAuth write of the connection
+  config in `tool-access.ts` (client registration, start, callback, renewal)
+  goes through `keepLatestOAuthSignIn`, which takes the two settings from the
+  row as it is at the moment of the update, not from the copy the operation
+  read earlier. The callback also locks the connection row and rechecks the
+  attempt against the settings before it stores credentials. A new OAuth write
+  of `config` added by an upstream merge must use the same helper.
 - Not available for curated apps, Vercel-backed or brokered sign-ins.
 
 Files: `packages/shared/src/oauth-sign-in-settings.ts`,
@@ -83,7 +90,8 @@ Files: `packages/shared/src/oauth-sign-in-settings.ts`,
 `ui/src/features/connections/oauth-sign-in-settings.ts` and their tests are
 fork-only. The wiring in upstream-owned files is marked "Fork-only (NX-617)" or
 "Differs from upstream (fork, NX-617)": `server/src/services/tool-access.ts`
-(`startOAuth`, `completeOAuthCallback`, `connectGalleryApp`),
+(`startOAuth`, `completeOAuthCallback`, `connectGalleryApp`, and the
+`keepLatestOAuthSignIn` calls at each OAuth config write),
 `server/src/routes/tool-access.ts` (callback handler), `server/src/app.ts`,
 `packages/shared/src/validators/tool-access.ts`, `packages/shared/src/index.ts`
 and `ui/src/features/connections/ConnectionSetupFlow.tsx`. On a release merge,

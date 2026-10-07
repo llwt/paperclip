@@ -12,9 +12,9 @@ import {
   loopbackOAuthState,
   loopbackOAuthStateMatchesClient,
   nextOAuthSignInSettings,
-  oauthScopesOutsideRequest,
   oauthSignInSettingsConfig,
   parseLoopbackOAuthState,
+  recheckOAuthSignIn,
   resolveGenericOAuthScopes,
 } from "./tool-oauth-sign-in.js";
 import { githubBotRequest } from "./chat-github-client.js";
@@ -9577,8 +9577,8 @@ export function toolAccessService(
       .update(toolConnections)
       .set({
         ownership: "dcr",
-        config: nextConfig,
-        transportConfig: nextConfig,
+        config: keepLatestOAuthSignIn(nextConfig),
+        transportConfig: keepLatestOAuthSignIn(nextConfig),
         credentialSecretRefs: nextCredentialSecretRefs,
         updatedAt: now(),
       })
@@ -9645,8 +9645,8 @@ export function toolAccessService(
       .update(toolConnections)
       .set({
         authKind: "oauth",
-        config: nextConfig,
-        transportConfig: nextConfig,
+        config: keepLatestOAuthSignIn(nextConfig),
+        transportConfig: keepLatestOAuthSignIn(nextConfig),
         credentialSecretRefs: nextCredentialSecretRefs,
         updatedAt: now(),
       })
@@ -9782,8 +9782,8 @@ export function toolAccessService(
     const [updated] = await db
       .update(toolConnections)
       .set({
-        config: nextConfig,
-        transportConfig: nextConfig,
+        config: keepLatestOAuthSignIn(nextConfig),
+        transportConfig: keepLatestOAuthSignIn(nextConfig),
         updatedAt: now(),
       })
       .where(
@@ -10148,8 +10148,8 @@ export function toolAccessService(
     const [updated] = await db
       .update(toolConnections)
       .set({
-        config: nextConfig,
-        transportConfig: nextConfig,
+        config: keepLatestOAuthSignIn(nextConfig),
+        transportConfig: keepLatestOAuthSignIn(nextConfig),
         updatedAt: now(),
       })
       .where(
@@ -10286,8 +10286,8 @@ export function toolAccessService(
         healthMessage:
           "OAuth authorization expired. Reconnect this app to continue.",
         lastError: "oauth_reauthorization_required",
-        config: nextConfig,
-        transportConfig: nextConfig,
+        config: keepLatestOAuthSignIn(nextConfig),
+        transportConfig: keepLatestOAuthSignIn(nextConfig),
         credentialSecretRefs: nextCredentialSecretRefs,
         credentialRefs: nextCredentialRefs,
         updatedAt: now(),
@@ -10515,8 +10515,8 @@ export function toolAccessService(
     const [updated] = await db
       .update(toolConnections)
       .set({
-        config: nextConfig,
-        transportConfig: nextConfig,
+        config: keepLatestOAuthSignIn(nextConfig),
+        transportConfig: keepLatestOAuthSignIn(nextConfig),
         credentialSecretRefs: nextCredentialSecretRefs,
         credentialRefs: [
           ...connection.credentialRefs.filter(
@@ -11276,8 +11276,8 @@ export function toolAccessService(
           await db
             .update(toolConnections)
             .set({
-              config: nextConfig,
-              transportConfig: nextConfig,
+              config: keepLatestOAuthSignIn(nextConfig),
+              transportConfig: keepLatestOAuthSignIn(nextConfig),
               updatedAt: now(),
             })
             .where(
@@ -13920,6 +13920,68 @@ export function toolAccessService(
     return { ...health, connection: refresh.connection };
   }
 
+  /**
+   * Fork-only (NX-617). Every OAuth write in this file builds the whole config
+   * from a row it read earlier, sometimes several awaits earlier. The sign-in
+   * settings are owned by the setup form, so such a write takes them from the
+   * row as it is at the moment of the update, never from its own older copy.
+   * For a connection without the settings this stores exactly `nextConfig`.
+   */
+  function keepLatestOAuthSignIn(nextConfig: Record<string, unknown>) {
+    const next = sql`${JSON.stringify(nextConfig)}::jsonb`;
+    const latest = sql`jsonb_strip_nulls(jsonb_build_object('loopbackRedirect', ${toolConnections.config} #> '{oauth,loopbackRedirect}', 'requestedScopes', ${toolConnections.config} #> '{oauth,requestedScopes}'))`;
+    return sql<Record<string, unknown>>`case when (${next} -> 'oauth') is null and ${latest} = '{}'::jsonb then ${next} else jsonb_set(${next}, '{oauth}', (coalesce(${next} -> 'oauth', '{}'::jsonb) - 'loopbackRedirect' - 'requestedScopes') || ${latest}) end`;
+  }
+
+  /**
+   * Fork-only (NX-617). Called inside the transaction that stores a sign-in's
+   * credentials. It locks the connection row, so a settings change either
+   * committed before this point and is checked here, or waits until the
+   * credentials are stored. An attempt that no longer fits the settings, or a
+   * grant wider than the request, stores nothing.
+   */
+  async function lockAndRecheckOAuthSignIn(
+    tx: Pick<Db, "select">,
+    input: {
+      connection: typeof toolConnections.$inferSelect;
+      stateRow: typeof toolOauthStates.$inferSelect;
+      loopbackAttempt: boolean;
+      grantedScope: unknown;
+    },
+  ) {
+    const [latest] = await tx
+      .select({ config: toolConnections.config })
+      .from(toolConnections)
+      .where(
+        and(
+          eq(toolConnections.id, input.connection.id),
+          eq(toolConnections.companyId, input.connection.companyId),
+        ),
+      )
+      .limit(1)
+      .for("update");
+    if (!latest) throw notFound("Tool connection not found");
+    const problem = recheckOAuthSignIn({
+      latestOauth: asRecord(asRecord(latest.config).oauth),
+      startedWithOauth: oauthConfig(input.connection),
+      attemptScopes: normalizeOauthScopes(input.stateRow.requestedScopes),
+      loopbackAttempt: input.loopbackAttempt,
+      grantedScope: input.grantedScope,
+    });
+    if (problem?.kind === "changed") {
+      throw conflict(
+        "This connection's sign-in settings changed after the sign-in started. Start the sign-in again.",
+        { code: "oauth_sign_in_settings_changed" },
+      );
+    }
+    if (problem?.kind === "overgrant") {
+      throw unprocessable(
+        "The authorization server granted scopes this connection did not ask for, so the sign-in was not saved.",
+        { code: "oauth_granted_scope_outside_request", scopes: problem.scopes },
+      );
+    }
+  }
+
   /** Fork-only (NX-617). */
   function requireLoopbackOAuthRedirectUri(): string {
     const redirectUri = loopbackOAuthRedirectUri(options.oauthLoopbackPort);
@@ -14537,8 +14599,8 @@ export function toolAccessService(
         // connection, and refresh, reconnect, revoke and diagnostics must all
         // treat it as one.
         authKind: "oauth",
-        config: nextConfig,
-        transportConfig: nextConfig,
+        config: keepLatestOAuthSignIn(nextConfig),
+        transportConfig: keepLatestOAuthSignIn(nextConfig),
         updatedAt: new Date(),
       })
       .where(eq(toolConnections.id, connection.id));
@@ -15633,21 +15695,6 @@ export function toolAccessService(
       code: input.code,
       resource: endpoints.resource,
     });
-    if (signInSettings.requestedScopes) {
-      // Differs from upstream (fork, NX-617): the scope list is the most this
-      // connection may hold. A provider that grants more is refused before
-      // anything is stored.
-      const outside = oauthScopesOutsideRequest(
-        token.scope,
-        normalizeOauthScopes(stateRow.requestedScopes),
-      );
-      if (outside.length > 0) {
-        throw unprocessable(
-          "The authorization server granted scopes this connection did not ask for, so the sign-in was not saved.",
-          { code: "oauth_granted_scope_outside_request", scopes: outside },
-        );
-      }
-    }
     const connectedAt = now();
     const expiresAt = token.expiresIn
       ? new Date(connectedAt.getTime() + token.expiresIn * 1000).toISOString()
@@ -15677,6 +15724,13 @@ export function toolAccessService(
             "Your company membership no longer permits connection changes. Ask a company owner to restore non-viewer access before you authorize this connection again.",
           );
         }
+        // Differs from upstream (fork, NX-617).
+        await lockAndRecheckOAuthSignIn(tx, {
+          connection,
+          stateRow,
+          loopbackAttempt: Boolean(loopbackAttempt),
+          grantedScope: token.scope,
+        });
         const txSecrets = secretService(tx);
         const txSecretContext = { dbClient: tx, secretClient: txSecrets };
 
@@ -15817,8 +15871,8 @@ export function toolAccessService(
             enabled: true,
             authKind: "oauth",
             credentialPolicy: connection.credentialPolicy,
-            config: nextConfig,
-            transportConfig: nextConfig,
+            config: keepLatestOAuthSignIn(nextConfig),
+            transportConfig: keepLatestOAuthSignIn(nextConfig),
             // A personal-only connection keeps tokens exclusively on its user
             // grant. Adding a personal identity to an existing shared/fallback
             // connection must not erase that connection's organization token.
@@ -15966,6 +16020,13 @@ export function toolAccessService(
           "Your company membership no longer permits connection changes. Ask a company owner to restore non-viewer access before you authorize this connection again.",
         );
       }
+      // Differs from upstream (fork, NX-617).
+      await lockAndRecheckOAuthSignIn(tx, {
+        connection,
+        stateRow,
+        loopbackAttempt: Boolean(loopbackAttempt),
+        grantedScope: token.scope,
+      });
       const roleCanManage =
         membership.membershipRole === "owner" ||
         membership.membershipRole === "admin";
@@ -16077,8 +16138,8 @@ export function toolAccessService(
           status: "active",
           enabled: true,
           authKind: "oauth",
-          config: nextConfig,
-          transportConfig: nextConfig,
+          config: keepLatestOAuthSignIn(nextConfig),
+          transportConfig: keepLatestOAuthSignIn(nextConfig),
           credentialSecretRefs: nextCredentialSecretRefs,
           credentialRefs: [
             ...connection.credentialRefs.filter(
