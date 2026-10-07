@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 // Helpers for talking to remote MCP servers over the Streamable HTTP transport.
 //
 // The MCP Streamable HTTP spec requires the client to advertise that it accepts
@@ -15,11 +16,6 @@
 export const MCP_HTTP_ACCEPT = "application/json, text/event-stream";
 export const MCP_PROTOCOL_VERSION = "2025-06-18";
 
-/**
- * Content-free description of the messages seen while looking for a response.
- * Carries counts, JSON-RPC method names and flags only: never params, results,
- * error bodies or message IDs.
- */
 /** Shape of a response stream that had no message for the request. It must
  * stay free of server-supplied text: counts, flags and fixed labels only. */
 export type McpHttpResponseSummary = {
@@ -49,7 +45,6 @@ const KNOWN_MCP_METHOD_LABELS: ReadonlySet<string> = new Set([
   "roots/list",
   "ping",
 ]);
-const OTHER_MCP_METHOD_LABEL = "other";
 
 export class McpHttpResponseError extends Error {
   constructor(
@@ -80,6 +75,7 @@ export class McpHttpInitializationError extends Error {
     message: string,
     readonly stage: "initialize" | "initialized_notification",
     readonly status: number | null,
+    readonly response?: Response,
   ) {
     super(message);
     this.name = "McpHttpInitializationError";
@@ -87,9 +83,8 @@ export class McpHttpInitializationError extends Error {
 }
 
 /**
- * Establish the short-lived Streamable HTTP session needed by stateful MCP
- * servers. The returned headers belong only to the caller's next request; no
- * session id is persisted with the connection or shared across operations.
+ * Establish a Streamable HTTP session. Callers may retain protocol headers in
+ * the in-memory cache scoped to the connection and effective credential identity.
  */
 export async function initializeMcpHttpSession(input: {
   send: (init: RequestInit) => Promise<Response>;
@@ -115,14 +110,12 @@ export async function initializeMcpHttpSession(input: {
       `Remote MCP initialization returned HTTP ${initializeResponse.status}`,
       "initialize",
       initializeResponse.status,
+      initializeResponse,
     );
   }
   let payload: unknown;
   try {
-    payload = parseMcpHttpResponseBody(
-      await initializeResponse.text(),
-      initializeResponse.headers.get("content-type"),
-    );
+    payload = await readMcpHttpResponse(initializeResponse, `${input.requestId}-initialize`);
   } catch {
     throw new McpHttpInitializationError("Remote MCP initialization returned an invalid response", "initialize", null);
   }
@@ -130,6 +123,7 @@ export async function initializeMcpHttpSession(input: {
     ? (payload as { result?: unknown }).result
     : null;
   const resultRecord = result && typeof result === "object" ? result as Record<string, unknown> : null;
+  if (!resultRecord) throw new McpHttpInitializationError("Remote MCP initialization failed", "initialize", null);
   const protocolVersion = typeof resultRecord?.protocolVersion === "string" && resultRecord.protocolVersion
     ? resultRecord.protocolVersion
     : MCP_PROTOCOL_VERSION;
@@ -249,9 +243,7 @@ export async function readMcpHttpResponse(
     if ("id" in record) summary.sawId = true;
     if ("result" in record || "error" in record) summary.sawResponse = true;
     if ("method" in record) {
-      const label = typeof record.method === "string" && KNOWN_MCP_METHOD_LABELS.has(record.method)
-        ? record.method
-        : OTHER_MCP_METHOD_LABEL;
+      const label = typeof record.method === "string" && KNOWN_MCP_METHOD_LABELS.has(record.method) ? record.method : "other";
       summary.methods[label] = (summary.methods[label] ?? 0) + 1;
     }
     if ("method" in record && "id" in record) await options.onRequest?.(record);
@@ -260,7 +252,7 @@ export async function readMcpHttpResponse(
   const event = async (value: string) => {
     const data = value.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).replace(/^ /, "")).join("\n");
     if (!data) return undefined;
-    // Differs from upstream v2026.1001.0, which fails the whole call on a
+    // Differs from upstream v2026.1005.0, which fails the whole call on a
     // non-JSON event. Skip it and keep reading, as parseMcpHttpResponseBody
     // does, so a stray keep-alive or comment-like event before the result does
     // not fail the call (and, in the gateway, mark the connection errored).
@@ -298,4 +290,33 @@ export async function readMcpHttpResponse(
     await reader.cancel().catch(() => undefined);
     reader.releaseLock();
   }
+}
+
+const sessions = new Map<string, { headers: Record<string, string>; expiresAt: number }>();
+const initializing = new Map<string, Promise<Record<string, string>>>();
+const SESSION_TTL_MS = 30 * 60_000;
+
+/** Cache only protocol headers; credential hashes and scope separate every
+ * connection and effective identity. Never cache a tool call or replay a write. */
+export async function getMcpHttpSession(input: Parameters<typeof initializeMcpHttpSession>[0] & { scope: string }) {
+  const key = `${input.scope}:${createHash("sha256").update(JSON.stringify(Object.entries(input.headers ?? {}).sort())).digest("hex")}`;
+  const cached = sessions.get(key);
+  if (cached && cached.expiresAt > Date.now()) return { ...input.headers, ...cached.headers };
+  const pending = initializing.get(key);
+  if (pending) return pending;
+  const promise = initializeMcpHttpSession(input).then((headers) => {
+    if (initializing.get(key) !== promise) throw new Error("MCP connection changed while initializing; reconnect before calling tools");
+    for (const [id, value] of sessions) if (value.expiresAt <= Date.now()) sessions.delete(id);
+    if (sessions.size >= 1000) sessions.delete(sessions.keys().next().value!);
+    const protocolHeaders = Object.fromEntries(Object.entries(headers).filter(([name]) => ["mcp-session-id", "mcp-protocol-version"].includes(name.toLowerCase())));
+    sessions.set(key, { headers: protocolHeaders, expiresAt: Date.now() + SESSION_TTL_MS });
+    return headers;
+  }).finally(() => { if (initializing.get(key) === promise) initializing.delete(key); });
+  initializing.set(key, promise);
+  return promise;
+}
+
+export function forgetMcpHttpSessions(connectionId: string) {
+  for (const key of sessions.keys()) if (key.startsWith(`${connectionId}:`)) sessions.delete(key);
+  for (const key of initializing.keys()) if (key.startsWith(`${connectionId}:`)) initializing.delete(key);
 }
