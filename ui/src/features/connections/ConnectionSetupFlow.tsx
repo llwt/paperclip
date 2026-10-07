@@ -2,6 +2,14 @@ import { RemoteMcpProductionSetup } from "./remote-mcp/RemoteMcpProductionSetup"
 import { useMemoryConnectorsEnabled } from "@/hooks/useMemoryConnectorsEnabled";
 import { AiConnectionCredentialStep } from "@/components/ai-connections/AiConnectionCredentialStep";
 import { ConnectionChoiceList } from "./ConnectionChoiceList";
+// Fork-only (llwt/paperclip, NX-617): localhost sign-in and requested scopes.
+import { OAuthSignInSettingsFields } from "./OAuthSignInSettingsFields";
+import {
+  EMPTY_OAUTH_SIGN_IN_DRAFT,
+  oauthSignInDraftError,
+  oauthSignInDraftFromConnectionConfig,
+  oauthSignInPayload,
+} from "./oauth-sign-in-settings";
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode, type Ref } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -662,6 +670,8 @@ function StandardConnectionSetupFlow({
   const [linkOAuthClientId, setLinkOAuthClientId] = useState("");
   const [linkOAuthClientSecret, setLinkOAuthClientSecret] = useState("");
   const [linkAdvancedOpen, setLinkAdvancedOpen] = useState(false);
+  // Fork-only (NX-617).
+  const [linkOAuthSignIn, setLinkOAuthSignIn] = useState(EMPTY_OAUTH_SIGN_IN_DRAFT);
   const [linkGuidance, setLinkGuidance] = useState<GenericConnectGuidance | null>(null);
   const [genericOAuthPending, setGenericOAuthPending] = useState(false);
   const [credentials, setCredentials] = useState<Record<string, string>>({});
@@ -1124,6 +1134,15 @@ function StandardConnectionSetupFlow({
     seededReconnectEndpoint.current = reconnectConnection.id;
     setLinkUrl((current) => current || endpoint);
   }, [configuredConnection, connectionsQuery.isFetchedAfterMount, reconnectConnection]);
+  // Fork-only (NX-617): show the sign-in options a reconnected connection has.
+  const seededReconnectSignIn = useRef<string | null>(null);
+  useEffect(() => {
+    if (!reconnectConnection || seededReconnectSignIn.current === reconnectConnection.id) return;
+    seededReconnectSignIn.current = reconnectConnection.id;
+    const stored = oauthSignInDraftFromConnectionConfig(reconnectConnection.config);
+    setLinkOAuthSignIn((current) => current.touched ? current : stored);
+    if (stored.loopbackRedirect || stored.scopesText) setLinkAdvancedOpen(true);
+  }, [reconnectConnection]);
   const reconnectApplication = useMemo(
     () => reconnectConnection
       ? (applicationsQuery.data?.applications ?? []).find(
@@ -1175,6 +1194,11 @@ function StandardConnectionSetupFlow({
     () => (linkUrl && !entry ? getAppDefinitionForUrl(linkUrl, visibleGalleryApps) : null),
     [entry, visibleGalleryApps, linkUrl],
   );
+  // Fork-only (NX-617): the sign-in options exist for a custom address that
+  // signs in through OAuth, not for a curated app such as Zapier.
+  const linkOAuthSignInApplies = (linkAuthMode === "auto" || linkAuthMode === "oauth")
+    && !zapierSource
+    && linkMatchedEntry?.slug !== "zapier";
 
   const selectedSetupMethod = entry
     ? availableToolConnectionMethod(entry, connectionMethodKey || null)
@@ -1319,6 +1343,8 @@ function StandardConnectionSetupFlow({
         );
         result = await toolsApi.connectApp(selectedCompanyId!, {
           ...genericPayload,
+          // Fork-only (NX-617): stored before the first sign-in starts.
+          ...(linkOAuthSignInApplies ? oauthSignInPayload(linkOAuthSignIn) : {}),
           ...(reconnectConnectionId ? { reconnectConnectionId } : {}),
           // Zapier issues a credential-bearing URL, so its branded setup keeps
           // the compact pasted-URL step. It is still a curated app, though: the
@@ -2486,6 +2512,14 @@ function StandardConnectionSetupFlow({
           onOAuthClientSecretChange={setLinkOAuthClientSecret}
           advancedOpen={linkAdvancedOpen}
           onAdvancedOpenChange={setLinkAdvancedOpen}
+          advancedExtra={linkOAuthSignInApplies ? (
+            <OAuthSignInSettingsFields
+              draft={linkOAuthSignIn}
+              onChange={setLinkOAuthSignIn}
+              disabled={connectMutation.isPending || genericOAuthPending}
+            />
+          ) : null}
+          advancedError={linkOAuthSignInApplies ? oauthSignInDraftError(linkOAuthSignIn) : null}
           guidance={linkGuidance}
           matchedEntry={linkMatchedEntry}
           onUseMatchedEntry={linkMatchedEntry ? () => useMatchedGalleryEntry(linkMatchedEntry) : undefined}
@@ -3108,6 +3142,8 @@ function LinkConnectStep({
   onOAuthClientSecretChange,
   advancedOpen,
   onAdvancedOpenChange,
+  advancedExtra,
+  advancedError,
   guidance,
   matchedEntry,
   onUseMatchedEntry,
@@ -3131,6 +3167,9 @@ function LinkConnectStep({
   onOAuthClientSecretChange: (next: string) => void;
   advancedOpen: boolean;
   onAdvancedOpenChange: (next: boolean) => void;
+  /** Fork-only (NX-617): extra fields at the end of Advanced authentication. */
+  advancedExtra?: ReactNode;
+  advancedError?: string | null;
   guidance: GenericConnectGuidance | null;
   /** A curated app whose endpoint matches, offered as a convenience only. */
   matchedEntry?: AppDefinition | null;
@@ -3314,6 +3353,7 @@ function LinkConnectStep({
                 </div>
               </div>
             ) : null}
+            {advancedExtra}
           </CollapsibleContent>
         </Collapsible>
       </div>
@@ -3324,7 +3364,7 @@ function LinkConnectStep({
         <Button variant="ghost" onClick={onBack} disabled={submitting}>
           Back
         </Button>
-        <Button onClick={onConnect} disabled={submitting || !canSubmit || Boolean(headerError)}>
+        <Button onClick={onConnect} disabled={submitting || !canSubmit || Boolean(headerError) || Boolean(advancedError)}>
           {submitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
           {submitting ? "Checking…" : "Check link"}
         </Button>
