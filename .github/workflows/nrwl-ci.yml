@@ -55,11 +55,7 @@ jobs:
   # files the unsharded run includes. The "server other" lane runs exactly the
   # server project test files that no shard selects, computed by
   # scripts/nrwl-ci-server-other.mjs. The server vitest config pins maxWorkers
-  # to 1, so one unsplit job would take the sum of all lanes. The serialized
-  # suites use upstream's shard count (9). With 5 shards, four tests in
-  # heartbeat-process-recovery.test.ts failed on hosted runners on the
-  # v2026.1005.0 merge, twice, while upstream's own 1/9 lane passed the file
-  # on the same head. The cause was not established.
+  # to 1, so one unsplit job would take the sum of all lanes.
   test:
     name: Tests (${{ matrix.label }})
     runs-on: ubuntu-latest
@@ -97,33 +93,21 @@ jobs:
           - label: workspaces-b
             script: test:run:general
             args: --group general-workspaces-b
-          - label: serialized 1/9
+          - label: serialized 1/5
             script: test:run:serialized
-            args: --shard-index 0 --shard-count 9
-          - label: serialized 2/9
+            args: --shard-index 0 --shard-count 5
+          - label: serialized 2/5
             script: test:run:serialized
-            args: --shard-index 1 --shard-count 9
-          - label: serialized 3/9
+            args: --shard-index 1 --shard-count 5
+          - label: serialized 3/5
             script: test:run:serialized
-            args: --shard-index 2 --shard-count 9
-          - label: serialized 4/9
+            args: --shard-index 2 --shard-count 5
+          - label: serialized 4/5
             script: test:run:serialized
-            args: --shard-index 3 --shard-count 9
-          - label: serialized 5/9
+            args: --shard-index 3 --shard-count 5
+          - label: serialized 5/5
             script: test:run:serialized
-            args: --shard-index 4 --shard-count 9
-          - label: serialized 6/9
-            script: test:run:serialized
-            args: --shard-index 5 --shard-count 9
-          - label: serialized 7/9
-            script: test:run:serialized
-            args: --shard-index 6 --shard-count 9
-          - label: serialized 8/9
-            script: test:run:serialized
-            args: --shard-index 7 --shard-count 9
-          - label: serialized 9/9
-            script: test:run:serialized
-            args: --shard-index 8 --shard-count 9
+            args: --shard-index 4 --shard-count 5
 
     steps:
       - name: Checkout repository
