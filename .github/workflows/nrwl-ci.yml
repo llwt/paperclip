@@ -82,6 +82,7 @@ jobs:
           - label: server other
             command: >-
               pnpm run preflight:workspace-links &&
+              pnpm --filter @paperclipai/plugin-sdk ensure-build-deps &&
               node scripts/nrwl-ci-server-other.mjs
           - label: workspaces-a 1/2
             script: test:run:general
