@@ -67,11 +67,15 @@ How it works:
   request goes into the target origin. No state is looked up and no code is
   exchanged on that hop. This relay is the one part that is not per
   connection: it answers any such request, whatever connection it belongs to.
-- A localhost attempt marks itself in its OAuth `state` (`lb1.<client
-  binding>.<random>`). The callback exchanges the code with the localhost
-  address and refuses if the connection's client changed since the start.
-  There is no database column for this on purpose: a fork migration would
-  collide with upstream's later migration numbers on the next release merge.
+- A localhost attempt carries its own snapshot in its OAuth `state`
+  (`lb2.<port>.<client binding>.<random>`). The callback rebuilds the localhost
+  address from that port, so the token request names the address the
+  authorization request named even if another process or a restarted server on
+  another port handles it, and it refuses if the connection's client changed
+  since the start. A dotted state in a format the server cannot read (for
+  example one started before an upgrade) is refused and needs a fresh sign-in.
+  There is no database column for this on purpose: upstream already has later
+  migrations than the fork.
 - With a scope list, a caller can only narrow it, the list is stored as the
   connection's scopes, and a grant wider than the request is not saved.
 - The settings belong to the setup form. Every OAuth write of the connection

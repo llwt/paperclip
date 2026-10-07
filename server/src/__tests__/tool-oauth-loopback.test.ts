@@ -88,17 +88,50 @@ describe("localhost sign-in helpers", () => {
     }
   });
 
-  it("marks a localhost attempt in its state and binds it to one client", () => {
-    const state = loopbackOAuthState("random-token_-", "client-a");
+  it("carries the start port and client binding of a localhost attempt in its state", () => {
+    const state = loopbackOAuthState("random-token_-", "client-a", 3100)!;
+    expect(state.startsWith("lb2.3100.")).toBe(true);
+    expect(state.endsWith(".random-token_-")).toBe(true);
     const attempt = parseLoopbackOAuthState(state);
-    expect(attempt).not.toBeNull();
-    expect(loopbackOAuthStateMatchesClient(attempt!, "client-a")).toBe(true);
-    expect(loopbackOAuthStateMatchesClient(attempt!, "client-b")).toBe(false);
+    expect(attempt).toMatchObject({ kind: "loopback", port: 3100 });
+    if (attempt?.kind !== "loopback") throw new Error("expected a localhost attempt");
+    expect(loopbackOAuthStateMatchesClient(attempt, "client-a")).toBe(true);
+    expect(loopbackOAuthStateMatchesClient(attempt, "client-b")).toBe(false);
+    expect(parseLoopbackOAuthState(loopbackOAuthState("r", "c", 1)!)).toMatchObject({ kind: "loopback", port: 1 });
+    expect(parseLoopbackOAuthState(loopbackOAuthState("r", "c", 65535)!)).toMatchObject({ kind: "loopback", port: 65535 });
+    // No state without a usable port.
+    for (const port of [0, -1, 65536, 3100.5, Number.NaN]) {
+      expect(loopbackOAuthState("r", "c", port)).toBeNull();
+    }
     // Ordinary states are base64url: no dot, never a localhost attempt.
     expect(parseLoopbackOAuthState("b3JkaW5hcnktc3RhdGU_-")).toBeNull();
-    expect(parseLoopbackOAuthState("lb1.only-two")).toBeNull();
-    expect(parseLoopbackOAuthState("lb2.binding.random")).toBeNull();
-    expect(parseLoopbackOAuthState("lb1..random")).toBeNull();
+  });
+
+  it("refuses every dotted state it cannot read instead of treating it as ordinary", () => {
+    for (const state of [
+      // The earlier format, which has no port.
+      "lb1.binding.random",
+      "lb3.3100.binding.random",
+      "lb2.binding.random",
+      "lb2.3100.binding",
+      "lb2.3100.binding.random.extra",
+      "lb2..binding.random",
+      "lb2.3100..random",
+      "lb2.3100.binding.",
+      // Ports that are not a canonical integer from 1 to 65535.
+      "lb2.0.binding.random",
+      "lb2.65536.binding.random",
+      "lb2.03100.binding.random",
+      "lb2.+3100.binding.random",
+      "lb2.3100x.binding.random",
+      "lb2.31e2.binding.random",
+      "lb2. 3100.binding.random",
+      "lb2.evil.example.binding.random",
+      "a.b",
+      ".",
+    ]) {
+      expect(parseLoopbackOAuthState(state), state).toEqual({ kind: "unsupported" });
+    }
   });
 
   it("leaves scope selection alone without a list and treats a list as the ceiling", () => {
@@ -653,7 +686,7 @@ describeEmbeddedPostgres("localhost sign-in for a pasted MCP URL", () => {
     expect(authorizationUrl.searchParams.get("client_id")).toBe("fixture-client-1");
 
     const state = authorizationUrl.searchParams.get("state")!;
-    expect(parseLoopbackOAuthState(state)).not.toBeNull();
+    expect(parseLoopbackOAuthState(state)).toMatchObject({ kind: "loopback", port: SERVER_PORT });
     const [stateRow] = await db.select().from(toolOauthStates).where(eq(toolOauthStates.state, state));
     expect(stateRow!.requestedScopes).toEqual(["mcp:read"]);
 
@@ -873,7 +906,7 @@ describeEmbeddedPostgres("localhost sign-in for a pasted MCP URL", () => {
     for (const forged of [
       "forged-state",
       // Shaped like a localhost attempt, but never issued.
-      loopbackOAuthState("forged-random", "fixture-client-1"),
+      loopbackOAuthState("forged-random", "fixture-client-1", SERVER_PORT)!,
       `${realState}x`,
     ]) {
       // The relay itself decides nothing about the state.
@@ -1236,6 +1269,137 @@ describeEmbeddedPostgres("localhost sign-in for a pasted MCP URL", () => {
     expect(response.status, JSON.stringify(response.body)).toBe(422);
     expect(response.body.details).toMatchObject({ code: "oauth_loopback_redirect_unavailable" });
     await expect(db.select().from(toolOauthStates)).resolves.toHaveLength(0);
+  });
+
+  it("exchanges with the port the attempt started on when another process handles the callback", async () => {
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+    const fixture = installFixture();
+    const company = await createCompany();
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const startedOn = toolAccessService(db, { oauthLoopbackPort: SERVER_PORT });
+    const connected = await startedOn.connectGalleryApp(
+      company.id,
+      { link: MCP_URL, name: "Two ports", oauthSignIn: { loopbackRedirect: true } },
+      actor,
+    );
+    const first = await startedOn.startOAuth(company.id, connected.connectionId, { redirectUri: PUBLIC_REDIRECT_URI, actor });
+    const second = await startedOn.startOAuth(company.id, connected.connectionId, { redirectUri: PUBLIC_REDIRECT_URI, actor });
+    expect(new URL(first.authorizationUrl).searchParams.get("redirect_uri")).toBe(LOOPBACK_REDIRECT_URI);
+
+    // The same database, a process on another port (a restart or a second
+    // instance), and one that does not know its port at all.
+    for (const [start, otherPort] of [[first, 4200], [second, null]] as const) {
+      const other = toolAccessService(db, { oauthLoopbackPort: otherPort });
+      await other.completeOAuthCallback({
+        state: new URL(start.authorizationUrl).searchParams.get("state")!,
+        code: fixture.issueCode(start.authorizationUrl),
+        iss: ISSUER,
+        redirectUri: PUBLIC_REDIRECT_URI,
+        actor,
+      });
+      const exchange = fixture.tokenRequests("authorization_code").at(-1)!;
+      expect(exchange.get("redirect_uri")).toBe(LOOPBACK_REDIRECT_URI);
+      expect(exchange.get("client_id")).toBe("fixture-client-1");
+    }
+    expect(fixture.tokenRequests("authorization_code")).toHaveLength(2);
+    expect(await connectionRow(connected.connectionId)).toMatchObject({ status: "active" });
+  });
+
+  it("refuses a localhost attempt in a format it cannot read and spends it", async () => {
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+    const fixture = installFixture();
+    const company = await createCompany();
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const service = toolAccessService(db, { oauthLoopbackPort: SERVER_PORT });
+    const connected = await service.connectGalleryApp(
+      company.id,
+      { link: MCP_URL, name: "Old format", oauthSignIn: { loopbackRedirect: true } },
+      actor,
+    );
+    const start = await service.startOAuth(company.id, connected.connectionId, { redirectUri: PUBLIC_REDIRECT_URI, actor });
+    const state = new URL(start.authorizationUrl).searchParams.get("state")!;
+    // The row of an attempt started before the port was part of the state.
+    const oldState = `lb1.${state.split(".")[2]}.${state.split(".")[3]}`;
+    await db.update(toolOauthStates).set({ state: oldState }).where(eq(toolOauthStates.state, state));
+
+    // Another user cannot spend it: the actor check still comes first.
+    await expect(service.completeOAuthCallback({
+      state: oldState,
+      code: "x",
+      iss: ISSUER,
+      redirectUri: PUBLIC_REDIRECT_URI,
+      actor: { actorType: "user", actorId: "someone-else" },
+    })).rejects.toMatchObject({ status: 403 });
+    await expect(db.select().from(toolOauthStates).where(eq(toolOauthStates.state, oldState))).resolves.toHaveLength(1);
+
+    await expect(service.completeOAuthCallback({
+      state: oldState,
+      code: fixture.issueCode(start.authorizationUrl),
+      iss: ISSUER,
+      redirectUri: PUBLIC_REDIRECT_URI,
+      actor,
+    })).rejects.toMatchObject({ status: 409, details: { code: "oauth_sign_in_restart_required" } });
+    // Not exchanged with a recomputed address, and not left to be retried.
+    expect(fixture.tokenRequests("authorization_code")).toHaveLength(0);
+    await expect(db.select().from(toolOauthStates).where(eq(toolOauthStates.state, oldState))).resolves.toHaveLength(0);
+
+    // A fresh sign-in works.
+    const fresh = await service.startOAuth(company.id, connected.connectionId, { redirectUri: PUBLIC_REDIRECT_URI, actor });
+    await service.completeOAuthCallback({
+      state: new URL(fresh.authorizationUrl).searchParams.get("state")!,
+      code: fixture.issueCode(fresh.authorizationUrl),
+      iss: ISSUER,
+      redirectUri: PUBLIC_REDIRECT_URI,
+      actor,
+    });
+    expect(fixture.tokenRequests("authorization_code")).toHaveLength(1);
+  });
+
+  it("binds a localhost attempt to a client the deployment preconfigured", async () => {
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_CLIENT_ID", "preconfigured-client");
+    const fixture = installFixture();
+    const company = await createCompany();
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const service = toolAccessService(db, { oauthLoopbackPort: SERVER_PORT });
+    const connected = await service.connectGalleryApp(
+      company.id,
+      { link: MCP_URL, name: "Preconfigured", oauthSignIn: { loopbackRedirect: true } },
+      actor,
+    );
+    const first = await service.startOAuth(company.id, connected.connectionId, { redirectUri: PUBLIC_REDIRECT_URI, actor });
+    const second = await service.startOAuth(company.id, connected.connectionId, { redirectUri: PUBLIC_REDIRECT_URI, actor });
+    expect(first.registrationSource).toBe("preconfigured");
+    expect(fixture.requestsTo("/register")).toHaveLength(0);
+    expect(new URL(first.authorizationUrl).searchParams.get("client_id")).toBe("preconfigured-client");
+    expect(new URL(first.authorizationUrl).searchParams.get("redirect_uri")).toBe(LOOPBACK_REDIRECT_URI);
+    // Such a client has no callback recorded on the connection; the attempt
+    // carries its own.
+    expect(oauthOf(await connectionRow(connected.connectionId))).not.toHaveProperty("clientRedirectUri");
+
+    // Completed by a process on another port: same address, same client.
+    await toolAccessService(db, { oauthLoopbackPort: 4200 }).completeOAuthCallback({
+      state: new URL(first.authorizationUrl).searchParams.get("state")!,
+      code: fixture.issueCode(first.authorizationUrl),
+      iss: ISSUER,
+      redirectUri: PUBLIC_REDIRECT_URI,
+      actor,
+    });
+    const exchanges = fixture.tokenRequests("authorization_code");
+    expect(exchanges).toHaveLength(1);
+    expect(exchanges[0]!.get("redirect_uri")).toBe(LOOPBACK_REDIRECT_URI);
+    expect(exchanges[0]!.get("client_id")).toBe("preconfigured-client");
+
+    // The deployment's client changes while the second attempt is out.
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_CLIENT_ID", "another-preconfigured-client");
+    await expect(service.completeOAuthCallback({
+      state: new URL(second.authorizationUrl).searchParams.get("state")!,
+      code: fixture.issueCode(second.authorizationUrl),
+      iss: ISSUER,
+      redirectUri: PUBLIC_REDIRECT_URI,
+      actor,
+    })).rejects.toMatchObject({ status: 409, details: { code: "oauth_sign_in_settings_changed" } });
+    expect(fixture.tokenRequests("authorization_code")).toHaveLength(1);
   });
 
   describe("settings changed while an OAuth operation is in flight", () => {
@@ -1601,7 +1765,7 @@ describeEmbeddedPostgres("localhost sign-in for a pasted MCP URL", () => {
       const forgedRelay = await request(app)
         .get("/api/tools/oauth/callback")
         .set("Host", `localhost:${SERVER_PORT}`)
-        .query({ ...query, state: loopbackOAuthState("forged", "fixture-client-1") });
+        .query({ ...query, state: loopbackOAuthState("forged", "fixture-client-1", SERVER_PORT)! });
       const forgedLocation = relayedTo(forgedRelay)!;
       const forged = await onPublic(app, "get", `${forgedLocation.pathname}${forgedLocation.search}`);
       expect(forged.status).toBe(400);

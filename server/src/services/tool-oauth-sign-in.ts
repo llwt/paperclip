@@ -121,32 +121,58 @@ export function recheckOAuthSignIn(input: {
 }
 
 /*
- * A sign-in started with the localhost switch on carries that fact in its own
- * `state` value: `lb1.<client binding>.<random>`. The state is the primary key
- * Paperclip looks the attempt up by, so the callback reads back exactly what the
- * start wrote, per attempt, whatever happened to the connection's settings or
- * client registration in between. Ordinary states are base64url and never
- * contain a dot, so they can never be read as a localhost attempt.
+ * A sign-in started with the localhost switch on carries its own snapshot in
+ * its `state` value: `lb2.<port>.<client binding>.<random>`. The state is the
+ * primary key Paperclip looks the attempt up by, so the callback reads back
+ * exactly what the start wrote, per attempt, whatever happened to the
+ * connection's settings, its client registration or the server's port in
+ * between. Ordinary states are base64url and never contain a dot, so they can
+ * never be read as a localhost attempt.
+ *
+ * The port is the one the start advertised in the authorization request. The
+ * callback rebuilds the address from it, so the token request names the same
+ * address even when another process, or the same one after a restart on another
+ * port, handles the callback. Scheme, host and path are fixed by the format:
+ * the state can never name an arbitrary address.
  *
  * This is a snapshot without a database column. A column on `tool_oauth_states`
- * would need a fork migration, and upstream already has later migrations, so
- * its number would collide on the next release merge.
+ * would need a fork migration, and upstream already has later migrations.
  */
-const LOOPBACK_STATE_PREFIX = "lb1";
+const LOOPBACK_STATE_VERSION = "lb2";
 
 function oauthClientBinding(clientId: string): string {
   return createHash("sha256").update(clientId).digest("base64url").slice(0, 22);
 }
 
-export function loopbackOAuthState(randomToken: string, clientId: string): string {
-  return `${LOOPBACK_STATE_PREFIX}.${oauthClientBinding(clientId)}.${randomToken}`;
+function canonicalPort(value: string): number | null {
+  if (!/^[1-9]\d{0,4}$/.test(value)) return null;
+  const port = Number(value);
+  return port <= 65535 ? port : null;
 }
 
-/** `null` for an ordinary attempt; otherwise the client binding the start recorded. */
-export function parseLoopbackOAuthState(state: string): { clientBinding: string } | null {
+/** `null` when the port is not usable: the caller must not start the attempt. */
+export function loopbackOAuthState(randomToken: string, clientId: string, port: number): string | null {
+  if (!loopbackOAuthRedirectUri(port)) return null;
+  return `${LOOPBACK_STATE_VERSION}.${port}.${oauthClientBinding(clientId)}.${randomToken}`;
+}
+
+export type LoopbackOAuthAttempt =
+  | { kind: "loopback"; port: number; clientBinding: string }
+  /**
+   * A dotted state this version cannot read (an older `lb1` attempt, which has
+   * no port, or a newer format). It must be refused, never treated as an
+   * ordinary attempt: that would exchange with a recomputed address.
+   */
+  | { kind: "unsupported" };
+
+/** `null` for an ordinary attempt. */
+export function parseLoopbackOAuthState(state: string): LoopbackOAuthAttempt | null {
+  if (!state.includes(".")) return null;
   const parts = state.split(".");
-  if (parts.length !== 3 || parts[0] !== LOOPBACK_STATE_PREFIX || !parts[1] || !parts[2]) return null;
-  return { clientBinding: parts[1] };
+  if (parts.length !== 4 || parts[0] !== LOOPBACK_STATE_VERSION) return { kind: "unsupported" };
+  const port = canonicalPort(parts[1]!);
+  if (port === null || !parts[2] || !parts[3]) return { kind: "unsupported" };
+  return { kind: "loopback", port, clientBinding: parts[2] };
 }
 
 export function loopbackOAuthStateMatchesClient(

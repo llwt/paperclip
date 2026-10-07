@@ -13982,6 +13982,20 @@ export function toolAccessService(
     }
   }
 
+  /** Fork-only (NX-617). The state of a localhost attempt, with its port and client. */
+  function requireLoopbackOAuthState(clientId: string): string {
+    requireLoopbackOAuthRedirectUri();
+    const state = loopbackOAuthState(
+      randomOauthToken(),
+      clientId,
+      options.oauthLoopbackPort as number,
+    );
+    if (!state) throw unprocessable("Sign-in through localhost is not available.", {
+      code: "oauth_loopback_redirect_unavailable",
+    });
+    return state;
+  }
+
   /** Fork-only (NX-617). */
   function requireLoopbackOAuthRedirectUri(): string {
     const redirectUri = loopbackOAuthRedirectUri(options.oauthLoopbackPort);
@@ -14367,7 +14381,7 @@ export function toolAccessService(
     // fact and its client in the state itself, so the callback exchanges the
     // code with the same callback address and client this request names.
     const state = signInSettings.loopbackRedirect
-      ? loopbackOAuthState(randomOauthToken(), client.clientId)
+      ? requireLoopbackOAuthState(client.clientId)
       : randomOauthToken();
     const codeVerifier = randomOauthToken(48);
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
@@ -15635,9 +15649,24 @@ export function toolAccessService(
     // localhost switch exchanges its code with the localhost callback address,
     // whatever address this request arrived on and whatever the switch says
     // now. Every other attempt keeps the address the route computed.
-    const loopbackAttempt = parseLoopbackOAuthState(stateRow.state);
-    if (loopbackAttempt) {
-      input = { ...input, redirectUri: requireLoopbackOAuthRedirectUri() };
+    const parsedAttempt = parseLoopbackOAuthState(stateRow.state);
+    const loopbackAttempt = parsedAttempt?.kind === "loopback" ? parsedAttempt : null;
+    // The address is rebuilt from the port the attempt started with, not from
+    // this process's port: the token request must name the address the
+    // authorization request named.
+    const attemptRedirectUri = loopbackAttempt
+      ? loopbackOAuthRedirectUri(loopbackAttempt.port)
+      : null;
+    if (parsedAttempt && !attemptRedirectUri) {
+      // A localhost attempt in a format this version cannot read, for example
+      // one started before an upgrade. It is spent; the next one works.
+      throw conflict(
+        "This sign-in was started by a different Paperclip version. Start the sign-in again.",
+        { code: "oauth_sign_in_restart_required" },
+      );
+    }
+    if (attemptRedirectUri) {
+      input = { ...input, redirectUri: attemptRedirectUri };
     }
     const signInSettings = readOAuthSignInSettings(oauthConfig(connection));
     if (signInSettings.requestedScopes) {
