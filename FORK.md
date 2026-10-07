@@ -15,22 +15,21 @@ and this fork is retired.
 
 ## Inventory of fork-only commits
 
-Base: upstream tag `v2026.916.0` (`dffc2b3ca`). Last refreshed 2026-10-05
-against upstream `master` `1c07b5903` and the latest stable tag `v2026.1001.0`
-(`8f8a0ab7e`). `nrwl-main` (`200a198f0`) was 7 ahead and 342 behind upstream
-`master`, and 77 behind `v2026.1001.0`.
+Base: upstream tag `v2026.1005.0` (`467125faf`), merged on 2026-10-07 (it
+contains `v2026.1001.0`). Last refreshed 2026-10-07 against upstream `master`
+`b31558064`, which is 170 commits past that tag. `v2026.1005.0` was the latest
+stable tag on that day. The commits below are the ones on `nrwl-main` before
+the merge; what is left of each is the diff of `nrwl-main` against the tag.
 
 | Commit | What | Upstream status | Drops out when |
 | --- | --- | --- | --- |
-| `d554c4789` | UI: composer stays available while pause state loads (upstream #13562) | Upstream's own `v2026.916.1` hotfix, not ours | Any merge of a later stable tag |
-| `25fcf9633` | Gateway: configurable tool timeout, connection stays listed after a tool timeout | Not submitted. Port branch `gateway-tool-timeout-upstream` (`534d5ebd1`) is ready | The upstream PR from the port branch lands |
+| `25fcf9633` | Gateway: configurable tool timeout, connection stays listed after a tool timeout | Not submitted. Port branch `gateway-tool-timeout-upstream` (`014ad6cb0`) is ready | The upstream PR from the port branch lands |
 | `669a157cb` | Gateway: approved execution budget stays fixed, timeout env values bounded | Not submitted. Same port branch | Same PR |
-| `0d78b3d67` | Gateway: pick the `tools/call` response by request ID, summarize the stream when none matches | Partly upstream: `v2026.1001.0` also selects by request ID. The stream summary is not upstream | Same PR, smaller after the `v2026.1001.0` merge |
+| `0d78b3d67` | Gateway: summarize the stream when no message matches the `tools/call` request ID | The selection by request ID is upstream since `v2026.1001.0` and the fork's own copy was dropped in the `v2026.1005.0` merge. The stream summary is not upstream. As upstream does, a malformed `tools/call` response marks the connection errored | Same PR |
 | `ba2e6f933` | Gateway: known method labels only, skip non-JSON stream events | Not submitted. Same port branch | Same PR |
 | `0fc5dd88b` | UI: remount the composer takeover card per pending input (fork PR #1) | Open upstream as paperclipai/paperclip#15121, no review yet | #15121 lands and that release is merged |
-| `200a198f0` | Tools: offer sign-in when a custom MCP server answers 401 without `WWW-Authenticate` (fork PR #2) | Not submitted. Port branch `fix/mcp-401-sign-in-without-challenge` (`cb19b98d4`) is ready | The upstream PR from that port branch lands and that release is merged |
+| `200a198f0` | Tools: offer sign-in when a custom MCP server answers 401 without `WWW-Authenticate` (fork PR #2) | Not submitted. Port branch `fix/mcp-401-sign-in-without-challenge` (`e0ffbf2f6`) is ready. The port branch also reduces the `x-amzn-remapped-www-authenticate` hint to its metadata address, which `nrwl-main` does not do yet | The upstream PR from that port branch lands and that release is merged |
 | fork PR #7 | CLI: `install --ref` builds `server/ui-dist`, copies `skills`, stages real workspace dependency versions, and works with `ignore-scripts=true` (see "Install") | Not submitted. Upstream `master` (`a1ab55a56`) has the same code. Upstream issue #15026 and open upstream PR #13928 cover the staging faults, not the `ignore-scripts` ones. Port branch `nx-509-git-install-upstream` is ready, local only on chungus | The upstream PR from that port branch lands and that release is merged |
-| fork PR #3, test commit | Tests: three test-call fixtures in `tool-access-service.test.ts` answer with the request ID. Needed by `0d78b3d67` | Identical change is in upstream `v2026.1001.0` | The `v2026.1001.0` merge |
 | fork PR #3, fork files | `FORK.md`, `.github/workflows/nrwl-ci.yml` and `scripts/nrwl-ci-server-other.mjs` | Fork-only by design, will not go upstream | The fork is retired |
 
 To refresh this table:
@@ -54,7 +53,8 @@ gh pr view <number> -R paperclipai/paperclip        # each upstream PR
    ready for review.
 3. **Mark deliberate differences in the code.** Where a patched line differs
    from upstream on purpose, say so in a comment next to it (see the "Differs
-   from upstream" comment in `server/src/services/mcp-http.ts`).
+   from upstream" comment in `server/src/services/mcp-http.ts`). A release
+   merge updates the tag named in such a comment.
 4. **Upstream release merges land as a merge commit, never squashed.** Fix PRs
    may be squash-merged. No rebase and no force push on `nrwl-main`.
 5. Posting to `paperclipai/paperclip` (PR, issue or comment) is external and
