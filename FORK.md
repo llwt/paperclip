@@ -352,10 +352,12 @@ line into a procedure step without testing it first.
 
 ### Restarts end running agent runs
 
-- **Tested.** `paperclipai service restart` is not a hot restart on this host
-  today: it ends every running agent run, including the run that issued it
-  (that run exited 143, which is SIGTERM). Issue the restart from a place that
-  survives it, or expect the task to be resumed by a later run.
+State at the install (12:24 UTC), before any change to the service unit:
+
+- **Tested.** `paperclipai service restart` was not a hot restart: it ended
+  every running agent run, including the run that issued it (that run exited
+  143, which is SIGTERM). Issue the restart from a place that survives it, or
+  expect the task to be resumed by a later run.
 - **Tested.** Server log of the restart at 12:24:30 UTC. Old server:
 
   ```
@@ -372,16 +374,38 @@ line into a procedure step without testing it first.
   ```
 
   The failed query in the first error reads `heartbeat_runs`.
-- **Tested.** `systemctl --user show paperclipai.service -p KillMode` reports
+- **Tested.** `systemctl --user show paperclipai.service -p KillMode` reported
   `control-group`. The unit and its drop-ins set no `KillMode`.
-- **Likely cause, not proven.** With `control-group` systemd sends SIGTERM to
-  every process of the service at once. The embedded PostgreSQL goes down
-  while the server still needs it to write the snapshot of its running runs,
-  and the agent processes get the same SIGTERM directly.
+- **Likely cause.** With `control-group` systemd sends SIGTERM to every process
+  of the service at once. The embedded PostgreSQL goes down while the server
+  still needs it to write the snapshot of its running runs, and the agent
+  processes get the same SIGTERM directly. The trial below fits this
+  explanation.
 - **Read from source.** The unit the CLI generates
   (`cli/src/services/service-manager.ts`) sets no `KillMode`, on this fork and
-  on upstream. This is an upstream gap, not a fork patch.
-- **Not tested, do not rely on it.** A `KillMode=process` drop-in might let
-  the server take the snapshot and let the new server adopt the runs. NX-597
-  is the trial for that. Until NX-597 reports a result and this section is
-  updated, treat every restart as one that ends all running agent runs.
+  on upstream. This is an upstream gap, not a fork patch. It is not reported
+  upstream.
+
+Trial of a fix (NX-597, drop-in `40-kill-mode.conf` with `KillMode=process`,
+llwt/configs PR #24). The drop-in is on chungus since 13:25 UTC on 2026-10-07.
+It is a trial under review, not an accepted fix, and it has open defects:
+
+- **Tested, one restart.** With the drop-in, `paperclipai service restart` at
+  13:25 UTC kept all 4 live `claude_local` runs: `hot-restart-report.json`
+  shows 4 `adoptedRunIds` and no `lostRunIds`, and health was `ok` after about
+  4 s.
+- **Tested, defect.** A kept run finishes its work but then ends as
+  `interrupted` (`orphaned_running_run`), with no log, usage or session id
+  recorded after the restart.
+- **Tested, defect.** The kept runs left their environment lease unreleased.
+  The next wake on such a task is deferred and no run starts until the lease
+  is released by hand. Seen on three tasks after that one restart.
+- **Read from source, not tested.** After a hard server crash under
+  `KillMode=process`, PostgreSQL and agent processes are left running.
+- **Not tested.** `codex_local` runs across a restart, and whether the next
+  run resumes the session of a kept run.
+
+Until NX-597 is closed and this section is updated: check
+`systemctl --user show paperclipai.service -p KillMode` before a restart.
+With `control-group`, every running agent run ends. With `process`, runs are
+kept, but check each task that had a run for the two defects above.
