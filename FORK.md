@@ -239,9 +239,9 @@ open a revert pull request and wait for a green `nrwl-ci` like any other change.
 `update --rollback` flips `current` to `previous[0]` in `install.json` for any
 managed install, npm or git, and restarts the active service. It does not
 reverse migrations. This is read from the source
-(`rollbackManagedInstall` in `cli/src/commands/update.ts`) and has not been
-run on this host yet. Test it on the first install under this process and
-update this section.
+(`rollbackManagedInstall` in `cli/src/commands/update.ts`). It was then run on
+this host: see "Record of the `98fa44c` install" for the result and for why
+its exit code cannot be trusted here.
 
 ## Smoke checklist
 
@@ -255,3 +255,128 @@ The health endpoint reports `commit: null`, so the SHA check reads
 4. One MCP gateway tool call succeeds (the tool timeout path).
 5. One pending card renders and accepts input in the UI (the card remount
    path).
+
+## Record of the `98fa44c` install
+
+What the first install under this process showed (NX-449, chungus,
+2026-10-07, from `ba2e6f933fa5` to
+`98fa44c0d29b7db77612dc23bf64e4288f4661ce`). Every statement is marked
+**Tested** (run on this host, with the result seen) or **Read from source**
+(taken from the code at `98fa44c`, not run). Do not turn a "read from source"
+line into a procedure step without testing it first.
+
+### Install
+
+- **Tested.** The sequence in "Install" worked: `install --repo llwt/paperclip
+  --ref 98fa44c0d29b7db77612dc23bf64e4288f4661ce -y` (exit 0 after 244 s), then
+  `paperclipai service restart`, then the smoke checklist. The install ran
+  through the CLI of a checkout with the same tree as the target, with
+  `GH_TOKEN` from `gh auth token`, because the installed CLI was older than
+  fork PR #7.
+- **Not tested.** The same install through the installed `paperclipai` shim.
+  `98fa44c` contains fork PR #7, so it should work from the next install on.
+- **Tested.** `install` only stages the payload, flips `current` and writes
+  `install.json`. The old server keeps running until the restart.
+- **Tested.** Smoke checklist steps 1 to 4 passed on `98fa44c`. Step 5 needs a
+  person to click a card in the UI; an agent can only show that the UI is
+  served from the new payload.
+- **Process, not a test result.** Steven's approval binds to one full SHA. A
+  new commit on `nrwl-main` after the approval is not covered: it needs a new
+  approval before it is installed, and smoke step 2 checks the installed `sha`
+  against the approved one.
+
+### Backup
+
+- **Tested.** `install` takes no database backup. No backup file appeared
+  during the install. The newest ones were the one taken by hand just before
+  it and the server's own hourly backup from 8 minutes earlier.
+- **Read from source.** `cli/src/commands/install.ts` has no backup call. Only
+  `paperclipai update` runs one (`runPreUpdateBackup` in
+  `cli/src/commands/update.ts`).
+- **Tested.** `paperclipai db:backup`, run before the install, wrote
+  `paperclip-<timestamp>.sql.gz` (about 92 MiB) to
+  `~/.paperclip/instances/default/data/backups/`. Run it first every time
+  ("Install" step 3).
+- **Not tested.** Restoring from that backup.
+
+### Rollback
+
+- **Tested.** `paperclipai update --rollback` works for a git install. Run
+  twice with no agent run active: the first call moved `install.json`, the
+  `current` link, the server process and the embedded PostgreSQL to
+  `ba2e6f933fa5`, the second moved all four back to `98fa44c0d29b`.
+  `/api/health` returned `status: ok` after each. It swaps the current payload
+  with `previous[0]`, so a second rollback returns to where you were.
+- **Tested.** It restarts the active service itself. No separate
+  `service restart` was needed.
+- **Tested.** Its exit code is not reliable on this host. Both calls exited 1
+  after about 65 s with `Paperclip service did not become healthy at version
+  <version>: reported no version`, although the flip and the restart had
+  worked. After a rollback, ignore the exit code and check:
+
+  ```sh
+  jq -r .sha ~/.paperclip/cli/install.json        # expect the rollback target
+  readlink ~/.paperclip/cli/current               # expect installs/git/<first 12 of that sha>
+  paperclipai service status                      # active, healthy
+  ```
+
+  and that `/api/health` returns 200 with `status: ok`.
+- **Read from source.** After the flip the CLI waits for the service to report
+  the target version (`waitForHealth` in `cli/src/commands/service.ts`, 60 s).
+  It reads `serverVersion` or `version` from `/api/health`. The response on
+  this host has neither field (tested), so the wait always times out.
+- **Limit of the test.** There were no new DB migrations between `ba2e6f933fa5`
+  and `98fa44c0d29b`, so the rollback was a payload flip only. A rollback
+  across new migrations is not tested; "Rollback" step 3 still applies.
+- **Not tested.** The fallback by hand (restore a saved copy of `install.json`,
+  point `~/.paperclip/cli/current` at the old payload directory, restart). It
+  was prepared and not needed.
+
+### Do not use `paperclipai update` on this host
+
+**Read from source, not tested.** All three points come from
+`cli/src/commands/update.ts`; `update` was never run here.
+
+- `update` restarts the service through the same version check that fails for
+  `update --rollback`. In `update` a failed check triggers an automatic
+  rollback (`rollbackAfterServiceValidationFailure`), so it would most likely
+  undo itself and report a failure.
+- `update` installs an npm release of `paperclipai`, not a git ref. On this
+  host that would replace the fork build with a plain upstream one.
+- Use `install --repo llwt/paperclip --ref <sha>` for every change of build.
+
+### Restarts end running agent runs
+
+- **Tested.** `paperclipai service restart` is not a hot restart on this host
+  today: it ends every running agent run, including the run that issued it
+  (that run exited 143, which is SIGTERM). Issue the restart from a place that
+  survives it, or expect the task to be resumed by a later run.
+- **Tested.** Server log of the restart at 12:24:30 UTC. Old server:
+
+  ```
+  ERROR: hot-restart shutdown preparation failed; falling back to graceful heartbeat run drain {"signal":"SIGTERM"}
+      caused by: Error: read ECONNRESET
+  ERROR: graceful heartbeat run drain failed {"signal":"SIGTERM"}
+  ERROR: Embedded PostgreSQL exited unexpectedly; attempting recovery
+  ```
+
+  New server:
+
+  ```
+  WARN: hot-restart intent present but shutdown snapshot is missing; no runs can be adopted
+  ```
+
+  The failed query in the first error reads `heartbeat_runs`.
+- **Tested.** `systemctl --user show paperclipai.service -p KillMode` reports
+  `control-group`. The unit and its drop-ins set no `KillMode`.
+- **Likely cause, not proven.** With `control-group` systemd sends SIGTERM to
+  every process of the service at once. The embedded PostgreSQL goes down
+  while the server still needs it to write the snapshot of its running runs,
+  and the agent processes get the same SIGTERM directly.
+- **Read from source.** The unit the CLI generates
+  (`cli/src/services/service-manager.ts`) sets no `KillMode`, on this fork and
+  on upstream. This is an upstream gap, not a fork patch.
+- **Not tested, do not rely on it.** A `KillMode=process` drop-in might let
+  the server take the snapshot and let the new server adopt the runs. NX-597
+  is the trial for that. Until NX-597 reports a result and this section is
+  updated, treat every restart as one that ends all running agent runs.
