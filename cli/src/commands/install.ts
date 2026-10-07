@@ -242,6 +242,35 @@ function gitBuildEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return env;
 }
 
+// npm skips dependency install scripts when ignore-scripts=true is configured. The
+// only one a payload needs at runtime is hydrate-symlinks.js of the
+// @embedded-postgres platform package: it links the versioned PostgreSQL libraries
+// (libpq.so.5 and others), and the embedded database cannot start without them.
+// Create the missing links from the package's own pg-symlinks.json, so the setting
+// stays in force and no dependency script has to run. Returns the links created.
+export function hydrateEmbeddedPostgresSymlinks(payloadPath: string): number {
+  const scopeDir = path.join(payloadPath, "node_modules", "@embedded-postgres");
+  if (!fs.existsSync(scopeDir)) return 0;
+  let created = 0;
+  for (const entry of fs.readdirSync(scopeDir)) {
+    const packageDir = path.join(scopeDir, entry);
+    const symlinkFile = path.join(packageDir, "native", "pg-symlinks.json");
+    if (!fs.existsSync(symlinkFile)) continue;
+    const symlinks = JSON.parse(fs.readFileSync(symlinkFile, "utf8")) as Array<{ source: string; target: string }>;
+    for (const { source, target } of symlinks) {
+      const sourcePath = path.resolve(packageDir, source);
+      const targetPath = path.resolve(packageDir, target);
+      if (![sourcePath, targetPath].every((candidate) => candidate.startsWith(packageDir + path.sep))) {
+        throw new Error(`Refusing to link outside ${packageDir}: ${source} -> ${target}`);
+      }
+      if (fs.lstatSync(targetPath, { throwIfNoEntry: false })) continue;
+      fs.symlinkSync(path.relative(path.dirname(targetPath), sourcePath), targetPath);
+      created += 1;
+    }
+  }
+  return created;
+}
+
 export async function installGitPayload(repo: string, sha: string, runCommand: CommandRunner, paths = resolveInstallStorePaths()): Promise<{ payloadPath: string; reused: boolean; version: string }> {
   const identifier = sha.slice(0, 12);
   const payloadPath = payloadPathFor(paths, "git", identifier);
@@ -269,8 +298,13 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
   // through corepack, nothing puts it on PATH, so provision a shim into the staging dir.
   const pnpmShimDir = path.join(stagingRoot, "pnpm-bin");
   fs.mkdirSync(pnpmShimDir, { recursive: true, mode: 0o700 });
+  // pnpm leaves the workspace root node_modules/.bin off the script PATH when
+  // ignore-scripts=true is configured, so packages that rely on the root
+  // TypeScript (tsc) fail to build. Put it on PATH here; this runs no dependency
+  // lifecycle scripts and leaves the setting itself alone.
+  const workspaceBinDir = path.join(checkoutPath, "node_modules", ".bin");
   const buildEnv = (extra: NodeJS.ProcessEnv = {}) =>
-    gitBuildEnv({ PATH: [pnpmShimDir, process.env.PATH].filter(Boolean).join(path.delimiter), ...extra });
+    gitBuildEnv({ PATH: [pnpmShimDir, workspaceBinDir, process.env.PATH].filter(Boolean).join(path.delimiter), ...extra });
   try {
     await runGitHubCurl(["--fail", "--silent", "--show-error", "--location", "--output", archivePath, `https://codeload.github.com/${repo}/tar.gz/${sha}`], runCommand, { maxBuffer: 4 * 1024 * 1024 });
     await runCommand("tar", ["-xzf", archivePath, "--strip-components=1", "-C", checkoutPath], { maxBuffer: 4 * 1024 * 1024 });
@@ -278,6 +312,20 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    // The server package ships ui-dist, but only its prepack script builds it, and
+    // prepare-bundled-package.mjs stages the server without running prepack.
+    await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    // Same for the skills directory those packages ship: scripts/release.sh copies
+    // it in by hand, so do the same here for the same three packages.
+    const skillsPath = path.join(checkoutPath, "skills");
+    if (fs.existsSync(skillsPath)) {
+      for (const packageDir of ["server", "packages/adapters/claude-local", "packages/adapters/codex-local"]) {
+        const packageSkillsPath = path.join(checkoutPath, packageDir, "skills");
+        if (!fs.existsSync(path.dirname(packageSkillsPath))) continue;
+        fs.rmSync(packageSkillsPath, { recursive: true, force: true });
+        fs.cpSync(skillsPath, packageSkillsPath, { recursive: true });
+      }
+    }
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
     for (const [index, workspacePackage] of workspacePackages.entries()) {
@@ -287,7 +335,9 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       if (bundledDependencies.length > 0) {
         const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
         await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-        await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
+        // The staged copy keeps the package's prepack script, which only works inside the
+        // workspace. The checkout is already built, so pack without scripts like scripts/release-lib.sh.
+        await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot, "--ignore-scripts"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
       } else {
         await runCommand("corepack", ["pnpm", "--dir", workspacePackage.dir, "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
       }
@@ -300,6 +350,8 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       throw new Error(`Git install packaging produced ${workspaceTarballs.length} workspace tarballs; expected ${workspacePackages.length}.`);
     }
     await runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 });
+    const hydratedLinks = hydrateEmbeddedPostgresSymlinks(stagedPayload);
+    if (hydratedLinks > 0) console.log(pc.yellow(`Dependency install scripts did not run (npm ignore-scripts); linked ${hydratedLinks} embedded PostgreSQL libraries directly.`));
     await smokePayload(stagedPayload, metadata.version, runCommand);
     fs.renameSync(stagedPayload, payloadPath);
     return { payloadPath, reused: false, version: metadata.version };

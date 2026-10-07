@@ -7,7 +7,21 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
-export function materializePublishManifest(pkg) {
+// Versions of the workspace packages in a checkout, keyed by package name. A
+// release rewrites every public package to one version first, but a git install
+// stages the checkout as it is, where some packages have their own version.
+export function readWorkspacePackageVersions(sourceRoot = repoRoot) {
+  const manifestPath = resolve(sourceRoot, "scripts", "release-package-manifest.json");
+  if (!existsSync(manifestPath)) return {};
+  const versions = {};
+  for (const { dir, name } of JSON.parse(readFileSync(manifestPath, "utf8"))) {
+    const packagePath = resolve(sourceRoot, dir, "package.json");
+    if (existsSync(packagePath)) versions[name] = JSON.parse(readFileSync(packagePath, "utf8")).version;
+  }
+  return versions;
+}
+
+export function materializePublishManifest(pkg, workspaceVersions = {}) {
   const publishConfig = pkg.publishConfig ?? {};
   const publishManifest = { ...pkg };
 
@@ -22,7 +36,7 @@ export function materializePublishManifest(pkg) {
         if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) return [name, specifier];
         const range = specifier.slice("workspace:".length);
         const prefix = range === "^" || range === "~" ? range : "";
-        return [name, `${prefix}${pkg.version}`];
+        return [name, `${prefix}${workspaceVersions[name] ?? pkg.version}`];
       }),
     );
   }
@@ -156,7 +170,7 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   }
 
   const deployedPackagePath = resolve(destinationDir, "package.json");
-  const publishManifest = materializePublishManifest(sourcePackage);
+  const publishManifest = materializePublishManifest(sourcePackage, readWorkspacePackageVersions(sourceRoot));
   const installManifest = createBundledInstallManifest(publishManifest, bundledDependencies);
   writeFileSync(deployedPackagePath, `${JSON.stringify(installManifest, null, 2)}\n`);
 

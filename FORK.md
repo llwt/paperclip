@@ -29,6 +29,7 @@ against upstream `master` `1c07b5903` and the latest stable tag `v2026.1001.0`
 | `ba2e6f933` | Gateway: known method labels only, skip non-JSON stream events | Not submitted. Same port branch | Same PR |
 | `0fc5dd88b` | UI: remount the composer takeover card per pending input (fork PR #1) | Open upstream as paperclipai/paperclip#15121, no review yet | #15121 lands and that release is merged |
 | `200a198f0` | Tools: offer sign-in when a custom MCP server answers 401 without `WWW-Authenticate` (fork PR #2) | Not submitted. Port branch `fix/mcp-401-sign-in-without-challenge` (`cb19b98d4`) is ready | The upstream PR from that port branch lands and that release is merged |
+| fork PR #7 | CLI: `install --ref` builds `server/ui-dist`, copies `skills`, stages real workspace dependency versions, and works with `ignore-scripts=true` (see "Install") | Not submitted. Upstream `master` (`a1ab55a56`) has the same code. Upstream issue #15026 and open upstream PR #13928 cover the staging faults, not the `ignore-scripts` ones. Port branch `nx-509-git-install-upstream` is ready, local only on chungus | The upstream PR from that port branch lands and that release is merged |
 | fork PR #3, test commit | Tests: three test-call fixtures in `tool-access-service.test.ts` answer with the request ID. Needed by `0d78b3d67` | Identical change is in upstream `v2026.1001.0` | The `v2026.1001.0` merge |
 | fork PR #3, fork files | `FORK.md`, `.github/workflows/nrwl-ci.yml` and `scripts/nrwl-ci-server-other.mjs` | Fork-only by design, will not go upstream | The fork is retired |
 
@@ -174,15 +175,57 @@ after Steven approves the SHA.
    a merged pull request, so an install never involves a push to `nrwl-main`.
 2. Record the current `sha` from `~/.paperclip/cli/install.json`. List the
    migrations the new commit adds: `git diff --stat <old> <new> -- packages/db/src/migrations`.
-3. Confirm a fresh database backup exists (`/api/health` reports
-   `databaseBackup.status: ok`).
-4. `paperclipai install --repo llwt/paperclip --ref <sha> -y`
-5. `paperclipai service restart`
-6. Run the smoke checklist.
+3. Take a database backup: `paperclipai db:backup`. `install` takes none (only
+   `update` does).
+4. Copy anything hand-made out of `~/.paperclip/cli/installs` first. `install`
+   keeps the new payload and the two before it and deletes every other
+   directory under `installs/npm` and `installs/git`, hand-made ones included.
+5. `GH_TOKEN="$(gh auth token)" paperclipai install --repo llwt/paperclip --ref <sha> -y`
+6. `paperclipai service restart`
+7. Run the smoke checklist.
+
+Facts about `install --ref` on this host (found on NX-449 and NX-509):
+
+- **Run the fixed CLI from a checkout while the installed CLI is older than
+  fork PR #7.** The installed CLI cannot build a git ref (see the next
+  point). In a checkout of the target SHA, after `pnpm install`, replace
+  `paperclipai` in step 5 with `node cli/node_modules/tsx/dist/cli.mjs cli/src/index.ts`.
+  Once a payload that contains fork PR #7 is installed, the installed CLI works.
+- Before fork PR #7 a git install could not complete: nothing built
+  `server/ui-dist` or copied `server/skills` before the server was staged
+  (`ENOENT` from `scripts/prepare-bundled-package.mjs`), and the staged server
+  asked for `@paperclipai/plugin-sdk` at the server's version, which does not
+  exist. The two older "git" payloads on chungus (`669a157cb307`,
+  `ba2e6f933fa5`) are hand-patched copies of the npm `2026.916.1` payload.
+- **The ref lookup needs a GitHub token.** It calls the GitHub API, and the
+  anonymous limit is 60 requests per hour per host. The CLI reads `GH_TOKEN` or
+  `GITHUB_TOKEN`. In a Paperclip run `GH_TOKEN` is empty, so take it from
+  `gh auth token` as in step 5.
+- **`ignore-scripts=true` stays on.** The host npm config
+  (`~/.config/npm/npmrc`) sets it on purpose, and the install works with it
+  since fork PR #7. Do not disable it for the install. Two things made it fail
+  before: pnpm leaves the workspace root `node_modules/.bin` off the script
+  PATH under that setting (`tsc: not found`), which the installer now adds
+  itself; and npm skips the `@embedded-postgres/<platform>` install script,
+  which links `libpq.so.5` and the ICU libraries, so the embedded database
+  could not start. The installer now creates those links from the package's
+  `pg-symlinks.json` and prints a line when it does. No dependency script runs.
+  The other install scripts npm skips in the payload (`esbuild`, `protobufjs`,
+  `ssh2`, `cpu-features`) are not needed: read from their sources, not tested
+  one by one.
+- The install does not depend on the setting either way: staged packages are
+  packed with `--ignore-scripts`, because their `prepack` script fails outside
+  the workspace. A full install with the setting off is not tested.
+- The build needs a Rust toolchain (`cargo`) on PATH for
+  `packages/paperclip-runner`, besides Node and corepack.
+- The whole install takes about 5 minutes on chungus.
+- To try an install without touching the live one, set both `HOME` and
+  `PAPERCLIP_HOME` to a scratch directory. `PAPERCLIP_HOME` alone is not
+  enough: the shim is written to `$HOME/.local/bin/paperclipai`.
 
 ## Rollback
 
-1. `paperclipai update --rollback` (flips to the retained previous payload), or
+1. `paperclipai update --rollback`, or
    `paperclipai install --repo llwt/paperclip --ref <previous sha> -y`.
 2. `paperclipai service restart`, then the smoke checklist.
 3. If the new build ran migrations, the old code may not work on the new
@@ -193,9 +236,12 @@ A rollback changes the installed build only. It does not move `nrwl-main`,
 which cannot be reset or force pushed. To take the bad commit off `nrwl-main`,
 open a revert pull request and wait for a green `nrwl-ci` like any other change.
 
-Not verified yet: whether `update --rollback` works for a git install, and
-whether `install` takes its own database backup the way `update` does. Test
-both on the first install under this process and update this section.
+`update --rollback` flips `current` to `previous[0]` in `install.json` for any
+managed install, npm or git, and restarts the active service. It does not
+reverse migrations. This is read from the source
+(`rollbackManagedInstall` in `cli/src/commands/update.ts`) and has not been
+run on this host yet. Test it on the first install under this process and
+update this section.
 
 ## Smoke checklist
 

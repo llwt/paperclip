@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   type CommandRunner,
+  hydrateEmbeddedPostgresSymlinks,
   installCommand,
   installGitPayload,
   resolveGitHubRef,
@@ -178,7 +179,7 @@ describe("managed install commands", () => {
       file === "corepack" ||
       (file === "npm" && args[0] === "pack") ||
       (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")));
-    expect(buildCalls).toHaveLength(9);
+    expect(buildCalls).toHaveLength(10);
     for (const call of buildCalls) {
       const env = call[2]?.env;
       expect(env, `${call[0]} ${call[1].join(" ")} must run with an explicit env`).toBeDefined();
@@ -186,6 +187,107 @@ describe("managed install commands", () => {
     }
     const uiPackCall = buildCalls.find(([file, , options]) => file === "corepack" && options?.env?.PAPERCLIP_RELEASE_REUSE_UI_DIST === "1");
     expect(uiPackCall).toBeDefined();
+  });
+
+  it("builds server/ui-dist and copies skills before staging the bundled server package", async () => {
+    const sha = "e".repeat(40);
+    const baseRunCommand = createGitCheckoutRunCommand(sha);
+    const runCommand = vi.fn(async (file: string, args: string[], options?: Parameters<CommandRunner>[2]) => {
+      if (file === "tar") {
+        const result = await baseRunCommand(file, args, options);
+        // Like the real server package: bundled dependencies, and ui-dist and skills in "files".
+        const checkout = args[args.indexOf("-C") + 1];
+        fs.mkdirSync(path.join(checkout, "skills", "paperclip"), { recursive: true });
+        fs.writeFileSync(path.join(checkout, "skills", "paperclip", "SKILL.md"), "# Paperclip\n");
+        fs.writeFileSync(
+          path.join(checkout, "server", "package.json"),
+          JSON.stringify({ name: "@paperclipai/server", version: "0.3.1", files: ["ui-dist", "skills"], dependencies: { "@paperclipai/db": "workspace:*" }, bundleDependencies: ["acpx"] }),
+        );
+        return result;
+      }
+      if (file === "bash" && args[0] === "scripts/prepare-server-ui-dist.sh") {
+        const uiDist = path.join(String(options?.cwd), "server", "ui-dist");
+        fs.mkdirSync(uiDist, { recursive: true });
+        fs.writeFileSync(path.join(uiDist, "index.html"), "<!doctype html>");
+        return { stdout: "", stderr: "" };
+      }
+      if (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")) {
+        // Same copy as scripts/prepare-bundled-package.mjs: every "files" entry must exist.
+        const sourcePackage = JSON.parse(fs.readFileSync(path.join(args[1], "package.json"), "utf8")) as { name: string; files?: string[] };
+        fs.mkdirSync(args[2], { recursive: true });
+        for (const entry of sourcePackage.files ?? []) fs.cpSync(path.join(args[1], entry), path.join(args[2], entry), { recursive: true });
+        fs.writeFileSync(path.join(args[2], "package.json"), JSON.stringify({ name: sourcePackage.name, version: "0.3.1" }));
+        return { stdout: "", stderr: "" };
+      }
+      if (file === "npm" && args[0] === "pack" && args[1]?.includes("workspace-package-")) {
+        const staged = JSON.parse(fs.readFileSync(path.join(args[1], "package.json"), "utf8")) as { name: string };
+        const destination = args[args.indexOf("--pack-destination") + 1];
+        fs.writeFileSync(path.join(destination, `${staged.name.replace("@", "").replace("/", "-")}-0.3.1.tgz`), "package");
+        if (staged.name === "@paperclipai/server") fs.cpSync(args[1], path.join(destination, "packed-server"), { recursive: true });
+        return { stdout: "", stderr: "" };
+      }
+      if (file === "npm" && args[0] === "install") {
+        const result = await baseRunCommand(file, args, options);
+        const prefix = args[args.indexOf("--prefix") + 1];
+        fs.cpSync(path.join(path.dirname(prefix), "packed-server"), path.join(prefix, "node_modules", "@paperclipai", "server"), { recursive: true });
+        return result;
+      }
+      return baseRunCommand(file, args, options);
+    });
+    const installed = await installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths());
+    expect(fs.existsSync(path.join(installed.payloadPath, "node_modules", "@paperclipai", "server", "ui-dist", "index.html"))).toBe(true);
+    expect(fs.existsSync(path.join(installed.payloadPath, "node_modules", "@paperclipai", "server", "skills", "paperclip", "SKILL.md"))).toBe(true);
+    const order = runCommand.mock.calls.map(([file, args]) => `${file === process.execPath ? "node" : file} ${args[0] === "pnpm" ? args[1] : path.basename(args[0] ?? "")}`);
+    expect(order.indexOf("bash prepare-server-ui-dist.sh")).toBeGreaterThan(order.indexOf("corepack install"));
+    expect(order.indexOf("bash prepare-server-ui-dist.sh")).toBeLessThan(order.indexOf("node prepare-bundled-package.mjs"));
+    // The staged server keeps its prepack script, which fails outside the workspace.
+    const stagedPackCalls = runCommand.mock.calls.filter(([file, args]) => file === "npm" && args[0] === "pack" && args[1]?.includes("workspace-package-"));
+    expect(stagedPackCalls.length).toBeGreaterThan(0);
+    for (const [, args] of stagedPackCalls) expect(args).toContain("--ignore-scripts");
+  });
+
+  it("puts the checkout node_modules/.bin on the build PATH so ignore-scripts=true does not hide tsc", async () => {
+    const sha = "f".repeat(40);
+    const runCommand = createGitCheckoutRunCommand(sha);
+    await installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths());
+    const buildCalls = runCommand.mock.calls.filter(([file, args]) => file === "bash" || (file === "corepack" && args.includes("run")));
+    expect(buildCalls).toHaveLength(3);
+    for (const [file, args, options] of buildCalls) {
+      const workspaceBinDir = path.join(String(options?.cwd), "node_modules", ".bin");
+      expect(String(options?.env?.PATH).split(path.delimiter), `${file} ${args.join(" ")}`).toContain(workspaceBinDir);
+    }
+    // The installer must not switch dependency lifecycle scripts back on.
+    for (const [file, args, options] of runCommand.mock.calls) {
+      expect(args, `${file} ${args.join(" ")}`).not.toContain("--ignore-scripts=false");
+      expect(Object.keys(options?.env ?? {}).map((key) => key.toLowerCase())).not.toContain("npm_config_ignore_scripts");
+    }
+  });
+
+  it("links the embedded PostgreSQL libraries when npm skipped the dependency install script", async () => {
+    const sha = "a1".repeat(20);
+    const baseRunCommand = createGitCheckoutRunCommand(sha);
+    const runCommand = vi.fn(async (file: string, args: string[], options?: Parameters<CommandRunner>[2]) => {
+      const result = await baseRunCommand(file, args, options);
+      if (file === "npm" && args[0] === "install") {
+        // What npm leaves behind under ignore-scripts=true: the library files and the link list, no links.
+        const native = path.join(args[args.indexOf("--prefix") + 1], "node_modules", "@embedded-postgres", "linux-x64", "native");
+        fs.mkdirSync(path.join(native, "lib"), { recursive: true });
+        fs.writeFileSync(path.join(native, "lib", "libpq.so.5.18"), "elf");
+        fs.symlinkSync("libpq.so.5.18", path.join(native, "lib", "libpq.so"));
+        fs.writeFileSync(path.join(native, "pg-symlinks.json"), JSON.stringify([
+          { source: "native/lib/libpq.so.5.18", target: "native/lib/libpq.so" },
+          { source: "native/lib/libpq.so.5.18", target: "native/lib/libpq.so.5" },
+        ]));
+      }
+      return result;
+    });
+    const installed = await installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths());
+    const lib = path.join(installed.payloadPath, "node_modules", "@embedded-postgres", "linux-x64", "native", "lib");
+    expect(fs.readlinkSync(path.join(lib, "libpq.so.5"))).toBe("libpq.so.5.18");
+    expect(fs.readFileSync(path.join(lib, "libpq.so.5"), "utf8")).toBe("elf");
+    expect(hydrateEmbeddedPostgresSymlinks(installed.payloadPath)).toBe(0);
+    fs.writeFileSync(path.join(lib, "..", "pg-symlinks.json"), JSON.stringify([{ source: "native/lib/libpq.so.5.18", target: "../../../escape.so" }]));
+    expect(() => hydrateEmbeddedPostgresSymlinks(installed.payloadPath)).toThrow("Refusing to link outside");
   });
 
   it("resolves the complete server workspace dependency closure in dependency order", () => {
