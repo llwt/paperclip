@@ -6,8 +6,8 @@ inventory below, at which point the instance returns to plain upstream releases
 and this fork is retired.
 
 - Mainline: `nrwl-main`. Installs pin a full commit SHA on it. The branch is
-  protected: GitHub rejects any commit that has no green `nrwl-ci`, and the
-  process sends every change through a pull request (see "CI gate").
+  protected: GitHub accepts a change only through a pull request with a green
+  `nrwl-ci` and rejects every direct push (see "CI gate").
 - `master` is a pure mirror of upstream `master`. Never commit to it.
 - Fork-only files: this file, `.github/workflows/nrwl-ci.yml` and
   `scripts/nrwl-ci-server-other.mjs`. Everything
@@ -55,14 +55,15 @@ gh pr view <number> -R paperclipai/paperclip        # each upstream PR
    from upstream on purpose, say so in a comment next to it (see the "Differs
    from upstream" comment in `server/src/services/mcp-http.ts`). A release
    merge updates the tag named in such a comment.
-4. **Merge commits only.** No rebase and no force push on `nrwl-main`.
+4. **Upstream release merges land as a merge commit, never squashed.** Fix PRs
+   may be squash-merged. No rebase and no force push on `nrwl-main`.
 5. Posting to `paperclipai/paperclip` (PR, issue or comment) is external and
    needs Steven's go-ahead each time.
 6. **Every change goes through a fork pull request with a green `nrwl-ci`.**
    That covers fixes, upstream release merges, reverts and edits to this file.
-   Never push to `nrwl-main` directly. This is a process rule: branch
-   protection rejects a push of a commit that has no green `nrwl-ci`, for
-   admins too, but it does not require a pull request (see "CI gate").
+   Never push to `nrwl-main` directly. GitHub enforces this: branch protection
+   requires a pull request and a green `nrwl-ci` on its head, for admins too,
+   and rejects a direct push (see "CI gate").
 
 ## Taking upstream releases
 
@@ -76,10 +77,11 @@ git merge --no-ff <tag>
 ```
 
 - Push `merge/upstream-<tag>` to the fork and open a fork PR from it into
-  `nrwl-main`. Do not squash it. The release merge has no shortcut: the merge
-  commit has no `nrwl-ci` result until a PR runs it, so GitHub rejects a push
-  of it straight to `nrwl-main`, and the PR merges only once `nrwl-ci` is green
-  on its head. Merge it through the PR, not by a push (rule 6).
+  `nrwl-main`. Merge that PR with a merge commit. Never squash or rebase it
+  (rule 4). The release merge has no shortcut: branch protection requires a
+  pull request, so GitHub rejects a push of the merge commit straight to
+  `nrwl-main`, and the PR merges only once `nrwl-ci` is green on its head
+  (rule 6).
 - Conflicts only appear in files the fork patched. Where a port branch exists
   for the file, take the port branch version, and keep the "Differs from
   upstream" comments.
@@ -118,8 +120,9 @@ failures outside the baseline", and never skip or delete the test.
 
 ### Branch protection
 
-`nrwl-ci` is a required status check on `nrwl-main`, enforced by GitHub branch
-protection. Settings as of 2026-10-06:
+`nrwl-main` takes changes only through a pull request, and `nrwl-ci` is a
+required status check on it. GitHub branch protection enforces both. Settings
+as of 2026-10-07:
 
 | Setting | Value |
 | --- | --- |
@@ -128,30 +131,30 @@ protection. Settings as of 2026-10-06:
 | Enforced for admins (`enforce_admins`) | On |
 | Force pushes | Blocked |
 | Branch deletion | Blocked |
-| Required reviews | None |
+| Pull request required (`required_pull_request_reviews`) | Yes |
+| Required approving reviews | 0 |
+| Dismiss stale reviews, code owner review, last push approval | Off |
 | Push restrictions | None |
+| Rulesets | None |
 
 What this means in practice:
 
 - A pull request into `nrwl-main` cannot be merged until `nrwl-ci` is green on
   its head commit. That holds for everyone, including the admin account all
   agents use. There is no admin override.
-- A direct push to `nrwl-main` is rejected when the pushed commit has no green
-  `nrwl-ci`. The workflow runs only on pull requests into `nrwl-main`, so a
-  commit gets that check only as the head of a pull request.
-- Protection does not require a pull request (no required reviews, no push
-  restrictions, no rulesets). GitHub therefore accepts a direct push of a
-  commit that already has a green `nrwl-ci`, for example a fast-forward of
-  `nrwl-main` to the head of an up to date pull request. Do not do this: rule 6
-  makes the merged pull request the only allowed way in. That part is process,
-  not something GitHub enforces.
+- A direct push to `nrwl-main` is rejected in every case, for admins too,
+  because protection requires a pull request. That includes a push of a commit
+  that already has a green `nrwl-ci`, such as the head of an up to date pull
+  request. The merged pull request is the only way in (rule 6).
 - `nrwl-main` cannot be force pushed or deleted. To take a commit back, open a
   revert pull request.
 - `strict` is off: a pull request does not have to contain the latest
   `nrwl-main` to merge. Its `nrwl-ci` result is for the merge with the base as
   it was when the run started.
-- Branch protection does not require a review. The independent review and
-  Steven's approval of the head SHA are process, not something GitHub enforces.
+- Zero approving reviews are required. All agents share one GitHub account and
+  an account cannot approve its own pull request, so an approval requirement
+  could not be met. The independent review and Steven's approval of the head
+  SHA are process, not something GitHub enforces.
 - `master` has no part in this: the protection covers `nrwl-main` only.
 
 To inspect the live settings (read only):
@@ -171,8 +174,9 @@ An install is a deployment. It is its own task, assigned by the Coordinator
 after Steven approves the SHA.
 
 1. The target is a full SHA on `nrwl-main` with a green `nrwl-ci` run. Never
-   install a branch name. By rule 6 a commit reaches `nrwl-main` only through
-   a merged pull request, so an install never involves a push to `nrwl-main`.
+   install a branch name. GitHub lets a commit reach `nrwl-main` only through
+   a merged pull request (rule 6), so an install never involves a push to
+   `nrwl-main`.
 2. Record the current `sha` from `~/.paperclip/cli/install.json`. List the
    migrations the new commit adds: `git diff --stat <old> <new> -- packages/db/src/migrations`.
 3. Take a database backup: `paperclipai db:backup`. `install` takes none (only
@@ -233,8 +237,9 @@ Facts about `install --ref` on this host (found on NX-449 and NX-509):
    step 3.
 
 A rollback changes the installed build only. It does not move `nrwl-main`,
-which cannot be reset or force pushed. To take the bad commit off `nrwl-main`,
-open a revert pull request and wait for a green `nrwl-ci` like any other change.
+which cannot be reset, force pushed or pushed to directly. To take the bad
+commit off `nrwl-main`, open a revert pull request and wait for a green
+`nrwl-ci` like any other change.
 
 `update --rollback` flips `current` to `previous[0]` in `install.json` for any
 managed install, npm or git, and restarts the active service. It does not
