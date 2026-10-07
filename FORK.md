@@ -78,24 +78,31 @@ How it works:
   migrations than the fork.
 - With a scope list, a caller can only narrow it, the list is stored as the
   connection's scopes, and a grant wider than the request is not saved.
-- The settings belong to the setup form. Every OAuth write of the connection
-  config in `tool-access.ts` (client registration, start, callback, renewal)
-  goes through `keepLatestOAuthSignIn`, which takes the two settings from the
-  row as it is at the moment of the update, not from the copy the operation
-  read earlier. The callback also locks the connection row and rechecks the
-  attempt against the settings before it stores credentials. A new OAuth write
-  of `config` added by an upstream merge must use the same helper.
+- The settings belong to the setup form. The tool access service wraps its
+  database handle (`withOAuthSignInPreservingWrites`, first statement of
+  `toolAccessService`), so every update of a connection's `config` or
+  `transportConfig` made through it, in or out of a transaction, takes the two
+  settings from the row as it is at the moment of the update, not from the copy
+  the operation read earlier. That covers client registration, start, callback,
+  renewal, catalog refresh, discovery and every later upstream addition without
+  a change at the write itself. Only the setup form's connect request and its
+  undo store a config as given (`ownedConnectionConfig`, four uses). The legacy
+  token backfill wraps its handle the same way. The callback also locks the
+  connection row and rechecks the attempt before it stores credentials. A test
+  asserts the wrap, the four owned writes and the absence of raw SQL updates.
 - Not available for curated apps, Vercel-backed or brokered sign-ins.
 
 Files: `packages/shared/src/oauth-sign-in-settings.ts`,
 `server/src/services/tool-oauth-sign-in.ts`,
+`server/src/services/tool-oauth-sign-in-writes.ts`,
 `server/src/__tests__/tool-oauth-loopback.test.ts`,
 `ui/src/features/connections/OAuthSignInSettingsFields.tsx`,
 `ui/src/features/connections/oauth-sign-in-settings.ts` and their tests are
 fork-only. The wiring in upstream-owned files is marked "Fork-only (NX-617)" or
 "Differs from upstream (fork, NX-617)": `server/src/services/tool-access.ts`
-(`startOAuth`, `completeOAuthCallback`, `connectGalleryApp`, and the
-`keepLatestOAuthSignIn` calls at each OAuth config write),
+(`toolAccessService` first statement, `startOAuth`, `completeOAuthCallback`,
+`connectGalleryApp`), `server/src/services/tool-oauth-legacy-backfill.ts` (two
+lines),
 `server/src/routes/tool-access.ts` (callback handler), `server/src/app.ts`,
 `packages/shared/src/validators/tool-access.ts`, `packages/shared/src/index.ts`
 and `ui/src/features/connections/ConnectionSetupFlow.tsx`. On a release merge,

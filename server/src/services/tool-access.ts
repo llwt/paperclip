@@ -17,6 +17,7 @@ import {
   recheckOAuthSignIn,
   resolveGenericOAuthScopes,
 } from "./tool-oauth-sign-in.js";
+import { ownedConnectionConfig, withOAuthSignInPreservingWrites } from "./tool-oauth-sign-in-writes.js";
 import { githubBotRequest } from "./chat-github-client.js";
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
 import {
@@ -3044,6 +3045,10 @@ export function toolAccessService(
   db: Db,
   options: ToolAccessServiceOptions = {},
 ) {
+  // Differs from upstream (fork, NX-617): every update of a connection's config
+  // made through this handle keeps the sign-in settings the row has at that
+  // moment. See tool-oauth-sign-in-writes.ts.
+  db = withOAuthSignInPreservingWrites(db);
   const secrets = secretService(db);
 
   async function resolvedRemoteEndpoint(
@@ -9577,8 +9582,8 @@ export function toolAccessService(
       .update(toolConnections)
       .set({
         ownership: "dcr",
-        config: keepLatestOAuthSignIn(nextConfig),
-        transportConfig: keepLatestOAuthSignIn(nextConfig),
+        config: nextConfig,
+        transportConfig: nextConfig,
         credentialSecretRefs: nextCredentialSecretRefs,
         updatedAt: now(),
       })
@@ -9645,8 +9650,8 @@ export function toolAccessService(
       .update(toolConnections)
       .set({
         authKind: "oauth",
-        config: keepLatestOAuthSignIn(nextConfig),
-        transportConfig: keepLatestOAuthSignIn(nextConfig),
+        config: nextConfig,
+        transportConfig: nextConfig,
         credentialSecretRefs: nextCredentialSecretRefs,
         updatedAt: now(),
       })
@@ -9782,8 +9787,8 @@ export function toolAccessService(
     const [updated] = await db
       .update(toolConnections)
       .set({
-        config: keepLatestOAuthSignIn(nextConfig),
-        transportConfig: keepLatestOAuthSignIn(nextConfig),
+        config: nextConfig,
+        transportConfig: nextConfig,
         updatedAt: now(),
       })
       .where(
@@ -10148,8 +10153,8 @@ export function toolAccessService(
     const [updated] = await db
       .update(toolConnections)
       .set({
-        config: keepLatestOAuthSignIn(nextConfig),
-        transportConfig: keepLatestOAuthSignIn(nextConfig),
+        config: nextConfig,
+        transportConfig: nextConfig,
         updatedAt: now(),
       })
       .where(
@@ -10286,8 +10291,8 @@ export function toolAccessService(
         healthMessage:
           "OAuth authorization expired. Reconnect this app to continue.",
         lastError: "oauth_reauthorization_required",
-        config: keepLatestOAuthSignIn(nextConfig),
-        transportConfig: keepLatestOAuthSignIn(nextConfig),
+        config: nextConfig,
+        transportConfig: nextConfig,
         credentialSecretRefs: nextCredentialSecretRefs,
         credentialRefs: nextCredentialRefs,
         updatedAt: now(),
@@ -10515,8 +10520,8 @@ export function toolAccessService(
     const [updated] = await db
       .update(toolConnections)
       .set({
-        config: keepLatestOAuthSignIn(nextConfig),
-        transportConfig: keepLatestOAuthSignIn(nextConfig),
+        config: nextConfig,
+        transportConfig: nextConfig,
         credentialSecretRefs: nextCredentialSecretRefs,
         credentialRefs: [
           ...connection.credentialRefs.filter(
@@ -11276,8 +11281,8 @@ export function toolAccessService(
           await db
             .update(toolConnections)
             .set({
-              config: keepLatestOAuthSignIn(nextConfig),
-              transportConfig: keepLatestOAuthSignIn(nextConfig),
+              config: nextConfig,
+              transportConfig: nextConfig,
               updatedAt: now(),
             })
             .where(
@@ -12560,8 +12565,10 @@ export function toolAccessService(
             transport,
             status: "draft",
             enabled: false,
-            config,
-            transportConfig: config,
+            // Differs from upstream (fork, NX-617): this is the writer that owns
+            // the sign-in settings, so its config is stored as given.
+            config: ownedConnectionConfig(config),
+            transportConfig: ownedConnectionConfig(config),
             credentialRefs,
             credentialSecretRefs: connectionCredentialSecretRefs,
             credentialSource,
@@ -12993,8 +13000,10 @@ export function toolAccessService(
                   transport: revivedConnectionPrevious.transport,
                   status: revivedConnectionPrevious.status,
                   enabled: revivedConnectionPrevious.enabled,
-                  config: revivedConnectionPrevious.config,
-                  transportConfig: revivedConnectionPrevious.transportConfig,
+                  // Differs from upstream (fork, NX-617): undoing the write
+                  // above restores the earlier sign-in settings too.
+                  config: ownedConnectionConfig(revivedConnectionPrevious.config),
+                  transportConfig: ownedConnectionConfig(revivedConnectionPrevious.transportConfig),
                   credentialRefs: revivedConnectionPrevious.credentialRefs,
                   credentialSecretRefs:
                     revivedConnectionPrevious.credentialSecretRefs,
@@ -13921,19 +13930,6 @@ export function toolAccessService(
   }
 
   /**
-   * Fork-only (NX-617). Every OAuth write in this file builds the whole config
-   * from a row it read earlier, sometimes several awaits earlier. The sign-in
-   * settings are owned by the setup form, so such a write takes them from the
-   * row as it is at the moment of the update, never from its own older copy.
-   * For a connection without the settings this stores exactly `nextConfig`.
-   */
-  function keepLatestOAuthSignIn(nextConfig: Record<string, unknown>) {
-    const next = sql`${JSON.stringify(nextConfig)}::jsonb`;
-    const latest = sql`jsonb_strip_nulls(jsonb_build_object('loopbackRedirect', ${toolConnections.config} #> '{oauth,loopbackRedirect}', 'requestedScopes', ${toolConnections.config} #> '{oauth,requestedScopes}'))`;
-    return sql<Record<string, unknown>>`case when (${next} -> 'oauth') is null and ${latest} = '{}'::jsonb then ${next} else jsonb_set(${next}, '{oauth}', (coalesce(${next} -> 'oauth', '{}'::jsonb) - 'loopbackRedirect' - 'requestedScopes') || ${latest}) end`;
-  }
-
-  /**
    * Fork-only (NX-617). Called inside the transaction that stores a sign-in's
    * credentials. It locks the connection row, so a settings change either
    * committed before this point and is checked here, or waits until the
@@ -14613,8 +14609,8 @@ export function toolAccessService(
         // connection, and refresh, reconnect, revoke and diagnostics must all
         // treat it as one.
         authKind: "oauth",
-        config: keepLatestOAuthSignIn(nextConfig),
-        transportConfig: keepLatestOAuthSignIn(nextConfig),
+        config: nextConfig,
+        transportConfig: nextConfig,
         updatedAt: new Date(),
       })
       .where(eq(toolConnections.id, connection.id));
@@ -15900,8 +15896,8 @@ export function toolAccessService(
             enabled: true,
             authKind: "oauth",
             credentialPolicy: connection.credentialPolicy,
-            config: keepLatestOAuthSignIn(nextConfig),
-            transportConfig: keepLatestOAuthSignIn(nextConfig),
+            config: nextConfig,
+            transportConfig: nextConfig,
             // A personal-only connection keeps tokens exclusively on its user
             // grant. Adding a personal identity to an existing shared/fallback
             // connection must not erase that connection's organization token.
@@ -16167,8 +16163,8 @@ export function toolAccessService(
           status: "active",
           enabled: true,
           authKind: "oauth",
-          config: keepLatestOAuthSignIn(nextConfig),
-          transportConfig: keepLatestOAuthSignIn(nextConfig),
+          config: nextConfig,
+          transportConfig: nextConfig,
           credentialSecretRefs: nextCredentialSecretRefs,
           credentialRefs: [
             ...connection.credentialRefs.filter(

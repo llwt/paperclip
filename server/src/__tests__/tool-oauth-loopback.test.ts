@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { Writable } from "node:stream";
 import express from "express";
 import pino from "pino";
@@ -52,6 +53,11 @@ import {
   recheckOAuthSignIn,
   resolveGenericOAuthScopes,
 } from "../services/tool-oauth-sign-in.js";
+import {
+  ownedConnectionConfig,
+  withOAuthSignInPreservingWrites,
+} from "../services/tool-oauth-sign-in-writes.js";
+import { backfillLegacyToolOAuthTokens } from "../services/tool-oauth-legacy-backfill.js";
 import { toolAccessRoutes } from "../routes/tool-access.js";
 import { errorHandler } from "../middleware/index.js";
 import { actorMiddleware } from "../middleware/auth.js";
@@ -387,6 +393,7 @@ function installFixture(options: FixtureOptions = {}) {
 
     if (href === MCP_URL && method === "POST") {
       if (headers.authorization !== `Bearer ${accessToken}`) {
+        await passGate("probe");
         return {
           ok: false,
           status: 401,
@@ -399,6 +406,7 @@ function installFixture(options: FixtureOptions = {}) {
           json: async () => ({}),
         } as unknown as Response;
       }
+      await passGate("catalog");
       return jsonResponse({
         jsonrpc: "2.0",
         id: "paperclip-catalog-refresh",
@@ -472,7 +480,7 @@ function installFixture(options: FixtureOptions = {}) {
      * Hold the next request of this kind open. `reached` resolves when the
      * server is waiting on it; `release` lets it answer.
      */
-    pauseNext(kind: "register" | "exchange" | "refresh") {
+    pauseNext(kind: "register" | "exchange" | "refresh" | "catalog" | "probe") {
       let reached!: () => void;
       let release!: () => void;
       const reachedPromise = new Promise<void>((resolve) => { reached = resolve; });
@@ -1626,6 +1634,296 @@ describeEmbeddedPostgres("localhost sign-in for a pasted MCP URL", () => {
         actorId: null,
       });
       expect(stored).toBe("fixture-refresh-rotated-1");
+    });
+  });
+
+  describe("every write of a connection's config keeps the latest sign-in settings", () => {
+    const actor = { actorType: "user" as const, actorId: "board-user" };
+    const NEWER = { requestedScopes: ["mcp:read"], loopbackRedirect: true };
+
+    async function setOAuth(connectionId: string, patch: Record<string, unknown>) {
+      const row = await connectionRow(connectionId);
+      const config = { ...row.config, oauth: { ...oauthOf(row), ...patch } };
+      await db.update(toolConnections).set({ config, transportConfig: config }).where(eq(toolConnections.id, connectionId));
+    }
+
+    async function authorized(input: { personal: boolean; oauthSignIn: Record<string, unknown> }) {
+      const fixture = installFixture();
+      const company = await createCompany();
+      const service = toolAccessService(db, { oauthLoopbackPort: SERVER_PORT });
+      const connected = await service.connectGalleryApp(
+        company.id,
+        { link: MCP_URL, name: "Writers", oauthSignIn: input.oauthSignIn, ...(input.personal ? { grantKind: "user" as const } : {}) },
+        actor,
+      );
+      const start = await service.startOAuth(company.id, connected.connectionId, {
+        redirectUri: PUBLIC_REDIRECT_URI,
+        actor,
+        ...(input.personal ? { subjectUserId: actor.actorId } : {}),
+      });
+      const complete = () => service.completeOAuthCallback({
+        state: new URL(start.authorizationUrl).searchParams.get("state")!,
+        code: fixture.issueCode(start.authorizationUrl),
+        iss: ISSUER,
+        redirectUri: PUBLIC_REDIRECT_URI,
+        actor,
+      });
+      return { fixture, company, service, connectionId: connected.connectionId, complete };
+    }
+
+    it.each([
+      { path: "shared credential", personal: false },
+      { path: "personal grant", personal: true },
+    ])("keeps settings saved while the callback's catalog request is pending, after the credentials are stored ($path)", async ({ personal }) => {
+      vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+      const { fixture, connectionId, complete } = await authorized({
+        personal,
+        oauthSignIn: { requestedScopes: ["mcp:read", "mcp:write"] },
+      });
+      // The first authenticated MCP request is the callback's own catalog
+      // refresh, which runs after its credential transaction has committed.
+      const paused = fixture.pauseNext("catalog");
+      const callback = complete();
+      await paused.reached;
+      expect(fixture.tokenRequests("authorization_code")).toHaveLength(1);
+      await setOAuth(connectionId, NEWER);
+      paused.release();
+      await callback;
+
+      const row = await connectionRow(connectionId);
+      expect(row.status).toBe("active");
+      expect(oauthOf(row)).toMatchObject(NEWER);
+      expect(row.transportConfig).toEqual(row.config);
+      await expect(db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, connectionId)))
+        .resolves.toHaveLength(1);
+    });
+
+    it.each([
+      { path: "shared credential", personal: false },
+      { path: "personal grant", personal: true },
+    ])("keeps settings saved while an ordinary catalog refresh is waiting on the server ($path)", async ({ personal }) => {
+      vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+      const { fixture, service, connectionId, complete } = await authorized({
+        personal,
+        oauthSignIn: { requestedScopes: ["mcp:read", "mcp:write"] },
+      });
+      await complete();
+
+      const paused = fixture.pauseNext("catalog");
+      const refreshing = service.refreshCatalog(connectionId, actor);
+      await paused.reached;
+      await setOAuth(connectionId, NEWER);
+      expect(oauthOf(await connectionRow(connectionId))).toMatchObject(NEWER);
+      paused.release();
+      await refreshing;
+
+      const row = await connectionRow(connectionId);
+      expect(oauthOf(row)).toMatchObject(NEWER);
+      expect(row.transportConfig).toEqual(row.config);
+
+      // Cleared while the next refresh is pending: the refresh does not write
+      // its older copy back either.
+      const again = fixture.pauseNext("catalog");
+      const refreshingAgain = service.refreshCatalog(connectionId, actor);
+      await again.reached;
+      const current = await connectionRow(connectionId);
+      const { requestedScopes: _a, loopbackRedirect: _b, ...withoutSettings } = oauthOf(current);
+      const cleared = { ...current.config, oauth: withoutSettings };
+      await db.update(toolConnections).set({ config: cleared, transportConfig: cleared }).where(eq(toolConnections.id, connectionId));
+      again.release();
+      await refreshingAgain;
+      const after = oauthOf(await connectionRow(connectionId));
+      expect(after).not.toHaveProperty("requestedScopes");
+      expect(after).not.toHaveProperty("loopbackRedirect");
+    });
+
+    it("keeps settings saved while discovery is probing a connection that is not signed in yet", async () => {
+      vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+      const fixture = installFixture();
+      const company = await createCompany();
+      const service = toolAccessService(db, { oauthLoopbackPort: SERVER_PORT });
+      const connected = await service.connectGalleryApp(
+        company.id,
+        { link: MCP_URL, name: "Probing", oauthSignIn: { requestedScopes: ["mcp:read", "mcp:write"] } },
+        actor,
+      );
+      // No tokens yet: the server answers 401 and Paperclip records what it
+      // discovered about the sign-in on the connection.
+      const paused = fixture.pauseNext("probe");
+      const probing = service.refreshCatalog(connected.connectionId, actor).catch((error: unknown) => error);
+      await paused.reached;
+      await setOAuth(connected.connectionId, NEWER);
+      paused.release();
+      await probing;
+
+      const row = await connectionRow(connected.connectionId);
+      expect(oauthOf(row)).toMatchObject(NEWER);
+      expect(row.transportConfig).toEqual(row.config);
+    });
+
+    it("keeps the settings through a generic update with an older config, finishing setup and a health check", async () => {
+      vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+      const { company, service, connectionId, complete } = await authorized({
+        personal: false,
+        oauthSignIn: { requestedScopes: ["mcp:read", "mcp:write"] },
+      });
+      const completed = await complete();
+      const stale = await connectionRow(connectionId);
+      await setOAuth(connectionId, NEWER);
+
+      // A caller that sends back the whole config it read earlier.
+      await service.updateConnection(connectionId, { config: stale.config });
+      expect(oauthOf(await connectionRow(connectionId))).toMatchObject(NEWER);
+
+      await service.finishGalleryAppConnection(company.id, connectionId, {
+        enabledCatalogEntryIds: completed.catalog.map((entry) => entry.id),
+        askFirstCatalogEntryIds: [],
+        access: "all_agents",
+      }, actor);
+      expect(oauthOf(await connectionRow(connectionId))).toMatchObject(NEWER);
+
+      await service.checkHealth(connectionId);
+      expect(oauthOf(await connectionRow(connectionId))).toMatchObject(NEWER);
+    });
+
+    it("restores the earlier settings when a reconnect that changed them is undone by the form's owner", async () => {
+      vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+      const { company, service, connectionId, complete } = await authorized({
+        personal: false,
+        oauthSignIn: { requestedScopes: ["mcp:read", "mcp:write"] },
+      });
+      await complete();
+      // The owner of the settings replaces them outright, in both directions.
+      await service.connectGalleryApp(company.id, {
+        link: MCP_URL,
+        reconnectConnectionId: connectionId,
+        oauthSignIn: { requestedScopes: ["mcp:read"], loopbackRedirect: true },
+      }, actor);
+      expect(oauthOf(await connectionRow(connectionId))).toMatchObject({ requestedScopes: ["mcp:read"], loopbackRedirect: true });
+      await service.connectGalleryApp(company.id, {
+        link: MCP_URL,
+        reconnectConnectionId: connectionId,
+        oauthSignIn: { requestedScopes: null, loopbackRedirect: false },
+      }, actor);
+      const cleared = oauthOf(await connectionRow(connectionId));
+      expect(cleared).not.toHaveProperty("requestedScopes");
+      expect(cleared).not.toHaveProperty("loopbackRedirect");
+    });
+
+    describe("the wrapped database handle", () => {
+      async function seed(oauth: Record<string, unknown> | null) {
+        const company = await createCompany();
+        const service = toolAccessService(db);
+        installFixture();
+        const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: `Seed ${randomUUID()}` }, actor);
+        const row = await connectionRow(connected.connectionId);
+        const { oauth: _dropped, ...rest } = row.config;
+        const config = oauth ? { ...rest, oauth } : rest;
+        await db.update(toolConnections).set({ config, transportConfig: config }).where(eq(toolConnections.id, row.id));
+        return { id: row.id, config, companyId: company.id };
+      }
+
+      it("stores exactly what it is given for a connection without the settings", async () => {
+        const wrapped = withOAuthSignInPreservingWrites(db);
+        for (const oauth of [null, {}, { clientId: "c", scopes: ["a"] }]) {
+          const { id } = await seed(oauth);
+          for (const next of [
+            { url: MCP_URL, nested: { a: [1, null, "x"], b: null }, flag: false },
+            { url: MCP_URL, oauth: {} },
+            { url: MCP_URL, oauth: { clientId: "other", scopes: [] } },
+            {},
+          ]) {
+            await wrapped.update(toolConnections).set({ config: next, transportConfig: next }).where(eq(toolConnections.id, id));
+            const row = await connectionRow(id);
+            expect(row.config).toEqual(next);
+            expect(row.transportConfig).toEqual(next);
+          }
+        }
+      });
+
+      it("takes the two settings from the row, whatever the write carries", async () => {
+        const wrapped = withOAuthSignInPreservingWrites(db);
+        const { id } = await seed({ clientId: "c", loopbackRedirect: true, requestedScopes: ["a", "b"] });
+        for (const next of [
+          { url: MCP_URL },
+          { url: MCP_URL, oauth: { clientId: "d" } },
+          { url: MCP_URL, oauth: { clientId: "d", loopbackRedirect: false, requestedScopes: ["a", "b", "c"] } },
+          { url: MCP_URL, oauth: { requestedScopes: null } },
+        ]) {
+          const [returned] = await wrapped
+            .update(toolConnections)
+            .set({ config: next, transportConfig: next, updatedAt: new Date() })
+            .where(eq(toolConnections.id, id))
+            .returning();
+          const expected = {
+            ...next,
+            oauth: {
+              ...(("oauth" in next ? next.oauth : {}) as Record<string, unknown>),
+              loopbackRedirect: true,
+              requestedScopes: ["a", "b"],
+            },
+          };
+          expect(returned!.config).toEqual(expected);
+          expect((await connectionRow(id)).transportConfig).toEqual(expected);
+        }
+        // A write that sets only one of the two columns, and one that sets neither.
+        await wrapped.update(toolConnections).set({ transportConfig: { url: "t" } }).where(eq(toolConnections.id, id));
+        expect((await connectionRow(id)).transportConfig).toEqual({ url: "t", oauth: { loopbackRedirect: true, requestedScopes: ["a", "b"] } });
+        await wrapped.update(toolConnections).set({ healthMessage: "ok" }).where(eq(toolConnections.id, id));
+        expect(oauthOf(await connectionRow(id))).toMatchObject({ loopbackRedirect: true, requestedScopes: ["a", "b"] });
+      });
+
+      it("applies inside transactions and nested transactions, and leaves owned writes and other tables alone", async () => {
+        const wrapped = withOAuthSignInPreservingWrites(db);
+        expect(withOAuthSignInPreservingWrites(wrapped)).toBe(wrapped);
+        const { id, companyId } = await seed({ requestedScopes: ["a"] });
+        await wrapped.transaction(async (tx) => {
+          await tx.update(toolConnections).set({ config: { url: "one" } }).where(eq(toolConnections.id, id));
+          await tx.transaction(async (inner) => {
+            await inner.update(toolConnections).set({ transportConfig: { url: "two" } }).where(eq(toolConnections.id, id));
+          });
+        });
+        const row = await connectionRow(id);
+        expect(row.config).toEqual({ url: "one", oauth: { requestedScopes: ["a"] } });
+        expect(row.transportConfig).toEqual({ url: "two", oauth: { requestedScopes: ["a"] } });
+
+        // The owner of the settings replaces them, including clearing them.
+        await wrapped
+          .update(toolConnections)
+          .set({ config: ownedConnectionConfig({ url: "owned" }), transportConfig: ownedConnectionConfig({ url: "owned" }) })
+          .where(eq(toolConnections.id, id));
+        expect((await connectionRow(id)).config).toEqual({ url: "owned" });
+
+        // Another table's `config`-like columns are not touched by the rule.
+        await wrapped.update(companies).set({ name: "Renamed" }).where(eq(companies.id, companyId));
+        const [company] = await db.select().from(companies).where(eq(companies.id, companyId));
+        expect(company!.name).toBe("Renamed");
+        // Reads and inserts go straight through.
+        await expect(wrapped.select().from(toolConnections).where(eq(toolConnections.id, id))).resolves.toHaveLength(1);
+      });
+
+      it("covers the legacy token backfill, which rewrites both config columns", async () => {
+        const { id } = await seed({ clientId: "c", access_token: "raw-legacy-access", requestedScopes: ["a"] });
+        const stale = await connectionRow(id);
+        expect(JSON.stringify(stale.config)).toContain("raw-legacy-access");
+        await backfillLegacyToolOAuthTokens(db);
+        const row = await connectionRow(id);
+        expect(JSON.stringify(row.config)).not.toContain("raw-legacy-access");
+        expect(oauthOf(row)).toMatchObject({ clientId: "c", requestedScopes: ["a"] });
+      });
+
+      it("is the handle the tool access service and the backfill use, with four owned writes", () => {
+        const read = (path: string) => readFileSync(new URL(path, import.meta.url), "utf8");
+        const service = read("../services/tool-access.ts");
+        // The wrap is the first statement of the service, before anything can
+        // capture the unwrapped handle.
+        expect(service).toMatch(/options: ToolAccessServiceOptions = \{\},\n\) \{\n(?:\s*\/\/.*\n)*\s*db = withOAuthSignInPreservingWrites\(db\);/);
+        // Only the setup form's write and its undo store a config as given.
+        expect(service.match(/ownedConnectionConfig\(/g)).toHaveLength(4);
+        // No raw SQL update of the table goes around the handle.
+        expect(service).not.toMatch(/update\s+"?tool_connections"?\s+set/i);
+        expect(read("../services/tool-oauth-legacy-backfill.ts")).toContain("db = withOAuthSignInPreservingWrites(db);");
+      });
     });
   });
 

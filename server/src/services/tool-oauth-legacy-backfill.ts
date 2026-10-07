@@ -1,5 +1,6 @@
 import { and, eq, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { withOAuthSignInPreservingWrites } from "./tool-oauth-sign-in-writes.js";
 import {
   companySecretBindings,
   companySecretProviderConfigs,
@@ -291,6 +292,8 @@ async function upsertTokenSecret(
 }
 
 export async function backfillLegacyToolOAuthTokens(db: Db): Promise<ToolOAuthLegacyBackfillResult> {
+  // Differs from upstream (fork, NX-617): see tool-oauth-sign-in-writes.ts.
+  db = withOAuthSignInPreservingWrites(db);
   const result: ToolOAuthLegacyBackfillResult = {
     scannedConnections: 0,
     migratedConnections: 0,
