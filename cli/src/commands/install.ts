@@ -269,8 +269,13 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
   // through corepack, nothing puts it on PATH, so provision a shim into the staging dir.
   const pnpmShimDir = path.join(stagingRoot, "pnpm-bin");
   fs.mkdirSync(pnpmShimDir, { recursive: true, mode: 0o700 });
+  // pnpm leaves the workspace root node_modules/.bin off the script PATH when
+  // ignore-scripts=true is configured, so packages that rely on the root
+  // TypeScript (tsc) fail to build. Put it on PATH here; this runs no dependency
+  // lifecycle scripts and leaves the setting itself alone.
+  const workspaceBinDir = path.join(checkoutPath, "node_modules", ".bin");
   const buildEnv = (extra: NodeJS.ProcessEnv = {}) =>
-    gitBuildEnv({ PATH: [pnpmShimDir, process.env.PATH].filter(Boolean).join(path.delimiter), ...extra });
+    gitBuildEnv({ PATH: [pnpmShimDir, workspaceBinDir, process.env.PATH].filter(Boolean).join(path.delimiter), ...extra });
   try {
     await runGitHubCurl(["--fail", "--silent", "--show-error", "--location", "--output", archivePath, `https://codeload.github.com/${repo}/tar.gz/${sha}`], runCommand, { maxBuffer: 4 * 1024 * 1024 });
     await runCommand("tar", ["-xzf", archivePath, "--strip-components=1", "-C", checkoutPath], { maxBuffer: 4 * 1024 * 1024 });

@@ -188,6 +188,23 @@ describe("managed install commands", () => {
     expect(uiPackCall).toBeDefined();
   });
 
+  it("puts the checkout node_modules/.bin on the build PATH so ignore-scripts=true does not hide tsc", async () => {
+    const sha = "f".repeat(40);
+    const runCommand = createGitCheckoutRunCommand(sha);
+    await installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths());
+    const buildCalls = runCommand.mock.calls.filter(([file, args]) => file === "bash" || (file === "corepack" && args.includes("run")));
+    expect(buildCalls.length).toBeGreaterThanOrEqual(2);
+    for (const [file, args, options] of buildCalls) {
+      const workspaceBinDir = path.join(String(options?.cwd), "node_modules", ".bin");
+      expect(String(options?.env?.PATH).split(path.delimiter), `${file} ${args.join(" ")}`).toContain(workspaceBinDir);
+    }
+    // The installer must not switch dependency lifecycle scripts back on.
+    for (const [file, args, options] of runCommand.mock.calls) {
+      expect(args, `${file} ${args.join(" ")}`).not.toContain("--ignore-scripts=false");
+      expect(Object.keys(options?.env ?? {}).map((key) => key.toLowerCase())).not.toContain("npm_config_ignore_scripts");
+    }
+  });
+
   it("resolves the complete server workspace dependency closure in dependency order", () => {
     const checkout = path.join(root, "checkout");
     const packages = [
