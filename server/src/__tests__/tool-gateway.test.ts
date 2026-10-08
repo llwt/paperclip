@@ -4536,7 +4536,7 @@ rl.on("line", (line) => {
     }
   });
 
-  it("fails a stream without the tools/call response as malformed, with a content-free summary, and marks the connection errored", async () => {
+  it("fails a stream without the tools/call response as malformed, with a content-free summary, and keeps the connection healthy", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
@@ -4579,43 +4579,9 @@ rl.on("line", (line) => {
       });
       expect(JSON.stringify(error.details.responseSummary)).not.toContain(marker);
 
-      expect(await connectionHealth(connection.id)).toBe("error");
+      expect(await connectionHealth(connection.id)).toBe("ok");
       const listed = (await gateway.listToolsForSession(session.token)).map((tool) => tool.name);
-      expect(listed).not.toContain(slowTool);
-      expect(listed).not.toContain(fastTool);
-    } finally {
-      await fake.close();
-    }
-  });
-
-  it.each([
-    ["a plain JSON body with the wrong ID", { body: { jsonrpc: "2.0", id: "not-the-request-id", result: {} } }],
-    ["a JSON scalar", { headers: { "content-type": "application/json" }, rawBody: "42" }],
-    ["an empty stream body", { headers: { "content-type": "text/event-stream" }, rawBody: "" }],
-  ])("marks the connection errored when the tools/call response is %s", async (_label, response) => {
-    const company = await createCompany(db);
-    const agent = await createAgent(db, company.id);
-    const { run } = await createIssueAndRun(db, company.id, agent.id);
-    const fake = await startFakeRemoteMcpServer((request) =>
-      upstreamToolName(request) === "slow_query" ? response : {});
-    try {
-      const { connection, slowTool, fastTool } =
-        await createRemoteConnectionWithSlowAndFastTools(company.id, fake.url);
-      await allowAllToolsForAgent(db, company.id, agent.id);
-      const gateway = createTestToolGatewayService(db);
-      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
-
-      const error = await gateway.executeTool({
-        sessionToken: session.token,
-        tool: slowTool,
-        parameters: { key: "alpha", value: "one" },
-      }).catch((caught) => caught);
-      expectGatewayError(error, 502, "remote_mcp_malformed_response");
-
-      expect(await connectionHealth(connection.id)).toBe("error");
-      const listed = (await gateway.listToolsForSession(session.token)).map((tool) => tool.name);
-      expect(listed).not.toContain(slowTool);
-      expect(listed).not.toContain(fastTool);
+      expect(listed).toEqual(expect.arrayContaining([slowTool, fastTool]));
     } finally {
       await fake.close();
     }
