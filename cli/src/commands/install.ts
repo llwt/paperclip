@@ -234,6 +234,35 @@ export async function installNpmPayload(
   }
 }
 
+// npm skips dependency install scripts when ignore-scripts=true is configured. The
+// only one a payload needs at runtime is hydrate-symlinks.js of the
+// @embedded-postgres platform package: it links the versioned PostgreSQL libraries
+// (libpq.so.5 and others), and the embedded database cannot start without them.
+// Create the missing links from the package's own pg-symlinks.json, so the setting
+// stays in force and no dependency script has to run. Returns the links created.
+export function hydrateEmbeddedPostgresSymlinks(payloadPath: string): number {
+  const scopeDir = path.join(payloadPath, "node_modules", "@embedded-postgres");
+  if (!fs.existsSync(scopeDir)) return 0;
+  let created = 0;
+  for (const entry of fs.readdirSync(scopeDir)) {
+    const packageDir = path.join(scopeDir, entry);
+    const symlinkFile = path.join(packageDir, "native", "pg-symlinks.json");
+    if (!fs.existsSync(symlinkFile)) continue;
+    const symlinks = JSON.parse(fs.readFileSync(symlinkFile, "utf8")) as Array<{ source: string; target: string }>;
+    for (const { source, target } of symlinks) {
+      const sourcePath = path.resolve(packageDir, source);
+      const targetPath = path.resolve(packageDir, target);
+      if (![sourcePath, targetPath].every((candidate) => candidate.startsWith(packageDir + path.sep))) {
+        throw new Error(`Refusing to link outside ${packageDir}: ${source} -> ${target}`);
+      }
+      if (fs.lstatSync(targetPath, { throwIfNoEntry: false })) continue;
+      fs.symlinkSync(path.relative(path.dirname(targetPath), sourcePath), targetPath);
+      created += 1;
+    }
+  }
+  return created;
+}
+
 function gitBuildEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const env = { ...process.env, ...extra };
   // Source builds need devDependencies (esbuild, typescript); ambient NODE_ENV=production
@@ -305,6 +334,8 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       throw new Error(`Git install packaging produced ${workspaceTarballs.length} workspace tarballs; expected ${workspacePackages.length}.`);
     }
     await runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 });
+    const hydratedLinks = hydrateEmbeddedPostgresSymlinks(stagedPayload);
+    if (hydratedLinks > 0) console.log(pc.yellow(`Dependency install scripts did not run (npm ignore-scripts); linked ${hydratedLinks} embedded PostgreSQL libraries directly.`));
     await smokePayload(stagedPayload, metadata.version, runCommand);
     fs.renameSync(stagedPayload, payloadPath);
     return { payloadPath, reused: false, version: metadata.version };
