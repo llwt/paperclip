@@ -8,6 +8,7 @@ import {
   $createTextNode,
   $getRoot,
   $getSelection,
+  $isElementNode,
   $isRangeSelection,
   createEditor,
   DELETE_CHARACTER_COMMAND,
@@ -34,19 +35,68 @@ interface RichText {
 
 let richText: RichText;
 
+/**
+ * MDXEditor's markdown importer and exporter with the visitors a quote holding
+ * text and code blocks needs. The visitors are not part of the package's
+ * public entry, so they are loaded from its files like the rich-text copy.
+ */
+interface Markdown {
+  CodeBlockNode: Klass<LexicalNode>;
+  $createCodeBlockNode: (options: { code: string; language: string; meta: string }) => LexicalNode;
+  importMarkdownToLexical: (options: Record<string, unknown>) => void;
+  exportMarkdownFromLexical: (options: Record<string, unknown>) => string;
+  importVisitors: unknown[];
+  exportVisitors: unknown[];
+}
+
+let markdown: Markdown;
+
 beforeAll(async () => {
   const requireFromUi = createRequire(import.meta.url);
-  const requireFromMdxEditor = createRequire(requireFromUi.resolve("@mdxeditor/editor"));
+  const mdxEditorEntry = requireFromUi.resolve("@mdxeditor/editor");
+  const requireFromMdxEditor = createRequire(mdxEditorEntry);
   const richTextDir = dirname(requireFromMdxEditor.resolve("@lexical/rich-text"));
   richText = (await import(
     /* @vite-ignore */ pathToFileURL(join(richTextDir, "LexicalRichText.mjs")).href
   )) as RichText;
+
+  const mdxEditor = (await import("@mdxeditor/editor")) as unknown as Omit<
+    Markdown,
+    "importVisitors" | "exportVisitors"
+  >;
+  const loadVisitor = async (file: string, name: string) => {
+    const module = (await import(
+      /* @vite-ignore */ pathToFileURL(join(dirname(mdxEditorEntry), "plugins", file)).href
+    )) as Record<string, unknown>;
+    if (!module[name]) throw new Error(`MDXEditor no longer ships ${name} in ${file}`);
+    return module[name];
+  };
+  markdown = {
+    CodeBlockNode: mdxEditor.CodeBlockNode,
+    $createCodeBlockNode: mdxEditor.$createCodeBlockNode,
+    importMarkdownToLexical: mdxEditor.importMarkdownToLexical,
+    exportMarkdownFromLexical: mdxEditor.exportMarkdownFromLexical,
+    importVisitors: await Promise.all([
+      loadVisitor("core/MdastRootVisitor.js", "MdastRootVisitor"),
+      loadVisitor("core/MdastParagraphVisitor.js", "MdastParagraphVisitor"),
+      loadVisitor("core/MdastTextVisitor.js", "MdastTextVisitor"),
+      loadVisitor("quote/MdastBlockQuoteVisitor.js", "MdastBlockQuoteVisitor"),
+      loadVisitor("codeblock/MdastCodeVisitor.js", "MdastCodeVisitor"),
+    ]),
+    exportVisitors: await Promise.all([
+      loadVisitor("core/LexicalRootVisitor.js", "LexicalRootVisitor"),
+      loadVisitor("core/LexicalParagraphVisitor.js", "LexicalParagraphVisitor"),
+      loadVisitor("core/LexicalTextVisitor.js", "LexicalTextVisitor"),
+      loadVisitor("quote/LexicalQuoteVisitor.js", "LexicalQuoteVisitor"),
+      loadVisitor("codeblock/CodeBlockVisitor.js", "CodeBlockVisitor"),
+    ]),
+  };
 });
 
 function createTestEditor(withQuoteExit = true) {
   const editor = createEditor({
     namespace: "quote-exit-test",
-    nodes: [richText.QuoteNode],
+    nodes: [richText.QuoteNode, markdown.CodeBlockNode],
     onError(error: Error) {
       throw error;
     },
@@ -66,6 +116,7 @@ function shape(editor: LexicalEditor): string {
     const type = node.getType();
     if (type === "text") return node.getTextContent();
     if (type === "linebreak") return "\\n";
+    if (!$isElementNode(node)) return type;
     const label = type === "paragraph" ? "p" : type;
     const children = (node as ElementNode).getChildren().map(describeNode);
     return label === "p" ? `p(${children.join("")})` : `${label}[${children.join(" ")}]`;
@@ -119,6 +170,40 @@ function typeQuote(editor: LexicalEditor, text: string) {
     root.append(quote);
     quote.selectEnd();
   });
+}
+
+/** Loads markdown through MDXEditor's importer, as a saved comment is loaded. */
+function loadMarkdown(editor: LexicalEditor, source: string) {
+  update(editor, () => {
+    const root = $getRoot();
+    root.clear();
+    markdown.importMarkdownToLexical({
+      root,
+      markdown: source,
+      visitors: [...markdown.importVisitors],
+      syntaxExtensions: [],
+      mdastExtensions: [],
+      jsxComponentDescriptors: [],
+      directiveDescriptors: [],
+      codeBlockEditorDescriptors: [{ priority: 0, match: () => true, Editor: () => null }],
+    });
+  });
+}
+
+/** Saves the document through MDXEditor's exporter, without the trailing empty paragraph. */
+function saveMarkdown(editor: LexicalEditor): string {
+  return editor.getEditorState().read(() =>
+    markdown
+      .exportMarkdownFromLexical({
+        root: $getRoot(),
+        visitors: [...markdown.exportVisitors],
+        toMarkdownExtensions: [],
+        toMarkdownOptions: {},
+        jsxComponentDescriptors: [],
+        jsxIsAvailable: false,
+      })
+      .trimEnd(),
+  );
 }
 
 function selectQuoteParagraph(editor: LexicalEditor, index: number, edge: "start" | "end") {
@@ -331,6 +416,47 @@ describe("quote exit", () => {
         expect(selection.anchor.offset).toBe(3);
         expect(selection.focus.offset).toBe(3);
       });
+    });
+
+    it("wraps loose text around a code block and leaves the code block a block", () => {
+      const editor = createTestEditor();
+      update(editor, () => {
+        const root = $getRoot();
+        root.clear();
+        const quote = richText.$createQuoteNode();
+        quote.append(
+          $createTextNode("a"),
+          markdown.$createCodeBlockNode({ code: "one", language: "js", meta: "" }),
+          markdown.$createCodeBlockNode({ code: "two", language: "js", meta: "" }),
+          $createTextNode("b"),
+        );
+        root.append(quote);
+      });
+
+      expect(shape(editor)).toBe("quote[p(a) codeblock codeblock p(b)]");
+    });
+
+    it("keeps the code blocks of a loaded quote apart, so they save as they were", () => {
+      const source = [
+        "> ```js",
+        "> hello",
+        "> ```",
+        ">",
+        "> ```js",
+        "> world",
+        "> ```",
+        ">",
+        "> after",
+      ].join("\n");
+      const withoutPlugin = createTestEditor(false);
+      loadMarkdown(withoutPlugin, source);
+      const editor = createTestEditor();
+      loadMarkdown(editor, source);
+
+      expect(shape(editor)).toBe("quote[codeblock codeblock p(after)] p()");
+      expect(shape(editor)).toBe(shape(withoutPlugin));
+      expect(saveMarkdown(editor)).toBe(source);
+      expect(saveMarkdown(editor)).toBe(saveMarkdown(withoutPlugin));
     });
 
     it("leaves a loaded quote as it is", () => {

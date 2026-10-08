@@ -2,6 +2,7 @@ import { createRootEditorSubscription$, realmPlugin } from "@mdxeditor/editor";
 import {
   $createParagraphNode,
   $getSelection,
+  $isDecoratorNode,
   $isElementNode,
   $isParagraphNode,
   $isRangeSelection,
@@ -49,16 +50,25 @@ function $getCaretBlock(): ElementNode | null {
 }
 
 /**
+ * A child that already stands as a block of its own: a paragraph or list, or a
+ * block decorator such as a code block, table or rule.
+ */
+function $isBlockChild(node: LexicalNode): boolean {
+  return ($isElementNode(node) || $isDecoratorNode(node)) && !node.isInline();
+}
+
+/**
  * Gives a quote the shape the markdown importer builds: every line sits in a
  * paragraph. Runs of inline children are wrapped where they stand and an empty
- * quote gets one empty paragraph, with the caret kept in place.
+ * quote gets one empty paragraph, with the caret kept in place. Block children
+ * are left as they are.
  */
 export function $wrapQuoteInlineChildren(quote: ElementNode): void {
   const children = quote.getChildren();
   const runs: { start: number; nodes: LexicalNode[] }[] = [];
   let run: LexicalNode[] | null = null;
   children.forEach((child, index) => {
-    if ($isElementNode(child) && !child.isInline()) {
+    if ($isBlockChild(child)) {
       run = null;
     } else if (run) {
       run.push(child);
