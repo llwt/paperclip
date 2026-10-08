@@ -106,7 +106,10 @@ function loadQuote(editor: LexicalEditor, paragraphs: string[], options: { befor
   });
 }
 
-/** A quote as the `> ` shortcut builds it: the text sits directly in the quote. */
+/**
+ * A quote as the `> ` shortcut builds it: the text sits directly in the quote.
+ * With the plugin registered it is wrapped into a paragraph as the update ends.
+ */
 function typeQuote(editor: LexicalEditor, text: string) {
   update(editor, () => {
     const root = $getRoot();
@@ -175,15 +178,96 @@ describe("quote exit", () => {
       expect(shape(editor)).toBe("quote[p(quoted) p() p(reply)]");
     });
 
-    it("already leaves a quote typed with the shortcut", () => {
+    it("drops out of a quote typed with the shortcut on the first Enter", () => {
       const editor = createTestEditor(false);
       typeQuote(editor, "quoted");
 
       pressEnter(editor);
-      pressEnter(editor);
-      type(editor, "reply");
+      type(editor, "more");
 
-      expect(shape(editor)).toBe("quote[quoted] p() p(reply)");
+      expect(shape(editor)).toBe("quote[quoted] p(more)");
+    });
+  });
+
+  describe("typed quote shape", () => {
+    it("wraps the text of a typed quote in a paragraph and keeps the caret", () => {
+      const editor = createTestEditor();
+      typeQuote(editor, "quoted");
+
+      expect(shape(editor)).toBe("quote[p(quoted)]");
+      expect(caret(editor)).toBe("quote>paragraph");
+
+      type(editor, "!");
+      expect(shape(editor)).toBe("quote[p(quoted!)]");
+    });
+
+    it("gives an empty typed quote an empty paragraph holding the caret", () => {
+      const editor = createTestEditor();
+      typeQuote(editor, "");
+
+      expect(shape(editor)).toBe("quote[p()]");
+      expect(caret(editor)).toBe("quote>paragraph");
+
+      type(editor, "quoted");
+      expect(shape(editor)).toBe("quote[p(quoted)]");
+    });
+
+    it("keeps formatted text and line breaks together on one line", () => {
+      const editor = createTestEditor();
+      update(editor, () => {
+        const quote = richText.$createQuoteNode();
+        quote.append(
+          $createTextNode("bold").toggleFormat("bold"),
+          $createTextNode(" first"),
+          $createLineBreakNode(),
+          $createTextNode("second"),
+        );
+        $getRoot().clear().append(quote);
+        quote.selectEnd();
+      });
+
+      expect(shape(editor)).toBe("quote[p(bold first\\nsecond)]");
+    });
+
+    it("keeps a caret that sits between the children of the quote", () => {
+      const editor = createTestEditor();
+      update(editor, () => {
+        const quote = richText.$createQuoteNode();
+        quote.append($createTextNode("first"), $createLineBreakNode());
+        $getRoot().clear().append(quote);
+        quote.select(2, 2);
+      });
+
+      type(editor, "second");
+
+      expect(shape(editor)).toBe("quote[p(first\\nsecond)]");
+    });
+
+    it("wraps loose text next to a paragraph without touching the paragraph", () => {
+      const editor = createTestEditor();
+      update(editor, () => {
+        const quote = richText.$createQuoteNode();
+        quote.append(
+          $createTextNode("loose"),
+          $createParagraphNode().append($createTextNode("kept")),
+          $createTextNode("tail"),
+        );
+        $getRoot().clear().append(quote);
+        quote.selectEnd();
+      });
+
+      expect(shape(editor)).toBe("quote[p(loose) p(kept) p(tail)]");
+      expect(caret(editor)).toBe("quote>paragraph");
+
+      type(editor, "!");
+      expect(shape(editor)).toBe("quote[p(loose) p(kept) p(tail!)]");
+    });
+
+    it("leaves a loaded quote as it is", () => {
+      const editor = createTestEditor();
+      loadQuote(editor, ["first", "second"]);
+
+      expect(shape(editor)).toBe("quote[p(first) p(second)]");
     });
   });
 
@@ -226,18 +310,47 @@ describe("quote exit", () => {
       expect(shape(editor)).toBe("p(intro) quote[p(quoted)] p(reply) p(after)");
     });
 
-    // Existing behaviour, kept on purpose: a typed quote holds its text
-    // directly, so the first Enter already leaves it. Only loaded quotes
-    // continue on a non-empty line.
-    it("keeps the existing typed-quote behaviour: the first Enter leaves the quote", () => {
+    it("continues a typed quote on a non-empty line", () => {
+      const editor = createTestEditor();
+      typeQuote(editor, "first");
+
+      pressEnter(editor);
+      expect(caret(editor)).toBe("quote>paragraph");
+
+      type(editor, "second");
+      expect(shape(editor)).toBe("quote[p(first) p(second)]");
+    });
+
+    it("leaves a typed quote from its empty last line", () => {
       const editor = createTestEditor();
       typeQuote(editor, "quoted");
 
       pressEnter(editor);
-      pressEnter(editor);
-      type(editor, "reply");
+      expect(shape(editor)).toBe("quote[p(quoted) p()]");
+      expect(caret(editor)).toBe("quote>paragraph");
 
-      expect(shape(editor)).toBe("quote[quoted] p() p(reply)");
+      pressEnter(editor);
+      expect(shape(editor)).toBe("quote[p(quoted)] p()");
+      expect(caret(editor)).toBe("root>paragraph");
+
+      type(editor, "reply");
+      expect(shape(editor)).toBe("quote[p(quoted)] p(reply)");
+    });
+
+    it("splits a typed quote line in two when Enter is pressed inside it", () => {
+      const editor = createTestEditor();
+      typeQuote(editor, "firstsecond");
+      update(editor, () => {
+        const selection = $getSelection();
+        if (!$isRangeSelection(selection)) throw new Error("Expected a range selection");
+        selection.anchor.offset = 5;
+        selection.focus.offset = 5;
+      });
+
+      pressEnter(editor);
+
+      expect(shape(editor)).toBe("quote[p(first) p(second)]");
+      expect(caret(editor)).toBe("quote>paragraph");
     });
 
     it("turns a quote with nothing in it into a paragraph", () => {
@@ -344,16 +457,44 @@ describe("quote exit", () => {
       expect(caret(editor)).toBe("root>paragraph");
     });
 
-    // Lexical's own character deletion needs a mounted DOM, so the two cases
-    // below check that the handler declines and leaves the key to the editor.
-    it("leaves a typed quote to the editor, which already unwraps it", () => {
+    it("turns an empty typed quote into a paragraph", () => {
       const editor = createTestEditor();
       typeQuote(editor, "");
 
-      expect(declinesBackspace(editor)).toBe(true);
-      expect(shape(editor)).toBe("quote[]");
+      pressBackspace(editor);
+      expect(shape(editor)).toBe("p()");
+      expect(caret(editor)).toBe("root>paragraph");
+
+      type(editor, "reply");
+      expect(shape(editor)).toBe("p(reply)");
     });
 
+    it("lifts the line out when pressed at the start of a typed quote", () => {
+      const editor = createTestEditor();
+      typeQuote(editor, "quoted");
+      selectQuoteParagraph(editor, 0, "start");
+
+      pressBackspace(editor);
+
+      expect(shape(editor)).toBe("p(quoted)");
+      expect(caret(editor)).toBe("root>paragraph");
+    });
+
+    it("merges an empty line of a typed quote into the one above it", () => {
+      const editor = createTestEditor();
+      typeQuote(editor, "first");
+      pressEnter(editor);
+
+      pressBackspace(editor);
+      expect(shape(editor)).toBe("quote[p(first)]");
+      expect(caret(editor)).toBe("quote>paragraph");
+
+      type(editor, "more");
+      expect(shape(editor)).toBe("quote[p(firstmore)]");
+    });
+
+    // Lexical's own character deletion needs a mounted DOM, so this checks
+    // that the handler declines and leaves the key to the editor.
     it("leaves a caret inside the first quote line to the editor", () => {
       const editor = createTestEditor();
       loadQuote(editor, ["first"]);
