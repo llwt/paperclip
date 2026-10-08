@@ -92,15 +92,35 @@ test("a route/authz suite never leaks into the general-server shards", () => {
   const shard = dryRunJson(["--mode", "general", "--group", "general-server", "--shard-index", "0", "--shard-count", SHARD_COUNT.toString()]);
   for (const file of shard.selectedGeneralServerSuites) {
     assert.ok(
-      !/[^/]*(?:route|routes|authz)[^/]*\.test\.ts$/.test(file),
+      !(file.startsWith("server/src/__tests__/") && /[^/]*(?:route|routes|authz)[^/]*\.test\.ts$/.test(file)),
       `route/authz suite must stay in the serialized lane, not general-server: ${file}`,
     );
   }
 });
 
+test("general shards retain scripts and route-named suites outside the serialized directory", () => {
+  const general = dryRunJson(["--mode", "general", "--group", "general-server", "--shard-index", "0", "--shard-count", "1"]);
+  for (const file of [
+    "server/scripts/verify-runner-vendor-dependencies.test.mjs",
+    "server/src/services/openrouter-models.test.ts",
+    "server/src/routes/setup-token-route.test.ts",
+  ]) assert.ok(general.selectedGeneralServerSuites.includes(file), `missing configured server suite: ${file}`);
+});
+
 test("shard flags are rejected for the workspaces-b group", () => {
   const result = dryRun(["--mode", "general", "--group", "general-workspaces-b", "--shard-index", "0", "--shard-count", "3"]);
   assert.notEqual(result.status, 0, "workspaces-b must not accept shard flags");
+});
+
+test("workspace lanes cover every non-server project in the root Vitest configuration", () => {
+  const config = readFileSync(path.join(repoRoot, "vitest.config.ts"), "utf8");
+  const roots = [...config.matchAll(/^\s+"([^"]+)",?\s*$/gm)].map(match => match[1]);
+  assert.ok(roots.includes("server"), "expected the explicit root Vitest project list");
+  const expected = roots.filter(root => root !== "server")
+    .map(root => JSON.parse(readFileSync(path.join(repoRoot, root, "package.json"), "utf8")).name).sort();
+  const actual = ["general-workspaces-a", "general-workspaces-b"]
+    .flatMap(group => dryRunJson(["--mode", "general", "--group", group]).workspaceProjects).sort();
+  assert.deepEqual(actual, expected, "no configured project may be silently omitted or run twice");
 });
 
 test("workspaces-a shards map to Vitest native --shard slices over a stable project list", () => {
@@ -273,6 +293,9 @@ test("the real shard partition is duration-balanced", () => {
 const chatSuitePath = "server/src/__tests__/chat-channels.integration.test.ts";
 const nativeRunnerSuitePath =
   "server/src/services/native-runtime/native-codex-runner.integration.test.ts";
+const dotRunnerSuitePath = "server/src/__tests__/dot-runner.test.ts";
+const restartRecoverySuitePath =
+  "server/src/services/native-runtime/native-runner-restart-recovery.integration.test.ts";
 
 // Mirrors pr-trusted.yml (12 shards, called by pr.yml so GITHUB_WORKFLOW is
 // "PR"): the chat suite runs in its dedicated lanes and the cargo-dependent
@@ -288,7 +311,9 @@ test("12 PR without-chat shards plus the dedicated chat and native-runner lanes 
   const files = shards.flatMap((shard) => shard.selectedGeneralServerSuites);
   assert.ok(!files.includes(chatSuitePath));
   assert.ok(!files.includes(nativeRunnerSuitePath));
-  assert.deepEqual([...files, chatSuitePath, nativeRunnerSuitePath].sort(), full.selectedGeneralServerSuites.sort());
+  assert.ok(!files.includes(dotRunnerSuitePath));
+  assert.ok(!files.includes(restartRecoverySuitePath));
+  assert.deepEqual([...files, chatSuitePath, nativeRunnerSuitePath, dotRunnerSuitePath, restartRecoverySuitePath].sort(), full.selectedGeneralServerSuites.sort());
   assert.equal(new Set(files).size, files.length);
   const defaultRun = dryRunJson([], prEnv);
   assert.ok(defaultRun.generalServerSuiteCount === full.generalServerSuiteCount);
@@ -307,15 +332,19 @@ for (const [caller, envOverrides] of [["Release", { GITHUB_WORKFLOW: "Release" }
     const files = shards.flatMap((shard) => shard.selectedGeneralServerSuites);
     assert.ok(!files.includes(chatSuitePath));
     assert.ok(files.includes(nativeRunnerSuitePath));
+    assert.ok(files.includes(dotRunnerSuitePath));
+    assert.ok(files.includes(restartRecoverySuitePath));
     assert.deepEqual([...files, chatSuitePath].sort(), full.selectedGeneralServerSuites.sort());
     assert.equal(new Set(files).size, files.length);
   });
 }
 
-test("the native-runner lane runs exactly the cargo-dependent vertical-slice suite", () => {
+test("the native-runner lane runs exactly the cargo-dependent suites", () => {
   const lane = dryRunJson(["--mode", "general", "--group", "general-server-native-runner"]);
   assert.deepEqual(lane.selectedGeneralServerSuites, [
     "server/src/services/native-runtime/native-codex-runner.integration.test.ts",
+    dotRunnerSuitePath,
+    restartRecoverySuitePath,
   ]);
 });
 

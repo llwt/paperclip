@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
-import { buildNativeModelEnvelope, parseNativeExecutionInput, NATIVE_EXECUTION_INPUT_SCHEMA, type NativeExecutionInputV1 } from "./native-execution.js";
+import { buildNativeModelEnvelope, parseNativeExecutionInput, NATIVE_EXECUTION_INPUT_SCHEMA, NATIVE_EXECUTION_INPUT_SCHEMA_V6, type NativeExecutionInputV1 } from "./native-execution.js";
 import {
   NATIVE_RUNTIME_ASSET_SCHEMA,
   PAPERCLIP_EXECUTION_PROMPT,
@@ -56,6 +56,34 @@ const input: NativeExecutionInputV1 = {
 };
 
 describe("NativeExecutionInputV1", () => {
+  it.each(["paperclip.native-execution-input.v3", "paperclip.native-execution-input.v4", NATIVE_EXECUTION_INPUT_SCHEMA])(
+    "preserves a saved %s execution through recovery parsing",
+    (schema) => {
+      const digest = "0".repeat(64);
+      const text = "Saved system instructions absent from the current release.";
+      const context = {
+        prompt: { revision: "saved-prompt-before-upgrade", text, digest: createHash("sha256").update(text).digest("hex") },
+        instructions: {
+          entryPath: "AGENTS.md",
+          bundle: { schema: NATIVE_RUNTIME_ASSET_SCHEMA, digest, manifestDigest: digest, rootPath: "/runtime/instructions", fileCount: 1, totalBytes: 42 },
+        },
+        skills: [],
+        mcp: { assignmentSetId: "none", digest, bindingId: null },
+      };
+      const persisted = JSON.parse(JSON.stringify({
+        ...input,
+        schema,
+        provider: schema === "paperclip.native-execution-input.v3" ? input.provider : { ...input.provider, approvalPolicy: "never" },
+        executionMode: "default",
+        planningContext: null,
+        runtimeContext: { ...context, aggregateDigest: canonicalNativeRuntimeContextDigest(context) },
+      }));
+      const recovered = parseNativeExecutionInput(persisted);
+      expect(recovered.runtimeContext).toEqual(persisted.runtimeContext);
+      expect(parseNativeExecutionInput(recovered)).toEqual(recovered);
+    },
+  );
+
   it("parses v3 immutable runtime context without changing the model task envelope", () => {
     const digest = "0".repeat(64);
     const context = {
@@ -104,7 +132,8 @@ describe("NativeExecutionInputV1", () => {
     expect(delta).toEqual({
       schema: "paperclip.native-continuation.v1",
       events: '{"messages":[{"authorType":"user","body":"Just this new comment"}]}',
-      completion: { revision: "1", criterionIds: ["objective"] },
+      completion: { revision: "1", criterionIds: ["objective"],
+        instruction: "Before ending this turn, obtain one accepted paperclip_finish or paperclip_block result. Earlier reports belong to earlier turns; a final message alone does not complete this turn." },
     });
     expect(JSON.stringify(delta)).not.toContain(input.task.title);
     expect(JSON.stringify(delta)).not.toContain(input.completionContract.contract.objective);
@@ -482,6 +511,61 @@ describe("native task context ownership", () => {
       runtimeContext: { ...context, aggregateDigest: canonicalNativeRuntimeContextDigest(context) },
     });
   }
+
+  it.each([
+    { driverKind: "opencode_server", provider: { kind: "opencode", model: "openrouter/deepseek/deepseek-v4-flash-0731", permissionMode: "deny" } },
+    { driverKind: "acpx_runtime", provider: {
+      kind: "acpx", agent: "pi", model: "openrouter/deepseek/deepseek-v4-flash-0731", permissionMode: "deny-all",
+      profile: { driverKind: "acpx_runtime", protocolVersion: 1, acpxVersion: "0.13.1", agent: "pi", agentProfileVersion: 1,
+        agentServerPackage: "pi-acp", agentServerVersion: "0.0.33", agentRuntimePackage: "@earendil-works/pi-coding-agent",
+        agentRuntimeVersion: "0.84.2", commandDigest: `sha256:${"a".repeat(64)}` },
+    } },
+    { driverKind: "openai_dot_mcp", provider: {
+      kind: "openai_dot", model: null,
+      binding: { bindingId: "dot-binding", bindingGeneration: 1, companyId: input.binding.companyId, agentId: input.binding.agentId,
+        acceptByUnixMs: 1_000, expiresAtUnixMs: 2_000 },
+    } },
+  ])("preserves an unregistered saved prompt for $provider.kind", ({ driverKind, provider }) => {
+    const current = currentInput();
+    if (!("runtimeContext" in current)) throw new Error("Expected a runtime context");
+    const text = "Saved instructions absent from the current release.";
+    const context = { ...current.runtimeContext,
+      prompt: { revision: "saved-prompt-before-upgrade", text, digest: createHash("sha256").update(text).digest("hex") } };
+    context.aggregateDigest = canonicalNativeRuntimeContextDigest(context);
+    const persisted = JSON.parse(JSON.stringify({
+      ...current, provider, session: { ...current.session, driverKind }, runtimeContext: context,
+      ...(provider.kind === "openai_dot" ? {
+        schema: NATIVE_EXECUTION_INPUT_SCHEMA_V6,
+        workspace: { access: "none", cwd: null, repoUrl: null, repoRef: null, branchName: null },
+        credentialBindings: [],
+      } : {}),
+    }));
+    const recovered = parseNativeExecutionInput(persisted);
+    expect(recovered.runtimeContext).toEqual(context);
+    expect(recovered.provider).toEqual(provider);
+    expect(recovered.session.driverKind).toBe(driverKind);
+    expect(parseNativeExecutionInput(recovered)).toEqual(recovered);
+  });
+
+  it("carries an opaque provider mode without a vendor restriction and fences obsolete field names", () => {
+    const current = currentInput();
+    const provider = {
+      kind: "acpx", agent: "codex", model: "gpt-5.6-sol", permissionMode: "approve-all", mode: "architect",
+      profile: { driverKind: "acpx_runtime", protocolVersion: 1, acpxVersion: "0.13.1", agent: "codex", agentProfileVersion: 3,
+        agentServerPackage: "@agentclientprotocol/codex-acp", agentServerVersion: "1.6.2",
+        agentRuntimePackage: "@openai/codex", agentRuntimeVersion: "0.160.0", commandDigest: `sha256:${"a".repeat(64)}` },
+    };
+    const value = { ...current, session: { ...current.session, driverKind: "acpx_runtime" }, provider };
+    const parsed = parseNativeExecutionInput(value);
+    expect(parsed.provider).toMatchObject({ agent: "codex", mode: "architect" });
+    expect(parseNativeExecutionInput(parsed)).toEqual(parsed);
+    expect(JSON.stringify(buildNativeModelEnvelope(parsed))).not.toContain("architect");
+    for (const mode of [null, 1, "", " ", "x".repeat(241), "plan\0", "plan\n"]) {
+      expect(() => parseNativeExecutionInput({ ...value, provider: { ...provider, mode } })).toThrow(/provider.mode/);
+    }
+    const { mode: _mode, ...withoutMode } = provider;
+    expect(() => parseNativeExecutionInput({ ...value, provider: { ...withoutMode, cursorMode: "plan" } })).toThrow(/input.provider/);
+  });
 
   it.each([
     ["v4", "paperclip.native-execution-input.v4", "paperclip.native-model-envelope.v2"],

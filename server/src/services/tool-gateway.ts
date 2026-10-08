@@ -1,3 +1,4 @@
+import { composeConnectionInstructions } from "./connection-instructions.js";
 import { isInsufficientConnectionScope, INSUFFICIENT_CONNECTION_SCOPE_MESSAGE } from "./connection-permission-errors.js";
 import { boundedMcpToolName } from "./mcp-tool-names.js";
 import { browserUseService } from "./browser-use.js";
@@ -107,7 +108,7 @@ import { RAILWAY_SSH_SECRET_PATH, runRailwaySshCommand } from "./railway-ssh.js"
 import {
   initializeMcpHttpSession,
   getMcpHttpSession,
-  forgetMcpHttpSessions,
+  forgetMcpHttpSession,
   readMcpHttpResponse,
   McpHttpResponseError,
   mcpHttpRequestHeaders,
@@ -2985,6 +2986,18 @@ export function createToolGatewayService(
     }
   }
 
+  /** Shared connection descriptors and task restrictions; no provider calls. */
+  async function connectionToolsForContext(session: ToolGatewaySession): Promise<ToolGatewayDescriptor[]> {
+    const guestBotConnection = await githubGuestBotConnectionForSession(db, session);
+    const connectedTools = (await connectedMcpToolsForCompany(session.companyId))
+      .filter(tool => !guestBotConnection || !tool.connectionId || (tool.connectionId === guestBotConnection && tool.providerType === "paperclip_github_chat"));
+    return [
+      ...await githubBotToolsForSession(db, session),
+      ...await slackToolsForSession(db, session),
+      ...connectedTools,
+    ];
+  }
+
   async function buildToolsForContext(
     session: ToolGatewaySession,
     signal?: AbortSignal,
@@ -2993,16 +3006,11 @@ export function createToolGatewayService(
     if (session.agentId) {
       await assertAgentInCompany(session.companyId, session.agentId);
     }
-    const guestBotConnection = await githubGuestBotConnectionForSession(db, session);
-    const allConnectedTools = (await connectedMcpToolsForCompany(
-      session.companyId,
-    )).filter(tool => !guestBotConnection || !tool.connectionId || (tool.connectionId === guestBotConnection && tool.providerType === "paperclip_github_chat"));
-    const onDemandTargets = allConnectedTools.filter(isOnDemandRemoteTool);
+    const connectionTools = await connectionToolsForContext(session);
+    const onDemandTargets = connectionTools.filter(isOnDemandRemoteTool);
     const tools = [
       ...allTools(),
-      ...await githubBotToolsForSession(db, session),
-      ...await slackToolsForSession(db, session),
-      ...allConnectedTools.filter((tool) => !isOnDemandRemoteTool(tool)),
+      ...connectionTools.filter((tool) => !isOnDemandRemoteTool(tool)),
     ].filter(
       (tool) =>
         session.agentId ||
@@ -4802,7 +4810,7 @@ export function createToolGatewayService(
   ): Promise<unknown> {
     if (tool.providerType !== "mcp_remote_http" && tool.providerType !== "provider_rest") return parameters;
     const { connection, entry } = await resolveConnectedRemoteTool(session, tool);
-    return projectedConnectionToolArguments(connection, parameters, entry.toolName);
+    return projectedConnectionToolArguments(connection, parameters, entry.toolName, entry.inputSchema ?? {});
   }
 
   async function approvedManagedArgumentsRemainCurrent(
@@ -5617,7 +5625,7 @@ export function createToolGatewayService(
   function responseTooLargeError() {
     return new ToolGatewayHttpError(
       502,
-      "Remote MCP response exceeded the gateway size limit",
+      "Remote MCP response exceeded the gateway size limit. Request a smaller result, for example a narrower query or a smaller page size.",
       "mcp_remote_response_too_large",
       { maxBytes: MAX_REMOTE_MCP_RESPONSE_BYTES },
     );
@@ -5950,6 +5958,9 @@ export function createToolGatewayService(
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), ms);
     timer.unref?.();
+    // The cached MCP session this call used, so a failure resets only this
+    // identity's session and leaves other agents on the connection alone.
+    let mcpSession: { scope: string; headers: Record<string, string>; sessionId: string } | undefined;
     try {
       const dispatchRemote = (target: string, init: RequestInit) =>
         options.remoteHttpRequest
@@ -5992,8 +6003,9 @@ export function createToolGatewayService(
       }
       let requestHeaders = headers;
       if (connection.config.mcpSessionRequired === true) {
+        const scope = `${connection.id}:grant:${grant.id}:actor:${session.agentId}:${endpoint}`;
         requestHeaders = await getMcpHttpSession({
-          scope: `${connection.id}:grant:${grant.id}:actor:${session.agentId}:${endpoint}`,
+          scope,
           send: (init) =>
             dispatchRemote(endpoint, {
               ...init,
@@ -6003,6 +6015,8 @@ export function createToolGatewayService(
           headers,
           requestId,
         });
+        const sessionId = new Headers(requestHeaders).get("mcp-session-id");
+        if (sessionId) mcpSession = { scope, headers, sessionId };
       }
       // The guard runs inside this call and the connection is pinned to the
       // address it approved, so an operator-supplied hostname cannot be rebound
@@ -6141,7 +6155,7 @@ export function createToolGatewayService(
       if (sessionExpired) {
         // The next explicit call initializes again. Never replay a tools/call
         // automatically: the failed call may have changed app data.
-        forgetMcpHttpSessions(connection.id);
+        if (mcpSession) forgetMcpHttpSession(mcpSession);
       }
       const body = response.ok
         ? JSON.stringify(await readMcpHttpResponse(response, requestId, {
@@ -6201,11 +6215,6 @@ export function createToolGatewayService(
       try {
         payload = JSON.parse(body);
       } catch {
-        await markRemoteConnectionHealth(
-          connection,
-          "error",
-          "Remote MCP server returned invalid JSON.",
-        );
         throw new ToolGatewayHttpError(
           502,
           "Remote MCP server returned invalid JSON",
@@ -6287,9 +6296,14 @@ export function createToolGatewayService(
         const failure = error.reason === "too_large" ? responseTooLargeError()
           : error.reason === "malformed_response" ? malformedRemoteMcpResponse()
           : new ToolGatewayHttpError(502, "Remote MCP server returned invalid JSON", "mcp_remote_invalid_json");
-        await markRemoteConnectionHealth(connection, "error", failure.message);
+        // These describe one response body, not the connection: the server
+        // answered with HTTP 2xx. Marking the connection unhealthy would hide
+        // every tool, and only a successful call restores health.
+        // The reader may have cancelled the stream partway, and the server can
+        // then drop its session. Start a fresh session on the next call.
+        if (mcpSession) forgetMcpHttpSession(mcpSession);
         throw new ToolGatewayHttpError(failure.status, failure.message, failure.reasonCode, {
-          connectionId: connection.id, catalogEntryId: entry.id,
+          ...failure.details, connectionId: connection.id, catalogEntryId: entry.id,
           // The shape of what the server sent instead (no message content).
           ...(error.reason === "malformed_response" ? { responseSummary: error.summary ?? null } : {}),
           execution,
@@ -9020,6 +9034,44 @@ export function createToolGatewayService(
         const decision = await policyService.decide(policyInputForTool({ session, tool, consumeRateLimit: false }));
         return decision.allowed || decision.decision === "require_approval";
       } catch { return false; }
+    },
+
+    /** Standing instructions use exactly the same authorization as tool discovery. */
+    async resolveConnectionInstructionsForRun(binding: { companyId: string; agentId: string; runId: string }) {
+      const candidates = await db.select().from(toolConnections).where(and(
+        eq(toolConnections.companyId, binding.companyId), eq(toolConnections.enabled, true),
+        eq(toolConnections.status, "active"), sql`${toolConnections.agentInstructions}->>'enabled' = 'true'`,
+      ));
+      if (!candidates.length) return null;
+      const runContext = await resolveRunContext(binding);
+      const session = await captureSessionIdentity({
+        ...binding, ...runContext, id: randomUUID(), token: "", createdAt: new Date(), expiresAt: new Date(Date.now() + 60_000),
+      });
+      await assertAgentInCompany(binding.companyId, binding.agentId);
+      const candidateIds = new Set(candidates.map((connection) => connection.id));
+      // Prompt assembly needs authorization, not a full discovery listing. Share
+      // descriptors and policy decisions, but only authorize candidate sources;
+      // discovery admission pressure must not remove guidance or reset sessions.
+      const tools = (await connectionToolsForContext(session))
+        .filter((tool) => tool.connectionId && candidateIds.has(tool.connectionId));
+      const decisions = await decideToolsForListing(tools, (tool) => policyInputForTool({ session, tool }));
+      const visible = new Set(decisions.flatMap(({ tool, decision }) =>
+        (decision.allowed || decision.decision === "require_approval") && tool.connectionId ? [tool.connectionId] : [],
+      ));
+      const sources: Parameters<typeof composeConnectionInstructions>[0] = [];
+      for (const connection of candidates) {
+        if (!visible.has(connection.id)) continue;
+        try {
+          const grant = await resolveConnectionGrant(session, connection, false);
+          sources.push({ connection, grantId: grant.id });
+        } catch (error) {
+          // A missing/revoked identity makes this connection unavailable, without
+          // opening an interaction or blocking unrelated work at prompt assembly.
+          if (!(error instanceof ToolGatewayHttpError) && !(error instanceof HttpError)) throw error;
+          if (error.status >= 500) throw error;
+        }
+      }
+      return composeConnectionInstructions(sources);
     },
 
     async browserUseResources(binding: { companyId: string; agentId: string; runId?: string; issueId?: string }) {

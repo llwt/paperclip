@@ -138,7 +138,7 @@ import { httpAdapter } from "./http/index.js";
 import {
   DEFAULT_OPENCODE_RUNNER_MODEL,
   PaperclipRunnerProviderProfileError,
-  QUALIFIED_ACPX_RUNNER_MODELS,
+  DEFAULT_ACPX_RUNNER_MODELS,
   QUALIFIED_OPENCODE_RUNNER_VERSION,
   resolvePaperclipRunnerProviderProfile,
 } from "../services/native-runtime/provider-profile.js";
@@ -405,8 +405,12 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
         }],
       };
     }
+    if (profile.provider === "openai_dot") {
+      return { adapterType: "paperclip_runner", status: "warn" as const, testedAt: new Date().toISOString(),
+        checks: [{ code: "dot_event_test_required", level: "warn" as const, message: "Dot manages its model and billing. Validate the dedicated agent binding and event round trip in Paperclip; this read-only check does not wake the Dot." }] };
+    }
     if (profile.provider === "acpx") {
-      if (["cursor", "copilot", "pi"].includes(profile.acpxAgent)) {
+      if (["copilot", "pi"].includes(profile.acpxAgent)) {
         // The profile resolver already validated the isolated host's exact
         // qualification pair. Do not report a production readiness pass.
         return {
@@ -416,7 +420,7 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
         };
       }
       try {
-        if (profile.acpxAgent !== "claude" && profile.acpxAgent !== "grok") throw new Error("Select Codex to use the native Codex runner.");
+        if (profile.acpxAgent !== "claude" && profile.acpxAgent !== "grok" && profile.acpxAgent !== "cursor") throw new Error("Select Codex to use the native Codex runner.");
         const target = context.executionTarget;
         if (target?.kind === "remote") {
           const probe = await runAdapterExecutionTargetShellCommand(
@@ -434,8 +438,8 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
               message: "The remote platform is supported. Runtime package integrity and readiness must still be verified by the remote runner before launch." }],
           };
         }
-        const { probeAcpxClaudeInstallation, probeAcpxGrokInstallation } = await import("@paperclipai/paperclip-runner/live");
-        await (profile.acpxAgent === "grok" ? probeAcpxGrokInstallation : probeAcpxClaudeInstallation)(profile.model);
+        const { probeAcpxClaudeInstallation, probeAcpxGrokInstallation, probeAcpxCursorInstallation } = await import("../vendor/paperclip-runner/live/index.js");
+        await (profile.acpxAgent === "grok" ? probeAcpxGrokInstallation : profile.acpxAgent === "cursor" ? probeAcpxCursorInstallation : probeAcpxClaudeInstallation)(profile.model);
         return {
           adapterType: "paperclip_runner", status: "pass" as const, testedAt: new Date().toISOString(),
           checks: [{ code: "acpx_runtime_ready", level: "info" as const, message: `ACPX ${profile.acpxAgent} runtime is installed and verified. Model access is checked when it runs.` }],
@@ -490,19 +494,19 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
   models: [
     ...codexModels,
     { id: DEFAULT_OPENCODE_RUNNER_MODEL, label: "OpenRouter · DeepSeek V4 Flash 0731" },
-    { id: QUALIFIED_ACPX_RUNNER_MODELS.claude, label: "Claude Sonnet 5" },
+    { id: DEFAULT_ACPX_RUNNER_MODELS.claude, label: "Claude Sonnet 5" },
     { id: "global.anthropic.claude-sonnet-4-6", label: "Amazon Bedrock · Claude Sonnet 4.6 (global)" },
   ],
   listModels: async () => [
     ...await listCodexModels(),
     { id: DEFAULT_OPENCODE_RUNNER_MODEL, label: "OpenRouter · DeepSeek V4 Flash 0731" },
-    { id: QUALIFIED_ACPX_RUNNER_MODELS.claude, label: "Claude Sonnet 5" },
+    { id: DEFAULT_ACPX_RUNNER_MODELS.claude, label: "Claude Sonnet 5" },
     { id: "global.anthropic.claude-sonnet-4-6", label: "Amazon Bedrock · Claude Sonnet 4.6 (global)" },
   ],
   refreshModels: async () => [
     ...await refreshCodexModels(),
     { id: DEFAULT_OPENCODE_RUNNER_MODEL, label: "OpenRouter · DeepSeek V4 Flash 0731" },
-    { id: QUALIFIED_ACPX_RUNNER_MODELS.claude, label: "Claude Sonnet 5" },
+    { id: DEFAULT_ACPX_RUNNER_MODELS.claude, label: "Claude Sonnet 5" },
     { id: "global.anthropic.claude-sonnet-4-6", label: "Amazon Bedrock · Claude Sonnet 4.6 (global)" },
   ],
   supportsLocalAgentJwt: false,
@@ -519,9 +523,9 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
           "opencode",
           `opencode-ai@${QUALIFIED_OPENCODE_RUNNER_VERSION}`,
         )
-      : buildNpmRuntimeCommandSpec(config, "codex", "@openai/codex@0.156.0"),
+      : buildNpmRuntimeCommandSpec(config, "codex", "@openai/codex@0.160.0"),
   agentConfigurationDoc:
-    "# Paperclip Runner\n\nAdapter: paperclip_runner\n\nRuns Codex, OpenCode, Claude Managed, AWS AgentCore, or ACPX Claude/Grok Build through the Rust Paperclip runner and authenticated PRP transport. Cursor, GitHub Copilot, and Pi are awaiting local and Daytona qualification and are not enabled for production runs. Managed providers use company-scoped qualified profiles, explicit retention acknowledgement, and spend limits.\n",
+    "# Paperclip Runner\n\nAdapter: paperclip_runner\n\nRuns Codex, OpenCode, Claude Managed, AWS AgentCore, or ACPX Claude/Grok Build/Cursor through the Rust Paperclip runner and authenticated PRP transport. GitHub Copilot and Pi are awaiting local and Daytona qualification and are not enabled for production runs. Managed providers use company-scoped qualified profiles, explicit retention acknowledgement, and spend limits.\n",
   getConfigSchema: () => ({
     fields: [
       {

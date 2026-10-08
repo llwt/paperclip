@@ -1,3 +1,8 @@
+import { isCrossSiteOAuthCallbackNavigation, oauthCallbackInterstitialHtml } from "../lib/oauth-browser-return.js";
+import { aiConnectionRouterPluginKey } from "@paperclipai/shared";
+import { aiConnectionRouterService } from "../services/ai-connection-router.js";
+import { composioAppSetupSchema, composioAppsRefreshSchema, composioAppsSyncSchema, composioAppAccountSchema } from "@paperclipai/shared";
+import { aggregatorAppsSyncSchema, aggregatorAppsRefreshSchema, arcadeDiscoverySetupSchema } from "@paperclipai/shared/aggregator-apps";
 import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
 import { agents, companies, connectionGrants, issueThreadInteractions, toolConnectionInstalls } from "@paperclipai/db";
@@ -189,29 +194,6 @@ export function connectionIntentOAuthOutcomeHtml(input: {
   })();
   const targetOrigin = JSON.stringify(openerOrigin ?? "");
   return `<!doctype html><html><head><meta charset="utf-8"><title>Connection authorization</title></head><body><p>Returning to Paperclip…</p><script>const message=${message};const targetOrigin=${targetOrigin}||window.location.origin;if(window.opener&&window.opener!==window){window.opener.postMessage(message,targetOrigin);window.close();}else{window.location.replace(${fallback});}</script></body></html>`;
-}
-
-// Some providers' consent pages navigate to this callback and, if their own
-// page is still on screen ~2s later, replace it with a "you can close this
-// window" screen (Railway does exactly this). Exchanging the code and
-// discovering the tool catalog routinely takes longer than that, so the
-// provider's timer wins and the browser never lands back in Paperclip even
-// though the connection completed. For a cross-site browser navigation, commit
-// a Paperclip document immediately and repeat the same request from it; the
-// repeat is same-origin and does the slow work.
-export function isCrossSiteOAuthCallbackNavigation(req: Request): boolean {
-  return req.get("sec-fetch-site") === "cross-site"
-    && req.get("sec-fetch-mode") === "navigate";
-}
-
-export function oauthCallbackInterstitialHtml(continuePath: string): string {
-  const attribute = continuePath
-    .replaceAll("&", "&amp;")
-    .replaceAll("\"", "&quot;")
-    .replaceAll("<", "&lt;");
-  // A meta refresh alone, not a script as well: the OAuth code is single-use, so
-  // two racing follow-ups would let the loser render an expired-state error.
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><meta http-equiv="refresh" content="0;url=${attribute}"><title>Finishing connection</title></head><body><p>Finishing your connection…</p></body></html>`;
 }
 
 function normalizeCloudConnectorEnrollmentReturnTo(returnTo?: string | null): string | null {
@@ -854,9 +836,9 @@ function connectorEnrollmentPrincipal(req: Request): string {
             : "Vercel Connect setup is disabled on this Paperclip instance.",
         },
       },
-      apps: APP_STORE_DEFINITIONS.filter((app) => (enableMemoryConnectors || !isMemoryConnectorId(app.slug))).map((app) =>
+      apps: [...APP_STORE_DEFINITIONS.filter((app) => (enableMemoryConnectors || !isMemoryConnectorId(app.slug))).map((app) =>
         appWithPaperclipCloudConnectorAvailability(app, advertisedProfiles)
-      ),
+      ), ...await aiConnectionRouterService(db).catalog()],
     });
   });
 
@@ -895,6 +877,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
     const resumedConnection = retainedConnectionId
       ? await svc.getConnection(retainedConnectionId, companyId)
       : null;
+    if (resumedConnection) await assertToolConnectionConfigureAccess(req, resumedConnection);
     const effectiveGrantKind = resumedConnection
       ? resumedConnection.credentialPolicy === "per_user"
         ? "user"
@@ -1685,6 +1668,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
           status: connection.status,
           enabled: connection.enabled,
           credentialRefCount: (connection.credentialRefs ?? []).length + connection.credentialSecretRefs.length,
+          ...(req.body.agentInstructions !== undefined ? { agentInstructionsChanged: true, agentInstructionsEnabled: connection.agentInstructions?.enabled ?? false } : {}),
         },
       });
       res.status(201).json(connection);
@@ -2032,6 +2016,68 @@ function connectorEnrollmentPrincipal(req: Request): string {
     res.json({ access: accessSummary });
   });
 
+  async function composioAppManager(req: Request, res: Response) {
+    assertBoard(req);
+    const connection = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
+    if (!connection) return null;
+    if (!await isToolConnectionManager(req, connection.companyId)) throw forbidden("Only a connection manager can configure apps and grant agent access");
+    return connection;
+  }
+
+  router.get("/tool-connections/:connectionId/aggregator/apps", async (req, res) => {
+    const connection = await composioAppManager(req, res);
+    if (!connection) return;
+    res.set("Cache-Control", "private, no-store");
+    res.json(await svc.listAggregatorApps(connection.id, { actorType: "user", actorId: req.actor.userId ?? "board" }));
+  });
+  router.post("/tool-connections/:connectionId/aggregator/apps/sync", validate(aggregatorAppsSyncSchema), async (req, res) => {
+    const connection = await composioAppManager(req, res);
+    if (!connection) return;
+    res.json(await svc.syncAggregatorApps(connection.id, req.body.force, { actorType: "user", actorId: req.actor.userId ?? "board" }));
+  });
+  router.post("/tool-connections/:connectionId/aggregator/apps/refresh", validate(aggregatorAppsRefreshSchema), async (req, res) => {
+    const connection = await composioAppManager(req, res);
+    if (!connection) return;
+    res.json(await svc.refreshAggregatorApps(connection.id, req.body.toolkits, { actorType: "user", actorId: req.actor.userId ?? "board" }));
+  });
+  router.put("/tool-connections/:connectionId/aggregator/discovery", validate(arcadeDiscoverySetupSchema), async (req, res) => {
+    const connection = await composioAppManager(req, res);
+    if (!connection) return;
+    res.json(await svc.configureArcadeDiscovery(connection.id, req.body, { actorType: "user", actorId: req.actor.userId ?? "board" }));
+  });
+
+  router.get("/tool-connections/:connectionId/composio/apps", async (req, res) => {
+    const connection = await composioAppManager(req, res);
+    if (!connection) return;
+    res.json(await svc.listComposioApps(connection.id, { actorType: "user", actorId: req.actor.userId ?? "board" }));
+  });
+
+  router.post("/tool-connections/:connectionId/composio/apps/sync", validate(composioAppsSyncSchema), async (req, res) => {
+    const connection = await composioAppManager(req, res);
+    if (!connection) return;
+    res.json(await svc.syncComposioApps(connection.id, req.body.force, { actorType: "user", actorId: req.actor.userId ?? "board" }));
+  });
+
+  router.post("/tool-connections/:connectionId/composio/apps/refresh", validate(composioAppsRefreshSchema), async (req, res) => {
+    const connection = await composioAppManager(req, res);
+    if (!connection) return;
+    res.json(await svc.refreshComposioApps(connection.id, req.body.toolkits, { actorType: "user", actorId: req.actor.userId ?? "board" }));
+  });
+
+  router.post("/tool-connections/:connectionId/composio/apps/:toolkit/accounts", validate(composioAppAccountSchema), async (req, res) => {
+    const connection = await composioAppManager(req, res);
+    if (!connection) return;
+    res.json(await svc.manageComposioAppAccount(connection.id, req.params.toolkit as string, req.body, { actorType: "user", actorId: req.actor.userId ?? "board" }));
+  });
+
+  router.post("/tool-connections/:connectionId/composio/apps/:toolkit/setup", validate(composioAppSetupSchema), async (req, res) => {
+    const connection = await composioAppManager(req, res);
+    if (!connection) return;
+    const result = await svc.setupComposioApp(connection.id, req.params.toolkit as string, req.body,
+      { actorType: "user", actorId: req.actor.userId ?? "board" });
+    res.json(result);
+  });
+
   router.post("/tool-connections/:connectionId/test-calls", validate(toolConnectionTestCallSchema), async (req, res) => {
     assertBoard(req);
     if (!options.toolGateway) {
@@ -2082,6 +2128,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
     const existing = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
     if (!existing) return;
     await assertToolConnectionConfigureAccess(req, existing);
+    if (aiConnectionRouterPluginKey(existing)) throw badRequest("Update this connection pool through its pool settings.");
     const connection = await svc.updateConnection(existing.id, req.body);
     const lifecycleChanges = classifyConnectionUpdate(
       { enabled: existing.enabled, config: existing.config },
@@ -2101,6 +2148,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
         details: {
           status: connection.status,
           enabled: connection.enabled,
+          ...(req.body.agentInstructions !== undefined ? { agentInstructionsChanged: true, agentInstructionsEnabled: connection.agentInstructions?.enabled ?? false } : {}),
           credentialRefCount: (connection.credentialRefs ?? []).length + connection.credentialSecretRefs.length,
         },
       });
@@ -2113,6 +2161,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
           details: {
             status: connection.status,
             enabled: connection.enabled,
+          ...(req.body.agentInstructions !== undefined ? { agentInstructionsChanged: true, agentInstructionsEnabled: connection.agentInstructions?.enabled ?? false } : {}),
             lifecycle: change.lifecycle,
             ...change.details,
           },
@@ -2126,6 +2175,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
     const existing = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
     if (!existing) return;
     await assertToolConnectionConfigureAccess(req, existing);
+    if (aiConnectionRouterPluginKey(existing)) throw badRequest("Remove this connection pool through its revision-checked pool settings.");
     const applicationBefore = await svc.getApplication(existing.applicationId);
     const { connection, removal } = await svc.archiveConnection(
       existing.id,

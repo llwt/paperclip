@@ -11,6 +11,7 @@ import type {
 import type { CodexAppServerTransport } from "../drivers/codex/app-server-transport.js";
 import { CodexAppServerDriver } from "../drivers/codex/codex-app-server-driver.js";
 import type { CodexWorkingDirectoryAuthority } from "../drivers/codex/codex-boundaries.js";
+import { describeRunnerdDotDriver } from "../drivers/dot/runnerd-dot-driver.js";
 import { HarnessDriverBackend } from "./harness-driver-backend.js";
 import {
   nativeSystemInstructions,
@@ -72,7 +73,7 @@ function transportDriverIdentity(input: NativeExecutionInput): {
       return {
         kind: "opencode_server",
         displayName: "OpenCode server",
-        version: "1.18.32",
+        version: "1.18.34",
       };
     case "claude_managed":
       return {
@@ -140,7 +141,6 @@ function createTransportBackedNativeSessionBackend(
         ]
       : []),
     ...nativeTaskConstraints(input),
-    "Return one semantic completion result.",
   ];
 
   return new HarnessDriverBackend(
@@ -203,6 +203,17 @@ function createTransportBackedNativeSessionBackend(
 export function describeRunnerdNativeSessionBackend(
   input: NativeExecutionInput,
 ): Promise<NativeSessionBackendDescriptor> {
+  if (input.schema === "paperclip.native-execution-input.v6") {
+    // Dot uses its dedicated Rust bridge, rather than the JSON-RPC facade.
+    const descriptor = describeRunnerdDotDriver();
+    return Promise.resolve({
+      kind: "runner",
+      name: descriptor.kind,
+      version: descriptor.version,
+      capabilities: descriptor.capabilities,
+      runtimeContextCapabilities: descriptor.runtimeContextCapabilities,
+    });
+  }
   return createTransportBackedNativeSessionBackend(input, {}).descriptor();
 }
 
