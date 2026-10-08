@@ -263,6 +263,76 @@ describe("quote exit", () => {
       expect(shape(editor)).toBe("quote[p(loose) p(kept) p(tail!)]");
     });
 
+    it("keeps a caret in the first of several loose runs where it was", () => {
+      const editor = createTestEditor();
+      update(editor, () => {
+        const quote = richText.$createQuoteNode();
+        quote.append(
+          $createTextNode("a"),
+          $createLineBreakNode(),
+          $createTextNode("b"),
+          $createParagraphNode().append($createTextNode("kept")),
+          $createTextNode("c"),
+          $createLineBreakNode(),
+          $createTextNode("d"),
+        );
+        $getRoot().clear().append(quote);
+        quote.select(2, 2);
+      });
+
+      expect(shape(editor)).toBe("quote[p(a\\nb) p(kept) p(c\\nd)]");
+
+      type(editor, "X");
+      expect(shape(editor)).toBe("quote[p(a\\nXb) p(kept) p(c\\nd)]");
+    });
+
+    it("keeps a caret in a later loose run where it was", () => {
+      const editor = createTestEditor();
+      update(editor, () => {
+        const quote = richText.$createQuoteNode();
+        quote.append(
+          $createTextNode("a"),
+          $createLineBreakNode(),
+          $createTextNode("b"),
+          $createParagraphNode().append($createTextNode("kept")),
+          $createTextNode("c"),
+          $createLineBreakNode(),
+          $createTextNode("d"),
+        );
+        $getRoot().clear().append(quote);
+        quote.select(6, 6);
+      });
+
+      type(editor, "X");
+      expect(shape(editor)).toBe("quote[p(a\\nb) p(kept) p(c\\nXd)]");
+    });
+
+    it("keeps a caret between two paragraphs on the quote, past a wrapped run", () => {
+      const editor = createTestEditor();
+      update(editor, () => {
+        const quote = richText.$createQuoteNode();
+        quote.append(
+          $createTextNode("a"),
+          $createLineBreakNode(),
+          $createTextNode("b"),
+          $createParagraphNode().append($createTextNode("one")),
+          $createParagraphNode().append($createTextNode("two")),
+          $createParagraphNode().append($createTextNode("three")),
+        );
+        $getRoot().clear().append(quote);
+        quote.select(5, 5);
+      });
+
+      expect(shape(editor)).toBe("quote[p(a\\nb) p(one) p(two) p(three)]");
+      update(editor, () => {
+        const selection = $getSelection();
+        if (!$isRangeSelection(selection)) throw new Error("no range selection");
+        expect(selection.anchor.getNode().getType()).toBe("quote");
+        expect(selection.anchor.offset).toBe(3);
+        expect(selection.focus.offset).toBe(3);
+      });
+    });
+
     it("leaves a loaded quote as it is", () => {
       const editor = createTestEditor();
       loadQuote(editor, ["first", "second"]);

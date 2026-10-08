@@ -55,18 +55,18 @@ function $getCaretBlock(): ElementNode | null {
  */
 export function $wrapQuoteInlineChildren(quote: ElementNode): void {
   const children = quote.getChildren();
-  const runs: LexicalNode[][] = [];
+  const runs: { start: number; nodes: LexicalNode[] }[] = [];
   let run: LexicalNode[] | null = null;
-  for (const child of children) {
+  children.forEach((child, index) => {
     if ($isElementNode(child) && !child.isInline()) {
       run = null;
     } else if (run) {
       run.push(child);
     } else {
       run = [child];
-      runs.push(run);
+      runs.push({ start: index, nodes: run });
     }
-  }
+  });
   if (runs.length === 0 && children.length > 0) return;
 
   // A caret anchored on the quote itself counts its children; note which child
@@ -84,16 +84,28 @@ export function $wrapQuoteInlineChildren(quote: ElementNode): void {
     return;
   }
 
-  for (const nodes of runs) {
-    const start = nodes[0].getIndexWithinParent();
+  const paragraphs = runs.map(({ nodes }) => {
     const paragraph = $createParagraphNode();
     nodes[0].insertBefore(paragraph);
     paragraph.append(...nodes);
-    points.forEach((point, index) => {
-      const offset = pointOffsets[index] - start;
-      if (offset >= 0 && offset <= nodes.length) point.set(paragraph.getKey(), offset, "element");
-    });
-  }
+    return paragraph;
+  });
+
+  // Every offset was counted before any run was wrapped, so each point is
+  // placed once from those counts: into the run it touched, or else on the
+  // quote, moved back by the children the earlier runs folded away.
+  points.forEach((point, index) => {
+    const offset = pointOffsets[index];
+    const runIndex = runs.findIndex(({ start, nodes }) => offset >= start && offset <= start + nodes.length);
+    if (runIndex !== -1) {
+      point.set(paragraphs[runIndex].getKey(), offset - runs[runIndex].start, "element");
+      return;
+    }
+    const folded = runs
+      .filter(({ start }) => start < offset)
+      .reduce((count, { nodes }) => count + nodes.length - 1, 0);
+    point.set(quote.getKey(), offset - folded, "element");
+  });
 }
 
 /**
