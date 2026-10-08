@@ -1576,6 +1576,11 @@ async function startServerWithDatabaseTeardown(
         if (swept.cleared > 0) {
           logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
         }
+
+        const healed = await heartbeat.sweepEndedTerminalRunLeases();
+        if (healed.released > 0) {
+          logger.warn({ ...healed }, "startup sweep released environment leases of ended terminal runs");
+        }
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
         throw err;
@@ -1815,6 +1820,12 @@ async function startServerWithDatabaseTeardown(
               const swept = await heartbeat.sweepStaleIssueLocks();
               if (swept.cleared > 0) {
                 logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
+              }
+            })
+            .then(async () => {
+              const healed = await heartbeat.sweepEndedTerminalRunLeases();
+              if (healed.released > 0) {
+                logger.warn({ ...healed }, "periodic sweep released environment leases of ended terminal runs");
               }
             })
             .catch((err) => {

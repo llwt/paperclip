@@ -923,6 +923,14 @@ export function recoveryService(
     ) => boolean;
     liveRunExecutions?: Readonly<{ has(id: string): boolean }>;
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
+    /**
+     * Releases the environment leases of a run the stale-lock sweep just
+     * terminalized, when its execution has verifiably ended. The callee owns
+     * every safety check and never throws.
+     */
+    releaseLeasesForEndedTerminalRun?: (
+      run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
+    ) => Promise<unknown>;
   },
 ) {
   const issuesSvc = issueService(db);
@@ -6147,7 +6155,12 @@ export function recoveryService(
         runReferencedByActiveIssue: runIdsReferencedByActiveIssue.has(row.id),
       });
       runStatusById.set(row.id, outcome.status);
-      if (outcome.terminalized) result.terminalizedRunIds.push(row.id);
+      if (outcome.terminalized) {
+        result.terminalizedRunIds.push(row.id);
+        // This backstop is the run's only finalizer. Without the release the
+        // lease stays active and defers every later wake on the task.
+        await deps.releaseLeasesForEndedTerminalRun?.(row);
+      }
     }
 
     const isCleanable = (runId: string | null) => {
