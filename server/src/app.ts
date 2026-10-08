@@ -856,6 +856,8 @@ export async function createApp(
       deploymentExposure: opts.deploymentExposure,
       authPublicBaseUrl: opts.authPublicBaseUrl,
       trustedLocalStdioRuntimeHost,
+      // Fork-only (NX-617): localhost sign-in uses the port actually bound.
+      oauthLoopbackPort: opts.serverPort,
       toolGateway,
       connectionIntentHeartbeat,
     }),
