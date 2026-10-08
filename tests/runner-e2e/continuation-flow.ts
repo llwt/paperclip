@@ -1,11 +1,11 @@
 import { gradeLifecycleBaseline, type LifecycleCheckpoint } from "./lifecycle-baseline.js";
 import { lifecycleLiveCase, lifecycleLiveContinuation, gradeLifecycleNarrative } from "./lifecycle-live-cases.js";
-import { prepareLegacyContinuationSkill } from "./continuation-fixtures.js";
+import { prepareLegacyContinuationSkill, prepareContinuationBudget } from "./continuation-fixtures.js";
 import { captureFirstTaskAttachments } from "./first-task-attachments.js";
 import { answerableRuntimeRunIds, isSingleClaudeQuestion } from "./runtime-question-readiness.js";
 import { expect, type Page } from "@playwright/test";
 import path from "node:path";
-import { continuationAnswerCommitted, continuationInitialReady } from "./continuation-readiness.js";
+import { continuationAnswerCommitted, continuationInitialReady, continuationCheckpointReady } from "./continuation-readiness.js";
 import { captureLoadedContinuation } from "./continuation-screenshot.js";
 import { seedContinuationContext } from "./continuation-workspace.js";
 import { pollUntil, type RunnerApi } from "./api.js";
@@ -53,6 +53,7 @@ export async function runContinuationFlow(input: {
     ? lifecycleLiveContinuation(execution.task.id, input.nonce)
     : continuationScenario(execution.task.id, input.nonce);
   const checkpoints: LifecycleCheckpoint[] = [];
+  let budgetGuard: Awaited<ReturnType<typeof prepareContinuationBudget>> | undefined;
   let issue: Row | undefined;
   let runs: Row[] = [];
   let checks: ReturnType<typeof gradeContinuation> = [];
@@ -84,6 +85,11 @@ export async function runContinuationFlow(input: {
         const paused = answerableRuntimeRunIds(state.interactions);
         const idle =
           continuationAnswerCommitted(state.interactions, answeredInteractionId) &&
+          continuationCheckpointReady({
+            issue: { status: state.issue.status, executionRunId: state.issue.executionRunId },
+            runs: state.runs.map(r => ({ id: r.id, status: r.status, runtimeMode: r.runtimeMode })),
+            interactions: state.interactions,
+          }) &&
           state.runs.some((r) => !prior.has(r.id) || previousPaused.has(r.id)) &&
           state.runs.every((r) => ["succeeded", "failed", "timed_out", "cancelled"].includes(r.status) ||
             (r.status === "running" && paused.has(r.id))) &&
@@ -91,7 +97,8 @@ export async function runContinuationFlow(input: {
           !state.issue.activeRecoveryAction &&
           (!requireQuestion || continuationInitialReady(state.interactions));
         const key = idle
-          ? state.runs.map((r) => `${r.id}:${r.status}`).join()
+          ? JSON.stringify([state.issue.status, state.issue.executionRunId,
+              state.runs.map(r => [r.id, r.status]), state.interactions.map(i => [i.id, i.status])])
           : "";
         const ready = !!key && key === stable;
         stable = key;
@@ -120,13 +127,14 @@ export async function runContinuationFlow(input: {
     );
   }
   async function snapshot(phase: ContinuationCheckpoint["phase"]) {
-    const [tasks, summaries, comments, interactions, attachments] =
+    const [tasks, summaries, comments, interactions, attachments, activity] =
       await Promise.all([
         api.get<Row[]>(tasksPath),
         api.get<Row[]>(`/api/issues/${issue!.id}/documents`),
         api.get<Row[]>(`/api/issues/${issue!.id}/comments?order=asc`),
         api.get<Row[]>(`/api/issues/${issue!.id}/interactions`),
         captureFirstTaskAttachments(api, [{ id: issue!.id }], input.secrets),
+        api.get<Row[]>(`/api/issues/${issue!.id}/activity`),
       ]);
     const documents = await Promise.all(
       summaries.map((d) =>
@@ -149,12 +157,14 @@ export async function runContinuationFlow(input: {
       ) as ContinuationCheckpoint["children"],
       documents: documents as ContinuationCheckpoint["documents"],
       comments,
+      activity,
       interactions,
       attachments,
       runs: [...runs] as ContinuationCheckpoint["runs"],
     });
     await input.evidence("continuation.json", {
       ...scenario,
+      budgetGuard,
       checkpoints,
       checks,
     });
@@ -219,6 +229,7 @@ export async function runContinuationFlow(input: {
     expect(c.issue.status, "waiting is not complete").not.toBe("done");
   }
   try {
+    budgetGuard = await prepareContinuationBudget(api, fixtures.company.id, fixtures.agent.id);
     if (execution.profile.generation === "legacy") await prepareLegacyContinuationSkill(api, fixtures.company.id, fixtures.agent.id);
     await api.patch("/api/instance/settings/experimental", {
       enableClassicTaskInterface: false,
@@ -288,6 +299,7 @@ export async function runContinuationFlow(input: {
     if (issue) input.observe(issue, runs, checks);
     await input.evidence("continuation.json", {
       ...scenario,
+      budgetGuard,
       checkpoints,
       checks,
     });
