@@ -189,50 +189,6 @@ describe("managed install commands", () => {
     expect(uiPackCall).toBeDefined();
   });
 
-  it("puts the checkout node_modules/.bin on the build PATH so ignore-scripts=true does not hide tsc", async () => {
-    const sha = "f".repeat(40);
-    const runCommand = createGitCheckoutRunCommand(sha);
-    await installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths());
-    const buildCalls = runCommand.mock.calls.filter(([file, args]) => file === "bash" || (file === "corepack" && args.includes("run")));
-    expect(buildCalls.length).toBeGreaterThanOrEqual(2);
-    for (const [file, args, options] of buildCalls) {
-      const workspaceBinDir = path.join(String(options?.cwd), "node_modules", ".bin");
-      expect(String(options?.env?.PATH).split(path.delimiter), `${file} ${args.join(" ")}`).toContain(workspaceBinDir);
-    }
-    // The installer must not switch dependency lifecycle scripts back on.
-    for (const [file, args, options] of runCommand.mock.calls) {
-      expect(args, `${file} ${args.join(" ")}`).not.toContain("--ignore-scripts=false");
-      expect(Object.keys(options?.env ?? {}).map((key) => key.toLowerCase())).not.toContain("npm_config_ignore_scripts");
-    }
-  });
-
-  it("links the embedded PostgreSQL libraries when npm skipped the dependency install script", async () => {
-    const sha = "a1".repeat(20);
-    const baseRunCommand = createGitCheckoutRunCommand(sha);
-    const runCommand = vi.fn(async (file: string, args: string[], options?: Parameters<CommandRunner>[2]) => {
-      const result = await baseRunCommand(file, args, options);
-      if (file === "npm" && args[0] === "install") {
-        // What npm leaves behind under ignore-scripts=true: the library files and the link list, no links.
-        const native = path.join(args[args.indexOf("--prefix") + 1], "node_modules", "@embedded-postgres", "linux-x64", "native");
-        fs.mkdirSync(path.join(native, "lib"), { recursive: true });
-        fs.writeFileSync(path.join(native, "lib", "libpq.so.5.18"), "elf");
-        fs.symlinkSync("libpq.so.5.18", path.join(native, "lib", "libpq.so"));
-        fs.writeFileSync(path.join(native, "pg-symlinks.json"), JSON.stringify([
-          { source: "native/lib/libpq.so.5.18", target: "native/lib/libpq.so" },
-          { source: "native/lib/libpq.so.5.18", target: "native/lib/libpq.so.5" },
-        ]));
-      }
-      return result;
-    });
-    const installed = await installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths());
-    const lib = path.join(installed.payloadPath, "node_modules", "@embedded-postgres", "linux-x64", "native", "lib");
-    expect(fs.readlinkSync(path.join(lib, "libpq.so.5"))).toBe("libpq.so.5.18");
-    expect(fs.readFileSync(path.join(lib, "libpq.so.5"), "utf8")).toBe("elf");
-    expect(hydrateEmbeddedPostgresSymlinks(installed.payloadPath)).toBe(0);
-    fs.writeFileSync(path.join(lib, "..", "pg-symlinks.json"), JSON.stringify([{ source: "native/lib/libpq.so.5.18", target: "../../../escape.so" }]));
-    expect(() => hydrateEmbeddedPostgresSymlinks(installed.payloadPath)).toThrow("Refusing to link outside");
-  });
-
   it("resolves the complete server workspace dependency closure in dependency order", () => {
     const checkout = path.join(root, "checkout");
     const packages = [
@@ -418,4 +374,49 @@ describe("managed install commands", () => {
     expect(runCommand).not.toHaveBeenCalled();
   });
 
+  it("puts the checkout node_modules/.bin on the build PATH so ignore-scripts=true does not hide tsc", async () => {
+    const sha = "f".repeat(40);
+    const runCommand = createGitCheckoutRunCommand(sha);
+    await installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths());
+    const buildCalls = runCommand.mock.calls.filter(([file, args]) => file === "bash" || (file === "corepack" && args.includes("run")));
+    expect(buildCalls.length).toBeGreaterThanOrEqual(2);
+    for (const [file, args, options] of buildCalls) {
+      const workspaceBinDir = path.join(String(options?.cwd), "node_modules", ".bin");
+      expect(String(options?.env?.PATH).split(path.delimiter), `${file} ${args.join(" ")}`).toContain(workspaceBinDir);
+    }
+    // The installer must not switch dependency lifecycle scripts back on.
+    for (const [file, args, options] of runCommand.mock.calls) {
+      expect(args, `${file} ${args.join(" ")}`).not.toContain("--ignore-scripts=false");
+      for (const [key, value] of Object.entries(options?.env ?? {})) {
+        if (key.toLowerCase() === "npm_config_ignore_scripts") expect(value, key).toBe(process.env[key]);
+      }
+    }
+  });
+
+  it("links the embedded PostgreSQL libraries when npm skipped the dependency install script", async () => {
+    const sha = "a1".repeat(20);
+    const baseRunCommand = createGitCheckoutRunCommand(sha);
+    const runCommand = vi.fn(async (file: string, args: string[], options?: Parameters<CommandRunner>[2]) => {
+      const result = await baseRunCommand(file, args, options);
+      if (file === "npm" && args[0] === "install") {
+        // What npm leaves behind under ignore-scripts=true: the library files and the link list, no links.
+        const native = path.join(args[args.indexOf("--prefix") + 1], "node_modules", "@embedded-postgres", "linux-x64", "native");
+        fs.mkdirSync(path.join(native, "lib"), { recursive: true });
+        fs.writeFileSync(path.join(native, "lib", "libpq.so.5.18"), "elf");
+        fs.symlinkSync("libpq.so.5.18", path.join(native, "lib", "libpq.so"));
+        fs.writeFileSync(path.join(native, "pg-symlinks.json"), JSON.stringify([
+          { source: "native/lib/libpq.so.5.18", target: "native/lib/libpq.so" },
+          { source: "native/lib/libpq.so.5.18", target: "native/lib/libpq.so.5" },
+        ]));
+      }
+      return result;
+    });
+    const installed = await installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths());
+    const lib = path.join(installed.payloadPath, "node_modules", "@embedded-postgres", "linux-x64", "native", "lib");
+    expect(fs.readlinkSync(path.join(lib, "libpq.so.5"))).toBe("libpq.so.5.18");
+    expect(fs.readFileSync(path.join(lib, "libpq.so.5"), "utf8")).toBe("elf");
+    expect(hydrateEmbeddedPostgresSymlinks(installed.payloadPath)).toBe(0);
+    fs.writeFileSync(path.join(lib, "..", "pg-symlinks.json"), JSON.stringify([{ source: "native/lib/libpq.so.5.18", target: "../../../escape.so" }]));
+    expect(() => hydrateEmbeddedPostgresSymlinks(installed.payloadPath)).toThrow("Refusing to link outside");
+  });
 });
