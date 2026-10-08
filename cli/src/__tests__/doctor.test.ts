@@ -2,7 +2,21 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// doctor has no seam for the service health check, which would otherwise
+// query the host's service manager and report on the developer's own service.
+vi.mock("../services/service-manager.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/service-manager.js")>("../services/service-manager.js");
+  return {
+    ...actual,
+    detectServiceManager: vi.fn(async () => ({
+      supported: false as const,
+      reason: "No service manager in this test",
+    })),
+  };
+});
+
 import { doctor } from "../commands/doctor.js";
 import { writeConfig } from "../config/store.js";
 import type { PaperclipConfig } from "../config/schema.js";

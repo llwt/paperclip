@@ -29,6 +29,20 @@ import { systemdServiceName } from "../services/service-manager.js";
 
 const ORIGINAL_ENV = { ...process.env };
 
+// uninstallCommand looks up the host's service manager and its unit directory
+// unless both are injected. os.homedir() ignores the HOME set in beforeEach, so
+// the default unit directory is the real one.
+function withoutServiceManager() {
+  return {
+    detectServiceManager: vi.fn(async () => ({
+      supported: false as const,
+      reason: "No service manager in this test",
+    })),
+    platform: "linux" as const,
+    userHomeDir: process.env.HOME!,
+  };
+}
+
 describe("managed install commands", () => {
   let root: string;
 
@@ -335,7 +349,9 @@ describe("managed install commands", () => {
     fs.mkdirSync(paths.cliRoot, { recursive: true });
     fs.writeFileSync(unrelatedFile, "keep");
 
-    await expect(uninstallCommand()).rejects.toThrow("unverified install store");
+    const dependencies = withoutServiceManager();
+    await expect(uninstallCommand(dependencies)).rejects.toThrow("unverified install store");
+    expect(dependencies.detectServiceManager).toHaveBeenCalledOnce();
     expect(fs.readFileSync(unrelatedFile, "utf8")).toBe("keep");
   });
 
@@ -355,12 +371,14 @@ describe("managed install commands", () => {
       previous: [],
     }, paths);
 
+    const dependencies = withoutServiceManager();
     await withInstallStoreLock(
       async () => {
-        await expect(uninstallCommand()).rejects.toThrow("already running");
+        await expect(uninstallCommand(dependencies)).rejects.toThrow("already running");
       },
       paths,
     );
+    expect(dependencies.detectServiceManager).toHaveBeenCalledOnce();
     expect(fs.existsSync(paths.lockPath)).toBe(false);
   });
 
