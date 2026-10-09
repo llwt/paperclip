@@ -9,9 +9,9 @@ and this fork is retired.
   protected: GitHub accepts a change only through a pull request with a green
   `nrwl-ci` and rejects every direct push (see "CI gate").
 - `master` is a pure mirror of upstream `master`. Never commit to it.
-- Fork-only files: this file, `.github/workflows/nrwl-ci.yml` and
-  `scripts/nrwl-ci-server-other.mjs`. Everything
-  else is upstream code plus the patches listed below.
+- Fork-only files: this file, `.github/workflows/nrwl-ci.yml`,
+  `scripts/nrwl-ci-server-other.mjs` and the files named under "Localhost
+  sign-in". Everything else is upstream code plus the patches listed below.
 
 ## Inventory of fork-only commits
 
@@ -30,9 +30,11 @@ the merge; what is left of each is the diff of `nrwl-main` against the tag.
 | `0fc5dd88b` | UI: remount the composer takeover card per pending input (fork PR #1) | Open upstream as paperclipai/paperclip#15121, no review yet | #15121 lands and that release is merged |
 | `200a198f0` | Tools: offer sign-in when a custom MCP server answers 401 without `WWW-Authenticate` (fork PR #2) | Open upstream as paperclipai/paperclip#15450, from port branch `fix/mcp-401-sign-in-without-challenge` (`e0ffbf2f6`) | #15450 lands and that release is merged |
 | fork PR #12 | Tools: the `x-amzn-remapped-www-authenticate` hint is reduced to its metadata address, so endpoints and scopes it names directly are dropped (`metadataOnlyChallenge`) | Open upstream as part of paperclipai/paperclip#15450 (port branch commits `9f13a7dc8` and `e0ffbf2f6`) | #15450 lands and that release is merged |
+| fork PR #6 | UI: Enter on an empty last line of a quote block, and Backspace at its start, leave the quote in the editor (`ui/src/lib/quote-exit.ts`) | Not submitted. Port branch `fix/editor-leave-quote-block` (`eecb1eec6`) is ready | The upstream PR from that port branch lands and that release is merged |
 | fork PR #7 | CLI: `install --ref` builds `server/ui-dist`, copies `skills`, stages real workspace dependency versions, and works with `ignore-scripts=true` (see "Install") | Not submitted. Upstream `master` (`a1ab55a56`) has the same code. Upstream issue #15026 and open upstream PR #13928 cover the staging faults, not the `ignore-scripts` ones. Port branch `nx-509-git-install-upstream` is ready, local only on chungus | The upstream PR from that port branch lands and that release is merged |
 | fork PR #14 | Recovery: release the local environment lease of a terminal run once its process is gone (stale-lock sweep, cancel without a process handle, healing sweep at startup and on the recovery tick). Without it a run kept across a restart, or orphaned by a hard stop, blocks every later wake on its task | Not submitted. Upstream `master` has the same gap as of `v2026.1005.0`. Upstream PR text is prepared on NX-612 | The upstream PR lands and that release is merged |
 | fork PR #17 | Documents: same-company agents can upsert documents on another agent's idle issue; access decisions, the active run lock, recovery restrictions, revision checks and document locks still apply | Not submitted. Upstream `master` (`71cd0a262`) still lacks the open-write option as of 2026-10-08. Upstream PR text is prepared on NX-657 | The upstream fix lands and that release is merged |
+| NX-617 (this PR) | Tools: per-connection "Sign in through localhost" and "Scopes to request" for a pasted MCP URL (see "Localhost sign-in") | Not submitted. Upstream PR text is prepared on NX-617, no port branch yet | An upstream release carries an equivalent setting, or the Atlassian connection no longer needs a localhost callback |
 | fork PR #3, fork files | `FORK.md`, `.github/workflows/nrwl-ci.yml` and `scripts/nrwl-ci-server-other.mjs` | Fork-only by design, will not go upstream | The fork is retired |
 
 To refresh this table:
@@ -44,6 +46,82 @@ git cherry upstream/master fork/nrwl-main           # "-" means upstream has it
 git rev-list --left-right --count fork/nrwl-main...upstream/master
 gh pr view <number> -R paperclipai/paperclip        # each upstream PR
 ```
+
+## Localhost sign-in
+
+Two settings on a connection to a pasted MCP URL, both off by default, under
+"Advanced authentication" in the setup form (create and reconnect):
+
+- **Sign in through localhost.** The sign-in uses
+  `http://localhost:<server port>/api/tools/oauth/callback` as callback instead
+  of the public address. For an authorization server that refuses the public
+  address but accepts loopback (Atlassian for the Nx organization).
+- **Scopes to request.** The sign-in asks for exactly this list. Without it a
+  pasted URL asks for every scope the server advertises.
+
+How it works:
+
+- The browser that signs in reaches the callback through a port forward
+  (`ssh -L <port>:127.0.0.1:<port> <host>`), where it has no Paperclip session.
+  The callback handler answers such a request (no signed-in actor, `Host`
+  exactly `localhost` or `127.0.0.1`, no `X-Forwarded-Host`, exact path) with a
+  page that sends the browser to the same path on the configured public
+  address. That address must be HTTPS and not loopback. Nothing from the
+  request goes into the target origin. No state is looked up and no code is
+  exchanged on that hop. This relay is the one part that is not per
+  connection: it answers any such request, whatever connection it belongs to.
+- A localhost attempt carries its own snapshot in its OAuth `state`
+  (`lb2.<port>.<client binding>.<random>`). The callback rebuilds the localhost
+  address from that port, so the token request names the address the
+  authorization request named even if another process or a restarted server on
+  another port handles it, and it refuses if the connection's client changed
+  since the start. A dotted state in a format the server cannot read (for
+  example one started before an upgrade) is refused and needs a fresh sign-in.
+  There is no database column for this on purpose: upstream already has later
+  migrations than the fork.
+- With a scope list, a caller can only narrow it, the list is stored as the
+  connection's scopes, and a grant wider than the request is not saved.
+- The settings belong to the setup form. The tool access service wraps its
+  database handle (`withOAuthSignInPreservingWrites`, first statement of
+  `toolAccessService`), so every update of a connection's `config` or
+  `transportConfig` made through it, in or out of a transaction, takes the two
+  settings from the row as it is at the moment of the update, not from the copy
+  the operation read earlier. That covers client registration, start, callback,
+  renewal, catalog refresh and discovery without a change at the write itself.
+  Only the setup form's connect request and its undo store a config as given
+  (`ownedConnectionConfig`, four uses). The legacy token backfill wraps its
+  handle the same way. The callback also locks the connection row and rechecks
+  the attempt before it stores credentials. A test asserts the wrap, the four
+  owned writes and the absence of raw SQL updates.
+- The config schema accepts any JSON under `oauth`, and only an object can hold
+  the settings. A write whose `oauth` is an object loses its own copies of the
+  two keys and gets the row's, also when the row has none. A write whose
+  `oauth` is missing, JSON null, a scalar or an array is stored unchanged when
+  the row has no settings; when the row has settings, `oauth` becomes an object
+  holding just those settings and every other field is stored as written.
+- What the wrap does not cover: a `set` whose config value is a SQL expression,
+  raw SQL, an upsert (`insert ... onConflictDoUpdate`) and a database handle
+  that was not wrapped. None of these writes a connection's config today. A
+  write of that kind added by an upstream merge is not protected, so audit the
+  writers of `tool_connections.config` and `transportConfig` at every upstream
+  merge.
+- Not available for curated apps, Vercel-backed or brokered sign-ins.
+
+Files: `packages/shared/src/oauth-sign-in-settings.ts`,
+`server/src/services/tool-oauth-sign-in.ts`,
+`server/src/services/tool-oauth-sign-in-writes.ts`,
+`server/src/__tests__/tool-oauth-loopback.test.ts`,
+`ui/src/features/connections/OAuthSignInSettingsFields.tsx`,
+`ui/src/features/connections/oauth-sign-in-settings.ts` and their tests are
+fork-only. The wiring in upstream-owned files is marked "Fork-only (NX-617)" or
+"Differs from upstream (fork, NX-617)": `server/src/services/tool-access.ts`
+(`toolAccessService` first statement, `startOAuth`, `completeOAuthCallback`,
+`connectGalleryApp`), `server/src/services/tool-oauth-legacy-backfill.ts` (two
+lines),
+`server/src/routes/tool-access.ts` (callback handler), `server/src/app.ts`,
+`packages/shared/src/validators/tool-access.ts`, `packages/shared/src/index.ts`
+and `ui/src/features/connections/ConnectionSetupFlow.tsx`. On a release merge,
+keep those marked blocks and rerun `tool-oauth-loopback.test.ts`.
 
 ## Rules for a change to `nrwl-main`
 

@@ -5,6 +5,19 @@ import { browserUseService } from "./browser-use.js";
 import { COGNEE_STDIO_TEMPLATE, cogneeCloudUrl } from "./cognee-connection.js";
 import { isMemoryConnectorId, isRemoteMcpConnectorMethod, connectionPurposeTransportSchema } from "@paperclipai/shared";
 import { instanceSettingsService } from "./instance-settings.js";
+// Fork-only (llwt/paperclip, NX-617): localhost sign-in and requested scopes.
+import { oauthSignInSettingsActive, readOAuthSignInSettings } from "@paperclipai/shared";
+import {
+  loopbackOAuthRedirectUri,
+  loopbackOAuthState,
+  loopbackOAuthStateMatchesClient,
+  nextOAuthSignInSettings,
+  oauthSignInSettingsConfig,
+  parseLoopbackOAuthState,
+  recheckOAuthSignIn,
+  resolveGenericOAuthScopes,
+} from "./tool-oauth-sign-in.js";
+import { ownedConnectionConfig, withOAuthSignInPreservingWrites } from "./tool-oauth-sign-in-writes.js";
 import { githubBotRequest } from "./chat-github-client.js";
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
 import {
@@ -650,6 +663,12 @@ type ToolAccessServiceOptions = {
   catalogCacheTtlMs?: number;
   /** Test seam for deciding whether an OAuth client metadata URL is publicly resolvable. */
   oauthClientMetadataLookup?: RemoteHttpEndpointLookup;
+  /**
+   * Fork-only (NX-617): the port this server listens on, for connections that
+   * sign in through `http://localhost:<port>`. Unset means that switch cannot
+   * be used.
+   */
+  oauthLoopbackPort?: number | null;
   /** Test seam for deterministic remote endpoint resolution. Production uses DNS. */
   remoteHttpEndpointLookup?: RemoteHttpEndpointLookup;
   /** Test seam for protocol fixtures. Production uses the DNS-pinned transport. */
@@ -3026,6 +3045,10 @@ export function toolAccessService(
   db: Db,
   options: ToolAccessServiceOptions = {},
 ) {
+  // Differs from upstream (fork, NX-617): every update of a connection's config
+  // made through this handle keeps the sign-in settings the row has at that
+  // moment. See tool-oauth-sign-in-writes.ts.
+  db = withOAuthSignInPreservingWrites(db);
   const secrets = secretService(db);
 
   async function resolvedRemoteEndpoint(
@@ -12188,6 +12211,29 @@ export function toolAccessService(
         clientCompanyId: companyId,
       };
     }
+    // Differs from upstream (fork, NX-617): the sign-in settings are stored
+    // before the first authorization starts, and a reconnect of the same
+    // endpoint keeps them unless the form changes them. Upstream builds a fresh
+    // config here, which would drop them.
+    const retainedSignInConfig = asRecord(retainedConnection?.config);
+    const signInSettings = nextOAuthSignInSettings(
+      input.oauthSignIn,
+      retainedConnection &&
+        !retainedSignInConfig.sourceTemplateKey &&
+        retainedSignInConfig.url === (config as { url?: unknown }).url
+        ? retainedSignInConfig.oauth
+        : null,
+    );
+    if (oauthSignInSettingsActive(signInSettings)) {
+      assertOAuthSignInSettingsSupported(
+        { transport, credentialSource },
+        galleryEntry,
+      );
+      config.oauth = {
+        ...asRecord(config.oauth),
+        ...oauthSignInSettingsConfig(signInSettings),
+      };
+    }
     if (isGoogleSheetsRobotMethod) {
       const availability = googleSheetsRobotEmailFromEnv();
       if (!availability.available) {
@@ -12519,8 +12565,10 @@ export function toolAccessService(
             transport,
             status: "draft",
             enabled: false,
-            config,
-            transportConfig: config,
+            // Differs from upstream (fork, NX-617): this is the writer that owns
+            // the sign-in settings, so its config is stored as given.
+            config: ownedConnectionConfig(config),
+            transportConfig: ownedConnectionConfig(config),
             credentialRefs,
             credentialSecretRefs: connectionCredentialSecretRefs,
             credentialSource,
@@ -12952,8 +13000,10 @@ export function toolAccessService(
                   transport: revivedConnectionPrevious.transport,
                   status: revivedConnectionPrevious.status,
                   enabled: revivedConnectionPrevious.enabled,
-                  config: revivedConnectionPrevious.config,
-                  transportConfig: revivedConnectionPrevious.transportConfig,
+                  // Differs from upstream (fork, NX-617): undoing the write
+                  // above restores the earlier sign-in settings too.
+                  config: ownedConnectionConfig(revivedConnectionPrevious.config),
+                  transportConfig: ownedConnectionConfig(revivedConnectionPrevious.transportConfig),
                   credentialRefs: revivedConnectionPrevious.credentialRefs,
                   credentialSecretRefs:
                     revivedConnectionPrevious.credentialSecretRefs,
@@ -13879,6 +13929,105 @@ export function toolAccessService(
     return { ...health, connection: refresh.connection };
   }
 
+  /**
+   * Fork-only (NX-617). Called inside the transaction that stores a sign-in's
+   * credentials. It locks the connection row, so a settings change either
+   * committed before this point and is checked here, or waits until the
+   * credentials are stored. An attempt that no longer fits the settings, or a
+   * grant wider than the request, stores nothing.
+   */
+  async function lockAndRecheckOAuthSignIn(
+    tx: Pick<Db, "select">,
+    input: {
+      connection: typeof toolConnections.$inferSelect;
+      stateRow: typeof toolOauthStates.$inferSelect;
+      loopbackAttempt: boolean;
+      grantedScope: unknown;
+    },
+  ) {
+    const [latest] = await tx
+      .select({ config: toolConnections.config })
+      .from(toolConnections)
+      .where(
+        and(
+          eq(toolConnections.id, input.connection.id),
+          eq(toolConnections.companyId, input.connection.companyId),
+        ),
+      )
+      .limit(1)
+      .for("update");
+    if (!latest) throw notFound("Tool connection not found");
+    const problem = recheckOAuthSignIn({
+      latestOauth: asRecord(asRecord(latest.config).oauth),
+      startedWithOauth: oauthConfig(input.connection),
+      attemptScopes: normalizeOauthScopes(input.stateRow.requestedScopes),
+      loopbackAttempt: input.loopbackAttempt,
+      grantedScope: input.grantedScope,
+    });
+    if (problem?.kind === "changed") {
+      throw conflict(
+        "This connection's sign-in settings changed after the sign-in started. Start the sign-in again.",
+        { code: "oauth_sign_in_settings_changed" },
+      );
+    }
+    if (problem?.kind === "overgrant") {
+      throw unprocessable(
+        "The authorization server granted scopes this connection did not ask for, so the sign-in was not saved.",
+        { code: "oauth_granted_scope_outside_request", scopes: problem.scopes },
+      );
+    }
+  }
+
+  /** Fork-only (NX-617). The state of a localhost attempt, with its port and client. */
+  function requireLoopbackOAuthState(clientId: string): string {
+    requireLoopbackOAuthRedirectUri();
+    const state = loopbackOAuthState(
+      randomOauthToken(),
+      clientId,
+      options.oauthLoopbackPort as number,
+    );
+    if (!state) throw unprocessable("Sign-in through localhost is not available.", {
+      code: "oauth_loopback_redirect_unavailable",
+    });
+    return state;
+  }
+
+  /** Fork-only (NX-617). */
+  function requireLoopbackOAuthRedirectUri(): string {
+    const redirectUri = loopbackOAuthRedirectUri(options.oauthLoopbackPort);
+    if (!redirectUri) {
+      throw unprocessable(
+        "This Paperclip does not know its own port, so sign-in through localhost is not available.",
+        { code: "oauth_loopback_redirect_unavailable" },
+      );
+    }
+    return redirectUri;
+  }
+
+  /**
+   * Fork-only (NX-617). The settings apply to direct OAuth against a pasted
+   * remote MCP URL. A curated app keeps its reviewed scopes and callback rules,
+   * and brokered sign-ins have callback addresses of their own.
+   */
+  function assertOAuthSignInSettingsSupported(
+    connection: Pick<
+      typeof toolConnections.$inferSelect,
+      "transport" | "credentialSource"
+    >,
+    galleryEntry: AppDefinition | null,
+  ) {
+    if (
+      galleryEntry ||
+      connection.transport !== "mcp_remote" ||
+      connection.credentialSource === "vercel_connect"
+    ) {
+      throw badRequest(
+        "Sign-in through localhost and a custom scope list are only available for a custom MCP server address.",
+        { code: "oauth_sign_in_settings_unsupported" },
+      );
+    }
+  }
+
   async function startOAuth(
     companyId: string,
     connectionId: string,
@@ -13905,12 +14054,37 @@ export function toolAccessService(
     const galleryEntry = sourceTemplateKey
       ? getConnectableAppDefinition(sourceTemplateKey)
       : null;
+    // Differs from upstream (fork, NX-617): a connection may sign in through
+    // this server's localhost callback and may pin the scopes it asks for.
+    // With neither setting stored, everything below runs as upstream wrote it.
+    const signInSettings = readOAuthSignInSettings(oauthConfig(connection));
+    if (oauthSignInSettingsActive(signInSettings)) {
+      assertOAuthSignInSettingsSupported(connection, galleryEntry);
+    }
+    if (signInSettings.loopbackRedirect) {
+      input = { ...input, redirectUri: requireLoopbackOAuthRedirectUri() };
+    }
     assertOAuthRedirectConstraints(galleryEntry, input.redirectUri);
     const galleryMethod = galleryEntry
       ? connectionMethodForConnection(galleryEntry, connection)
       : null;
     const requestedScopes = (() => {
-      if (!galleryMethod) return input.scopes ?? null;
+      if (!galleryMethod) {
+        const resolved = resolveGenericOAuthScopes(
+          signInSettings.requestedScopes,
+          input.scopes,
+        );
+        if (resolved.ok) return resolved.scopes;
+        throw badRequest(
+          resolved.reason === "widened"
+            ? "Requested OAuth scopes are not in this connection's scope list"
+            : "This connection has a scope list, so a sign-in must request at least one scope",
+          {
+            code: "oauth_scope_widening_rejected",
+            scopes: resolved.reason === "widened" ? resolved.scopes : [],
+          },
+        );
+      }
       const allowed = normalizeOauthScopes(galleryMethod.defaults?.scopesHint);
       if (!input.scopes) return allowed;
       const requested = normalizeOauthScopes(input.scopes);
@@ -14199,7 +14373,12 @@ export function toolAccessService(
       .delete(toolOauthStates)
       .where(lt(toolOauthStates.expiresAt, new Date()));
 
-    const state = randomOauthToken();
+    // Differs from upstream (fork, NX-617): a localhost attempt records that
+    // fact and its client in the state itself, so the callback exchanges the
+    // code with the same callback address and client this request names.
+    const state = signInSettings.loopbackRedirect
+      ? requireLoopbackOAuthState(client.clientId)
+      : randomOauthToken();
     const codeVerifier = randomOauthToken(48);
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
     const binding = starterBinding;
@@ -14251,9 +14430,12 @@ export function toolAccessService(
     // method either sends its reviewed hint or omits scope entirely. Generic
     // MCP URLs retain discovery-first behavior because Paperclip has no manifest
     // against which it could safely judge the caller's requested scope.
+    // Differs from upstream (fork, NX-617): `requestedScopes` instead of
+    // `input.scopes`. They are the same value unless the connection has its own
+    // scope list, which then replaces the discovered one.
     const authorizationScopes = galleryMethod
       ? (requestedScopes ?? [])
-      : (input.scopes ?? endpoints.scopes);
+      : (requestedScopes ?? endpoints.scopes);
     if (authorizationScopes.length > 0)
       authorizationUrl.searchParams.set("scope", authorizationScopes.join(" "));
     const reviewedAuthorizationParams =
@@ -14395,7 +14577,11 @@ export function toolAccessService(
         // Curated apps persist only the reviewed scopes attached to this OAuth
         // state. Discovery metadata can advertise a provider's entire scope
         // universe and must never silently become Paperclip's requested set.
-        scopes: galleryMethod ? (requestedScopes ?? []) : endpoints.scopes,
+        // Differs from upstream (fork, NX-617): a connection with its own scope
+        // list stores that list, so a renewal never asks for the discovered set.
+        scopes: galleryMethod
+          ? (requestedScopes ?? [])
+          : (signInSettings.requestedScopes ?? endpoints.scopes),
         codeChallengeMethodsSupported:
           endpoints.codeChallengeMethodsSupported ?? [],
         tokenEndpointAuthMethodsSupported:
@@ -15455,6 +15641,44 @@ export function toolAccessService(
     const galleryEntry = sourceTemplateKey
       ? getConnectableAppDefinition(sourceTemplateKey)
       : null;
+    // Differs from upstream (fork, NX-617): an attempt that started with the
+    // localhost switch exchanges its code with the localhost callback address,
+    // whatever address this request arrived on and whatever the switch says
+    // now. Every other attempt keeps the address the route computed.
+    const parsedAttempt = parseLoopbackOAuthState(stateRow.state);
+    const loopbackAttempt = parsedAttempt?.kind === "loopback" ? parsedAttempt : null;
+    // The address is rebuilt from the port the attempt started with, not from
+    // this process's port: the token request must name the address the
+    // authorization request named.
+    const attemptRedirectUri = loopbackAttempt
+      ? loopbackOAuthRedirectUri(loopbackAttempt.port)
+      : null;
+    if (parsedAttempt && !attemptRedirectUri) {
+      // A localhost attempt in a format this version cannot read, for example
+      // one started before an upgrade. It is spent; the next one works.
+      throw conflict(
+        "This sign-in was started by a different Paperclip version. Start the sign-in again.",
+        { code: "oauth_sign_in_restart_required" },
+      );
+    }
+    if (attemptRedirectUri) {
+      input = { ...input, redirectUri: attemptRedirectUri };
+    }
+    const signInSettings = readOAuthSignInSettings(oauthConfig(connection));
+    if (signInSettings.requestedScopes) {
+      // The list may have been narrowed after this attempt started. An older,
+      // wider attempt must not complete against the narrower setting.
+      const attemptScopes = normalizeOauthScopes(stateRow.requestedScopes);
+      if (
+        attemptScopes.length === 0 ||
+        attemptScopes.some((scope) => !signInSettings.requestedScopes!.includes(scope))
+      ) {
+        throw conflict(
+          "This connection's scope list changed after the sign-in started. Start the sign-in again.",
+          { code: "oauth_sign_in_settings_changed" },
+        );
+      }
+    }
     assertOAuthRedirectConstraints(galleryEntry, input.redirectUri);
     const endpoints = await oauthEndpointsForConnection(
       connection,
@@ -15471,6 +15695,17 @@ export function toolAccessService(
       throw unprocessable(
         `OAuth client id is not configured for ${endpoints.provider}`,
       );
+    if (
+      loopbackAttempt &&
+      !loopbackOAuthStateMatchesClient(loopbackAttempt, client.clientId)
+    ) {
+      // A later sign-in start registered a different client. A code issued to
+      // the earlier client is never sent with the new one.
+      throw conflict(
+        "This connection's sign-in details changed after the sign-in started. Start the sign-in again.",
+        { code: "oauth_sign_in_settings_changed" },
+      );
+    }
 
     const token = await exchangeOAuthToken({
       tokenUrl: endpoints.tokenUrl,
@@ -15514,6 +15749,13 @@ export function toolAccessService(
             "Your company membership no longer permits connection changes. Ask a company owner to restore non-viewer access before you authorize this connection again.",
           );
         }
+        // Differs from upstream (fork, NX-617).
+        await lockAndRecheckOAuthSignIn(tx, {
+          connection,
+          stateRow,
+          loopbackAttempt: Boolean(loopbackAttempt),
+          grantedScope: token.scope,
+        });
         const txSecrets = secretService(tx);
         const txSecretContext = { dbClient: tx, secretClient: txSecrets };
 
@@ -15803,6 +16045,13 @@ export function toolAccessService(
           "Your company membership no longer permits connection changes. Ask a company owner to restore non-viewer access before you authorize this connection again.",
         );
       }
+      // Differs from upstream (fork, NX-617).
+      await lockAndRecheckOAuthSignIn(tx, {
+        connection,
+        stateRow,
+        loopbackAttempt: Boolean(loopbackAttempt),
+        grantedScope: token.scope,
+      });
       const roleCanManage =
         membership.membershipRole === "owner" ||
         membership.membershipRole === "admin";

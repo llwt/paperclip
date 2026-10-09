@@ -1124,6 +1124,7 @@ describe("agent issue mutation checkout ownership", () => {
       .send({ format: "markdown", body: "# Hidden" });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details?.code).toBe("issue_write_not_visible");
     expect(mockDocumentService.upsertIssueDocument).not.toHaveBeenCalled();
   });
 

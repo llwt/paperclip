@@ -57,6 +57,7 @@ import {
 } from "../lib/angle-bracket-markdown";
 import { unescapeBlockquoteMarkers } from "../lib/blockquote-markdown";
 import { pasteNormalizationPlugin } from "../lib/paste-normalization";
+import { quoteExitPlugin } from "../lib/quote-exit";
 import { cn } from "../lib/utils";
 import { useEditorAutocomplete, type SlashCommandOption } from "../context/EditorAutocompleteContext";
 
@@ -964,6 +965,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
       headingsPlugin(),
       listsPlugin(),
       quotePlugin(),
+      quoteExitPlugin(),
       tablePlugin(),
       linkPlugin({ validateUrl: isSafeMarkdownLinkUrl }),
       linkDialogPlugin(),
