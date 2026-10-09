@@ -9,6 +9,7 @@ import {
   instanceUserRoles,
   issueQuestionResponseDeliveries,
   companies,
+  completionContracts,
   createDb,
   documentRevisions,
   documents,
@@ -21,6 +22,8 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  nativeRunFinalizations,
+  nativeRunResults,
   projectWorkspaces,
   projects,
   workspaceOperations,
@@ -60,7 +63,10 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     await db.delete(documentRevisions);
     await db.delete(documents);
     await db.delete(issueRelations);
+    await db.delete(nativeRunFinalizations);
+    await db.delete(nativeRunResults);
     await db.delete(heartbeatRuns);
+    await db.delete(completionContracts);
     await db.delete(workspaceOperations);
     await db.delete(issues);
     await db.delete(executionWorkspaces);
@@ -4646,14 +4652,73 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       expect(row?.status).toBe("pending");
     });
 
-    it("refuses request_confirmation accept when an ended native run has not recorded a workspace_finalize", async () => {
-      // Native finalization can be resumed after the run ended, so the missing
-      // finalize can still arrive for a native run.
+    // Binds the source run to a native finalization coordinator row, the record
+    // the native finalization reconciler reads to resume a workspace finalize.
+    async function seedNativeFinalization(input: {
+      companyId: string;
+      issueId: string;
+      runId: string;
+      phase: string;
+    }) {
+      const contractId = randomUUID();
+      const resultId = randomUUID();
+      await db.insert(completionContracts).values({
+        id: contractId,
+        companyId: input.companyId,
+        issueId: input.issueId,
+        revision: 1,
+        schemaVersion: "paperclip.completion-contract.v1",
+        policyVersion: "phase6-v1",
+        risk: "standard",
+        completionAuthority: "server_arbiter",
+        incompleteCriteriaPolicy: "preserve_non_terminal",
+        contractJson: { revision: "accept-gate-v1", criteria: [] },
+        canonicalSha256: `contract:${contractId}`,
+        createdByActorType: "system",
+        createdByActorId: "accept-gate-fixture",
+      });
+      await db
+        .update(heartbeatRuns)
+        .set({
+          nativeIssueId: input.issueId,
+          completionContractId: contractId,
+          completionContractSha256: `contract:${contractId}`,
+        })
+        .where(eq(heartbeatRuns.id, input.runId));
+      await db.insert(nativeRunResults).values({
+        id: resultId,
+        companyId: input.companyId,
+        issueId: input.issueId,
+        runId: input.runId,
+        completionContractId: contractId,
+        serverFingerprint: `fingerprint:${resultId}`,
+        schemaStatus: "accepted",
+        resultJson: {},
+        canonicalSha256: `result:${resultId}`,
+      });
+      await db.insert(nativeRunFinalizations).values({
+        runId: input.runId,
+        companyId: input.companyId,
+        issueId: input.issueId,
+        phase: input.phase,
+        resultId,
+      });
+    }
+
+    it("refuses request_confirmation accept when an ended native run can still resume its workspace_finalize", async () => {
+      // The run has an accepted result and has not reached `terminal_failure`,
+      // so the native finalization reconciler can still record the finalize.
       const { companyId, executionWorkspaceId, issueId, goalId, interactionId, sourceRunId } =
         await seedAcceptGateFixture({
           sourceRunStatus: "succeeded",
           sourceRunRuntimeMode: "native",
         });
+      await seedNativeFinalization({
+        companyId,
+        issueId,
+        runId: sourceRunId!,
+        phase: "result_accepted",
+      });
 
       await db.insert(workspaceOperations).values({
         companyId,
@@ -4677,6 +4742,75 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
           "the run that created this interaction has not finished syncing its workspace",
         ),
         details: { executionWorkspaceId, sourceRunId },
+      });
+    });
+
+    it("allows request_confirmation accept when an ended native run reached terminal_failure without a workspace_finalize", async () => {
+      // The reconciler does not admit a `terminal_failure` run, so the finalize
+      // will not arrive.
+      const { companyId, executionWorkspaceId, issueId, goalId, interactionId, sourceRunId } =
+        await seedAcceptGateFixture({
+          sourceRunStatus: "failed",
+          sourceRunRuntimeMode: "native",
+        });
+      await seedNativeFinalization({
+        companyId,
+        issueId,
+        runId: sourceRunId!,
+        phase: "terminal_failure",
+      });
+
+      await db.insert(workspaceOperations).values({
+        companyId,
+        executionWorkspaceId,
+        heartbeatRunId: sourceRunId,
+        phase: "worktree_prepare",
+        status: "succeeded",
+        startedAt: new Date("2026-05-23T22:00:00.000Z"),
+      });
+
+      const accepted = await interactionsSvc.acceptInteraction(
+        { id: issueId, companyId, goalId, projectId: null },
+        interactionId,
+        {},
+        { userId: "local-board" },
+      );
+
+      expect(accepted.interaction).toMatchObject({
+        id: interactionId,
+        status: "accepted",
+      });
+    });
+
+    it("allows request_confirmation accept when an ended native run has no finalization to resume", async () => {
+      // No native finalization row: the reconciler has nothing to resume, so the
+      // run is as stuck as an ended legacy run.
+      const { companyId, executionWorkspaceId, issueId, goalId, interactionId, sourceRunId } =
+        await seedAcceptGateFixture({
+          sourceRunStatus: "failed",
+          sourceRunErrorCode: "process_lost",
+          sourceRunRuntimeMode: "native",
+        });
+
+      await db.insert(workspaceOperations).values({
+        companyId,
+        executionWorkspaceId,
+        heartbeatRunId: sourceRunId,
+        phase: "worktree_prepare",
+        status: "succeeded",
+        startedAt: new Date("2026-05-23T22:00:00.000Z"),
+      });
+
+      const accepted = await interactionsSvc.acceptInteraction(
+        { id: issueId, companyId, goalId, projectId: null },
+        interactionId,
+        {},
+        { userId: "local-board" },
+      );
+
+      expect(accepted.interaction).toMatchObject({
+        id: interactionId,
+        status: "accepted",
       });
     });
 
