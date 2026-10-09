@@ -2529,6 +2529,31 @@ export async function heartbeatRunIsTerminalOrMissing(
 }
 
 /**
+ * Whether a run that has recorded no `workspace_finalize` operation can no
+ * longer record one. True once the run is terminal or missing, except for
+ * native-runtime runs: the native finalization reconciler can still record
+ * `workspace_finalize` for a run that has already ended.
+ */
+async function heartbeatRunCanNoLongerRecordWorkspaceFinalize(
+  dbOrTx: Pick<Db, "select">,
+  runId: string,
+): Promise<boolean> {
+  const run = await dbOrTx
+    .select({
+      status: heartbeatRuns.status,
+      runtimeMode: heartbeatRuns.runtimeMode,
+    })
+    .from(heartbeatRuns)
+    .where(eq(heartbeatRuns.id, runId))
+    .then(
+      (rows: Array<{ status: string; runtimeMode: string }>) => rows[0] ?? null,
+    );
+  if (!run) return true;
+  if (run.runtimeMode === "native") return false;
+  return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+}
+
+/**
  * Returns whether a specific run's sync-back on a specific execution workspace
  * has settled — i.e. the accept/review gates that guard against a still-in-flight
  * worktree sync no longer need to block on this run.
@@ -2537,7 +2562,12 @@ export async function heartbeatRunIsTerminalOrMissing(
  * - No operations recorded → settled. The run never touched the workspace state
  *   the gates protect.
  * - Earlier phases recorded but no `workspace_finalize` yet → NOT settled. The
- *   sync-back hasn't been attempted; the gate should wait for it.
+ *   sync-back hasn't been attempted; the gate should wait for it — unless the
+ *   owning run has itself ended (or no longer exists). An ended run never writes
+ *   the missing record (the process was lost, or setup failed before the
+ *   sync-back), so waiting would wedge the gate forever. Native-runtime runs are
+ *   the exception: their finalization can be resumed after the run ended, so a
+ *   native run with no `workspace_finalize` yet still blocks.
  * - Latest `workspace_finalize` reached a terminal status (`succeeded`, `failed`,
  *   or `skipped`) → settled. A finalize that ran and finished is done even if it
  *   failed: it will not retry within this run, so continuing to block would wedge
@@ -2579,7 +2609,9 @@ export async function runWorkspaceIsFinalized(
   }
 
   // The run touched the workspace but hasn't reached the sync-back phase yet.
-  if (!latestFinalize) return false;
+  // That only stays true while the run can still get there.
+  if (!latestFinalize)
+    return heartbeatRunCanNoLongerRecordWorkspaceFinalize(dbOrTx, runId);
 
   // A finalize that reached any terminal status is settled — including `failed`
   // and `skipped`. It will not retry within this run, so gates must stop waiting.
