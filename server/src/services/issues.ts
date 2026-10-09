@@ -2532,10 +2532,16 @@ export async function heartbeatRunIsTerminalOrMissing(
 /**
  * Whether a run that has recorded no `workspace_finalize` operation can no
  * longer record one. A live run still can. An ended (or missing) run cannot,
- * with one exception: the native finalization reconciler resumes the
- * workspace finalization of an ended native-runtime run that has an accepted
- * result and has not reached `terminal_failure`. An ended native run without
- * that binding is as stuck as any other ended run.
+ * with one exception: an ended native-runtime run can be picked up again
+ * through its finalization coordinator row. The native finalization reconciler
+ * resumes the workspace finalization of a run with an accepted result, and
+ * same-run session recovery returns a failed run without a result to `running`
+ * (`claimNativeSessionResumptions`, `claimNativeRestartRecoveries`), after
+ * which a result and a finalize can arrive. Every one of those paths refuses
+ * `terminal_failure`, and session resumption writes it when the persisted
+ * state cannot be resumed. So an ended native run blocks until its coordinator
+ * row reaches `terminal_failure`; one without a coordinator row is as stuck as
+ * any other ended run.
  */
 async function heartbeatRunCanNoLongerRecordWorkspaceFinalize(
   dbOrTx: Pick<Db, "select">,
@@ -2554,26 +2560,15 @@ async function heartbeatRunCanNoLongerRecordWorkspaceFinalize(
   if (!run) return true;
   if (!TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
   if (run.runtimeMode !== "native") return true;
-  // Same admission as the reconciler (`native-finalization-reconciler.ts`) and
-  // `resumeNativeWorkspaceFinalization`: a persisted result, and a phase other
-  // than `terminal_failure`. A retry delay or a held lease only postpones the
-  // resume, so neither is checked here.
+  // Deliberately not narrowed by result, retry delay or lease: a pending
+  // `retryable_failure` retry has no result yet, and a delay or a held lease
+  // only postpones the resume.
   const finalization = await dbOrTx
-    .select({
-      phase: nativeRunFinalizations.phase,
-      resultId: nativeRunFinalizations.resultId,
-    })
+    .select({ phase: nativeRunFinalizations.phase })
     .from(nativeRunFinalizations)
     .where(eq(nativeRunFinalizations.runId, runId))
-    .then(
-      (rows: Array<{ phase: string; resultId: string | null }>) =>
-        rows[0] ?? null,
-    );
-  const resumable =
-    finalization !== null &&
-    finalization.resultId !== null &&
-    finalization.phase !== "terminal_failure";
-  return !resumable;
+    .then((rows: Array<{ phase: string }>) => rows[0] ?? null);
+  return finalization === null || finalization.phase === "terminal_failure";
 }
 
 /**
@@ -2589,8 +2584,8 @@ async function heartbeatRunCanNoLongerRecordWorkspaceFinalize(
  *   owning run has itself ended (or no longer exists). An ended run never writes
  *   the missing record (the process was lost, or setup failed before the
  *   sync-back), so waiting would wedge the gate forever. The exception is an
- *   ended native-runtime run whose finalization the reconciler can still resume
- *   (accepted result, not `terminal_failure`): that run still blocks.
+ *   ended native-runtime run whose finalization coordinator row has not reached
+ *   `terminal_failure`: native recovery can still resume it, so it still blocks.
  * - Latest `workspace_finalize` reached a terminal status (`succeeded`, `failed`,
  *   or `skipped`) → settled. A finalize that ran and finished is done even if it
  *   failed: it will not retry within this run, so continuing to block would wedge
