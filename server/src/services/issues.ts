@@ -4105,16 +4105,20 @@ async function listIssueBlockerAttentionMap(
   const scheduledMonitorIssueIds = new Set<string>();
   const now = new Date();
   for (const node of nodesById.values()) {
-    if (node.status === "done" || node.status === "cancelled") continue;
-    if (node.assigneeAgentId) {
-      const assignee = agentsById.get(node.assigneeAgentId);
-      if (
-        !assignee ||
-        assignee.companyId !== companyId ||
-        !BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES.has(assignee.status)
-      )
-        continue;
-    }
+    // Match the eligibility used by tickDueIssueMonitors and issueAllowsMonitor.
+    if (
+      (node.status !== "in_progress" && node.status !== "in_review") ||
+      !node.assigneeAgentId ||
+      node.assigneeUserId
+    )
+      continue;
+    const assignee = agentsById.get(node.assigneeAgentId);
+    if (
+      !assignee ||
+      assignee.companyId !== companyId ||
+      !BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES.has(assignee.status)
+    )
+      continue;
     if (hasScheduledIssueMonitorPath(node, now)) {
       scheduledMonitorIssueIds.add(node.id);
     }

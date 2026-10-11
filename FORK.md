@@ -23,7 +23,7 @@ the merge; what is left of each is the diff of `nrwl-main` against the tag.
 
 | Commit | What | Upstream status | Drops out when |
 | --- | --- | --- | --- |
-| Scheduled blocker checks (this PR) | A future scheduled check covers an open blocker and marks its dependency path live. Overdue, cleared, timed out, exhausted checks and checks owned by uninvokable agents keep the previous attention result | Not submitted | An upstream release carries the same scheduled-check blocker coverage |
+| `d6ca4706f` | A future scheduled check covers an agent-owned `in_progress` or `in_review` blocker with no user assignee and marks its dependency path live. Checks that cannot fire, overdue, cleared, timed out, exhausted checks and checks owned by uninvokable agents keep the previous attention result | Not submitted | An upstream release carries the same scheduled-check blocker coverage |
 | `25fcf9633` | Gateway: configurable tool timeout, connection stays listed after a tool timeout | Not submitted. Port branch `gateway-tool-timeout-upstream` (`014ad6cb0`) is ready | The upstream PR from the port branch lands |
 | `669a157cb` | Gateway: approved execution budget stays fixed, timeout env values bounded | Not submitted. Same port branch | Same PR |
 | `0d78b3d67` | Gateway: summarize the stream when no message matches the `tools/call` request ID | The selection by request ID is upstream since `v2026.1001.0` and the fork's own copy was dropped in the `v2026.1005.0` merge. The stream summary is not upstream. As upstream does, a malformed `tools/call` response marks the connection errored | Same PR |

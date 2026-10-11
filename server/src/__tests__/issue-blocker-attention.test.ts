@@ -416,7 +416,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
-  it.each(["backlog", "todo", "in_progress", "in_review", "blocked"])(
+  it.each(["in_progress", "in_review"])(
     "covers a %s blocker with a future scheduled check",
     async (status) => {
       const { companyId, agentId } = await createCompany("MON");
@@ -450,6 +450,67 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       expect((await svc.list(companyId, { attention: "blocked" })).some((issue) => issue.id === parentId)).toBe(false);
     },
   );
+
+  it.each(["backlog", "todo", "blocked"])(
+    "keeps a %s blocker uncovered when its stored check cannot fire",
+    async (status) => {
+      const { companyId, agentId } = await createCompany("MIS");
+      const parentId = await insertIssue({ companyId, identifier: "MIS-1", title: "Root", status: "blocked" });
+      const blockerId = await insertIssue({
+        companyId, identifier: "MIS-2", title: "Ineligible check", status,
+        assigneeAgentId: agentId,
+      });
+      await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+      const attention = async () => (await svc.list(companyId, { status: "blocked" }))
+        .find((issue) => issue.id === parentId)?.blockerAttention;
+      const previous = await attention();
+      expect(previous).toMatchObject({ state: "needs_attention", reason: "attention_required", blockingTreeLive: false });
+
+      await db.update(issues).set({ monitorNextCheckAt: new Date(Date.now() + 60_000) }).where(eq(issues.id, blockerId));
+
+      expect(await attention()).toEqual(previous);
+    },
+  );
+
+  it("keeps an unassigned review blocker stalled despite a future check", async () => {
+    const { companyId } = await createCompany("MUA");
+    const parentId = await insertIssue({ companyId, identifier: "MUA-1", title: "Root", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId, identifier: "MUA-2", title: "Unassigned review", status: "in_review",
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+    const attention = async () => (await svc.list(companyId, { status: "blocked" }))
+      .find((issue) => issue.id === parentId)?.blockerAttention;
+    const previous = await attention();
+    expect(previous).toMatchObject({ state: "stalled", reason: "stalled_review", blockingTreeLive: false });
+
+    await db.update(issues).set({ monitorNextCheckAt: new Date(Date.now() + 60_000) }).where(eq(issues.id, blockerId));
+
+    expect(await attention()).toEqual(previous);
+  });
+
+  it("does not hide a stalled review below a blocked task with an ineligible check", async () => {
+    const { companyId, agentId } = await createCompany("MBI");
+    const parentId = await insertIssue({ companyId, identifier: "MBI-1", title: "Root", status: "blocked" });
+    const middleId = await insertIssue({ companyId, identifier: "MBI-2", title: "Middle", status: "blocked", assigneeAgentId: agentId });
+    const leafId = await insertIssue({
+      companyId, identifier: "MBI-3", title: "Stalled review", status: "in_review", assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: middleId, blockedIssueId: parentId });
+    await block({ companyId, blockerIssueId: leafId, blockedIssueId: middleId });
+    const attention = async () => (await svc.list(companyId, { status: "blocked" }))
+      .find((issue) => issue.id === parentId)?.blockerAttention;
+    const previous = await attention();
+    expect(previous).toMatchObject({
+      state: "stalled", reason: "stalled_review", blockingTreeLive: false,
+      sampleStalledBlockerIdentifier: "MBI-3",
+    });
+
+    await db.update(issues).set({ monitorNextCheckAt: new Date(Date.now() + 60_000) }).where(eq(issues.id, middleId));
+
+    expect(await attention()).toEqual(previous);
+    expect((await svc.list(companyId, { attention: "blocked" })).some((issue) => issue.id === parentId)).toBe(true);
+  });
 
   it.each(["overdue", "cleared", "timeout", "attempts", "state timeout", "state attempts"])(
     "stalls a review blocker again when its scheduled check is %s",
