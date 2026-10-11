@@ -7270,8 +7270,13 @@ export function toolAccessService(
       const failure = sanitizeHttpFailure(error);
       const sizeFailure = error instanceof McpHttpResponseError && error.reason === "too_large";
       // The server answered. One oversized response must not hide its other
-      // tools or overwrite health; still fail and audit the discovery request.
-      const updated = sizeFailure ? connection : await updateConnectionHealth(
+      // tools or overwrite health. Record the probe attempt so an oversized
+      // server keeps the normal sweep interval instead of starving its batch.
+      const updated = sizeFailure ? (await db
+        .update(toolConnections)
+        .set({ healthCheckedAt: new Date() })
+        .where(eq(toolConnections.id, connection.id))
+        .returning())[0] : await updateConnectionHealth(
         connection,
         failure.status,
         failure.message,

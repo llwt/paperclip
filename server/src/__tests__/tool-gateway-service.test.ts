@@ -1341,6 +1341,9 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect(await readConnection()).toEqual(before);
     expect(error).toMatchObject({ status: 502, reasonCode: "mcp_remote_response_too_large", details: { maxBytes: 8 * 1024 * 1024 } });
     expect(error.message).toContain("8388608 bytes");
+    expect(error.message).toContain("initialization response");
+    expect(error.message).not.toContain("Narrow the request");
+    expect(error.message).not.toContain("gateway size limit");
     expect((await gateway.listToolsForSession(session.token)).map((candidate) => candidate.name)).toContain(tool.name);
     const audits = await db.select().from(toolAccessAuditEvents).where(eq(toolAccessAuditEvents.connectionId, connection.id));
     expect(audits).toEqual(expect.arrayContaining([expect.objectContaining({ reasonCode: "mcp_remote_response_too_large", details: expect.objectContaining({ error: expect.stringContaining("8388608 bytes") }) })]));

@@ -5648,10 +5648,12 @@ export function createToolGatewayService(
     };
   }
 
-  function responseTooLargeError(maxBytes = MAX_REMOTE_MCP_RESPONSE_BYTES) {
+  function responseTooLargeError(maxBytes = MAX_REMOTE_MCP_RESPONSE_BYTES, initializingSession = false) {
     return new ToolGatewayHttpError(
       502,
-      `Remote MCP response exceeded the gateway size limit of ${maxBytes} bytes. Narrow the request: use a smaller page or limit, or request fewer fields.`,
+      initializingSession
+        ? `Remote MCP initialization response exceeded the response reader size limit of ${maxBytes} bytes. The server must return a smaller initialization response.`
+        : `Remote MCP response exceeded the gateway size limit of ${maxBytes} bytes. Narrow the request: use a smaller page or limit, or request fewer fields.`,
       "mcp_remote_response_too_large",
       { maxBytes },
     );
@@ -5987,6 +5989,7 @@ export function createToolGatewayService(
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), ms);
     timer.unref?.();
+    let initializingSession = false;
     try {
       const dispatchRemote = (target: string, init: RequestInit) =>
         options.remoteHttpRequest
@@ -6029,6 +6032,7 @@ export function createToolGatewayService(
       }
       let requestHeaders = headers;
       if (connection.config.mcpSessionRequired === true) {
+        initializingSession = true;
         requestHeaders = await getMcpHttpSession({
           scope: `${connection.id}:grant:${grant.id}:actor:${session.agentId}:${endpoint}`,
           send: (init) =>
@@ -6040,6 +6044,7 @@ export function createToolGatewayService(
           headers,
           requestId,
         });
+        initializingSession = false;
       }
       // The guard runs inside this call and the connection is pinned to the
       // address it approved, so an operator-supplied hostname cannot be rebound
@@ -6321,7 +6326,7 @@ export function createToolGatewayService(
       return { result, headerSummary, execution };
     } catch (error) {
       if (error instanceof McpHttpResponseError) {
-        const failure = error.reason === "too_large" ? responseTooLargeError(error.maxBytes)
+        const failure = error.reason === "too_large" ? responseTooLargeError(error.maxBytes, initializingSession)
           : error.reason === "malformed_response" ? malformedRemoteMcpResponse()
           : new ToolGatewayHttpError(502, "Remote MCP server returned invalid JSON", "mcp_remote_invalid_json");
         // One response exceeding the size limit is not evidence that the

@@ -86,7 +86,9 @@ describe("remote connector lifecycle", () => {
     failure = "too_large";
     forgetMcpHttpSessions(connected.connectionId);
     const error = await service[operation](connected.connectionId, actor).catch((caught) => caught);
-    expect(await readConnection()).toEqual(before);
+    const after = await readConnection();
+    expect(after).toEqual({ ...before, healthCheckedAt: operation === "checkHealth" ? after.healthCheckedAt : before.healthCheckedAt });
+    if (operation === "checkHealth") expect(after.healthCheckedAt!.getTime()).toBeGreaterThanOrEqual(before.healthCheckedAt!.getTime());
     expect(await readCatalog()).toEqual(catalogBefore);
     expect(error).toMatchObject({ status: 502, details: { code: "mcp_response_too_large", maxBytes: 8 * 1024 * 1024 } });
     expect(error.message).toContain("8388608 bytes");
@@ -97,14 +99,15 @@ describe("remote connector lifecycle", () => {
       details: expect.objectContaining({ maxBytes: 8 * 1024 * 1024, status: before.healthStatus }),
     })]));
     // Repeated oversized discovery cannot create a missing catalog or promote
-    // unknown health to ok. Preserve the pre-existing diagnostics and stamps.
+    // unknown health to ok. Preserve diagnostics and successful health stamps.
     await db.delete(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, connected.connectionId));
     await db.update(toolConnections).set({ healthStatus: "unknown", healthMessage: "Not verified", lastError: "Prior diagnostic", lastCatalogRefreshAt: null }).where(eq(toolConnections.id, connected.connectionId));
     const uncatalogued = await readConnection();
     for (let attempt = 0; attempt < 2; attempt++) {
       forgetMcpHttpSessions(connected.connectionId);
       await expect(service[operation](connected.connectionId, actor)).rejects.toMatchObject({ details: { code: "mcp_response_too_large", maxBytes: 8 * 1024 * 1024 } });
-      expect(await readConnection()).toEqual(uncatalogued);
+      const after = await readConnection();
+      expect(after).toEqual({ ...uncatalogued, healthCheckedAt: operation === "checkHealth" ? after.healthCheckedAt : uncatalogued.healthCheckedAt });
       expect(await readCatalog()).toEqual([]);
     }
     failure = "malformed";
@@ -112,6 +115,55 @@ describe("remote connector lifecycle", () => {
     await expect(service[operation](connected.connectionId, actor)).rejects.toMatchObject({ status: 502 });
     expect((await readConnection()).healthStatus).toBe("error");
     expect(await readCatalog()).toEqual([]);
+  });
+  it.each(["tools/list", "initialize"])("backs off oversized %s health probes so the next sweep can check another connection", async (method) => {
+    const org = await company();
+    const otherOrg = await company();
+    let oversizedUrl: string | null = null;
+    const probedUrls: string[] = [];
+    const service = toolAccessService(db, {
+      deploymentMode: "local_trusted", deploymentExposure: "private",
+      remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
+      remoteHttpRequest: async (url, init) => {
+        const body = JSON.parse(String(init.body));
+        if (body.method === method) {
+          probedUrls.push(url);
+          if (url === oversizedUrl) return Response.json({ id: body.id, result: body.method === "initialize"
+            ? { instructions: "x".repeat(8 * 1024 * 1024) }
+            : { tools: [{ ...tool("read"), description: "x".repeat(8 * 1024 * 1024) }] } });
+        }
+        if (body.method === "initialize") return Response.json({ id: body.id, result: { protocolVersion: "2025-06-18" } });
+        if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+        return Response.json({ id: body.id, result: { tools: [tool("read")] } });
+      },
+    });
+    const firstUrl = `https://api.arcade.dev/mcp/${randomUUID()}`;
+    const secondUrl = `https://api.arcade.dev/mcp/${randomUUID()}`;
+    const first = await service.connectGalleryApp(org.id, { galleryKey: "arcade", connectionMethodKey: "mcp", link: firstUrl, authMode: "none" }, actor);
+    const second = await service.connectGalleryApp(otherOrg.id, { galleryKey: "arcade", connectionMethodKey: "mcp", link: secondUrl, authMode: "none" }, actor);
+    await db.update(toolConnections).set({ enabled: true, status: "active", healthCheckedAt: null }).where(eq(toolConnections.id, first.connectionId));
+    await db.update(toolConnections).set({ enabled: true, status: "active", healthCheckedAt: new Date(0) }).where(eq(toolConnections.id, second.connectionId));
+    const readFirst = async () => (await db.select().from(toolConnections).where(eq(toolConnections.id, first.connectionId)))[0];
+    const before = await readFirst();
+    oversizedUrl = firstUrl;
+    probedUrls.length = 0;
+    forgetMcpHttpSessions(first.connectionId);
+    forgetMcpHttpSessions(second.connectionId);
+    try {
+      const startedAt = Date.now();
+      const firstSweep = await service.sweepConnectionHealth({ limit: 1 });
+      expect(probedUrls).toEqual([firstUrl]);
+      expect(firstSweep).toEqual({ checked: 1, healthy: 0, failed: 1, failedConnectionIds: [first.connectionId] });
+      const after = await readFirst();
+      expect(after).toEqual({ ...before, healthCheckedAt: after.healthCheckedAt });
+      expect(await service.sweepConnectionHealth({ limit: 1 })).toEqual({ checked: 1, healthy: 1, failed: 0, failedConnectionIds: [] });
+      expect(after.healthCheckedAt!.getTime()).toBeGreaterThanOrEqual(startedAt);
+      expect(probedUrls).toEqual([firstUrl, secondUrl]);
+      expect(await service.sweepConnectionHealth({ limit: 1 })).toEqual({ checked: 0, healthy: 0, failed: 0, failedConnectionIds: [] });
+    } finally {
+      await db.update(toolConnections).set({ enabled: false }).where(eq(toolConnections.companyId, org.id));
+      await db.update(toolConnections).set({ enabled: false }).where(eq(toolConnections.companyId, otherOrg.id));
+    }
   });
   it.each([undefined, false])("allows all aggregator setup with stored setting %s", async (legacyValue) => {
     await db.delete(instanceSettings);
