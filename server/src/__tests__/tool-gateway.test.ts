@@ -4385,7 +4385,7 @@ rl.on("line", (line) => {
       const { run } = await createIssueAndRun(db, company.id, agent.id);
       const fake = await startFakeRemoteMcpServer(() => scenario.response());
       try {
-        await createRemoteMcpTool(db, company.id, {
+        const remoteTool = await createRemoteMcpTool(db, company.id, {
           applicationKey: `failure-${scenario.reasonCode}`,
           toolName: "kv_set",
           url: fake.url,
@@ -4408,6 +4408,11 @@ rl.on("line", (line) => {
           },
           (error) => expectGatewayError(error, scenario.status, scenario.reasonCode),
         );
+
+        if (scenario.reasonCode === "mcp_remote_invalid_json"
+          || scenario.reasonCode === "remote_mcp_malformed_response") {
+          expect(await connectionHealth(remoteTool.connection.id)).toBe("error");
+        }
 
         const [invocation] = await db.select().from(toolInvocations);
         expect(invocation).toMatchObject({
@@ -4555,6 +4560,67 @@ rl.on("line", (line) => {
         parameters: { key: "alpha", value: "one" },
       });
       expect(result.result).toMatchObject({ content: "ok" });
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it.each([
+    ["JSON", 200, "application/json", false],
+    ["JSON with Content-Length", 200, "application/json", true],
+    ["an event stream", 200, "text/event-stream", false],
+    ["a non-OK HTTP body", 503, "application/json", true],
+  ])("keeps other tools listed and callable after an oversized response from %s", async (_label, status, contentType, includeLength) => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const fake = await startFakeRemoteMcpServer((request) => {
+      if (upstreamToolName(request) !== "slow_query") return {};
+      const message = {
+        jsonrpc: "2.0",
+        id: request.body?.id,
+        result: { content: [{ type: "text", text: "x".repeat(1_000_001) }] },
+      };
+      const rawBody = contentType === "text/event-stream"
+        ? `event: message\ndata: ${JSON.stringify(message)}\n\n`
+        : JSON.stringify(message);
+      return {
+        status,
+        headers: {
+          "content-type": contentType,
+          ...(includeLength ? { "content-length": String(Buffer.byteLength(rawBody)) } : {}),
+        },
+        rawBody,
+      };
+    });
+    try {
+      const { connection, slowTool, fastTool } =
+        await createRemoteConnectionWithSlowAndFastTools(company.id, fake.url);
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+
+      expect(await connectionHealth(connection.id)).toBe("ok");
+      const error = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: slowTool,
+        parameters: { key: "alpha", value: "one" },
+      }).catch((caught) => caught);
+      expectGatewayError(error, 502, "mcp_remote_response_too_large");
+      expect(error.details).toMatchObject({ maxBytes: 1_000_000 });
+      expect(error.message).toContain("1000000 bytes");
+      expect(error.message).toContain("smaller page or limit");
+      expect(error.message).toContain("fewer fields");
+
+      expect(await connectionHealth(connection.id)).toBe("ok");
+      const listed = (await gateway.listToolsForSession(session.token)).map((tool) => tool.name);
+      expect(listed).toEqual(expect.arrayContaining([slowTool, fastTool]));
+      const sibling = await gateway.executeTool({
+        sessionToken: session.token,
+        tool: fastTool,
+        parameters: { key: "alpha", value: "one" },
+      });
+      expect(sibling.result).toMatchObject({ content: "ok" });
     } finally {
       await fake.close();
     }
