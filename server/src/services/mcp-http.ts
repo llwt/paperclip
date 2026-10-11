@@ -51,6 +51,7 @@ export class McpHttpResponseError extends Error {
     readonly reason: "invalid_json" | "malformed_response" | "too_large",
     message: string,
     readonly summary?: McpHttpResponseSummary,
+    readonly maxBytes?: number,
   ) {
     super(message);
     this.name = "McpHttpResponseError";
@@ -118,8 +119,11 @@ export async function initializeMcpHttpSession(input: {
   let payload: unknown;
   try {
     payload = await readMcpHttpResponse(initializeResponse, `${input.requestId}-initialize`, { signal: input.signal });
-  } catch {
+  } catch (error) {
     input.signal?.throwIfAborted();
+    // A bounded response still proves the server answered. Preserve the size
+    // reason so callers can leave connection health unchanged.
+    if (error instanceof McpHttpResponseError && error.reason === "too_large") throw error;
     throw new McpHttpInitializationError("Remote MCP initialization returned an invalid response", "initialize", null);
   }
   const result = payload && typeof payload === "object" && "result" in payload
@@ -246,7 +250,7 @@ export async function readMcpHttpResponse(
     let body: string;
     try { body = await Promise.race([response.text(), aborted]); }
     finally { stopListening(); }
-    if (Buffer.byteLength(body, "utf8") > maxBytes) throw new McpHttpResponseError("too_large", "MCP response exceeded the size limit");
+    if (Buffer.byteLength(body, "utf8") > maxBytes) throw new McpHttpResponseError("too_large", `MCP response exceeded the size limit of ${maxBytes} bytes`, undefined, maxBytes);
     return readMcpHttpResponse(new Response(body, {
       headers: { "content-type": response.headers.get("content-type") ?? "application/json" },
     }), requestId, options);
@@ -293,7 +297,7 @@ export async function readMcpHttpResponse(
     while (true) {
       const { value, done } = await Promise.race([reader.read(), aborted]);
       bytes += value?.byteLength ?? 0;
-      if (bytes > maxBytes) throw new McpHttpResponseError("too_large", "MCP response exceeded the size limit");
+      if (bytes > maxBytes) throw new McpHttpResponseError("too_large", `MCP response exceeded the size limit of ${maxBytes} bytes`, undefined, maxBytes);
       buffer += decoder.decode(value, { stream: !done });
       if (isStream) {
         // Normalize CRLF after concatenating chunks, including split CR/LF pairs.

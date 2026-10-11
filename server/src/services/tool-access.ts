@@ -213,6 +213,7 @@ import { isSlackMcpAccessDisabledResponse } from "./slack-mcp-error.js";
 import {
   initializeMcpHttpSession,
   McpHttpInitializationError,
+  McpHttpResponseError,
   getMcpHttpSession,
   forgetMcpHttpSessions,
   readMcpHttpResponse,
@@ -2882,6 +2883,9 @@ function sanitizeHttpFailure(error: unknown): {
   message: string;
   code: string;
 } {
+  if (error instanceof McpHttpResponseError && error.reason === "too_large") {
+    return { status: "error", message: error.message, code: "mcp_response_too_large" };
+  }
   if (error instanceof HttpError) {
     const code = asRecord(error.details).code;
     if (code === "cognee_access_unverified" || code === "memory_api_key_rejected") {
@@ -7305,7 +7309,15 @@ export function toolAccessService(
       )
         throw error;
       const failure = sanitizeHttpFailure(error);
-      const updated = await updateConnectionHealth(
+      const sizeFailure = error instanceof McpHttpResponseError && error.reason === "too_large";
+      // The server answered. One oversized response must not hide its other
+      // tools or overwrite health. Record the probe attempt so an oversized
+      // server keeps the normal sweep interval instead of starving its batch.
+      const updated = sizeFailure ? (await db
+        .update(toolConnections)
+        .set({ healthCheckedAt: new Date() })
+        .where(eq(toolConnections.id, connection.id))
+        .returning())[0] : await updateConnectionHealth(
         connection,
         failure.status,
         failure.message,
@@ -7321,10 +7333,15 @@ export function toolAccessService(
         outcome: "failure",
         reasonCode: failure.code,
         actor,
-        details: { status: failure.status, transport: connection.transport },
+        details: {
+          status: updated.healthStatus,
+          transport: connection.transport,
+          ...(sizeFailure ? { maxBytes: error.maxBytes } : {}),
+        },
       });
       throw new HttpError(healthFailureHttpStatus(failure), failure.message, {
         code: failure.code,
+        ...(sizeFailure ? { maxBytes: error.maxBytes } : {}),
         connection: toConnection(updated),
         runtimeSlot,
         setupUrl: connectionSetupUrl(connection),
@@ -7362,7 +7379,10 @@ export function toolAccessService(
       )
         throw error;
       const failure = sanitizeHttpFailure(error);
-      const updated = await updateConnectionHealth(
+      const sizeFailure = error instanceof McpHttpResponseError && error.reason === "too_large";
+      // The server answered. One oversized response must not hide its other
+      // tools or overwrite health; still fail and audit the discovery request.
+      const updated = sizeFailure ? connection : await updateConnectionHealth(
         connection,
         failure.status,
         failure.message,
@@ -7373,11 +7393,15 @@ export function toolAccessService(
         action: "tool_connection.catalog_refresh",
         outcome: "failure",
         reasonCode: failure.code,
-        details: { status: failure.status },
+        details: {
+          status: updated.healthStatus,
+          ...(sizeFailure ? { maxBytes: error.maxBytes } : {}),
+        },
         actor,
       });
       throw new HttpError(healthFailureHttpStatus(failure), failure.message, {
         code: failure.code,
+        ...(sizeFailure ? { maxBytes: error.maxBytes } : {}),
         setupUrl: connectionSetupUrl(connection),
         reconnectUrl: connectionReconnectUrl(connection),
       });
