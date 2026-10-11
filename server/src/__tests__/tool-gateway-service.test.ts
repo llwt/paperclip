@@ -1317,6 +1317,41 @@ describeEmbeddedPostgres("tool gateway service", () => {
     }
   });
 
+  it("keeps health and tools after oversized initialization but errors on malformed initialization", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    const { connection } = await createRemoteMcpToolFixture(db, company.id);
+    await db.update(toolConnections).set({ config: { url: "https://8.8.8.8/mcp", mcpSessionRequired: true } }).where(eq(toolConnections.id, connection.id));
+    await db.insert(toolPolicies).values({ companyId: company.id, name: "Allow read tools", policyType: "allow", selectors: { riskLevel: "read" } });
+    let malformed = false;
+    const gateway = createTestToolGatewayService(db, {
+      remoteHttpRequest: async (_url, init) => {
+        const payload = JSON.parse(String(init.body));
+        expect(payload.method).toBe("initialize");
+        return Response.json(malformed
+          ? { id: "wrong-id", result: {} }
+          : { id: payload.id, result: { instructions: "x".repeat(8 * 1024 * 1024) } });
+      },
+    });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const tool = (await gateway.listToolsForSession(session.token)).find((candidate) => candidate.providerType === "mcp_remote_http")!;
+    const readConnection = async () => (await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id)))[0];
+    const before = await readConnection();
+    const call = () => gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} });
+    const error = await call().catch((caught) => caught);
+    expect(await readConnection()).toEqual(before);
+    expect(error).toMatchObject({ status: 502, reasonCode: "mcp_remote_response_too_large", details: { maxBytes: 8 * 1024 * 1024 } });
+    expect(error.message).toContain("8388608 bytes");
+    expect(error.message).toContain("initialization response");
+    expect(error.message).not.toContain("Narrow the request");
+    expect(error.message).not.toContain("gateway size limit");
+    expect((await gateway.listToolsForSession(session.token)).map((candidate) => candidate.name)).toContain(tool.name);
+    const audits = await db.select().from(toolAccessAuditEvents).where(eq(toolAccessAuditEvents.connectionId, connection.id));
+    expect(audits).toEqual(expect.arrayContaining([expect.objectContaining({ reasonCode: "mcp_remote_response_too_large", details: expect.objectContaining({ error: expect.stringContaining("8388608 bytes") }) })]));
+    malformed = true;
+    await expect(call()).rejects.toMatchObject({ status: 502, reasonCode: "mcp_remote_fetch_failed" });
+    expect((await readConnection()).healthStatus).toBe("error");
+  });
+
   it("initializes a fresh Streamable HTTP session before a stateful tools/call", async () => {
     const { company, agent, run } = await createRunFixture(db);
     const { connection } = await createRemoteMcpToolFixture(db, company.id);
