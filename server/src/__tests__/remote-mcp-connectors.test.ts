@@ -3,9 +3,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, heartbeatRuns, issues, toolCatalogEntries, toolConnectionInstalls, toolInvocations, companies, companyMemberships, instanceSettings, createDb, toolConnections, toolPolicies, toolProfileEntries } from "@paperclipai/db";
+import { agents, heartbeatRuns, issues, toolCatalogEntries, toolConnectionInstalls, toolInvocations, companies, companyMemberships, instanceSettings, createDb, toolConnections, toolPolicies, toolProfileEntries, toolAccessAuditEvents } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { forgetMcpHttpSessions } from "../services/mcp-http.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { createToolGatewayService } from "../services/tool-gateway.js";
 import { instanceSettingsService, normalizeExperimentalSettings } from "../services/instance-settings.js";
@@ -50,6 +51,68 @@ describe("remote connector lifecycle", () => {
     });
     return { service, requests, add: () => { added = true; }, remove: () => { removed = true; }, restore: () => { removed = false; } };
   }
+  it.each([
+    ["checkHealth", "tools/list"],
+    ["refreshCatalog", "tools/list"],
+    ["checkHealth", "initialize"],
+    ["refreshCatalog", "initialize"],
+  ] as const)("%s preserves health on oversized %s but errors on malformed responses", async (operation, method) => {
+    const org = await company();
+    let failure: "too_large" | "malformed" | null = null;
+    const service = toolAccessService(db, {
+      deploymentMode: "local_trusted", deploymentExposure: "private",
+      remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
+      remoteHttpRequest: async (_url, init) => {
+        const body = JSON.parse(String(init.body));
+        if (body.method === method && failure) {
+          return Response.json(failure === "too_large"
+            ? { id: body.id, result: body.method === "initialize"
+              ? { instructions: "x".repeat(8 * 1024 * 1024) }
+              : { tools: [{ ...tool("read"), description: "x".repeat(8 * 1024 * 1024) }] } }
+            : { id: "wrong-id", result: {} });
+        }
+        if (body.method === "initialize") return Response.json({ id: body.id, result: { protocolVersion: "2025-06-18" } });
+        if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+        return Response.json({ id: body.id, result: { tools: [tool("read")] } });
+      },
+    });
+    const connected = await service.connectGalleryApp(org.id, {
+      galleryKey: "arcade", connectionMethodKey: "mcp", link: `https://api.arcade.dev/mcp/${randomUUID()}`, authMode: "none",
+    }, actor);
+    const readConnection = async () => (await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId)))[0];
+    const readCatalog = () => db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, connected.connectionId));
+    const before = await readConnection();
+    const catalogBefore = await readCatalog();
+    failure = "too_large";
+    forgetMcpHttpSessions(connected.connectionId);
+    const error = await service[operation](connected.connectionId, actor).catch((caught) => caught);
+    expect(await readConnection()).toEqual(before);
+    expect(await readCatalog()).toEqual(catalogBefore);
+    expect(error).toMatchObject({ status: 502, details: { code: "mcp_response_too_large", maxBytes: 8 * 1024 * 1024 } });
+    expect(error.message).toContain("8388608 bytes");
+    const audits = await db.select().from(toolAccessAuditEvents).where(eq(toolAccessAuditEvents.connectionId, connected.connectionId));
+    expect(audits).toEqual(expect.arrayContaining([expect.objectContaining({
+      action: operation === "checkHealth" ? "tool_connection.health_check" : "tool_connection.catalog_refresh",
+      outcome: "failure", reasonCode: "mcp_response_too_large",
+      details: expect.objectContaining({ maxBytes: 8 * 1024 * 1024, status: before.healthStatus }),
+    })]));
+    // Repeated oversized discovery cannot create a missing catalog or promote
+    // unknown health to ok. Preserve the pre-existing diagnostics and stamps.
+    await db.delete(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, connected.connectionId));
+    await db.update(toolConnections).set({ healthStatus: "unknown", healthMessage: "Not verified", lastError: "Prior diagnostic", lastCatalogRefreshAt: null }).where(eq(toolConnections.id, connected.connectionId));
+    const uncatalogued = await readConnection();
+    for (let attempt = 0; attempt < 2; attempt++) {
+      forgetMcpHttpSessions(connected.connectionId);
+      await expect(service[operation](connected.connectionId, actor)).rejects.toMatchObject({ details: { code: "mcp_response_too_large", maxBytes: 8 * 1024 * 1024 } });
+      expect(await readConnection()).toEqual(uncatalogued);
+      expect(await readCatalog()).toEqual([]);
+    }
+    failure = "malformed";
+    forgetMcpHttpSessions(connected.connectionId);
+    await expect(service[operation](connected.connectionId, actor)).rejects.toMatchObject({ status: 502 });
+    expect((await readConnection()).healthStatus).toBe("error");
+    expect(await readCatalog()).toEqual([]);
+  });
   it.each([undefined, false])("allows all aggregator setup with stored setting %s", async (legacyValue) => {
     await db.delete(instanceSettings);
     if (legacyValue !== undefined) await db.insert(instanceSettings).values({ experimental: { enableMcpAggregators: legacyValue } });

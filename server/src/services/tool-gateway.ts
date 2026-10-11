@@ -5648,12 +5648,12 @@ export function createToolGatewayService(
     };
   }
 
-  function responseTooLargeError() {
+  function responseTooLargeError(maxBytes = MAX_REMOTE_MCP_RESPONSE_BYTES) {
     return new ToolGatewayHttpError(
       502,
-      `Remote MCP response exceeded the gateway size limit of ${MAX_REMOTE_MCP_RESPONSE_BYTES} bytes. Narrow the request: use a smaller page or limit, or request fewer fields.`,
+      `Remote MCP response exceeded the gateway size limit of ${maxBytes} bytes. Narrow the request: use a smaller page or limit, or request fewer fields.`,
       "mcp_remote_response_too_large",
-      { maxBytes: MAX_REMOTE_MCP_RESPONSE_BYTES },
+      { maxBytes },
     );
   }
 
@@ -6321,7 +6321,7 @@ export function createToolGatewayService(
       return { result, headerSummary, execution };
     } catch (error) {
       if (error instanceof McpHttpResponseError) {
-        const failure = error.reason === "too_large" ? responseTooLargeError()
+        const failure = error.reason === "too_large" ? responseTooLargeError(error.maxBytes)
           : error.reason === "malformed_response" ? malformedRemoteMcpResponse()
           : new ToolGatewayHttpError(502, "Remote MCP server returned invalid JSON", "mcp_remote_invalid_json");
         // One response exceeding the size limit is not evidence that the
