@@ -24,6 +24,9 @@ export function readWorkspacePackageVersions(sourceRoot = repoRoot) {
 export function materializePublishManifest(pkg, workspaceVersions = {}) {
   const publishConfig = pkg.publishConfig ?? {};
   const publishManifest = { ...pkg };
+  // Git installs keep checkout versions; release and verification staging use
+  // one new version for every public package.
+  const useWorkspaceVersions = workspaceVersions[pkg.name] === pkg.version;
 
   for (const key of ["main", "types", "exports", "bin"]) {
     if (publishConfig[key] !== undefined) publishManifest[key] = publishConfig[key];
@@ -36,7 +39,8 @@ export function materializePublishManifest(pkg, workspaceVersions = {}) {
         if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) return [name, specifier];
         const range = specifier.slice("workspace:".length);
         const prefix = range === "^" || range === "~" ? range : "";
-        return [name, `${prefix}${workspaceVersions[name] ?? pkg.version}`];
+        const version = useWorkspaceVersions ? workspaceVersions[name] ?? pkg.version : pkg.version;
+        return [name, `${prefix}${version}`];
       }),
     );
   }

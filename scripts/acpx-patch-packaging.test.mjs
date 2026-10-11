@@ -189,6 +189,25 @@ test("bundled package staging uses the real version of a workspace dependency th
   assert.equal(staged.dependencies["@paperclipai/shared"], workspaceVersions["@paperclipai/shared"]);
 });
 
+test("bundled package staging uses the staged version when it differs from the checkout", () => {
+  const workspaceVersions = readWorkspacePackageVersions();
+  const version = "0.0.0-grok-verify.test";
+  const staged = materializePublishManifest({
+    ...serverPackage,
+    version,
+    optionalDependencies: { "@paperclipai/shared": "workspace:^" },
+    peerDependencies: { "@paperclipai/plugin-sdk": "workspace:~" },
+  }, workspaceVersions);
+
+  assert.notEqual(workspaceVersions[serverPackage.name], version);
+  for (const [name, specifier] of Object.entries(serverPackage.dependencies)) {
+    assert.equal(staged.dependencies[name], specifier.startsWith("workspace:") ? version : specifier);
+  }
+  assert.equal(staged.optionalDependencies["@paperclipai/shared"], `^${version}`);
+  assert.equal(staged.peerDependencies["@paperclipai/plugin-sdk"], `~${version}`);
+  assert.equal(serverPackage.dependencies["@paperclipai/plugin-sdk"], "workspace:*");
+});
+
 test("bundled package staging installs only dependencies included in the tarball", () => {
   const publishManifest = {
     name: "@paperclipai/db",
