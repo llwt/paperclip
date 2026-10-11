@@ -5651,7 +5651,7 @@ export function createToolGatewayService(
   function responseTooLargeError() {
     return new ToolGatewayHttpError(
       502,
-      "Remote MCP response exceeded the gateway size limit",
+      `Remote MCP response exceeded the gateway size limit of ${MAX_REMOTE_MCP_RESPONSE_BYTES} bytes. Narrow the request: use a smaller page or limit, or request fewer fields.`,
       "mcp_remote_response_too_large",
       { maxBytes: MAX_REMOTE_MCP_RESPONSE_BYTES },
     );
@@ -6324,8 +6324,14 @@ export function createToolGatewayService(
         const failure = error.reason === "too_large" ? responseTooLargeError()
           : error.reason === "malformed_response" ? malformedRemoteMcpResponse()
           : new ToolGatewayHttpError(502, "Remote MCP server returned invalid JSON", "mcp_remote_invalid_json");
-        await markRemoteConnectionHealth(connection, "error", failure.message);
+        // One response exceeding the size limit is not evidence that the
+        // connection is down. Leave the health untouched so the connection's
+        // other tools stay listed and callable.
+        if (error.reason !== "too_large") {
+          await markRemoteConnectionHealth(connection, "error", failure.message);
+        }
         throw new ToolGatewayHttpError(failure.status, failure.message, failure.reasonCode, {
+          ...failure.details,
           connectionId: connection.id, catalogEntryId: entry.id,
           // The shape of what the server sent instead (no message content).
           ...(error.reason === "malformed_response" ? { responseSummary: error.summary ?? null } : {}),
