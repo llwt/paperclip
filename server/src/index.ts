@@ -9,7 +9,7 @@ import { instrumentationReady, shutdownInstrumentation } from "./instrumentation
 import { sentryReady, shutdownSentry, captureException } from "./sentry.js";
 import { waitForPendingRunFailureReports } from "./services/run-failure-report.js";
 import { verifyStoppedNativeSessionForReplacement } from "./services/native-runtime/native-session-executor.js";
-import { embeddedPostgresOwnerPort } from "./embedded-postgres-owner.js";
+import { createReusedEmbeddedPostgresShutdown, embeddedPostgresOwnerPort } from "./embedded-postgres-owner.js";
 import { deliverExecutionStatuses } from "./services/execution-status-delivery.js";
 import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./services/execution-recovery-resolution.js";
 import { reconcileSafeNativeReplacements } from "./services/native-runtime/native-safe-replacement.js";
@@ -414,6 +414,7 @@ async function startServerWithDatabaseTeardown(
   let embeddedPostgres: EmbeddedPostgresInstance | null = null;
   let embeddedPostgresSupervisor: EmbeddedPostgresSupervisor | null = null;
   let embeddedPostgresStartedByThisProcess = false;
+  let stopReusedEmbeddedPostgres: (() => Promise<void>) | null = null;
   let migrationSummary: MigrationSummary = "skipped";
   let activeDatabaseConnectionString: string;
   let resolvedEmbeddedPostgresPort: number | null = null;
@@ -515,11 +516,15 @@ async function startServerWithDatabaseTeardown(
   
     const runningPid = getRunningPid();
     if (runningPid) {
-      port = embeddedPostgresOwnerPort(readFileSync(postmasterPidFile, "utf8"), dataDir, runningPid);
+      const ownerContents = readFileSync(postmasterPidFile, "utf8");
+      port = embeddedPostgresOwnerPort(ownerContents, dataDir, runningPid);
       const actualDataDir = await getPostgresDataDirectory(`postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`);
       if (typeof actualDataDir !== "string" || resolve(actualDataDir) !== resolve(dataDir)) {
         throw new Error("Refusing to reuse PostgreSQL: its data directory belongs to another instance.");
       }
+      // Differs from upstream (fork): normal shutdown also owns a verified
+      // reused postmaster, after the hot-restart snapshot and pool teardown.
+      stopReusedEmbeddedPostgres = createReusedEmbeddedPostgresShutdown(dataDir, ownerContents, runningPid);
       logger.warn(`Embedded PostgreSQL already running; reusing existing process (pid=${runningPid}, port=${port})`);
     } else {
       const configuredAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${configuredPort}/postgres`;
@@ -2008,7 +2013,7 @@ async function startServerWithDatabaseTeardown(
       ?.paperclipShutdown;
     const stopEmbeddedPostgres = embeddedPostgres && embeddedPostgresStartedByThisProcess
       ? () => embeddedPostgresSupervisor?.shutdown() ?? embeddedPostgres!.stop()
-      : null;
+      : stopReusedEmbeddedPostgres;
 
     // Await the ordered application teardown before the process exits. A live
     // setup-token login session must stop and release its sandbox lease before

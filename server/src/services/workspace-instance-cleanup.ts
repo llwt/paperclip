@@ -149,6 +149,7 @@ async function readVerifiedPostgresCommand(pid: number, dataDir: string): Promis
 export async function stopEmbeddedPostgresIfRunning(
   dataDir: string,
   dependencies: EmbeddedPostgresStopDependencies = defaultPostgresStopDependencies,
+  expectedPostmaster?: { pid: number; startedAt: string; port: number },
 ): Promise<boolean> {
   const postmasterPidPath = path.join(dataDir, "postmaster.pid");
   if (!await pathExists(postmasterPidPath)) return false;
@@ -165,6 +166,14 @@ export async function stopEmbeddedPostgresIfRunning(
   const canonicalRecordedDataDir = await fs.realpath(recordedDataDir).catch(() => path.resolve(recordedDataDir));
   if (canonicalRecordedDataDir !== canonicalDataDir) {
     throw new Error(`Refusing to remove ${dataDir}: postmaster.pid points at a different PostgreSQL data directory.`);
+  }
+  // Fork-only: a server adopting a postmaster can stop only that identity.
+  // Check the same PID-file read used below, so a replaced file cannot change
+  // the signal target after the caller has checked ownership.
+  if (expectedPostmaster && (pid !== expectedPostmaster.pid ||
+      pidLines[2]?.trim() !== expectedPostmaster.startedAt ||
+      Number(pidLines[3]?.trim()) !== expectedPostmaster.port)) {
+    throw new Error("Refusing to stop PostgreSQL: its postmaster identity changed after reuse.");
   }
   if (!dependencies.processIsAlive(pid)) return false;
   if (await dependencies.readVerifiedPostgresCommand(pid, canonicalDataDir) === null) return false;

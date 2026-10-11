@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { getPostgresDataDirectory } from "@paperclipai/db";
+import { stopEmbeddedPostgresIfRunning } from "../services/workspace-instance-cleanup.js";
 
 const ORIGINAL_PAPERCLIP_API_URL = process.env.PAPERCLIP_API_URL;
 const ORIGINAL_PAPERCLIP_RUNTIME_API_URL = process.env.PAPERCLIP_RUNTIME_API_URL;
@@ -221,6 +223,8 @@ vi.mock("@paperclipai/db", () => ({
   createDb: createDbMock,
   ensurePostgresDatabase: vi.fn(),
   getPostgresDataDirectory: vi.fn(),
+  prepareEmbeddedPostgresNativeRuntime: vi.fn(),
+  createEmbeddedPostgresLogBuffer: vi.fn(() => ({ append: vi.fn(), getRecentLogs: vi.fn(() => []) })),
   inspectMigrations: vi.fn(async () => ({ status: "upToDate" })),
   applyPendingMigrations: vi.fn(),
   reconcilePendingMigrationHistory: vi.fn(async () => ({ repairedMigrations: [] })),
@@ -230,6 +234,11 @@ vi.mock("@paperclipai/db", () => ({
   companies: {},
   companyMemberships: {},
   instanceUserRoles: {},
+}));
+
+vi.mock("embedded-postgres", () => ({ default: vi.fn() }));
+vi.mock("../services/workspace-instance-cleanup.js", () => ({
+  stopEmbeddedPostgresIfRunning: vi.fn(async () => true),
 }));
 
 vi.mock("../app.js", () => ({
@@ -435,6 +444,38 @@ describe("startServer feedback export wiring", () => {
     createBetterAuthInstanceMock.mockReturnValue({});
     deriveAuthTrustedOriginsMock.mockReturnValue([]);
     process.env.BETTER_AUTH_SECRET = "test-secret";
+  });
+
+  it("stops a verified reused postmaster through server shutdown", async () => {
+    const dataDir = mkdtempSync(path.join(tmpdir(), "paperclip-reused-db-"));
+    writeFileSync(path.join(dataDir, "PG_VERSION"), "18");
+    writeFileSync(path.join(dataDir, "postmaster.pid"), `${process.pid}\n${dataDir}\n123456\n54330\n`);
+    loadConfigMock.mockReturnValue(buildTestConfig({ databaseUrl: undefined, embeddedPostgresDataDir: dataDir }));
+    vi.mocked(getPostgresDataDirectory).mockResolvedValueOnce(dataDir);
+    try {
+      const started = await startServer();
+      expect(stopEmbeddedPostgresIfRunning).not.toHaveBeenCalled();
+      await started.shutdown();
+      expect(stopEmbeddedPostgresIfRunning).toHaveBeenCalledExactlyOnceWith(dataDir, undefined, {
+        pid: process.pid, startedAt: "123456", port: 54330,
+      });
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses reuse when PostgreSQL reports a foreign data directory", async () => {
+    const dataDir = mkdtempSync(path.join(tmpdir(), "paperclip-foreign-db-"));
+    writeFileSync(path.join(dataDir, "PG_VERSION"), "18");
+    writeFileSync(path.join(dataDir, "postmaster.pid"), `${process.pid}\n${dataDir}\n123456\n54330\n`);
+    loadConfigMock.mockReturnValue(buildTestConfig({ databaseUrl: undefined, embeddedPostgresDataDir: dataDir }));
+    vi.mocked(getPostgresDataDirectory).mockResolvedValueOnce(path.join(dataDir, "foreign"));
+    try {
+      await expect(startServer()).rejects.toThrow("belongs to another instance");
+      expect(stopEmbeddedPostgresIfRunning).not.toHaveBeenCalled();
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 
   it("starts without PAPERCLIP_DECISION_SIGNING_SECRET by generating a persisted key", async () => {
