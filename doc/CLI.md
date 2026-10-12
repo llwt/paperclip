@@ -248,8 +248,10 @@ reports payloads that are still in use, then removes them on a later prune once
 they are free. If inspection fails (including a permission error), or on a
 platform without this check such as macOS, pruning keeps and reports the older
 payloads and the install continues. These extra payloads do not replace the two
-rollback entries. The check observes processes at prune time; it does not prevent
-a process from starting in a payload after inspection.
+rollback entries. On macOS and Windows, older payloads accumulate because the
+check is unsupported. Remove them manually only after confirming no process uses
+them. The check observes processes at prune time; it does not prevent a process
+from starting in a payload after inspection.
 
 ```sh
 paperclipai install
