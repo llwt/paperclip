@@ -2047,9 +2047,10 @@ export function issueThreadInteractionService(
 
     // Block only while the source run's worktree sync-back is genuinely still
     // pending or in flight. A finalize that reached a terminal outcome — including
-    // a `failed` sync-back or a stale `running` record left by an ended run — is
-    // treated as settled by `runWorkspaceIsFinalized`, so a dead run can no longer
-    // wedge this confirmation forever.
+    // a `failed` sync-back, a stale `running` record left by an ended run, or an
+    // ended run that never recorded a finalize at all — is treated as settled by
+    // `runWorkspaceIsFinalized`, so a dead run can no longer wedge this
+    // confirmation forever.
     const isFinalized = await runWorkspaceIsFinalized(
       args.db,
       args.issue.companyId,
