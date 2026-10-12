@@ -5492,6 +5492,79 @@ function deriveNormalizedUsageDelta(
   };
 }
 
+export async function getLatestSessionUsageJson(
+  db: Db,
+  input: {
+    companyId: string;
+    agentId: string;
+    sessionId: string;
+    excludeRunId: string;
+  },
+) {
+  let cursorId: string | null = null;
+  const batchSize = 20;
+  while (true) {
+    const conditions = [
+      eq(heartbeatRuns.companyId, input.companyId),
+      eq(heartbeatRuns.agentId, input.agentId),
+      eq(heartbeatRuns.sessionIdAfter, input.sessionId),
+      ne(heartbeatRuns.id, input.excludeRunId),
+      sql`${heartbeatRuns.createdAt} <= (
+        select created_at from heartbeat_runs where id = ${input.excludeRunId}
+      )`,
+    ];
+    if (cursorId) {
+      // Keep PostgreSQL timestamp precision when paging through tied run times.
+      conditions.push(sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) < (
+        select created_at, id from heartbeat_runs where id = ${cursorId}
+      )`);
+    }
+    const rows = await db
+      .select({
+        id: heartbeatRuns.id,
+        usageJson: heartbeatRuns.usageJson,
+      })
+      .from(heartbeatRuns)
+      .where(and(...conditions))
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(batchSize);
+    // Failed and timed-out runs can retain the session without reporting usage.
+    // They must not hide the last available cumulative counters.
+    const previous = rows.find((row) => readRawUsageTotals(row.usageJson) !== null);
+    if (previous) return previous.usageJson;
+    if (rows.length < batchSize) return null;
+    cursorId = rows[rows.length - 1]!.id;
+  }
+}
+
+export async function resolveNormalizedUsageForSession(input: {
+  sessionId: string | null;
+  rawUsage: UsageTotals | null;
+  usageBasis?: "per_run" | "session_cumulative" | null;
+  getPreviousUsageJson: (sessionId: string) => Promise<unknown>;
+}) {
+  const { sessionId, rawUsage, usageBasis } = input;
+  // Adapters that declare per-run usage (e.g. the ACPX lane reports each
+  // turn's tokens, not session totals) must not be session-delta'd, or
+  // consecutive runs would be undercounted.
+  if (!sessionId || !rawUsage || usageBasis === "per_run") {
+    return {
+      normalizedUsage: rawUsage,
+      previousRawUsage: null as UsageTotals | null,
+      derivedFromSessionTotals: false,
+    };
+  }
+
+  const previousRawUsage = readRawUsageTotals(
+    await input.getPreviousUsageJson(sessionId),
+  );
+  return {
+    normalizedUsage: deriveNormalizedUsageDelta(rawUsage, previousRawUsage),
+    previousRawUsage,
+    derivedFromSessionTotals: previousRawUsage !== null,
+  };
+}
+
 function formatCount(value: number | null | undefined) {
   if (typeof value !== "number" || !Number.isFinite(value)) return "0";
   return value.toLocaleString("en-US");
@@ -11268,30 +11341,6 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
   }
 
-  async function getLatestRunForSession(
-    agentId: string,
-    sessionId: string,
-    opts?: { excludeRunId?: string | null },
-  ) {
-    const conditions = [
-      eq(heartbeatRuns.agentId, agentId),
-      eq(heartbeatRuns.sessionIdAfter, sessionId),
-    ];
-    if (opts?.excludeRunId) {
-      conditions.push(sql`${heartbeatRuns.id} <> ${opts.excludeRunId}`);
-    }
-    return db
-      .select({
-        id: heartbeatRuns.id,
-        usageJson: heartbeatRuns.usageJson,
-      })
-      .from(heartbeatRuns)
-      .where(and(...conditions))
-      .orderBy(desc(heartbeatRuns.createdAt))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-  }
-
   const issueMonitorDispatchColumns = {
     id: issues.id,
     companyId: issues.companyId,
@@ -12135,36 +12184,6 @@ export function heartbeatService(
       .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
       .limit(1)
       .then((rows) => rows[0] ?? null);
-  }
-
-  async function resolveNormalizedUsageForSession(input: {
-    agentId: string;
-    runId: string;
-    sessionId: string | null;
-    rawUsage: UsageTotals | null;
-    usageBasis?: "per_run" | "session_cumulative" | null;
-  }) {
-    const { agentId, runId, sessionId, rawUsage, usageBasis } = input;
-    // Adapters that declare per-run usage (e.g. the ACPX lane reports each
-    // turn's tokens, not session totals) must not be session-delta'd, or
-    // consecutive runs would be undercounted.
-    if (!sessionId || !rawUsage || usageBasis === "per_run") {
-      return {
-        normalizedUsage: rawUsage,
-        previousRawUsage: null as UsageTotals | null,
-        derivedFromSessionTotals: false,
-      };
-    }
-
-    const previousRun = await getLatestRunForSession(agentId, sessionId, {
-      excludeRunId: runId,
-    });
-    const previousRawUsage = readRawUsageTotals(previousRun?.usageJson);
-    return {
-      normalizedUsage: deriveNormalizedUsageDelta(rawUsage, previousRawUsage),
-      previousRawUsage,
-      derivedFromSessionTotals: previousRawUsage !== null,
-    };
   }
 
   async function evaluateSessionCompaction(input: {
@@ -25349,12 +25368,17 @@ export function heartbeatService(
         });
         const rawUsage = normalizeUsageTotals(adapterResult.usage);
         const sessionUsageResolution = await resolveNormalizedUsageForSession({
-          agentId: agent.id,
-          runId: run.id,
           sessionId:
             nextSessionState.displayId ?? nextSessionState.legacySessionId,
           rawUsage,
           usageBasis: adapterResult.usageBasis ?? null,
+          getPreviousUsageJson: (sessionId) =>
+            getLatestSessionUsageJson(db, {
+              companyId: agent.companyId,
+              agentId: agent.id,
+              sessionId,
+              excludeRunId: run.id,
+            }),
         });
         const normalizedUsage = sessionUsageResolution.normalizedUsage;
         const runErrorMessage =

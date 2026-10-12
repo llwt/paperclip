@@ -1,0 +1,207 @@
+{
+  "cliVersion": "0.160.1",
+  "fresh": {
+    "requests": [
+      {
+        "input_tokens": 28199,
+        "cached_input_tokens": 7168,
+        "output_tokens": 130
+      },
+      {
+        "input_tokens": 37280,
+        "cached_input_tokens": 28032,
+        "output_tokens": 260
+      },
+      {
+        "input_tokens": 37563,
+        "cached_input_tokens": 37120,
+        "output_tokens": 404
+      },
+      {
+        "input_tokens": 42301,
+        "cached_input_tokens": 37376,
+        "output_tokens": 469
+      },
+      {
+        "input_tokens": 53491,
+        "cached_input_tokens": 42112,
+        "output_tokens": 532
+      },
+      {
+        "input_tokens": 64675,
+        "cached_input_tokens": 53376,
+        "output_tokens": 353
+      },
+      {
+        "input_tokens": 69144,
+        "cached_input_tokens": 64512,
+        "output_tokens": 250
+      },
+      {
+        "input_tokens": 71551,
+        "cached_input_tokens": 68992,
+        "output_tokens": 591
+      },
+      {
+        "input_tokens": 74060,
+        "cached_input_tokens": 71424,
+        "output_tokens": 168
+      },
+      {
+        "input_tokens": 76829,
+        "cached_input_tokens": 73856,
+        "output_tokens": 39
+      },
+      {
+        "input_tokens": 79004,
+        "cached_input_tokens": 76672,
+        "output_tokens": 657
+      },
+      {
+        "input_tokens": 79719,
+        "cached_input_tokens": 78848,
+        "output_tokens": 251
+      },
+      {
+        "input_tokens": 84054,
+        "cached_input_tokens": 79488,
+        "output_tokens": 252
+      },
+      {
+        "input_tokens": 88503,
+        "cached_input_tokens": 83840,
+        "output_tokens": 126
+      },
+      {
+        "input_tokens": 90606,
+        "cached_input_tokens": 88320,
+        "output_tokens": 509
+      },
+      {
+        "input_tokens": 93250,
+        "cached_input_tokens": 90368,
+        "output_tokens": 294
+      },
+      {
+        "input_tokens": 95155,
+        "cached_input_tokens": 93056,
+        "output_tokens": 93
+      },
+      {
+        "input_tokens": 95306,
+        "cached_input_tokens": 94976,
+        "output_tokens": 509
+      },
+      {
+        "input_tokens": 96260,
+        "cached_input_tokens": 95104,
+        "output_tokens": 187
+      },
+      {
+        "input_tokens": 96559,
+        "cached_input_tokens": 96128,
+        "output_tokens": 1221
+      },
+      {
+        "input_tokens": 99326,
+        "cached_input_tokens": 96384,
+        "output_tokens": 159
+      },
+      {
+        "input_tokens": 99543,
+        "cached_input_tokens": 99200,
+        "output_tokens": 183
+      },
+      {
+        "input_tokens": 100200,
+        "cached_input_tokens": 99328,
+        "output_tokens": 482
+      },
+      {
+        "input_tokens": 101730,
+        "cached_input_tokens": 99968,
+        "output_tokens": 354
+      },
+      {
+        "input_tokens": 102992,
+        "cached_input_tokens": 101504,
+        "output_tokens": 616
+      },
+      {
+        "input_tokens": 103966,
+        "cached_input_tokens": 102784,
+        "output_tokens": 1317
+      },
+      {
+        "input_tokens": 106252,
+        "cached_input_tokens": 103808,
+        "output_tokens": 209
+      }
+    ],
+    "completed": {
+      "type": "turn.completed",
+      "usage": {
+        "input_tokens": 2167518,
+        "cached_input_tokens": 2063744,
+        "output_tokens": 10615
+      }
+    }
+  },
+  "resumed": {
+    "requests": [
+      {
+        "input_tokens": 111692,
+        "cached_input_tokens": 106112,
+        "output_tokens": 308
+      },
+      {
+        "input_tokens": 121381,
+        "cached_input_tokens": 111488,
+        "output_tokens": 356
+      },
+      {
+        "input_tokens": 122479,
+        "cached_input_tokens": 121216,
+        "output_tokens": 335
+      },
+      {
+        "input_tokens": 123807,
+        "cached_input_tokens": 122240,
+        "output_tokens": 334
+      },
+      {
+        "input_tokens": 124844,
+        "cached_input_tokens": 123648,
+        "output_tokens": 270
+      },
+      {
+        "input_tokens": 125171,
+        "cached_input_tokens": 124672,
+        "output_tokens": 364
+      },
+      {
+        "input_tokens": 125677,
+        "cached_input_tokens": 125056,
+        "output_tokens": 337
+      },
+      {
+        "input_tokens": 126072,
+        "cached_input_tokens": 125440,
+        "output_tokens": 1017
+      },
+      {
+        "input_tokens": 127308,
+        "cached_input_tokens": 125952,
+        "output_tokens": 81
+      }
+    ],
+    "completed": {
+      "type": "turn.completed",
+      "usage": {
+        "input_tokens": 3275949,
+        "cached_input_tokens": 3149568,
+        "output_tokens": 14017
+      }
+    }
+  }
+}

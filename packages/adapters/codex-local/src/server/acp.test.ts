@@ -725,6 +725,30 @@ describe("codex_local ACP lane", () => {
     );
   });
 
+  it("reports Codex ACP token counters as per-run usage without subtracting the prior turn", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-usage-");
+    let statusCalls = 0;
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => {
+        const runtime = new FakeRuntime(options);
+        runtime.getStatus = async () => ({
+          usage: {
+            cumulative: ++statusCalls === 1
+              ? { inputTokens: 90, cachedReadTokens: 70, outputTokens: 15 }
+              : { inputTokens: 100, cachedReadTokens: 80, outputTokens: 20 },
+          },
+        });
+        return runtime as never;
+      },
+    });
+
+    const result = await execute(buildContext(root));
+
+    expect(result.exitCode).toBe(0);
+    expect(result.usage).toEqual({ inputTokens: 100, cachedInputTokens: 80, outputTokens: 20 });
+    expect(result.usageBasis).toBe("per_run");
+  });
+
   it("executes through ACPX with Codex session config and ephemeral skills", async () => {
     const root = await makeTempRoot("paperclip-codex-acp-exec-");
     const skill = await createRuntimeSkill(root);
