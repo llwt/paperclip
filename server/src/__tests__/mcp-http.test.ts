@@ -66,6 +66,33 @@ describe("initializeMcpHttpSession", () => {
       "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
     });
   });
+
+  it("preserves the initialization size reason and byte limit", async () => {
+    await expect(initializeMcpHttpSession({
+      requestId: "oversized-init",
+      send: async (init) => {
+        const payload = JSON.parse(String(init.body));
+        expect(payload.method).toBe("initialize");
+        return Response.json({ id: payload.id, result: { instructions: "x".repeat(8 * 1024 * 1024) } });
+      },
+    })).rejects.toMatchObject({
+      name: "McpHttpResponseError",
+      reason: "too_large",
+      maxBytes: 8 * 1024 * 1024,
+      message: expect.stringContaining("8388608 bytes"),
+    });
+    const body = JSON.stringify({ id: "bounded", result: "x".repeat(40) });
+    const buffered = { headers: new Headers(), text: async () => body } as Response;
+    for (const response of [buffered, new Response(body)]) {
+      await expect(readMcpHttpResponse(response, "bounded", { maxBytes: 32 })).rejects.toMatchObject({
+        reason: "too_large", maxBytes: 32, message: expect.stringContaining("32 bytes"),
+      });
+    }
+    await expect(initializeMcpHttpSession({
+      requestId: "malformed-init",
+      send: async () => Response.json({ id: "wrong-id", result: {} }),
+    })).rejects.toMatchObject({ name: "McpHttpInitializationError", stage: "initialize", status: null });
+  });
 });
 
 describe("parseMcpHttpResponseBody", () => {
