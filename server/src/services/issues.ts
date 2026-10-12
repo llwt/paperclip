@@ -49,6 +49,7 @@ import {
   documents,
   goals,
   heartbeatRuns,
+  nativeRunFinalizations,
   routineRuns,
   executionWorkspaces,
   issueApprovals,
@@ -181,6 +182,7 @@ import {
 import {
   classifyIssueGraphLiveness,
   classifyIssueReviewPaths,
+  hasScheduledIssueMonitorPath,
   type IssueGraphLivenessInput,
   type IssueLivenessFinding,
 } from "./recovery/issue-graph-liveness.js";
@@ -2529,6 +2531,48 @@ export async function heartbeatRunIsTerminalOrMissing(
 }
 
 /**
+ * Whether a run that has recorded no `workspace_finalize` operation can no
+ * longer record one. A live run still can. An ended (or missing) run cannot,
+ * with one exception: an ended native-runtime run can be picked up again
+ * through its finalization coordinator row. The native finalization reconciler
+ * resumes the workspace finalization of a run with an accepted result, and
+ * same-run session recovery returns a failed run without a result to `running`
+ * (`claimNativeSessionResumptions`, `claimNativeRestartRecoveries`), after
+ * which a result and a finalize can arrive. Every one of those paths refuses
+ * `terminal_failure`, and session resumption writes it when the persisted
+ * state cannot be resumed. So an ended native run blocks until its coordinator
+ * row reaches `terminal_failure`; one without a coordinator row is as stuck as
+ * any other ended run.
+ */
+async function heartbeatRunCanNoLongerRecordWorkspaceFinalize(
+  dbOrTx: Pick<Db, "select">,
+  runId: string,
+): Promise<boolean> {
+  const run = await dbOrTx
+    .select({
+      status: heartbeatRuns.status,
+      runtimeMode: heartbeatRuns.runtimeMode,
+    })
+    .from(heartbeatRuns)
+    .where(eq(heartbeatRuns.id, runId))
+    .then(
+      (rows: Array<{ status: string; runtimeMode: string }>) => rows[0] ?? null,
+    );
+  if (!run) return true;
+  if (!TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+  if (run.runtimeMode !== "native") return true;
+  // Deliberately not narrowed by result, retry delay or lease: a pending
+  // `retryable_failure` retry has no result yet, and a delay or a held lease
+  // only postpones the resume.
+  const finalization = await dbOrTx
+    .select({ phase: nativeRunFinalizations.phase })
+    .from(nativeRunFinalizations)
+    .where(eq(nativeRunFinalizations.runId, runId))
+    .then((rows: Array<{ phase: string }>) => rows[0] ?? null);
+  return finalization === null || finalization.phase === "terminal_failure";
+}
+
+/**
  * Returns whether a specific run's sync-back on a specific execution workspace
  * has settled — i.e. the accept/review gates that guard against a still-in-flight
  * worktree sync no longer need to block on this run.
@@ -2537,7 +2581,12 @@ export async function heartbeatRunIsTerminalOrMissing(
  * - No operations recorded → settled. The run never touched the workspace state
  *   the gates protect.
  * - Earlier phases recorded but no `workspace_finalize` yet → NOT settled. The
- *   sync-back hasn't been attempted; the gate should wait for it.
+ *   sync-back hasn't been attempted; the gate should wait for it — unless the
+ *   owning run has itself ended (or no longer exists). An ended run never writes
+ *   the missing record (the process was lost, or setup failed before the
+ *   sync-back), so waiting would wedge the gate forever. The exception is an
+ *   ended native-runtime run whose finalization coordinator row has not reached
+ *   `terminal_failure`: native recovery can still resume it, so it still blocks.
  * - Latest `workspace_finalize` reached a terminal status (`succeeded`, `failed`,
  *   or `skipped`) → settled. A finalize that ran and finished is done even if it
  *   failed: it will not retry within this run, so continuing to block would wedge
@@ -2579,7 +2628,9 @@ export async function runWorkspaceIsFinalized(
   }
 
   // The run touched the workspace but hasn't reached the sync-back phase yet.
-  if (!latestFinalize) return false;
+  // That only stays true while the run can still get there.
+  if (!latestFinalize)
+    return heartbeatRunCanNoLongerRecordWorkspaceFinalize(dbOrTx, runId);
 
   // A finalize that reached any terminal status is settled — including `failed`
   // and `skipped`. It will not retry within this run, so gates must stop waiting.
@@ -3364,6 +3415,10 @@ type IssueBlockerAttentionNode = {
   title: string;
   status: string;
   executionRunId?: string | null;
+  monitorNextCheckAt?: Date | null;
+  monitorAttemptCount?: number;
+  executionPolicy?: Record<string, unknown> | null;
+  executionState?: Record<string, unknown> | null;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
 };
@@ -3377,7 +3432,14 @@ type IssueBlockerAttentionInputNode = Pick<
   | "status"
   | "assigneeAgentId"
   | "assigneeUserId"
-> & { executionRunId?: string | null };
+> & Pick<
+  IssueBlockerAttentionNode,
+  | "executionRunId"
+  | "monitorNextCheckAt"
+  | "monitorAttemptCount"
+  | "executionPolicy"
+  | "executionState"
+>;
 
 type IssueBlockerAttentionEdge = {
   issueId: string;
@@ -3751,6 +3813,10 @@ async function listIssueBlockerAttentionMap(
           title: issues.title,
           status: issues.status,
           executionRunId: issues.executionRunId,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
+          monitorAttemptCount: issues.monitorAttemptCount,
+          executionPolicy: issues.executionPolicy,
+          executionState: issues.executionState,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
         })
@@ -3775,6 +3841,10 @@ async function listIssueBlockerAttentionMap(
           title: issues.title,
           status: issues.status,
           executionRunId: issues.executionRunId,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
+          monitorAttemptCount: issues.monitorAttemptCount,
+          executionPolicy: issues.executionPolicy,
+          executionState: issues.executionState,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
         })
@@ -3830,6 +3900,10 @@ async function listIssueBlockerAttentionMap(
           title: row.title,
           status: row.status,
           executionRunId: row.executionRunId,
+          monitorNextCheckAt: row.monitorNextCheckAt,
+          monitorAttemptCount: row.monitorAttemptCount,
+          executionPolicy: row.executionPolicy,
+          executionState: row.executionState,
           assigneeAgentId: row.assigneeAgentId,
           assigneeUserId: row.assigneeUserId,
         });
@@ -4078,6 +4152,27 @@ async function listIssueBlockerAttentionMap(
           )
       : [];
   const agentsById = new Map(agentRows.map((agent) => [agent.id, agent]));
+  const scheduledMonitorIssueIds = new Set<string>();
+  const now = new Date();
+  for (const node of nodesById.values()) {
+    // Match the eligibility used by tickDueIssueMonitors and issueAllowsMonitor.
+    if (
+      (node.status !== "in_progress" && node.status !== "in_review") ||
+      !node.assigneeAgentId ||
+      node.assigneeUserId
+    )
+      continue;
+    const assignee = agentsById.get(node.assigneeAgentId);
+    if (
+      !assignee ||
+      assignee.companyId !== companyId ||
+      !BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES.has(assignee.status)
+    )
+      continue;
+    if (hasScheduledIssueMonitorPath(node, now)) {
+      scheduledMonitorIssueIds.add(node.id);
+    }
+  }
 
   type PathClassification = {
     covered: boolean;
@@ -4120,7 +4215,10 @@ async function listIssueBlockerAttentionMap(
         sampleStalledBlockerIdentifier: null,
       };
     }
-    if (explicitWaitingIssueIds.has(node.id)) {
+    if (
+      explicitWaitingIssueIds.has(node.id) ||
+      scheduledMonitorIssueIds.has(node.id)
+    ) {
       return {
         covered: true,
         stalled: false,
@@ -4267,6 +4365,7 @@ async function listIssueBlockerAttentionMap(
       node.status === "in_progress" ||
       activeIssueIds.has(node.id) ||
       explicitWaitingIssueIds.has(node.id) ||
+      scheduledMonitorIssueIds.has(node.id) ||
       Boolean(node.assigneeUserId)
     )
       return true;

@@ -205,7 +205,7 @@ describe("Connectors landing page", () => {
     "google-calendar", "google-chat", "google-people", "google-workspace-search",
   ];
 
-  it("temporarily hides all Google Workspace catalog rows without changing their definitions", async () => {
+  it("shows all nine Google Workspace catalog rows without changing their definitions", async () => {
     const definitions = googleSlugs.map((slug) => getAppStoreDefinition(slug)!);
     listGalleryMock.mockResolvedValue({ apps: [...definitions, getAppStoreDefinition("notion")] });
     const client = await renderBrowse();
@@ -213,7 +213,7 @@ describe("Connectors landing page", () => {
     for (const definition of definitions) {
       expect(definition.methods.length).toBeGreaterThan(0);
       expect(getAppStoreDefinition(definition.slug)).toBe(definition);
-      expect(container.querySelector(`[data-app-slug="${definition.slug}"]`)).toBeNull();
+      expect(container.querySelector(`[data-app-slug="${definition.slug}"]`)).not.toBeNull();
     }
     expect(container.querySelector('[data-app-slug="notion"]')).not.toBeNull();
     expect(client.getQueryData(queryKeys.apps.gallery("company-1"))).toEqual({
@@ -223,7 +223,7 @@ describe("Connectors landing page", () => {
   });
 
   it.each(["active", "draft", "disabled"])(
-    "hides saved Google %s accounts without disabling or removing them",
+    "shows saved Google %s accounts without disabling or removing them",
     async (status) => {
       const applications = googleSlugs.map((slug) => application({
         id: `app-${slug}`, name: `Saved ${slug}`, applicationKey: `app-gallery:${slug}:one`,
@@ -239,8 +239,8 @@ describe("Connectors landing page", () => {
       const client = await renderBrowse();
 
       for (const slug of googleSlugs) {
-        expect(container.querySelector(`[data-app-slug="${slug}"]`)).toBeNull();
-        expect(container.textContent).not.toContain(`Account for ${slug}`);
+        expect(container.querySelector(`[data-app-slug="${slug}"]`)).not.toBeNull();
+        expect(container.textContent).toContain(`Account for ${slug}`);
       }
       expect(client.getQueryData(queryKeys.tools.connections("company-1"))).toEqual({ connections });
       expect(client.getQueryData(queryKeys.tools.applications("company-1"))).toEqual({ applications });
@@ -249,7 +249,7 @@ describe("Connectors landing page", () => {
   );
 
   it.each(["config", "transportConfig"])(
-    "hides a Google account identified by %s even when its gallery entry is absent",
+    "shows Google and non-Google accounts identified by %s when the Google gallery entry is absent",
     async (sourceField) => {
       listGalleryMock.mockResolvedValue({ apps: [] });
       listApplicationsMock.mockResolvedValue({ applications: [application({
@@ -261,14 +261,15 @@ describe("Connectors landing page", () => {
       }), connection()] });
       await renderBrowse();
 
-      expect(container.textContent).not.toContain("Saved Google account");
+      expect(container.textContent).toContain("Saved Google account");
+      expect(container.textContent).toContain("devinfoley@gmail.com");
       expect(container.textContent).toContain("Notion");
       expect(archiveConnectionMock).not.toHaveBeenCalled();
     },
   );
 
   it.each(["catalog", "custom"])(
-    "preserves non-Google accounts in a mixed-provider %s row",
+    "shows Google and non-Google accounts in a mixed-provider %s row",
     async (rowKind) => {
       const notion = getAppStoreDefinition("notion")!;
       listGalleryMock.mockResolvedValue({ apps: rowKind === "catalog" ? [notion] : [] });
@@ -276,7 +277,7 @@ describe("Connectors landing page", () => {
         ? { name: "My tools", applicationKey: null, metadata: null }
         : {})] });
       const connections = [connection({
-        id: "google-account", name: "Hidden Google account",
+        id: "google-account", name: "Visible Google account",
         config: { sourceTemplateKey: "google-docs" },
       }), connection({
         id: "notion-account", name: "Visible Notion account",
@@ -286,7 +287,7 @@ describe("Connectors landing page", () => {
       const client = await renderBrowse();
 
       expect(container.textContent).toContain("Visible Notion account");
-      expect(container.textContent).not.toContain("Hidden Google account");
+      expect(container.textContent).toContain("Visible Google account");
       expect(container.textContent).toContain(rowKind === "catalog" ? "Notion" : "My tools");
       expect(client.getQueryData(queryKeys.tools.connections("company-1"))).toEqual({ connections });
       expect(archiveConnectionMock).not.toHaveBeenCalled();
@@ -294,7 +295,7 @@ describe("Connectors landing page", () => {
   );
 
   it.each(["metadata", "applicationKey"])(
-    "keeps a non-Google custom connector identified by %s when only its Google accounts are hidden",
+    "shows Google accounts under a non-Google custom connector identified by %s",
     async (sourceField) => {
       listGalleryMock.mockResolvedValue({ apps: [] });
       const savedApplication = application({
@@ -304,14 +305,14 @@ describe("Connectors landing page", () => {
       });
       listApplicationsMock.mockResolvedValue({ applications: [savedApplication] });
       const connections = [connection({
-        name: "Hidden Google account", config: { sourceTemplateKey: "google-docs" },
+        name: "Visible Google account", config: { sourceTemplateKey: "google-docs" },
       })];
       listConnectionsMock.mockResolvedValue({ connections });
       const client = await renderBrowse();
 
       expect(container.querySelector('[data-app-slug="custom-provider"]')).not.toBeNull();
       expect(container.textContent).toContain("My custom connector");
-      expect(container.textContent).not.toContain("Hidden Google account");
+      expect(container.textContent).toContain("Visible Google account");
       expect(client.getQueryData(queryKeys.tools.applications("company-1"))).toEqual({ applications: [savedApplication] });
       expect(client.getQueryData(queryKeys.tools.connections("company-1"))).toEqual({ connections });
       expect(archiveConnectionMock).not.toHaveBeenCalled();
@@ -462,6 +463,7 @@ describe("Connectors landing page", () => {
     ).toEqual([
       "discord",
       "github-code-review-bot",
+      "gmail",
       "imessage-photon",
       "jira",
       "microsoft-teams",
@@ -473,7 +475,7 @@ describe("Connectors landing page", () => {
     expect(
       container.querySelector('button[aria-label="Connect Jira"]'),
     ).toBeTruthy();
-    expect(container.querySelector('[data-app-slug="gmail"]')).toBeNull();
+    expect(container.querySelector('[data-app-slug="gmail"]')).not.toBeNull();
     expect(container.textContent).toContain("Connect your own tool");
 
     const customConnect = container.querySelector<HTMLButtonElement>(

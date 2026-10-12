@@ -24,17 +24,19 @@ Google OAuth client or the same Paperclip Cloud broker deployment.
 
 ## Temporary Connections page visibility hold
 
-While Google OAuth verification is pending, the Connections landing page
-(`ui/src/pages/apps/Browse.tsx`) hides all nine Google Workspace entries,
-including their saved accounts. This is a display-only filter. App definitions,
-direct setup and management routes, OAuth profiles, saved credentials, and
-runtime tools remain unchanged. This is not an access-control restriction.
+The `llwt/paperclip` fork shows all nine Google Workspace entries and their
+saved accounts on the Connectors page because this instance uses a
+customer-owned Google OAuth app. Upstream still hides these entries while
+Google verifies Paperclip's own OAuth app. The fork removes only the page's
+display filter; app definitions, direct setup and management routes, OAuth
+profiles, saved credentials, and runtime tools remain unchanged.
 
-Keep verification instances pinned to their pre-hold app release so reviewers
-can still find and test the integrations. After approval, remove the page's
-`GOOGLE_CONNECTOR_SLUGS` filter and update its visibility tests before upgrading
-those instances. Do not disable the shared definitions or broker profiles to
-control this page's visibility.
+Google Sheets' **Use the Paperclip robot account** method depends on upstream's
+own app and is untested on this instance. The customer-owned OAuth app does not
+validate that method. Its implementation is unchanged by this visibility fix.
+
+When an upstream release removes the display filter after Google approval,
+merge that release and drop this fork difference.
 
 ## Developer Preview enrollment
 
