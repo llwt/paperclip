@@ -1064,6 +1064,116 @@ describe("agent issue mutation checkout ownership", () => {
     );
   });
 
+  it.each(["done", "todo"])("allows peer document upserts on another agent's %s issue", async (status) => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:mutate" || input.action === "issue:read",
+      action: input.action,
+      reason: input.action === "issue:mutate" || input.action === "issue:read"
+        ? "allow_visible_issue_write"
+        : "deny_missing_grant",
+      explanation: "Visible issue writes are open by default.",
+    }));
+    const actor = peerActor();
+
+    const res = await request(createApp(actor))
+      .put(`/api/issues/${issueId}/documents/plan`)
+      .send({ format: "markdown", body: "# Peer update" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockDocumentService.upsertIssueDocument).toHaveBeenCalledWith(expect.objectContaining({
+      issueId,
+      key: "plan",
+      body: "# Peer update",
+      createdByAgentId: peerAgentId,
+      createdByRunId: actor.runId,
+      lockedDocumentStrategy: "create_new_document",
+    }));
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:mutate" }));
+    expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
+  });
+
+  it("denies peer document upserts when the issue mutation decision is denied", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo" }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:read",
+      action: input.action,
+      reason: input.action === "issue:read" ? "allow_explicit_grant" : "deny_missing_grant",
+      explanation: "The issue mutation boundary is closed.",
+    }));
+
+    const res = await request(createApp(peerActor()))
+      .put(`/api/issues/${issueId}/documents/plan`)
+      .send({ format: "markdown", body: "# Denied" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:mutate" }));
+    expect(mockDocumentService.upsertIssueDocument).not.toHaveBeenCalled();
+  });
+
+  it("denies document upserts on an issue outside the agent's visibility boundary", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo" }));
+    mockAccessService.decide.mockResolvedValue({
+      allowed: false,
+      reason: "deny_missing_grant",
+      explanation: "The issue is not visible to this agent.",
+    });
+
+    const res = await request(createApp(peerActor()))
+      .put(`/api/issues/${issueId}/documents/plan`)
+      .send({ format: "markdown", body: "# Hidden" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details?.code).toBe("issue_write_not_visible");
+    expect(mockDocumentService.upsertIssueDocument).not.toHaveBeenCalled();
+  });
+
+  it("denies cross-company document upserts without revealing the issue", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done" }));
+
+    const res = await request(createApp(peerActor({ companyId: "99999999-9999-4999-8999-999999999999" })))
+      .put(`/api/issues/${issueId}/documents/plan`)
+      .send({ format: "markdown", body: "# Wrong company" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(404);
+    expect(res.body.error).toBe("Issue not found");
+    expect(mockAccessService.decide).not.toHaveBeenCalled();
+    expect(mockDocumentService.upsertIssueDocument).not.toHaveBeenCalled();
+  });
+
+  it("blocks status-only recovery runs from peer document upserts on idle issues", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done" }));
+    const actor = peerActor();
+    const app = createApp(actor, createRunContextDb({
+      recoveryIntent: "status_only",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: false,
+      resumeRequiresNormalModel: true,
+    }, peerAgentId, actor.runId));
+
+    const res = await request(app)
+      .put(`/api/issues/${issueId}/documents/plan`)
+      .send({ format: "markdown", body: "# Recovery update" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Status-only recovery runs cannot update issue documents");
+    expect(mockDocumentService.upsertIssueDocument).not.toHaveBeenCalled();
+  });
+
+  it("preserves stale revision conflicts for peer document upserts on idle issues", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo" }));
+    const baseRevisionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    mockDocumentService.upsertIssueDocument.mockRejectedValueOnce(new HttpError(409, "Document was updated by someone else"));
+
+    const res = await request(createApp(peerActor()))
+      .put(`/api/issues/${issueId}/documents/plan`)
+      .send({ format: "markdown", body: "# Stale update", baseRevisionId });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.error).toBe("Document was updated by someone else");
+    expect(mockDocumentService.upsertIssueDocument).toHaveBeenCalledWith(expect.objectContaining({ baseRevisionId }));
+  });
+
   it("denies cross-company agents before comment authorization is evaluated", async () => {
     const res = await request(await createApp(peerActor({ companyId: "99999999-9999-4999-8999-999999999999" })))
       .post(`/api/issues/${issueId}/comments`)
