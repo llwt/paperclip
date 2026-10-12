@@ -1,7 +1,14 @@
-import { describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { eq, sql } from "drizzle-orm";
+import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
 import { parseCodexJsonl } from "../../../packages/adapters/codex-local/src/server/parse.js";
 import cliSessionUsage from "../../../packages/adapters/codex-local/src/server/__fixtures__/cli-session-usage.json" with { type: "json" };
-import { resolveNormalizedUsageForSession } from "../services/heartbeat.js";
+import { getLatestSessionUsageJson, resolveNormalizedUsageForSession } from "../services/heartbeat.js";
 
 function parseTurn(turn: "fresh" | "resumed") {
   return parseCodexJsonl([
@@ -120,5 +127,152 @@ describe("resolveNormalizedUsageForSession", () => {
     });
     expect(result.normalizedUsage).toEqual(input.rawUsage);
     expect(getPreviousUsageJson).not.toHaveBeenCalled();
+  });
+});
+
+const postgresSupport = await getEmbeddedPostgresTestSupport();
+const describePostgres = postgresSupport.supported ? describe : describe.skip;
+
+if (!postgresSupport.supported) {
+  console.warn(`Skipping session usage database tests: ${postgresSupport.reason}`);
+}
+
+describePostgres("session usage baseline lookup", () => {
+  let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  let db: ReturnType<typeof createDb>;
+
+  beforeAll(async () => {
+    database = await startEmbeddedPostgresTestDatabase("paperclip-session-usage-");
+    db = createDb(database.connectionString);
+  }, 20_000);
+
+  afterAll(async () => {
+    await database?.cleanup();
+  });
+
+  async function fixture() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const sessionId = randomUUID();
+    const excludeRunId = randomUUID();
+    const beforeCreatedAt = new Date("2026-10-12T12:00:03Z");
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Usage fixture",
+      issuePrefix: `U${companyId.slice(0, 8)}`,
+    });
+    await db.insert(agents).values({
+      id: agentId, companyId, name: "Usage agent", adapterType: "codex_local",
+    });
+    const run = {
+      companyId,
+      agentId,
+      sessionIdAfter: sessionId,
+      status: "succeeded",
+      createdAt: new Date("2026-10-12T12:00:00Z"),
+    };
+    await db.insert(heartbeatRuns).values({
+      ...run,
+      id: excludeRunId,
+      createdAt: beforeCreatedAt,
+      usageJson: parseTurn("resumed").usage,
+    });
+    const lookup = { companyId, agentId, sessionId, excludeRunId };
+    async function resolve() {
+      const parsed = parseTurn("resumed");
+      return resolveNormalizedUsageForSession({
+        sessionId,
+        rawUsage: parsed.usage,
+        usageBasis: parsed.usageBasis,
+        getPreviousUsageJson: (id) => getLatestSessionUsageJson(db, { ...lookup, sessionId: id }),
+      });
+    }
+    return { run, lookup, resolve };
+  }
+
+  it.each([
+    {
+      status: "failed",
+      usageJson: {
+        inputTokens: 0, cachedInputTokens: 0, outputTokens: 0,
+        rawInputTokens: 0, rawCachedInputTokens: 0, rawOutputTokens: 0,
+      },
+    },
+    { status: "timed_out", usageJson: null },
+  ])("uses the succeeded baseline through an intervening $status run without usable usage", async (missingRun) => {
+    const { run, resolve } = await fixture();
+    await db.insert(heartbeatRuns).values([
+      { ...run, usageJson: parseTurn("fresh").usage },
+      { ...run, ...missingRun, createdAt: new Date("2026-10-12T12:00:01Z") },
+    ]);
+    const result = await resolve();
+    expect(result.previousRawUsage).toEqual(parseTurn("fresh").usage);
+    expect(result.normalizedUsage).toEqual(requestTotals("resumed"));
+    expect(result.derivedFromSessionTotals).toBe(true);
+  });
+
+  it.each([
+    sql`'2026-10-12T12:00:00.000000Z'::timestamptz`,
+    sql`'2026-10-12T12:00:00.123456Z'::timestamptz`,
+  ])("walks batches with tied timestamps at full database precision (%s)", async (createdAt) => {
+    const { run, lookup, resolve } = await fixture();
+    await db.update(heartbeatRuns).set({ createdAt }).where(eq(heartbeatRuns.id, lookup.excludeRunId));
+    await db.insert(heartbeatRuns).values([
+      // Make the baseline sort last among rows with the same timestamp.
+      { ...run, id: `00000000-0000-0000-0000-${randomUUID().slice(-12)}`, createdAt, usageJson: parseTurn("fresh").usage },
+      ...Array.from({ length: 41 }, () => ({
+        ...run,
+        id: `ffffffff-ffff-ffff-ffff-${randomUUID().slice(-12)}`,
+        status: "failed",
+        usageJson: null,
+        createdAt,
+      })),
+    ]);
+    expect((await resolve()).normalizedUsage).toEqual(requestTotals("resumed"));
+  });
+
+  it("keeps usage unchanged if every earlier run has missing counters", async () => {
+    const { run, resolve } = await fixture();
+    await db.insert(heartbeatRuns).values({ ...run, status: "failed", usageJson: null });
+    const result = await resolve();
+    expect(result.normalizedUsage).toEqual(parseTurn("resumed").usage);
+    expect(result.previousRawUsage).toBeNull();
+    expect(result.derivedFromSessionTotals).toBe(false);
+  });
+
+  it("uses the newest usable counters even when that run failed", async () => {
+    const { run, resolve } = await fixture();
+    const previous = parseTurn("fresh").usage;
+    await db.insert(heartbeatRuns).values([
+      { ...run, usageJson: { inputTokens: 1, outputTokens: 1 } },
+      {
+        ...run,
+        status: "failed",
+        usageJson: {
+          inputTokens: 1,
+          rawInputTokens: previous.inputTokens,
+          rawCachedInputTokens: previous.cachedInputTokens,
+          rawOutputTokens: previous.outputTokens,
+        },
+        createdAt: new Date("2026-10-12T12:00:01Z"),
+      },
+    ]);
+    expect((await resolve()).normalizedUsage).toEqual(requestTotals("resumed"));
+  });
+
+  it("excludes other agents, sessions, later runs, and the current run", async () => {
+    const { run, lookup, resolve } = await fixture();
+    const otherCompanyId = randomUUID();
+    const otherAgentId = randomUUID();
+    await db.insert(companies).values({ id: otherCompanyId, name: "Other usage company", issuePrefix: `U${otherCompanyId.slice(0, 8)}` });
+    await db.insert(agents).values({ id: otherAgentId, companyId: otherCompanyId, name: "Other usage agent" });
+    await db.insert(heartbeatRuns).values([
+      { ...run, usageJson: parseTurn("fresh").usage },
+      { ...run, usageJson: parseTurn("resumed").usage, createdAt: new Date("2026-10-12T12:00:01Z"), companyId: otherCompanyId, agentId: otherAgentId },
+      { ...run, usageJson: parseTurn("resumed").usage, createdAt: new Date("2026-10-12T12:00:01Z"), sessionIdAfter: "other-session" },
+      { ...run, usageJson: parseTurn("resumed").usage, createdAt: new Date("2026-10-12T12:00:04Z") },
+    ]);
+    expect((await resolve()).normalizedUsage).toEqual(requestTotals("resumed"));
+    expect(await getLatestSessionUsageJson(db, { ...lookup, companyId: otherCompanyId })).toBeNull();
   });
 });

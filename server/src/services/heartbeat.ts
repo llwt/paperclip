@@ -5492,6 +5492,51 @@ function deriveNormalizedUsageDelta(
   };
 }
 
+export async function getLatestSessionUsageJson(
+  db: Db,
+  input: {
+    companyId: string;
+    agentId: string;
+    sessionId: string;
+    excludeRunId: string;
+  },
+) {
+  let cursorId: string | null = null;
+  const batchSize = 20;
+  while (true) {
+    const conditions = [
+      eq(heartbeatRuns.companyId, input.companyId),
+      eq(heartbeatRuns.agentId, input.agentId),
+      eq(heartbeatRuns.sessionIdAfter, input.sessionId),
+      ne(heartbeatRuns.id, input.excludeRunId),
+      sql`${heartbeatRuns.createdAt} <= (
+        select created_at from heartbeat_runs where id = ${input.excludeRunId}
+      )`,
+    ];
+    if (cursorId) {
+      // Keep PostgreSQL timestamp precision when paging through tied run times.
+      conditions.push(sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) < (
+        select created_at, id from heartbeat_runs where id = ${cursorId}
+      )`);
+    }
+    const rows = await db
+      .select({
+        id: heartbeatRuns.id,
+        usageJson: heartbeatRuns.usageJson,
+      })
+      .from(heartbeatRuns)
+      .where(and(...conditions))
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(batchSize);
+    // Failed and timed-out runs can retain the session without reporting usage.
+    // They must not hide the last available cumulative counters.
+    const previous = rows.find((row) => readRawUsageTotals(row.usageJson) !== null);
+    if (previous) return previous.usageJson;
+    if (rows.length < batchSize) return null;
+    cursorId = rows[rows.length - 1]!.id;
+  }
+}
+
 export async function resolveNormalizedUsageForSession(input: {
   sessionId: string | null;
   rawUsage: UsageTotals | null;
@@ -11293,30 +11338,6 @@ export function heartbeatService(
           eq(agentTaskSessions.taskKey, taskKey),
         ),
       )
-      .then((rows) => rows[0] ?? null);
-  }
-
-  async function getLatestRunForSession(
-    agentId: string,
-    sessionId: string,
-    opts?: { excludeRunId?: string | null },
-  ) {
-    const conditions = [
-      eq(heartbeatRuns.agentId, agentId),
-      eq(heartbeatRuns.sessionIdAfter, sessionId),
-    ];
-    if (opts?.excludeRunId) {
-      conditions.push(sql`${heartbeatRuns.id} <> ${opts.excludeRunId}`);
-    }
-    return db
-      .select({
-        id: heartbeatRuns.id,
-        usageJson: heartbeatRuns.usageJson,
-      })
-      .from(heartbeatRuns)
-      .where(and(...conditions))
-      .orderBy(desc(heartbeatRuns.createdAt))
-      .limit(1)
       .then((rows) => rows[0] ?? null);
   }
 
@@ -25342,12 +25363,13 @@ export function heartbeatService(
             nextSessionState.displayId ?? nextSessionState.legacySessionId,
           rawUsage,
           usageBasis: adapterResult.usageBasis ?? null,
-          getPreviousUsageJson: async (sessionId) => {
-            const previousRun = await getLatestRunForSession(agent.id, sessionId, {
+          getPreviousUsageJson: (sessionId) =>
+            getLatestSessionUsageJson(db, {
+              companyId: agent.companyId,
+              agentId: agent.id,
+              sessionId,
               excludeRunId: run.id,
-            });
-            return previousRun?.usageJson;
-          },
+            }),
         });
         const normalizedUsage = sessionUsageResolution.normalizedUsage;
         const runErrorMessage =

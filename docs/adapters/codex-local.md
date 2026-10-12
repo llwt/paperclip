@@ -34,10 +34,14 @@ Codex uses `previous_response_id` for session continuity. The adapter serializes
 ## Run Usage
 
 The CLI adapter reports `turn.completed.usage` as cumulative session counters.
-The heartbeat service stores the difference from the previous run's raw counters
-for the same agent and session. A fresh session keeps its counters unchanged.
+The heartbeat service stores the difference from the latest earlier run with
+usable raw counters for the same company, agent, and session. Failed or timed-out
+runs with zero or missing counters do not replace that baseline. A fresh session
+keeps its counters unchanged.
 If a counter decreases after a reset, the service uses that counter's current
-value. Cached input is a subset of input and is not added to input.
+value. The reset rule applies to each counter separately. Mixed resets can
+produce a cached-input delta greater than the input delta; this existing behavior
+is unchanged. Cached input is included in input and is not added to input.
 
 This behavior was verified against fresh and resumed rollout records from Codex
 CLI 0.160.1. Other CLI versions were not verified. The ACP lane reports per-turn
