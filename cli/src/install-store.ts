@@ -321,14 +321,66 @@ export function buildNextManifest(
   return { schemaVersion: INSTALL_MANIFEST_VERSION, ...record, previous };
 }
 
+export function isInstallPayloadInUse(
+  payloadPath: string,
+  options: { platform?: NodeJS.Platform; procRoot?: string } = {},
+): boolean {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "linux") {
+    throw new Error(`Live-process checks are not supported on ${platform}.`);
+  }
+  const procRoot = options.procRoot ?? "/proc";
+  const payloadRealPath = fs.realpathSync(payloadPath);
+  const pids = fs.readdirSync(procRoot).filter((entry) => /^\d+$/.test(entry));
+  if (pids.length === 0) throw new Error(`No processes are visible in ${procRoot}.`);
+  let checkError: unknown;
+  for (const pid of pids) {
+    const processRoot = path.join(procRoot, pid);
+    try {
+      for (const link of ["exe", "cwd"]) {
+        const target = fs.readlinkSync(path.join(processRoot, link));
+        const relative = path.relative(payloadRealPath, target);
+        if (
+          !relative ||
+          (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+        ) {
+          return true;
+        }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        try {
+          // Exited processes and kernel threads have no executable or cwd.
+          const stat = fs.readFileSync(path.join(processRoot, "stat"), "utf8");
+          const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+          const flags = Number(fields[6]);
+          if (fields[0] === "Z" || fields[0] === "X" || (flags & 0x00200000) !== 0) continue;
+        } catch (statError) {
+          if ((statError as NodeJS.ErrnoException).code === "ENOENT") continue;
+          checkError ??= statError;
+        }
+      }
+      checkError ??= error;
+    }
+  }
+  if (checkError) throw checkError;
+  return false;
+}
+
 export function pruneInstallPayloads(
   manifest: InstallManifest,
   paths = resolveInstallStorePaths(),
+  hooks: {
+    checkPayloadInUse?: (payloadPath: string) => boolean;
+    report?: (message: string) => void;
+  } = {},
 ): string[] {
   const retained = new Set(
     [manifest, ...manifest.previous].map((record) => path.resolve(record.payloadPath)),
   );
   const removed: string[] = [];
+  const checkPayloadInUse = hooks.checkPayloadInUse ?? isInstallPayloadInUse;
+  const report = hooks.report ?? console.warn;
   for (const source of ["npm", "git"] as const) {
     const sourceRoot = path.join(paths.installsRoot, source);
     if (!fs.existsSync(sourceRoot)) continue;
@@ -340,6 +392,18 @@ export function pruneInstallPayloads(
       if (entry.startsWith(".")) continue;
       const candidate = path.join(sourceRoot, entry);
       if (!retained.has(path.resolve(candidate))) {
+        let inUse: boolean;
+        try {
+          inUse = checkPayloadInUse(candidate);
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          report(`Kept install payload ${candidate}: live-process check failed: ${detail}`);
+          continue;
+        }
+        if (inUse) {
+          report(`Kept install payload ${candidate}: a live process runs from this payload.`);
+          continue;
+        }
         fs.rmSync(candidate, { recursive: true, force: true });
         removed.push(candidate);
       }
