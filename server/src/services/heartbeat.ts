@@ -23498,6 +23498,7 @@ export function heartbeatService(
           target: executionTarget,
           workspaceId: persistedExecutionWorkspace?.id ?? null,
         });
+        delete context.paperclipInstructionLocation;
         const hasInstructionFilesystem = nativeRuntimeResolution.kind !== "native"
           ? adapter.supportsInstructionsBundle === true
           : !["claude_managed_agents_api", "aws_agentcore_harness_api"].includes(nativeRuntimeResolution.profile.backend);
@@ -23565,6 +23566,14 @@ export function heartbeatService(
                 message: storageWarning, payload: instructionSave });
             }
             runtimeConfig = { ...runtimeConfig, instructionsFilePath: path.join(instructionCopy.localRoot, instructionCopy.entryFile) };
+            const instructionEntryPath = executionTarget?.kind === "remote"
+              ? path.posix.join(instructionCopy.executionRoot, instructionCopy.entryFile)
+              : path.join(instructionCopy.executionRoot, instructionCopy.entryFile);
+            context.paperclipInstructionLocation = {
+              entryFilePath: instructionEntryPath,
+              baseDir: executionTarget?.kind === "remote" ? path.posix.dirname(instructionEntryPath) : path.dirname(instructionEntryPath),
+              registeredWorkingCopy: true,
+            };
             if (isAgentDirectoryCopy(instructionCopy)) {
               const workspace = parseObject(context.paperclipWorkspace);
               context.paperclipWorkspace = { ...workspace, agentHome: instructionCopy.executionRoot,
