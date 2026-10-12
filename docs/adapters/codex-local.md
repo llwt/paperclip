@@ -31,6 +31,22 @@ The `codex_local` adapter runs OpenAI's Codex CLI locally. It supports session p
 
 Codex uses `previous_response_id` for session continuity. The adapter serializes and restores this across heartbeats, allowing the agent to maintain conversation context.
 
+## Run Usage
+
+The CLI adapter reports `turn.completed.usage` as cumulative session counters.
+The heartbeat service stores the difference from the previous run's raw counters
+for the same agent and session. A fresh session keeps its counters unchanged.
+If a counter decreases after a reset, the service uses that counter's current
+value. Cached input is a subset of input and is not added to input.
+
+This behavior was verified against fresh and resumed rollout records from Codex
+CLI 0.160.1. Other CLI versions were not verified. The ACP lane reports per-turn
+usage and does not use this session subtraction.
+
+This correction affects new runs only. It requires no database migration.
+Historical resumed CLI rows remain overstated, and their costs are not
+recalculated.
+
 ## Skills Injection
 
 The adapter symlinks Paperclip skills into the global Codex skills directory (`~/.codex/skills`). Existing user skills are not overwritten.

@@ -5492,6 +5492,34 @@ function deriveNormalizedUsageDelta(
   };
 }
 
+export async function resolveNormalizedUsageForSession(input: {
+  sessionId: string | null;
+  rawUsage: UsageTotals | null;
+  usageBasis?: "per_run" | "session_cumulative" | null;
+  getPreviousUsageJson: (sessionId: string) => Promise<unknown>;
+}) {
+  const { sessionId, rawUsage, usageBasis } = input;
+  // Adapters that declare per-run usage (e.g. the ACPX lane reports each
+  // turn's tokens, not session totals) must not be session-delta'd, or
+  // consecutive runs would be undercounted.
+  if (!sessionId || !rawUsage || usageBasis === "per_run") {
+    return {
+      normalizedUsage: rawUsage,
+      previousRawUsage: null as UsageTotals | null,
+      derivedFromSessionTotals: false,
+    };
+  }
+
+  const previousRawUsage = readRawUsageTotals(
+    await input.getPreviousUsageJson(sessionId),
+  );
+  return {
+    normalizedUsage: deriveNormalizedUsageDelta(rawUsage, previousRawUsage),
+    previousRawUsage,
+    derivedFromSessionTotals: previousRawUsage !== null,
+  };
+}
+
 function formatCount(value: number | null | undefined) {
   if (typeof value !== "number" || !Number.isFinite(value)) return "0";
   return value.toLocaleString("en-US");
@@ -12135,36 +12163,6 @@ export function heartbeatService(
       .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
       .limit(1)
       .then((rows) => rows[0] ?? null);
-  }
-
-  async function resolveNormalizedUsageForSession(input: {
-    agentId: string;
-    runId: string;
-    sessionId: string | null;
-    rawUsage: UsageTotals | null;
-    usageBasis?: "per_run" | "session_cumulative" | null;
-  }) {
-    const { agentId, runId, sessionId, rawUsage, usageBasis } = input;
-    // Adapters that declare per-run usage (e.g. the ACPX lane reports each
-    // turn's tokens, not session totals) must not be session-delta'd, or
-    // consecutive runs would be undercounted.
-    if (!sessionId || !rawUsage || usageBasis === "per_run") {
-      return {
-        normalizedUsage: rawUsage,
-        previousRawUsage: null as UsageTotals | null,
-        derivedFromSessionTotals: false,
-      };
-    }
-
-    const previousRun = await getLatestRunForSession(agentId, sessionId, {
-      excludeRunId: runId,
-    });
-    const previousRawUsage = readRawUsageTotals(previousRun?.usageJson);
-    return {
-      normalizedUsage: deriveNormalizedUsageDelta(rawUsage, previousRawUsage),
-      previousRawUsage,
-      derivedFromSessionTotals: previousRawUsage !== null,
-    };
   }
 
   async function evaluateSessionCompaction(input: {
@@ -25340,12 +25338,16 @@ export function heartbeatService(
         });
         const rawUsage = normalizeUsageTotals(adapterResult.usage);
         const sessionUsageResolution = await resolveNormalizedUsageForSession({
-          agentId: agent.id,
-          runId: run.id,
           sessionId:
             nextSessionState.displayId ?? nextSessionState.legacySessionId,
           rawUsage,
           usageBasis: adapterResult.usageBasis ?? null,
+          getPreviousUsageJson: async (sessionId) => {
+            const previousRun = await getLatestRunForSession(agent.id, sessionId, {
+              excludeRunId: run.id,
+            });
+            return previousRun?.usageJson;
+          },
         });
         const normalizedUsage = sessionUsageResolution.normalizedUsage;
         const runErrorMessage =

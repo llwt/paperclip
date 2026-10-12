@@ -187,7 +187,7 @@ describe("codex execute", () => {
       expect(result.exitCode).toBe(0);
       expect(result.errorMessage).toBeNull();
       expect(result.usage).toEqual({ inputTokens: 1, cachedInputTokens: 0, outputTokens: 1 });
-      expect(result.usageBasis).toBe("per_run");
+      expect(result.usageBasis).toBe("session_cumulative");
       expect(result.costUsd).toBeNull();
 
       const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;

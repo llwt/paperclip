@@ -90,7 +90,9 @@ export function parseCodexJsonl(stdout: string) {
     sessionId,
     summary: finalMessage?.trim() ?? "",
     usage,
-    usageBasis: "per_run" as const,
+    // Codex CLI turn.completed carries session totals, including resumed turns.
+    // Let the heartbeat service subtract the previous run's raw counters.
+    usageBasis: "session_cumulative" as const,
     errorMessage,
     sawProtocolEvent,
     sawProtocolTerminalEvent,

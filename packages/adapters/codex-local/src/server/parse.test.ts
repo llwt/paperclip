@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import cliSessionUsage from "./__fixtures__/cli-session-usage.json" with { type: "json" };
 import {
   classifyCodexAuthRefreshFailure,
   extractCodexRetryNotBefore,
@@ -10,6 +11,17 @@ import {
 } from "./parse.js";
 
 describe("parseCodexJsonl", () => {
+  it.each(["fresh", "resumed"] as const)("preserves %s CLI session counters for server normalization", (turn) => {
+    const completed = cliSessionUsage[turn].completed;
+    const parsed = parseCodexJsonl(JSON.stringify(completed));
+    expect(parsed.usageBasis).toBe("session_cumulative");
+    expect(parsed.usage).toEqual({
+      inputTokens: completed.usage.input_tokens,
+      cachedInputTokens: completed.usage.cached_input_tokens,
+      outputTokens: completed.usage.output_tokens,
+    });
+  });
+
   it("captures session id, assistant summary, usage, and error message", () => {
     const stdout = [
       JSON.stringify({ type: "thread.started", thread_id: "thread_123" }),
@@ -32,7 +44,7 @@ describe("parseCodexJsonl", () => {
         cachedInputTokens: 2,
         outputTokens: 4,
       },
-      usageBasis: "per_run",
+      usageBasis: "session_cumulative",
       errorMessage: "resume failed",
       sawProtocolEvent: true,
       sawProtocolTerminalEvent: true,
@@ -68,7 +80,7 @@ describe("parseCodexJsonl", () => {
         cachedInputTokens: 2,
         outputTokens: 4,
       },
-      usageBasis: "per_run",
+      usageBasis: "session_cumulative",
       errorMessage: null,
       sawProtocolEvent: true,
       sawProtocolTerminalEvent: true,
