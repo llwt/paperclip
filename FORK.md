@@ -23,6 +23,7 @@ the merge; what is left of each is the diff of `nrwl-main` against the tag.
 
 | Commit | What | Upstream status | Drops out when |
 | --- | --- | --- | --- |
+| NX-834 (in progress) | Tools: pure `compact-v1` connection presentation helper with versioned SHA-256 identities, readable bounded segments and fail-closed alias collisions. Protocol and runtime wiring are pending, so no behavior is enabled | Fork-specific implementation of the approved Nx plan. No upstream publication is authorized by this task | An upstream release provides equivalent presentation aliases without changing stored gateway identities, policy evaluation or signed approvals |
 | `d6ca4706f` | A future scheduled check covers an agent-owned `in_progress` or `in_review` blocker with no user assignee and marks its dependency path live. Checks that cannot fire, overdue, cleared, timed out, exhausted checks and checks owned by uninvokable agents keep the previous attention result | Not submitted | An upstream release carries the same scheduled-check blocker coverage |
 | `25fcf9633` | Gateway: configurable tool timeout, connection stays listed after a tool timeout | Not submitted. Port branch `gateway-tool-timeout-upstream` (`014ad6cb0`) is ready | The upstream PR from the port branch lands |
 | `669a157cb` | Gateway: approved execution budget stays fixed, timeout env values bounded | Not submitted. Same port branch | Same PR |
