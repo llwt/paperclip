@@ -79,6 +79,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
 
 import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixtures/prompt-context";
 import { execute } from "./execute.js";
+import { prepareClaudePromptBundle } from "./prompt-cache.js";
 import { resetClaudeCliCapabilitiesCacheForTests } from "./cli-capabilities.js";
 
 describe("claude remote execution", () => {
@@ -291,6 +292,8 @@ describe("claude remote execution", () => {
     const workspaceDir = path.join(rootDir, "workspace");
     const managedRemoteWorkspace = "/remote/workspace/.paperclip-runtime/runs/run-ssh-resume/workspace";
     await mkdir(workspaceDir, { recursive: true });
+    const bundle = await prepareClaudePromptBundle({ companyId: "company-1", skills: [],
+      instructionsContents: null, onLog: async () => {} });
 
     await execute({
       runId: "run-ssh-resume",
@@ -306,6 +309,7 @@ describe("claude remote execution", () => {
         sessionParams: {
           sessionId: "12345678-1234-4abc-9def-123456789012",
           cwd: managedRemoteWorkspace,
+          promptBundleKey: bundle.bundleKey,
           remoteExecution: {
             transport: "ssh",
             host: "127.0.0.1",
@@ -319,6 +323,7 @@ describe("claude remote execution", () => {
       },
       config: {
         engine: "cli",
+        paperclipRuntimeSkills: [],
         command: "claude",
       },
       context: {
@@ -545,6 +550,8 @@ describe("claude remote execution", () => {
     cleanupDirs.push(rootDir);
     const workspaceDir = path.join(rootDir, "workspace");
     await mkdir(workspaceDir, { recursive: true });
+    const bundle = await prepareClaudePromptBundle({ companyId: "company-1", skills: [],
+      instructionsContents: null, onLog: async () => {} });
 
     runChildProcess
       .mockResolvedValueOnce({
@@ -586,12 +593,13 @@ describe("claude remote execution", () => {
       },
       runtime: {
         sessionId: "12345678-1234-4abc-9def-123456789012",
-        sessionParams: { sessionId: "12345678-1234-4abc-9def-123456789012", cwd: workspaceDir },
+        sessionParams: { sessionId: "12345678-1234-4abc-9def-123456789012", cwd: workspaceDir, promptBundleKey: bundle.bundleKey },
         sessionDisplayId: "12345678-1234-4abc-9def-123456789012",
         taskKey: null,
       },
       config: {
         engine: "cli",
+        paperclipRuntimeSkills: [],
         command: "claude",
         env: { ANTHROPIC_API_KEY: "fixture-anthropic-key" },
       },
@@ -613,6 +621,61 @@ describe("claude remote execution", () => {
     expect(retry).not.toContain("## Compact assignment");
     expect(retry.indexOf("comment-first")).toBeLessThan(retry.indexOf("comment-second"));
     expect(retry.split("Append the same ledger entry.")).toHaveLength(3);
+  });
+
+  it.each(["managed", "workspace-relative", "unmapped"])("uses execution-target instruction locations for %s remote sources", async mode => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-location-remote-"));
+    cleanupDirs.push(rootDir);
+    vi.stubEnv("PAPERCLIP_HOME", path.join(rootDir, "home"));
+    const workspaceDir = path.join(rootDir, "workspace");
+    const instructionsPath = mode === "workspace-relative"
+      ? path.join(workspaceDir, "nested dir", "AGENTS.md")
+      : path.join(rootDir, "host run copy", "nested dir", "AGENTS.md");
+    await mkdir(workspaceDir, { recursive: true });
+    await mkdir(path.dirname(instructionsPath), { recursive: true });
+    await writeFile(instructionsPath, "Use ./SIBLING.md.\n");
+    const remoteWorkspace = "/remote/workspace/.paperclip-runtime/runs/run-location/workspace";
+    const targetEntry = mode === "managed"
+      ? "/remote/agent-files/run-location/live/nested dir/AGENTS.md"
+      : `${remoteWorkspace}/nested dir/AGENTS.md`;
+    const context = {
+      paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" },
+      ...(mode === "managed" ? { paperclipInstructionLocation: {
+        entryFilePath: targetEntry, baseDir: path.posix.dirname(targetEntry), registeredWorkingCopy: true,
+      } } : {}),
+    };
+    const request = {
+      runId: "run-location",
+      agent: { id: "agent-1", companyId: "company-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: "task-1" },
+      config: { engine: "cli", command: "claude", paperclipRuntimeSkills: [], instructionsFilePath: instructionsPath },
+      context,
+      executionTransport: { remoteExecution: { host: "127.0.0.1", port: 2222, username: "fixture",
+        remoteWorkspacePath: "/remote/workspace", remoteCwd: "/remote/workspace", privateKey: "PRIVATE KEY",
+        knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA", strictHostKeyChecking: true } },
+      onLog: async () => {},
+    };
+    const first = await execute(request);
+    await execute({ ...request, runtime: { ...request.runtime, sessionParams: {
+      ...first.sessionParams, sessionId: "12345678-1234-4abc-9def-123456789012",
+    } } });
+    const calls = runChildProcess.mock.calls as unknown as Array<[string, string, string[], { stdin: string }]>;
+    expect(calls).toHaveLength(2);
+    expect(calls[0][2]).not.toContain("--resume");
+    expect(calls[1][2]).toContain("--resume");
+    expect(calls[1][2]).not.toContain("--append-system-prompt-file");
+    for (const call of calls) {
+      expect(call[3].stdin.startsWith("## Paperclip instruction location for this invocation")).toBe(true);
+      expect(call[3].stdin).not.toContain(instructionsPath);
+      if (mode === "unmapped") {
+        expect(call[3].stdin).toContain("Target-side relative instruction references are unavailable");
+        expect(call[3].stdin).not.toContain("registered copy");
+      } else {
+        expect(call[3].stdin.split(targetEntry)).toHaveLength(2);
+        expect(call[3].stdin).toContain(`Resolve any relative file references from ${path.posix.dirname(targetEntry)}/.`);
+        expect(call[3].stdin.includes("registered copy")).toBe(mode === "managed");
+      }
+    }
   });
 
 });

@@ -130,6 +130,20 @@ Relative supporting files are read from `AGENT_HOME`, not the read-only prompt
 snapshot. External instruction bundles remain read-only and use their existing
 lifecycle.
 
+The Claude CLI adapter caches instruction entry text and skill contents in a
+content-addressed prompt bundle. Each fresh, resumed, or retry input starts with
+the current instruction location. The location uses the registered execution
+path and the entry's parent directory, including nested entry directories. It
+supersedes locations in earlier turns and asks the agent to re-read referenced
+siblings. It is not part of the cached system file. A missing or changed saved
+bundle key starts a fresh session; MCP identity, cwd, and target checks still
+apply. Writable copies remain separate for each run.
+
+For an unmanaged remote instruction source, the adapter maps paths inside the
+staged workspace to the execution workspace. A source outside that workspace
+needs an explicit target mapping for relative references. The input reports that
+limitation instead of giving the host path as a target path.
+
 The editor supplies the hash of the file it read. A stale browser save returns
 409 and retains the user's unsaved draft. Run synchronization itself uses
 per-file last-sync-wins: a later run can overwrite a saved browser edit to the
