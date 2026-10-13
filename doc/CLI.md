@@ -242,7 +242,18 @@ opening it.
 
 Managed installs keep CLI payloads under `~/.paperclip/cli`, expose a stable
 `~/.local/bin/paperclipai` shim, switch versions atomically, and retain two
-previous payloads for rollback.
+previous payloads for rollback. On Linux, pruning checks `/proc` for live
+executables and working directories inside each older payload. It keeps and
+reports payloads that are still in use, then removes them on a later prune once
+they are free. A process whose links the installing user may not read (another
+user's process, or a non-dumpable one) is skipped, so it is not protected: run
+the server and the installer as the same user. If no process can be inspected,
+if inspection fails for any other reason, or on a platform without this check
+such as macOS, pruning keeps and reports the older payloads and the install
+continues. These extra payloads do not replace the two rollback entries. On macOS and Windows, older payloads accumulate because the
+check is unsupported. Remove them manually only after confirming no process uses
+them. The check observes processes at prune time; it does not prevent a process
+from starting in a payload after inspection.
 
 ```sh
 paperclipai install

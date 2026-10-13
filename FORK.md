@@ -23,6 +23,7 @@ the merge; what is left of each is the diff of `nrwl-main` against the tag.
 
 | Commit | What | Upstream status | Drops out when |
 | --- | --- | --- | --- |
+| `2593ef230` | CLI: pruning preserves and reports older install payloads with a live executable or working directory on Linux. Processes the installing user may not inspect (`EACCES`, `EPERM`) are skipped and not protected. Unsupported platforms and failed process checks retain payloads without failing the install | Not submitted | An upstream release guards payload pruning against live processes and failed inspection |
 | `d6ca4706f` | A future scheduled check covers an agent-owned `in_progress` or `in_review` blocker with no user assignee and marks its dependency path live. Checks that cannot fire, overdue, cleared, timed out, exhausted checks and checks owned by uninvokable agents keep the previous attention result | Not submitted | An upstream release carries the same scheduled-check blocker coverage |
 | `25fcf9633` | Gateway: configurable tool timeout, connection stays listed after a tool timeout | Not submitted. Port branch `gateway-tool-timeout-upstream` (`014ad6cb0`) is ready | The upstream PR from the port branch lands |
 | `669a157cb` | Gateway: approved execution budget stays fixed, timeout env values bounded | Not submitted. Same port branch | Same PR |
