@@ -321,6 +321,19 @@ export function buildNextManifest(
   return { schemaVersion: INSTALL_MANIFEST_VERSION, ...record, previous };
 }
 
+function isExitedOrKernelProcess(processRoot: string): boolean {
+  try {
+    const stat = fs.readFileSync(path.join(processRoot, "stat"), "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    const flags = Number(fields[6]);
+    return fields[0] === "Z" || fields[0] === "X" || (flags & 0x00200000) !== 0;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ESRCH") return true;
+    throw error;
+  }
+}
+
 export function isInstallPayloadInUse(
   payloadPath: string,
   options: { platform?: NodeJS.Platform; procRoot?: string } = {},
@@ -333,37 +346,40 @@ export function isInstallPayloadInUse(
   const payloadRealPath = fs.realpathSync(payloadPath);
   const pids = fs.readdirSync(procRoot).filter((entry) => /^\d+$/.test(entry));
   if (pids.length === 0) throw new Error(`No processes are visible in ${procRoot}.`);
+  let inspected = false;
   let checkError: unknown;
   for (const pid of pids) {
     const processRoot = path.join(procRoot, pid);
-    try {
-      for (const link of ["exe", "cwd"]) {
-        const target = fs.readlinkSync(path.join(processRoot, link));
-        const relative = path.relative(payloadRealPath, target);
-        if (
-          !relative ||
-          (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
-        ) {
-          return true;
-        }
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+    for (const link of ["exe", "cwd"]) {
+      let target: string;
+      try {
+        target = fs.readlinkSync(path.join(processRoot, link));
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        // Another user's processes, and non-dumpable ones of this user, cannot be
+        // inspected without privileges. They are skipped, so they are not protected.
+        if (code === "EACCES" || code === "EPERM") continue;
         try {
           // Exited processes and kernel threads have no executable or cwd.
-          const stat = fs.readFileSync(path.join(processRoot, "stat"), "utf8");
-          const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-          const flags = Number(fields[6]);
-          if (fields[0] === "Z" || fields[0] === "X" || (flags & 0x00200000) !== 0) continue;
+          if ((code === "ENOENT" || code === "ESRCH") && isExitedOrKernelProcess(processRoot)) break;
+          checkError ??= error;
         } catch (statError) {
-          if ((statError as NodeJS.ErrnoException).code === "ENOENT") continue;
           checkError ??= statError;
         }
+        continue;
       }
-      checkError ??= error;
+      inspected = true;
+      const relative = path.relative(payloadRealPath, target);
+      if (
+        !relative ||
+        (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+      ) {
+        return true;
+      }
     }
   }
   if (checkError) throw checkError;
+  if (!inspected) throw new Error(`No process in ${procRoot} could be inspected.`);
   return false;
 }
 

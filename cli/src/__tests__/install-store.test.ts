@@ -159,18 +159,69 @@ describe("managed install store", () => {
     expect(isInstallPayloadInUse(old, { platform: "linux", procRoot })).toBe(false);
   });
 
-  it("keeps and reports a payload when process inspection fails", () => {
-    const { old, procRoot, manifest } = pruningFixture();
-    vi.spyOn(fs, "readlinkSync").mockImplementation(() => {
-      throw Object.assign(new Error("permission denied"), { code: "EACCES" });
-    });
+  function denyProcessLinks(processRoot: string, code: string) {
+    const readlink = fs.readlinkSync.bind(fs);
+    vi.spyOn(fs, "readlinkSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      if (String(target).startsWith(`${processRoot}${path.sep}`)) {
+        throw Object.assign(new Error("inspection denied"), { code });
+      }
+      return (readlink as (...args: unknown[]) => string)(target, ...rest);
+    }) as typeof fs.readlinkSync);
+  }
+
+  function addReadableProcess(procRoot: string, pid: string) {
+    fs.mkdirSync(path.join(procRoot, pid));
+    fs.symlinkSync(root, path.join(procRoot, pid, "exe"));
+    fs.symlinkSync(root, path.join(procRoot, pid, "cwd"));
+  }
+
+  it.each(["EACCES", "EPERM"])("skips a process whose links give %s and prunes a free payload", (code) => {
+    const { old, procRoot, processRoot, manifest } = pruningFixture();
+    addReadableProcess(procRoot, "456");
+    denyProcessLinks(processRoot, code);
+    const report = vi.fn();
+    expect(pruneInstallPayloads(manifest, paths, {
+      checkPayloadInUse: (payload) => isInstallPayloadInUse(payload, { platform: "linux", procRoot }),
+      report,
+    })).toEqual([old]);
+    expect(fs.existsSync(old)).toBe(false);
+    expect(report).not.toHaveBeenCalled();
+  });
+
+  it("still protects a payload in use next to a process that cannot be inspected", () => {
+    const { old, procRoot, processRoot } = pruningFixture();
+    fs.mkdirSync(path.join(procRoot, "456"));
+    fs.symlinkSync(root, path.join(procRoot, "456", "exe"));
+    fs.symlinkSync(old, path.join(procRoot, "456", "cwd"));
+    denyProcessLinks(processRoot, "EACCES");
+    expect(isInstallPayloadInUse(old, { platform: "linux", procRoot })).toBe(true);
+  });
+
+  it("keeps and reports a payload when no process can be inspected", () => {
+    const { old, procRoot, processRoot, manifest } = pruningFixture();
+    denyProcessLinks(processRoot, "EACCES");
     const report = vi.fn();
     expect(pruneInstallPayloads(manifest, paths, {
       checkPayloadInUse: (payload) => isInstallPayloadInUse(payload, { platform: "linux", procRoot }),
       report,
     })).toEqual([]);
     expect(fs.existsSync(old)).toBe(true);
-    expect(report).toHaveBeenCalledWith(`Kept install payload ${old}: live-process check failed: permission denied`);
+    expect(report).toHaveBeenCalledWith(
+      `Kept install payload ${old}: live-process check failed: No process in ${procRoot} could be inspected.`,
+    );
+  });
+
+  it("keeps and reports a payload when process inspection fails", () => {
+    const { old, procRoot, processRoot, manifest } = pruningFixture();
+    addReadableProcess(procRoot, "456");
+    denyProcessLinks(processRoot, "EIO");
+    const report = vi.fn();
+    expect(pruneInstallPayloads(manifest, paths, {
+      checkPayloadInUse: (payload) => isInstallPayloadInUse(payload, { platform: "linux", procRoot }),
+      report,
+    })).toEqual([]);
+    expect(fs.existsSync(old)).toBe(true);
+    expect(report).toHaveBeenCalledWith(`Kept install payload ${old}: live-process check failed: inspection denied`);
   });
 
   it.each(["darwin", "win32"] as const)("keeps and reports older payloads on %s", (platform) => {
@@ -210,6 +261,7 @@ describe("managed install store", () => {
   ])("handles missing process links for state %s and flags %i", (state, flags, fails) => {
     const { old, procRoot, processRoot } = pruningFixture();
     fs.writeFileSync(path.join(processRoot, "stat"), `123 (process (name)) ${state} 1 1 1 0 -1 ${flags} 0\n`);
+    addReadableProcess(procRoot, "456");
     const check = () => isInstallPayloadInUse(old, { platform: "linux", procRoot });
     if (fails) expect(check).toThrow();
     else expect(check()).toBe(false);
@@ -217,7 +269,16 @@ describe("managed install store", () => {
 
   it("ignores a process that exits during inspection", () => {
     const { old, procRoot } = pruningFixture();
+    addReadableProcess(procRoot, "456");
     expect(isInstallPayloadInUse(old, { platform: "linux", procRoot })).toBe(false);
+  });
+
+  it.skipIf(process.platform !== "linux")("prunes a free payload against the real process table", () => {
+    const { old, manifest } = pruningFixture();
+    const report = vi.fn();
+    expect(pruneInstallPayloads(manifest, paths, { report })).toEqual([old]);
+    expect(fs.existsSync(old)).toBe(false);
+    expect(report).not.toHaveBeenCalled();
   });
 
   it.skipIf(process.platform !== "linux")("protects a real child process working in an old payload", async () => {
