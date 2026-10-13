@@ -859,6 +859,70 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       return row?.status ?? null;
     }
 
+    it.each(["done", "cancelled"])("waits seven days after a bound non-child issue becomes %s", async (status) => {
+      const seeded = await seedTerminalWorkspace({ mergedPr: true });
+      await db.update(issues).set({ completedAt: new Date(nowMs - 10 * DAY_MS) })
+        .where(eq(issues.id, seeded.sourceIssueId));
+      const boundIssueId = randomUUID();
+      const terminalAt = new Date(nowMs - DAY_MS);
+      await db.insert(issues).values({
+        id: boundIssueId,
+        companyId: seeded.companyId,
+        projectId: seeded.projectId,
+        title: "Bound non-child issue",
+        status,
+        executionWorkspaceId: seeded.executionWorkspaceId,
+        completedAt: status === "done" ? terminalAt : null,
+        cancelledAt: status === "cancelled" ? terminalAt : null,
+      });
+      let clockMs = nowMs;
+      const service = executionWorkspaceService(db, {
+        resolvePullRequestDetails: async (companyId, reference) =>
+          pullRequestDetailsByKey.get(`${companyId}:${reference.number}`) ?? { state: "unknown" },
+        now: () => new Date(clockMs),
+        workspaceReaperCooldownDays: 7,
+      });
+
+      expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedCooldown: 1 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("active");
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+
+      clockMs = terminalAt.getTime() + 7 * DAY_MS;
+      expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 1, skippedCooldown: 0 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
+      await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+    }, 20_000);
+
+    it("rechecks a bound issue's terminal timestamp inside the archive guard", async () => {
+      const seeded = await seedTerminalWorkspace({ mergedPr: true });
+      const oldTerminalAt = new Date(nowMs - 10 * DAY_MS);
+      await db.update(issues).set({ completedAt: oldTerminalAt })
+        .where(eq(issues.id, seeded.sourceIssueId));
+      const boundIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: boundIssueId,
+        companyId: seeded.companyId,
+        title: "Bound issue completed again during assessment",
+        status: "done",
+        executionWorkspaceId: seeded.executionWorkspaceId,
+        completedAt: oldTerminalAt,
+      });
+      const service = executionWorkspaceService(db, {
+        now: () => new Date(nowMs),
+        workspaceReaperCooldownDays: 7,
+        resolvePullRequestDetails: async (companyId, reference) => {
+          // The candidate assessment already read the old terminal timestamp.
+          await db.update(issues).set({ completedAt: new Date(nowMs - DAY_MS) })
+            .where(eq(issues.id, boundIssueId));
+          return pullRequestDetailsByKey.get(`${companyId}:${reference.number}`) ?? { state: "unknown" };
+        },
+      });
+
+      expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedRace: 1 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("active");
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+    }, 20_000);
+
     it("skips a terminal tree that is younger than the cooldown", async () => {
       const seeded = await seedTerminalWorkspace({ mergedPr: true });
       // Keep the workspace inside the sweep boundary that the fixed clock sets.
@@ -1843,6 +1907,103 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(sweep).toMatchObject({ archived: 0, skippedUndelivered: 1 });
     expect(parentWorkspace?.status).toBe("active");
   });
+
+  it.each(["backlog", "todo", "in_progress", "in_review", "blocked"])("keeps a worktree bound to a non-child issue in %s", async (status) => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    const boundIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: boundIssueId,
+      companyId: seeded.companyId,
+      projectId: seeded.projectId,
+      title: "Bound non-child issue without a run",
+      status,
+      executionWorkspaceId: seeded.executionWorkspaceId,
+    });
+
+    expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedNonTerminalTree: 1 });
+    const [workspace] = await db.select().from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    expect(workspace?.status).toBe("active");
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, boundIssueId));
+    expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ archived: 1 });
+    await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+  }, 20_000);
+
+  it("rechecks a non-child issue binding inside the archive guard", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    const boundIssueId = randomUUID();
+    const service = executionWorkspaceService(db, {
+      workspaceReaperCooldownDays: 0,
+      resolvePullRequestDetails: async (companyId, reference) => {
+        // Bind an open issue after the candidate assessment read its issue set.
+        await db.insert(issues).values({
+          id: boundIssueId,
+          companyId: seeded.companyId,
+          projectId: seeded.projectId,
+          title: "New binding during assessment",
+          status: "blocked",
+          executionWorkspaceId: seeded.executionWorkspaceId,
+        });
+        return pullRequestDetailsByKey.get(`${companyId}:${reference.number}`) ?? { state: "unknown" };
+      },
+    });
+
+    expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedRace: 1 });
+    const [workspace] = await db.select().from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    expect(workspace?.status).toBe("active");
+    await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+  }, 20_000);
+
+  it("guards shared sessions without removing their underlying project directory", async () => {
+    const seeded = await seedTerminalWorkspace();
+    const projectWorkspaceId = randomUUID();
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId: seeded.companyId,
+      projectId: seeded.projectId,
+      name: "Primary",
+      sourceType: "local_path",
+      isPrimary: true,
+      cwd: seeded.repoRoot,
+    });
+    await db.update(executionWorkspaces).set({
+      mode: "shared_workspace",
+      strategyType: "project_primary",
+      providerType: "local_fs",
+      projectWorkspaceId,
+      cwd: seeded.repoRoot,
+      providerRef: seeded.repoRoot,
+      branchName: "main",
+    }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    const boundIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: boundIssueId,
+      companyId: seeded.companyId,
+      projectId: seeded.projectId,
+      title: "Bound shared session issue",
+      status: "todo",
+      executionWorkspaceId: seeded.executionWorkspaceId,
+    });
+
+    expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedNonTerminalTree: 1 });
+    const [boundIssue] = await db.select().from(issues).where(eq(issues.id, boundIssueId));
+    expect(boundIssue?.executionWorkspaceId).toBe(seeded.executionWorkspaceId);
+
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, boundIssueId));
+    // Existing shared-session cleanup keeps the directory and reports it as
+    // uncleaned. Preserve that behavior once every bound issue is terminal.
+    expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ eligible: 1, cleanupFailed: 1 });
+    const [workspace] = await db.select().from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    expect(workspace?.status).toBe("cleanup_failed");
+    expect(workspace?.closedAt).toBeInstanceOf(Date);
+    const [terminalIssue] = await db.select().from(issues).where(eq(issues.id, boundIssueId));
+    expect(terminalIssue?.executionWorkspaceId).toBe(seeded.executionWorkspaceId);
+    await expect(fs.access(seeded.repoRoot)).resolves.toBeUndefined();
+  }, 20_000);
 
   it("reaps only fully-terminal delivered workspaces without active checkout runs", async () => {
     const eligible = await seedTerminalWorkspace({ mergedPr: true, childStatus: "done" });
