@@ -222,7 +222,7 @@ export function parseMcpHttpResponseBody(bodyText: string, contentType: string |
  * keep a stream alive without answering, and each chunk resets the transport's
  * idle deadline, so a caller whose request carries no deadline of its own must
  * pass one here. An abort rejects with the signal's reason and cancels the stream.
- * Differs from upstream v2026.1005.0, which has no `signal` here or in
+ * Differs from upstream v2026.1012.0, which has no `signal` here or in
  * initializeMcpHttpSession. Keep this when porting to a newer base. */
 export async function readMcpHttpResponse(
   response: Response,
@@ -280,7 +280,7 @@ export async function readMcpHttpResponse(
   const event = async (value: string) => {
     const data = value.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).replace(/^ /, "")).join("\n");
     if (!data) return undefined;
-    // Differs from upstream v2026.1005.0, which fails the whole call on a
+    // Differs from upstream v2026.1012.0, which fails the whole call on a
     // non-JSON event. Skip it and keep reading, as parseMcpHttpResponseBody
     // does, so a stray keep-alive or comment-like event before the result does
     // not fail the call (and, in the gateway, mark the connection errored).

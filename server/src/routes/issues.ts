@@ -10148,7 +10148,7 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!issue) return;
-      // Differs from upstream v2026.1005.0: document upserts adopt the open-write rule.
+      // Differs from upstream v2026.1012.0: document upserts adopt the open-write rule.
       if (
         !(await assertAgentIssueMutationAllowed(req, res, issue, {
           allowVisibleIssueWrite: true,

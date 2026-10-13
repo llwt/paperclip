@@ -7094,7 +7094,7 @@ export function toolAccessService(
    * chunk. Bound the whole discovery instead, and cancel the stream when the
    * bound is reached.
    *
-   * Differs from upstream v2026.1005.0, where discovery has no total deadline.
+   * Differs from upstream v2026.1012.0, where discovery has no total deadline.
    * Keep this wrapper and the `deadline` signal when porting to a newer base.
    */
   async function remoteTools(
