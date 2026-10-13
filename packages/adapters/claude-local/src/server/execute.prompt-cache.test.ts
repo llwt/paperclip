@@ -187,16 +187,18 @@ describe("Claude current instruction location and resume gates", () => {
     }
   });
 
-  it("preserves the MCP identity and cwd gates while allowing token rotation", async () => {
+  it("resumes across token rotation and a changed MCP server set, and keeps the cwd gate", async () => {
     const server = { name: "tools", url: "https://tools.example/mcp", connectionId: "connection-1", token: "first" };
     const next = input({ runtimeMcp: { getServers: () => [server] } });
     const first = await execute(next);
     server.token = "second";
     await execute({ ...next, runtime: runtime(first) });
     expect(captured[1].args).toContain("--resume");
+    // Since v2026.1012.0 upstream resumes when the MCP server set changed:
+    // every invocation loads the current --mcp-config.
     server.connectionId = "connection-2";
     await execute({ ...next, runtime: runtime(first) });
-    expect(captured[2].args).not.toContain("--resume");
+    expect(captured[2].args).toContain("--resume");
     server.connectionId = "connection-1";
     await execute({ ...next, runtime: { ...runtime(first), sessionParams: { ...first.sessionParams, cwd: path.join(root, "different") } } });
     expect(captured[3].args).not.toContain("--resume");
