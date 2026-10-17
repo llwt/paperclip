@@ -340,6 +340,8 @@ describe("localhost sign-in helpers", () => {
 type FixtureOptions = {
   /** `scope` the token endpoint reports. Defaults to the scopes the authorization asked for. */
   grantedScope?: string;
+  /** `scopes_supported` of the authorization server. Defaults to the MCP scopes. */
+  authorizationServerScopes?: string[];
 };
 
 function jsonResponse(payload: unknown, status = 200): Response {
@@ -426,7 +428,7 @@ function installFixture(options: FixtureOptions = {}) {
         client_id_metadata_document_supported: true,
         code_challenge_methods_supported: ["S256"],
         token_endpoint_auth_methods_supported: ["none"],
-        scopes_supported: ADVERTISED_SCOPES,
+        scopes_supported: options.authorizationServerScopes ?? ADVERTISED_SCOPES,
       });
     }
     if (href === `${ISSUER}/register` && method === "POST") {
@@ -643,7 +645,8 @@ describeEmbeddedPostgres("localhost sign-in for a pasted MCP URL", () => {
     expect(state).not.toContain(".");
     expect(parseLoopbackOAuthState(state)).toBeNull();
     const [stateRow] = await db.select().from(toolOauthStates).where(eq(toolOauthStates.state, state));
-    expect(stateRow!.requestedScopes).toBeNull();
+    // Since v2026.1012.0 upstream records the scopes it asked for in the state row.
+    expect(stateRow!.requestedScopes).toEqual(ADVERTISED_SCOPES);
 
     const afterStart = await connectionRow(connected.body.connectionId);
     expect(oauthOf(afterStart)).not.toHaveProperty("loopbackRedirect");
@@ -706,6 +709,50 @@ describeEmbeddedPostgres("localhost sign-in for a pasted MCP URL", () => {
       scopes: ["mcp:read"],
     });
     expect(row.transportConfig).toEqual(row.config);
+  });
+
+  it("does not add offline_access to a connection's own scope list", async () => {
+    // Since v2026.1012.0 upstream adds `offline_access` for a pasted URL whose
+    // authorization server offers it. A scope list is requested as it is, and
+    // the callback accepts the attempt it started.
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+    const fixture = installFixture({ authorizationServerScopes: [...ADVERTISED_SCOPES, "offline_access"] });
+    const company = await createCompany();
+    const app = createRouteApp(db);
+
+    const connected = await connect(app, company.id, { oauthSignIn: LOOPBACK_SETTINGS });
+    expect(connected.status, JSON.stringify(connected.body)).toBe(201);
+    const startUrl = connected.body.auth.startUrl as string;
+    const authorizationUrl = new URL(startUrl);
+    expect(authorizationUrl.searchParams.get("scope")).toBe("mcp:read");
+    expect(authorizationUrl.searchParams.has("prompt")).toBe(false);
+    const state = authorizationUrl.searchParams.get("state")!;
+    const [stateRow] = await db.select().from(toolOauthStates).where(eq(toolOauthStates.state, state));
+    expect(stateRow!.requestedScopes).toEqual(["mcp:read"]);
+    expect(oauthOf(await connectionRow(connected.body.connectionId))).toMatchObject({ scopes: ["mcp:read"] });
+
+    await request(app)
+      .get("/api/tools/oauth/callback")
+      .set("Host", "paperclip.fixture.test")
+      .set("Accept", "text/html")
+      .query({ state, code: fixture.issueCode(startUrl), iss: ISSUER })
+      .expect(303);
+    const active = await connectionRow(connected.body.connectionId);
+    expect(active).toMatchObject({ status: "active", authKind: "oauth" });
+    expect(oauthOf(active)).toMatchObject({ requestedScopes: ["mcp:read"], scopes: ["mcp:read"] });
+  });
+
+  it("adds offline_access for a connection without a scope list, as upstream does", async () => {
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+    installFixture({ authorizationServerScopes: [...ADVERTISED_SCOPES, "offline_access"] });
+    const company = await createCompany();
+    const app = createRouteApp(db);
+
+    const connected = await connect(app, company.id);
+    expect(connected.status, JSON.stringify(connected.body)).toBe(201);
+    const authorizationUrl = new URL(connected.body.auth.startUrl);
+    expect(authorizationUrl.searchParams.get("scope")).toBe([...ADVERTISED_SCOPES, "offline_access"].join(" "));
+    expect(authorizationUrl.searchParams.get("prompt")).toBe("consent");
   });
 
   it("uses the localhost callback from every sign-in start", async () => {

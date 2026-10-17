@@ -15,11 +15,13 @@ and this fork is retired.
 
 ## Inventory of fork-only commits
 
-Base: upstream tag `v2026.1005.0` (`467125faf`), merged on 2026-10-07 (it
-contains `v2026.1001.0`). Last refreshed 2026-10-07 against upstream `master`
-`b31558064`, which is 170 commits past that tag. `v2026.1005.0` was the latest
-stable tag on that day. The commits below are the ones on `nrwl-main` before
-the merge; what is left of each is the diff of `nrwl-main` against the tag.
+Base: upstream tag `v2026.1012.0` (`bba6a45f0`), merged on 2026-10-13 (it
+contains `v2026.1005.0`). The tag is upstream `master` at `22a3ea341` plus two
+release commits that are not on `master`. Last refreshed 2026-10-13 against
+upstream `master` `4b958ecbd`, which is 240 commits past that tag.
+`v2026.1012.0` was the latest stable tag on that day. The commits below are
+the ones on `nrwl-main` before the merge; what is left of each is the diff of
+`nrwl-main` against the tag.
 
 | Commit | What | Upstream status | Drops out when |
 | --- | --- | --- | --- |
@@ -41,10 +43,10 @@ the merge; what is left of each is the diff of `nrwl-main` against the tag.
 | fork PR #17 | Documents: same-company agents can upsert documents on another agent's idle issue; access decisions, the active run lock, recovery restrictions, revision checks and document locks still apply | Not submitted. Upstream `master` (`71cd0a262`) still lacks the open-write option as of 2026-10-08. Upstream PR text is prepared on NX-657 | The upstream fix lands and that release is merged |
 | fork PR #19 | Tools: one remote tool discovery (the handshake and every catalog page) has a total budget of 60 seconds and fails with `remote_http_response_timeout`. `readMcpHttpResponse` and `initializeMcpHttpSession` take an optional `signal`. Without it a server that keeps the `tools/list` stream alive and never answers holds a catalog refresh or a health check open until the 8 MiB limit | Prepared as the Greptile review fix for paperclipai/paperclip#15448: commit `2deb0c002` on fork branch `fix/mcp-gateway-tool-call-connection-health-review-1`, not on the upstream PR yet | #15448 lands with that commit and that release is merged |
 | NX-617 (this PR) | Tools: per-connection "Sign in through localhost" and "Scopes to request" for a pasted MCP URL (see "Localhost sign-in") | Not submitted. Upstream PR text is prepared on NX-617, no port branch yet | An upstream release carries an equivalent setting, or the Atlassian connection no longer needs a localhost callback |
-| NX-766 (this PR) | Tools: MCP tool discovery reads the shared access rows once per listing, runs at most 16 decisions at a time, and admits two listings per process with a queue of 32 (503 `tool_discovery_busy` beyond that). Cherry-pick (`-x`) of upstream `cad26c6bf` (paperclipai/paperclip#14864), including its migration `0294_chilly_marvel_apes`, journal entry and snapshot, all byte-identical to upstream. Never renumber or edit them: the migration runner matches by name and hash | Upstream `master` since 2026-10-02 (`cad26c6bf`). Not in `v2026.1005.0`, the tag this fork is based on | The next upstream merge that contains `cad26c6bf`. Git then sees the same change on both sides and the migration is skipped as already applied |
 | NX-668 (this PR) | CLI tests: a setup guard blocks `systemctl`, `loginctl`, `journalctl` and `launchctl` in every CLI test and fails the test that reached them; the two `uninstallCommand` tests and the `doctor` test no longer look up the host service manager. Test-only, no runtime change | Not submitted. Upstream `master` (`9f4acc8f1`) has the same unguarded tests. Port branch `fix/cli-tests-never-reach-service-manager` is ready and the upstream PR text is prepared on NX-668 | The upstream PR from that port branch lands and that release is merged |
 | fork PR #29 | UI: show all nine Google Workspace catalog entries and saved accounts on the Connectors page for this instance's customer-owned OAuth app | Not submitted: upstream removes the filter itself after Google approval. No port branch or upstream PR because upstream already plans this removal, so rule 1 does not apply | The upstream release without the filter is merged |
 | NX-716 (this PR) | Interactions: a confirmation card whose source run ended without a `workspace_finalize` row can be accepted (`runWorkspaceIsFinalized` in `server/src/services/issues.ts`). Before, a card posted by a run that was then lost (`process_lost`) could never be accepted. A live run still blocks, and so does an ended native-runtime run whose finalization coordinator row has not reached `terminal_failure` (native recovery can still resume it) | Not submitted. Upstream `master` has the same gap. Upstream PR text is prepared on NX-716, no port branch yet | The upstream PR lands and that release is merged |
+| NX-892 (this PR) | `pnpm-lock.yaml`: the `server` entries for `@modelcontextprotocol/sdk` and `light-my-request`, 27 added lines. The tag's `server/package.json` names both, its lockfile does not, and `pnpm install --frozen-lockfile` (fork CI and `paperclipai install`) fails without them | Upstream `master` has them since its lockfile refresh `03cf6a6ec` (2026-10-06), which is after the commit the tag was cut from | The next upstream merge. Take upstream's lockfile on a conflict |
 | fork PR #3, fork files | `FORK.md`, `.github/workflows/nrwl-ci.yml` and `scripts/nrwl-ci-server-other.mjs` | Fork-only by design, will not go upstream | The fork is retired |
 
 To refresh this table:
@@ -177,6 +179,12 @@ git merge --no-ff <tag>
   for the file, take the port branch version, and keep the "Differs from
   upstream" comments.
 - After the merge, refresh the inventory: remove rows that upstream now carries.
+- Upstream keeps `pnpm-lock.yaml` current with a bot on `master`, so a tag can
+  carry a lockfile that lags its `package.json`. If
+  `pnpm install --frozen-lockfile` fails on the merge result, refresh the
+  lockfile in its own commit with upstream's fallback command
+  (`pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile`) and
+  give it an inventory row.
 - Sync the fork's `master` from upstream in the same task.
 - Exception: merge a specific upstream `master` commit only when one upstream
   fix is needed early, and record the reason in the PR.
