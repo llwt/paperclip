@@ -427,6 +427,11 @@ import {
   type AuthorizationActor,
 } from "./authorization.js";
 import { createToolGatewayService } from "./tool-gateway.js";
+import {
+  assignedMcpServerPresentation,
+  connectionToolNameModeForAgent,
+  type ConnectionToolNameMode,
+} from "./compact-connection-tool-names.js";
 import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
@@ -4574,6 +4579,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "name">;
   runId: string;
   expectedAssignmentDigest?: string | null;
+  connectionToolNames?: ConnectionToolNameMode;
 }): Promise<AdapterRuntimeMcpServer[]> {
   const access = toolAccessService(input.db);
   const effective = await access.getEffectiveProfilesForAgent(
@@ -4835,8 +4841,10 @@ export async function buildPaperclipRuntimeMcpServers(input: {
 
   return [
     {
-      name: "paperclip-assigned",
-      url: `${paperclipApiBaseUrl()}/mcp/gateways/${gateway!.gatewayPublicId}`,
+      ...assignedMcpServerPresentation(
+        `${paperclipApiBaseUrl()}/mcp/gateways/${gateway!.gatewayPublicId}`,
+        input.connectionToolNames ?? "legacy",
+      ),
       token: token.token,
       connectionId: `assignment:${assignmentDigest}`,
     },
@@ -24886,6 +24894,7 @@ export function heartbeatService(
               db,
               agent,
               runId: run.id,
+              connectionToolNames: connectionToolNameModeForAgent(agent),
             });
             const runtimeToolDelivery =
               adapter.runtimeToolDelivery ?? "invocation_context";

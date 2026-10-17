@@ -148,6 +148,17 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     expect(JSON.stringify(first)).not.toContain(uninstalledConnection!.id);
     expect(second).toHaveLength(1);
     expect(second[0]!.connectionId).toBe(first[0]!.connectionId);
+    // Fork-only (NX-834): opted-in Claude runs get label `p` and the versioned
+    // URL for the same gateway and assignment; both feed the session identity.
+    const compact = await buildPaperclipRuntimeMcpServers({
+      db, agent: agent!, runId: randomUUID(), connectionToolNames: "compact-v1",
+    });
+    expect(compact).toHaveLength(1);
+    expect(compact[0]).toMatchObject({
+      name: "p",
+      connectionId: first[0]!.connectionId,
+      url: `${first[0]!.url}?toolNames=compact-v1`,
+    });
 
     const gateways = await db.select().from(toolMcpGateways);
     expect(gateways).toHaveLength(1);
@@ -156,7 +167,7 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
       agentId: agent!.id,
     });
     const tokens = await db.select().from(toolMcpGatewayTokens);
-    expect(tokens).toHaveLength(2);
+    expect(tokens).toHaveLength(3);
     for (const token of tokens) {
       expect(token.subjectType).toBe("heartbeat_run");
       expect(token.subjectId).toMatch(/^[0-9a-f-]{36}$/);
@@ -173,7 +184,7 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
         expectedAssignmentDigest: "0".repeat(64),
       }),
     ).resolves.toEqual([]);
-    expect(await db.select().from(toolMcpGatewayTokens)).toHaveLength(2);
+    expect(await db.select().from(toolMcpGatewayTokens)).toHaveLength(3);
 
     await db.update(toolConnections)
       .set({ healthStatus: "degraded", healthMessage: "fixture unavailable" })
@@ -186,7 +197,7 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
         expectedAssignmentDigest: first[0]!.connectionId.slice("assignment:".length),
       }),
     ).resolves.toEqual([]);
-    expect(await db.select().from(toolMcpGatewayTokens)).toHaveLength(2);
+    expect(await db.select().from(toolMcpGatewayTokens)).toHaveLength(3);
     await expect(
       createManagedMcpRunConfig({
         db,

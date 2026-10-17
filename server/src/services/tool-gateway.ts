@@ -170,6 +170,12 @@ import {
   verifyToolArgumentsSignature,
 } from "./tool-content-guards.js";
 import { extendApprovedExecutionWaitDeadline } from "./approved-execution-wait.js";
+import {
+  COMPACT_CONNECTION_TOOL_NAME_VERSION,
+  presentCompactConnectionToolNames,
+  resolveCompactConnectionTool,
+  type ConnectionToolNameMode,
+} from "./compact-connection-tool-names.js";
 
 const DEFAULT_SESSION_TTL_MS = 15 * 60 * 1000;
 const MAX_SESSION_TTL_MS = 60 * 60 * 1000;
@@ -295,6 +301,32 @@ export interface ConnectedMcpGatewayMetadata {
   onDemandTools?: boolean;
 }
 
+// Context methods the MCP route answers itself; no connection alias may take them.
+export const NAMED_GATEWAY_CONTEXT_TOOL_NAMES = [
+  "paperclip_list_resources",
+  "paperclip_read_resource",
+  "paperclip_list_prompts",
+  "paperclip_get_prompt",
+] as const;
+
+/** `presentedName` is set only in compact mode and never replaces `name`. */
+export type NamedGatewayListedTool = ToolGatewayDescriptor & { presentedName?: string };
+
+// Alias collisions fail closed for the whole request, before any provider call.
+function compactNameOperation<T>(work: () => T): T {
+  try {
+    return work();
+  } catch (error) {
+    if (error instanceof Error && error.message === "compact_tool_name_collision") {
+      throw new ToolGatewayHttpError(409, "Compact tool names collide; use legacy tool names", "compact_tool_name_collision");
+    }
+    if (error instanceof Error && error.message === "compact_tool_identity_missing") {
+      throw new ToolGatewayHttpError(409, "A connection tool has no stable compact identity", "compact_tool_identity_missing");
+    }
+    throw error;
+  }
+}
+
 export interface ToolGatewayDescriptor extends AgentToolDescriptor {
   providerType: ToolGatewayProviderType;
   risk: "read" | "write" | "destructive";
@@ -358,6 +390,8 @@ interface ExecuteGatewayToolInput {
   approvedActionRequestId?: string | null;
   idempotencyKey?: string | null;
   callerHeaders?: Record<string, string | string[] | undefined>;
+  // Presentation only; the resolved descriptor keeps its internal name.
+  toolNameMode?: ConnectionToolNameMode;
 }
 
 interface ExecuteTestCallInput {
@@ -2799,19 +2833,30 @@ export function createToolGatewayService(
   async function findToolForSession(
     session: ToolGatewaySession,
     toolName: string,
+    toolNameMode: ConnectionToolNameMode = "legacy",
   ): Promise<ToolGatewayDescriptor> {
     const connectedTools = await connectedMcpToolsForCompany(session.companyId);
     const hasOnDemandTargets = connectedTools.some(isOnDemandRemoteTool);
     const virtualTools = hasOnDemandTargets ? VIRTUAL_TOOLS : [];
     const githubBotTools = await githubBotToolsForSession(db, session);
-    const tool = [...allTools(), ...connectedTools, ...virtualTools, ...githubBotTools, ...await slackToolsForSession(db, session)]
+    const candidates = [...allTools(), ...connectedTools, ...virtualTools, ...githubBotTools, ...await slackToolsForSession(db, session)]
       .filter(
         (candidate) =>
           session.agentId ||
           (candidate.providerType !== "paperclip_self" &&
             candidate.providerType !== "paperclip_plugin"),
-      )
-      .find((candidate) => candidate.name === toolName);
+      );
+    // Fork-only (NX-834): an alias maps to the original descriptor from this
+    // same load; every check below then runs on its internal name.
+    const tool = candidates.find((candidate) => candidate.name === toolName) ??
+      (toolNameMode === COMPACT_CONNECTION_TOOL_NAME_VERSION
+        ? compactNameOperation(() => resolveCompactConnectionTool({
+            companyId: session.companyId,
+            tools: candidates,
+            name: toolName,
+            reservedNames: NAMED_GATEWAY_CONTEXT_TOOL_NAMES,
+          }))
+        : undefined);
     if (!tool) {
       throw new ToolGatewayHttpError(
         404,
@@ -8868,7 +8913,8 @@ export function createToolGatewayService(
       bearerToken: string;
       callerHeaders?: Record<string, string | string[] | undefined>;
       signal?: AbortSignal;
-    }): Promise<ToolGatewayDescriptor[]> {
+      toolNameMode?: ConnectionToolNameMode;
+    }): Promise<NamedGatewayListedTool[]> {
       input.signal?.throwIfAborted();
       const session = await namedGatewaySessionFromBearer({
         gatewayId: input.gatewayId ?? null,
@@ -8893,7 +8939,12 @@ export function createToolGatewayService(
           visibleToolsHash: createHash("sha256").update(JSON.stringify(tools.map((tool) => tool.name).sort())).digest("hex"),
         },
       });
-      return tools;
+      if (input.toolNameMode !== COMPACT_CONNECTION_TOOL_NAME_VERSION) return tools;
+      return compactNameOperation(() => presentCompactConnectionToolNames({
+        companyId: session.companyId,
+        tools,
+        reservedNames: NAMED_GATEWAY_CONTEXT_TOOL_NAMES,
+      }));
     },
 
     async executeContextForNamedGateway(input: {
@@ -9898,7 +9949,7 @@ export function createToolGatewayService(
               : origin.responsibleUserId;
         }
       }
-      let tool = await findToolForSession(session, input.tool);
+      let tool = await findToolForSession(session, input.tool, input.toolNameMode);
       if (tool.providerType === "paperclip_slack_chat") {
         const definition = SLACK_TOOLS.find(t => t.name === tool.upstreamToolName);
         const args = definition?.schema.parse(input.parameters ?? {}) as Record<string, unknown> | undefined;

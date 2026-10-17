@@ -2,6 +2,26 @@ import { createHash } from "node:crypto";
 
 // Fork-only (NX-834): presentation names, never gateway or durable identities.
 export const COMPACT_CONNECTION_TOOL_NAME_VERSION = "compact-v1";
+// Query parameter on the named MCP endpoint. Its value is the format version,
+// so the URL (and with it the client session identity) changes with the format.
+export const CONNECTION_TOOL_NAMES_QUERY_PARAM = "toolNames";
+export const COMPACT_CONNECTION_TOOL_SERVER_LABEL = "p";
+// Server kill switch: compact requests get legacy names and aliases stop resolving.
+export const COMPACT_CONNECTION_TOOL_NAMES_DISABLED_ENV = "PAPERCLIP_COMPACT_CONNECTION_TOOL_NAMES_DISABLED";
+
+export type ConnectionToolNameMode = "legacy" | typeof COMPACT_CONNECTION_TOOL_NAME_VERSION;
+
+export function compactConnectionToolNamesDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const value = env[COMPACT_CONNECTION_TOOL_NAMES_DISABLED_ENV]?.trim().toLowerCase();
+  return value === "true" || value === "1";
+}
+
+/** Absent means legacy; anything other than the known version is rejected. */
+export function parseConnectionToolNameMode(value: unknown): ConnectionToolNameMode {
+  if (value === undefined) return "legacy";
+  if (value === COMPACT_CONNECTION_TOOL_NAME_VERSION) return value;
+  throw new Error("unsupported_tool_name_mode");
+}
 
 interface ConnectionTool {
   name: string;
@@ -21,7 +41,7 @@ function clientName(value: string): string {
   return value.replace(/[^a-zA-Z0-9_]/g, "_");
 }
 
-function isConnectionTool(tool: ConnectionTool): boolean {
+export function isCompactConnectionTool(tool: ConnectionTool): boolean {
   return tool.providerType === "mcp_remote_http" ||
     tool.providerType === "mcp_local_stdio" || tool.providerType === "provider_rest";
 }
@@ -54,7 +74,7 @@ export function compactConnectionToolNames<T extends ConnectionTool>(input: {
     toolsByName.set(tool.name, tool);
   }
   for (const tool of input.tools) {
-    if (!isConnectionTool(tool)) {
+    if (!isCompactConnectionTool(tool)) {
       presentedNames.set(tool, tool.name);
       continue;
     }
@@ -80,4 +100,69 @@ export function compactConnectionToolNames<T extends ConnectionTool>(input: {
     toolsByName.set(name, tool);
   }
   return { presentedNames, toolsByName };
+}
+
+/** Project only connection tools; every other name is reserved, so duplicate
+ * built-in or chat tool names cannot break or shadow connection aliases.
+ */
+function projectConnectionTools<T extends ConnectionTool>(input: {
+  companyId: string;
+  tools: readonly T[];
+  reservedNames?: readonly string[];
+}) {
+  return compactConnectionToolNames({
+    companyId: input.companyId,
+    tools: input.tools.filter(isCompactConnectionTool),
+    reservedNames: [
+      ...input.tools.filter(tool => !isCompactConnectionTool(tool)).map(tool => tool.name),
+      ...(input.reservedNames ?? []),
+    ],
+  });
+}
+
+export function presentCompactConnectionToolNames<T extends ConnectionTool>(input: {
+  companyId: string;
+  tools: readonly T[];
+  reservedNames?: readonly string[];
+}): Array<T & { presentedName: string }> {
+  const { presentedNames } = projectConnectionTools(input);
+  return input.tools.map(tool => ({ ...tool, presentedName: presentedNames.get(tool) ?? tool.name }));
+}
+
+/** Resolve a compact alias against the caller's current descriptors. */
+export function resolveCompactConnectionTool<T extends ConnectionTool>(input: {
+  companyId: string;
+  tools: readonly T[];
+  name: string;
+  reservedNames?: readonly string[];
+}): T | undefined {
+  const tool = projectConnectionTools(input).toolsByName.get(input.name);
+  // Legacy names resolve through the normal lookup; this only maps aliases.
+  return tool && tool.name !== input.name ? tool : undefined;
+}
+
+// Per-agent opt-in: `runtimeConfig.connectionToolNames: "compact-v1"`. Only
+// Claude runs (direct and ACP engine) read it; other adapters and the native
+// runner keep legacy names. Any other value, or the kill switch, means legacy.
+export const COMPACT_CONNECTION_TOOL_NAMES_RUNTIME_KEY = "connectionToolNames";
+
+export function connectionToolNameModeForAgent(
+  agent: { adapterType: string; runtimeConfig?: unknown },
+  env: NodeJS.ProcessEnv = process.env,
+): ConnectionToolNameMode {
+  if (agent.adapterType !== "claude_local" || compactConnectionToolNamesDisabled(env)) return "legacy";
+  const runtimeConfig = agent.runtimeConfig;
+  const value = runtimeConfig && typeof runtimeConfig === "object"
+    ? (runtimeConfig as Record<string, unknown>)[COMPACT_CONNECTION_TOOL_NAMES_RUNTIME_KEY]
+    : undefined;
+  return value === COMPACT_CONNECTION_TOOL_NAME_VERSION ? value : "legacy";
+}
+
+/** Label `p` plus the versioned URL; both are part of the client session identity. */
+export function assignedMcpServerPresentation(baseUrl: string, mode: ConnectionToolNameMode) {
+  if (mode !== COMPACT_CONNECTION_TOOL_NAME_VERSION) return { name: "paperclip-assigned", url: baseUrl };
+  return {
+    name: COMPACT_CONNECTION_TOOL_SERVER_LABEL,
+    url: `${baseUrl}?${CONNECTION_TOOL_NAMES_QUERY_PARAM}=${COMPACT_CONNECTION_TOOL_NAME_VERSION}`,
+  };
 }

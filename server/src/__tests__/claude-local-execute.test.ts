@@ -490,6 +490,56 @@ describe("claude execute", () => {
     }
   });
 
+  // Fork-only (NX-834): compact connection tool names change the server label
+  // and URL, so enabling, disabling or rolling back starts a fresh session.
+  it("starts a fresh Claude session whenever the compact tool-name mode changes", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-compact-names-"));
+    const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root);
+    const gatewayUrl = "https://paperclip.example/mcp/gateways/gw_0123456789abcdef0123456789abcdef";
+    const legacy = { name: "paperclip-assigned", url: gatewayUrl, token: "tok-1", connectionId: "assignment:abc" };
+    const compact = { name: "p", url: `${gatewayUrl}?toolNames=compact-v1`, token: "tok-2", connectionId: "assignment:abc" };
+    try {
+      let previous: Record<string, unknown> | null = null;
+      const run = async (runId: string, server: AdapterRuntimeMcpServer) => {
+        const result = await execute({
+          runId,
+          agent: { id: "agent-compact", companyId: "co-1", name: "agent-compact", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
+          runtime: {
+            sessionId: null,
+            sessionParams: previous ? sessionCodec.deserialize(sessionCodec.serialize(previous)) : null,
+            sessionDisplayId: null,
+            taskKey: null,
+          },
+          config: { engine: "cli", command: commandPath, cwd: workspace,
+            env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath }, promptTemplate: "Do work." },
+          runtimeMcp: { getServers: () => [{ ...server, token: `${server.token}-${runId}` }] },
+          context: {},
+          authToken: "tok",
+          onLog: async () => {},
+        });
+        previous = result.sessionParams ?? null;
+        const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload & { mcpConfigContents: string };
+        return { resumed: capture.argv.includes("--resume"), mcp: JSON.parse(capture.mcpConfigContents) };
+      };
+
+      expect((await run("run-1", legacy)).resumed).toBe(false);
+      expect((await run("run-2", legacy)).resumed).toBe(true);
+      const enabled = await run("run-3", compact);
+      expect(enabled.resumed).toBe(false);
+      expect(enabled.mcp).toEqual({ mcpServers: { p: { type: "http", url: compact.url,
+        headers: { Authorization: "Bearer tok-2-run-3" } } } });
+      expect((await run("run-4", compact)).resumed).toBe(true);
+      // Disabling the mode, or running an older binary that only knows the
+      // legacy label, presents the legacy identity again: fresh session.
+      const disabled = await run("run-5", legacy);
+      expect(disabled.resumed).toBe(false);
+      expect(Object.keys(disabled.mcp.mcpServers)).toEqual(["paperclip-assigned"]);
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   /**
    * Regression tests for https://github.com/paperclipai/paperclip/issues/2848
    *

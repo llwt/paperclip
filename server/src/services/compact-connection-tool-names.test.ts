@@ -1,6 +1,14 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { compactConnectionToolNames } from "./compact-connection-tool-names.js";
+import {
+  assignedMcpServerPresentation,
+  compactConnectionToolNames,
+  compactConnectionToolNamesDisabled,
+  connectionToolNameModeForAgent,
+  parseConnectionToolNameMode,
+  presentCompactConnectionToolNames,
+  resolveCompactConnectionTool,
+} from "./compact-connection-tool-names.js";
 
 function tool(overrides: Record<string, unknown> = {}) {
   return {
@@ -150,5 +158,53 @@ describe("compact connection tool presentation", () => {
 
   it("rejects an invalid injected digest", () => {
     expect(() => project([tool()], { digest: () => "invalid" })).toThrow("compact_tool_digest_invalid");
+  });
+
+  it("projects only connection tools and resolves aliases, not legacy names", () => {
+    const connection = tool();
+    const builtin = tool({ name: "paperclip_get_issue", providerType: "paperclip_self", providerMetadata: undefined });
+    // Duplicate non-connection names do not break connection aliases.
+    const duplicate = { ...builtin };
+    const listed = presentCompactConnectionToolNames({ companyId: "company-a", tools: [builtin, connection, duplicate] });
+    expect(listed.map(entry => entry.presentedName)).toEqual([
+      "paperclip_get_issue", expect.stringMatching(/^linear_[a-f0-9]{16}_search_issues$/), "paperclip_get_issue",
+    ]);
+    expect(listed[1]!.name).toBe(connection.name);
+    const alias = listed[1]!.presentedName;
+    const resolve = (name: string) => resolveCompactConnectionTool({ companyId: "company-a", tools: [builtin, connection, duplicate], name });
+    expect(resolve(alias)).toBe(connection);
+    expect(resolve(connection.name)).toBeUndefined();
+    expect(resolve("paperclip_get_issue")).toBeUndefined();
+    expect(resolveCompactConnectionTool({ companyId: "company-b", tools: [connection], name: alias })).toBeUndefined();
+    expect(() => presentCompactConnectionToolNames({ companyId: "company-a", tools: [connection], reservedNames: [alias] }))
+      .toThrow("compact_tool_name_collision");
+  });
+
+  it("accepts only the known mode and honors the kill switch", () => {
+    expect(parseConnectionToolNameMode(undefined)).toBe("legacy");
+    expect(parseConnectionToolNameMode("compact-v1")).toBe("compact-v1");
+    for (const value of ["", "legacy", "compact-v2", "COMPACT-V1", ["compact-v1"], 1]) {
+      expect(() => parseConnectionToolNameMode(value)).toThrow("unsupported_tool_name_mode");
+    }
+    expect(compactConnectionToolNamesDisabled({})).toBe(false);
+    expect(compactConnectionToolNamesDisabled({ PAPERCLIP_COMPACT_CONNECTION_TOOL_NAMES_DISABLED: "true" })).toBe(true);
+    expect(compactConnectionToolNamesDisabled({ PAPERCLIP_COMPACT_CONNECTION_TOOL_NAMES_DISABLED: "1" })).toBe(true);
+    expect(compactConnectionToolNamesDisabled({ PAPERCLIP_COMPACT_CONNECTION_TOOL_NAMES_DISABLED: "no" })).toBe(false);
+  });
+
+  it("opts in only Claude agents that ask for compact-v1", () => {
+    const optedIn = { adapterType: "claude_local", runtimeConfig: { connectionToolNames: "compact-v1" } };
+    expect(connectionToolNameModeForAgent(optedIn, {})).toBe("compact-v1");
+    expect(connectionToolNameModeForAgent({ ...optedIn, adapterType: "codex_local" }, {})).toBe("legacy");
+    expect(connectionToolNameModeForAgent({ adapterType: "claude_local", runtimeConfig: {} }, {})).toBe("legacy");
+    expect(connectionToolNameModeForAgent({ adapterType: "claude_local", runtimeConfig: { connectionToolNames: "compact-v2" } }, {}))
+      .toBe("legacy");
+    expect(connectionToolNameModeForAgent(optedIn, { PAPERCLIP_COMPACT_CONNECTION_TOOL_NAMES_DISABLED: "true" })).toBe("legacy");
+  });
+
+  it("presents the assigned server with label p and the versioned URL only in compact mode", () => {
+    const url = "https://paperclip.example/mcp/gateways/gw_1";
+    expect(assignedMcpServerPresentation(url, "legacy")).toEqual({ name: "paperclip-assigned", url });
+    expect(assignedMcpServerPresentation(url, "compact-v1")).toEqual({ name: "p", url: `${url}?toolNames=compact-v1` });
   });
 });
