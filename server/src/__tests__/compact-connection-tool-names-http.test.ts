@@ -32,11 +32,18 @@ function aliasFor(fixture: Fixture, index: number) {
 suite("compact connection tool names over the named MCP endpoint", () => {
   let db!: ReturnType<typeof createDb>;
   let temp!: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  // Match CI: the gateway must get its signing secret explicitly, not from a
+  // developer's inherited instance environment.
+  const inheritedSigningSecret = process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
   beforeAll(async () => {
+    delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
     temp = await startEmbeddedPostgresTestDatabase("paperclip-compact-names-");
     db = createDb(temp.connectionString);
   });
-  afterAll(async () => { await temp?.cleanup(); });
+  afterAll(async () => {
+    if (inheritedSigningSecret !== undefined) process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = inheritedSigningSecret;
+    await temp?.cleanup();
+  });
   afterEach(() => { delete process.env[COMPACT_CONNECTION_TOOL_NAMES_DISABLED_ENV]; });
 
   async function setup(toolCount = 10) {
@@ -44,7 +51,8 @@ suite("compact connection tool names over the named MCP endpoint", () => {
     await db.insert(connectionGrants).values({ companyId: fixture.company.id, connectionId: fixture.connection.id,
       kind: "organization", status: "active", isDefault: true });
     const providerCalls: string[] = [];
-    const gateway = createToolGatewayService(db, { remoteHttpRequest: async (_url, init) => {
+    // CI has no instance signing secret; ask-first calls need one to park.
+    const gateway = createToolGatewayService(db, { toolActionSigningSecret: `compact-${randomUUID()}`, remoteHttpRequest: async (_url, init) => {
       const body = JSON.parse(String(init.body));
       if (body.method === "tools/call") providerCalls.push(body.params.name);
       return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: body.method === "initialize"
