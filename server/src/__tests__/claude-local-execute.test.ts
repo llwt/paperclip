@@ -490,8 +490,9 @@ describe("claude execute", () => {
     }
   });
 
-  // Fork-only (NX-834): compact connection tool names change the server label
-  // and URL, so enabling, disabling or rolling back starts a fresh session.
+  // Fork-only (NX-834): Claude resumes across MCP server changes, except when
+  // the connection tool name format changes: the saved conversation would hold
+  // names that no longer exist, so enabling or disabling starts fresh.
   it("starts a fresh Claude session whenever the compact tool-name mode changes", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-compact-names-"));
     const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root);
@@ -524,13 +525,14 @@ describe("claude execute", () => {
 
       expect((await run("run-1", legacy)).resumed).toBe(false);
       expect((await run("run-2", legacy)).resumed).toBe(true);
+      // Upstream's rule still holds within one format: a changed server resumes.
+      expect((await run("run-2b", { ...legacy, connectionId: "assignment:def" })).resumed).toBe(true);
       const enabled = await run("run-3", compact);
       expect(enabled.resumed).toBe(false);
       expect(enabled.mcp).toEqual({ mcpServers: { p: { type: "http", url: compact.url,
         headers: { Authorization: "Bearer tok-2-run-3" } } } });
       expect((await run("run-4", compact)).resumed).toBe(true);
-      // Disabling the mode, or running an older binary that only knows the
-      // legacy label, presents the legacy identity again: fresh session.
+      // Disabling the mode (the first rollback step) starts fresh again.
       const disabled = await run("run-5", legacy);
       expect(disabled.resumed).toBe(false);
       expect(Object.keys(disabled.mcp.mcpServers)).toEqual(["paperclip-assigned"]);
