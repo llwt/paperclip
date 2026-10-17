@@ -17,6 +17,12 @@ import { ToolGatewayHttpError, type ToolGatewayService } from "../services/tool-
 import { forbidden, HttpError } from "../errors.js";
 import { accessService } from "../services/index.js";
 import { listConnectionLifecycleEvents } from "../services/tool-connection-activity.js";
+import {
+  CONNECTION_TOOL_NAMES_QUERY_PARAM,
+  compactConnectionToolNamesDisabled,
+  parseConnectionToolNameMode,
+  type ConnectionToolNameMode,
+} from "../services/compact-connection-tool-names.js";
 
 const TOOL_ACTIVITY_EVENT_TYPES = [
   "call_completed",
@@ -70,6 +76,17 @@ async function discoveryRequest<T>(req: Request, res: Response, work: (signal: A
   }
 }
 
+// Fork-only (NX-834): the URL selects how connection tool names are shown.
+// With the kill switch set, compact URLs get legacy names and no alias resolves.
+function requestedToolNameMode(req: Request): ConnectionToolNameMode | null {
+  try {
+    const mode = parseConnectionToolNameMode(req.query[CONNECTION_TOOL_NAMES_QUERY_PARAM]);
+    return compactConnectionToolNamesDisabled() ? "legacy" : mode;
+  } catch {
+    return null;
+  }
+}
+
 async function handleMcpGatewayProtocol(
   req: Request,
   res: Response,
@@ -80,6 +97,13 @@ async function handleMcpGatewayProtocol(
     const token = bearerToken(req);
     if (!token) {
       res.status(401).json({ error: "Bearer token is required" });
+      return;
+    }
+    const toolNameMode = requestedToolNameMode(req);
+    if (!toolNameMode) {
+      const id = (req.body as { id?: unknown } | undefined)?.id ?? null;
+      res.status(400).json({ jsonrpc: "2.0", id, error: { code: -32602, message: `Unsupported ${CONNECTION_TOOL_NAMES_QUERY_PARAM} mode`,
+        data: { reasonCode: "unsupported_tool_name_mode" } } });
       return;
     }
     const headers = callerHeaders(req);
@@ -116,6 +140,7 @@ async function handleMcpGatewayProtocol(
         bearerToken: token,
         callerHeaders: headers,
         signal,
+        toolNameMode,
       }));
       res.json({
         jsonrpc: "2.0",
@@ -123,7 +148,7 @@ async function handleMcpGatewayProtocol(
         result: {
           tools: [
             ...tools.map((tool) => ({
-            name: tool.name,
+            name: tool.presentedName ?? tool.name,
             title: tool.displayName,
             description: tool.description,
             inputSchema: tool.parametersSchema ?? { type: "object", properties: {} },
@@ -187,6 +212,7 @@ async function handleMcpGatewayProtocol(
         tool: name,
         parameters: params.arguments ?? {},
         callerHeaders: req.headers,
+        toolNameMode,
       });
       const resultRecord = result.result && typeof result.result === "object" && !Array.isArray(result.result)
         ? result.result as Record<string, unknown>
