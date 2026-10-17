@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { ASSIGNED_MCP_SERVER_NAME } from "./mcp-tool-names.js";
 
 // Fork-only (NX-834): presentation names, never gateway or durable identities.
 export const COMPACT_CONNECTION_TOOL_NAME_VERSION = "compact-v1";
@@ -160,7 +161,7 @@ export function connectionToolNameModeForAgent(
 
 /** Label `p` plus the versioned URL; both are part of the client session identity. */
 export function assignedMcpServerPresentation(baseUrl: string, mode: ConnectionToolNameMode) {
-  if (mode !== COMPACT_CONNECTION_TOOL_NAME_VERSION) return { name: "paperclip-assigned", url: baseUrl };
+  if (mode !== COMPACT_CONNECTION_TOOL_NAME_VERSION) return { name: ASSIGNED_MCP_SERVER_NAME, url: baseUrl };
   return {
     name: COMPACT_CONNECTION_TOOL_SERVER_LABEL,
     url: `${baseUrl}?${CONNECTION_TOOL_NAMES_QUERY_PARAM}=${COMPACT_CONNECTION_TOOL_NAME_VERSION}`,

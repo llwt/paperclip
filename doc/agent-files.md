@@ -136,8 +136,9 @@ the current instruction location. The location uses the registered execution
 path and the entry's parent directory, including nested entry directories. It
 supersedes locations in earlier turns and asks the agent to re-read referenced
 siblings. It is not part of the cached system file. A missing or changed saved
-bundle key starts a fresh session; MCP identity, cwd, and target checks still
-apply. Writable copies remain separate for each run.
+bundle key starts a fresh session; cwd and target checks still apply. A changed
+MCP server set does not start a fresh session: the session resumes and loads the
+current tools. Writable copies remain separate for each run.
 
 For an unmanaged remote instruction source, the adapter maps paths inside the
 staged workspace to the execution workspace. A source outside that workspace
@@ -186,6 +187,22 @@ New current-file bytes are not database revision rows. Old instruction-only
 candidates are retained solely for upgrade compatibility.
 
 Crash recovery can collect a stopped working copy without starting a model.
+Cleanup does not wait for a directory lock before process-stop proof exists, or
+after the copy is superseded or cleanup is complete. An unavailable copy keeps
+its failed-save receipt. Recovery can later clean an unavailable remote copy
+after destruction of its exact lease and executes no remote command. An
+unavailable local copy can still contain uncollected edits; this cleanup path
+preserves those bytes even if local stop proof arrives later.
+Deferred cleanup retries after a
+delay so one blocked copy does not prevent other copies from being cleaned.
+If releasing a run's instruction copy fails, the run records a cleanup warning
+and leaves the durable copy for the recovery sweep. Cleanup does not replace the
+provider's result, discard usage accounting, or prevent environment lease release.
+It does not claim that unsaved agent-file changes were saved; collection failures
+keep their separate failed-save receipts. A run attempts failed cleanup only once
+before handing it to recovery, rather than repeating the lock wait in teardown.
+Re-preparing an existing run uses the same lock as cleanup and rechecks its
+receipt under that lock. Preparing a new run keeps its separate admission path.
 Missing stop proof or lost remote bytes produce a visible diagnostic, never a
 save receipt. An interrupted apply can replay its changed files with the same
 last-sync-wins rule. Cleanup resumes for terminal runs; no copy is retained as

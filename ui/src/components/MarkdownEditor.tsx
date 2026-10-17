@@ -493,7 +493,10 @@ export function computeMentionMenuPosition(
   const desiredLeft = viewport.offsetLeft + anchor.viewportLeft + MENTION_MENU_CARET_GAP;
   const left = Math.max(minLeft, Math.min(desiredLeft, maxLeft));
 
-  return { top, left };
+  // The menu can grow beyond its estimated width for long task names.
+  // Constrain its actual layout to the space remaining beside the caret.
+  const maxWidth = Math.max(0, viewport.offsetLeft + viewport.width - MENTION_MENU_PADDING - left);
+  return { top, left, maxWidth };
 }
 
 function getMentionMenuSize(optionCount: number): MentionMenuSize {
@@ -1032,7 +1035,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
       const option = mentionOptionByKey.get(`agent:${parsed.agentId}`);
       applyMentionChipDecoration(link, {
         ...parsed,
-        icon: parsed.icon ?? option?.agentIcon ?? null,
+        appearance: option?.agentAppearance,
       });
     }
   }, [mentionOptionByKey]);
@@ -1536,6 +1539,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
             style={{
               top: mentionMenuPosition.top,
               left: mentionMenuPosition.left,
+              maxWidth: mentionMenuPosition.maxWidth,
               touchAction: "pan-y",
               WebkitOverflowScrolling: "touch",
             }}

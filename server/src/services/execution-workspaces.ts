@@ -1321,7 +1321,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   // flag lets only one sweep run at a time, so one sweep owns the shared state.
   let terminalSweepInProgress = false;
 
-  async function listWorkspaceIssueTree(workspace: Pick<ExecutionWorkspaceRow, "companyId" | "sourceIssueId">) {
+  async function listWorkspaceIssues(workspace: Pick<ExecutionWorkspaceRow, "id" | "companyId" | "sourceIssueId">) {
     if (!workspace.sourceIssueId) return [];
     return db
       .select({
@@ -1334,7 +1334,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       .from(issues)
       .where(and(
         eq(issues.companyId, workspace.companyId),
-        sql<boolean>`
+        or(eq(issues.executionWorkspaceId, workspace.id), sql<boolean>`
           ${issues.id} IN (
             WITH RECURSIVE issue_tree(id) AS (
               SELECT ${issues.id}
@@ -1349,7 +1349,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             )
             SELECT id FROM issue_tree
           )
-        `,
+        `),
       ));
   }
 
@@ -1381,16 +1381,15 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     workspace: ExecutionWorkspaceRow,
     git: ExecutionWorkspaceCloseGitReadiness | null,
   ) {
-    const issueTree = await listWorkspaceIssueTree(workspace);
-    const sourceIssue = issueTree.find((issue) => issue.id === workspace.sourceIssueId) ?? null;
+    const workspaceIssues = await listWorkspaceIssues(workspace);
+    const sourceIssue = workspaceIssues.find((issue) => issue.id === workspace.sourceIssueId) ?? null;
     const sourceIssueTerminal = Boolean(sourceIssue && TERMINAL_ISSUE_STATUSES.has(sourceIssue.status));
-    const subtreeTerminal = Boolean(sourceIssue && issueTree.every((issue) => TERMINAL_ISSUE_STATUSES.has(issue.status)));
+    const workspaceIssuesTerminal = Boolean(sourceIssue && workspaceIssues.every((issue) => TERMINAL_ISSUE_STATUSES.has(issue.status)));
     // The cooldown anchor is the most recent terminal timestamp across the whole
-    // issue tree. The reaper compares it against the cooldown window. A null
-    // anchor means no issue in the tree is terminal yet, so the cooldown never
-    // applies (the terminal-tree gates above already block the archive).
+    // source tree and all bound issues. The reaper compares it against the
+    // cooldown window. The terminal gates block the archive if any are open.
     let cooldownAnchor: Date | null = null;
-    for (const issue of issueTree) {
+    for (const issue of workspaceIssues) {
       const terminalAt = issueTerminalTimestamp(issue);
       if (terminalAt && (!cooldownAnchor || terminalAt.getTime() > cooldownAnchor.getTime())) {
         cooldownAnchor = terminalAt;
@@ -1458,7 +1457,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         isMergedIntoBase: git?.isMergedIntoBase ?? null,
       }),
       sourceIssueTerminal,
-      subtreeTerminal,
+      workspaceIssuesTerminal,
       cooldownAnchor,
       workspaceDirty: Boolean(git?.hasDirtyTrackedFiles || git?.hasUntrackedFiles),
       workspaceHeadSha,
@@ -2624,7 +2623,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         const reopenPending = metadataHasReopenPendingConsumption(
           workspace.metadata as Record<string, unknown> | null,
         );
-        if (!assessment.sourceIssueTerminal || !assessment.subtreeTerminal) {
+        if (!assessment.sourceIssueTerminal || !assessment.workspaceIssuesTerminal) {
           if (reopenPending) {
             // The source issue left the terminal state, so the reopen transition
             // committed. Clear the reopen-pending flag under the lifecycle lock so
@@ -2652,9 +2651,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           continue;
         }
         // Hold the archive during the cooldown window. The anchor is the most
-        // recent terminal timestamp across the issue tree. A person can reopen
-        // the work inside this window. A cooldown of 0 disables the check, so the
-        // reaper archives the workspace on the same sweep. The archive statement
+        // recent terminal timestamp across the source tree and all bound issues.
+        // A person can reopen the work inside this window. A cooldown of 0
+        // disables the check, so the reaper archives on the same sweep. The archive statement
         // below re-checks the same cutoff under the lifecycle lock, so the loop
         // check and the guarded statement agree.
         const cooldownCutoff = workspaceReaperCooldownMs > 0
@@ -2780,6 +2779,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
                   AND live_run.status IN ('queued', 'running')
               )`,
               sql<boolean>`NOT EXISTS (
+                SELECT 1
+                FROM ${issues} bound_issue
+                WHERE bound_issue.company_id = ${workspace.companyId}
+                  AND bound_issue.execution_workspace_id = ${workspace.id}
+                  AND bound_issue.status NOT IN ('done', 'cancelled')
+              )`,
+              sql<boolean>`NOT EXISTS (
                 WITH RECURSIVE issue_tree(id, status) AS (
                   SELECT root.id, root.status
                   FROM ${issues} root
@@ -2795,9 +2801,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               )`,
               // Re-check the cooldown under the lifecycle lock. This predicate
               // matches the loop check above: block the archive when any issue in
-              // the tree became terminal after the cutoff. The tree walk mirrors
-              // the terminal-tree walk above. A null cutoff means the cooldown is
-              // disabled, so this predicate drops out of the guard.
+              // the source tree or bound to the workspace became terminal after
+              // the cutoff. A null cutoff disables this guard.
               cooldownCutoff
                 ? sql<boolean>`NOT EXISTS (
                 WITH RECURSIVE cooldown_tree(id, status, completed_at, cancelled_at, updated_at) AS (
@@ -2811,7 +2816,14 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
                   JOIN cooldown_tree parent ON child.parent_id = parent.id
                   WHERE child.company_id = ${workspace.companyId}
                 )
-                SELECT 1 FROM cooldown_tree
+                SELECT 1 FROM (
+                  SELECT status, completed_at, cancelled_at, updated_at FROM cooldown_tree
+                  UNION ALL
+                  SELECT bound_issue.status, bound_issue.completed_at, bound_issue.cancelled_at, bound_issue.updated_at
+                  FROM ${issues} bound_issue
+                  WHERE bound_issue.company_id = ${workspace.companyId}
+                    AND bound_issue.execution_workspace_id = ${workspace.id}
+                ) cooldown_issues
                 WHERE COALESCE(
                   CASE
                     WHEN status = 'done' THEN completed_at

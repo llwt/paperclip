@@ -707,6 +707,7 @@ describe("claude execute", () => {
     const instructionsFile = path.join(root, "instructions.md");
     await fs.writeFile(instructionsFile, "# Agent instructions", "utf-8");
     const metaEvents: Array<{ commandArgs: string[]; commandNotes: string[] }> = [];
+    const getFreshSessionHandoff = vi.fn(async () => "FRESH_HANDOFF: original goal and prior decisions");
     const prompts: string[] = [];
     const baselineCommand = path.join(root, "claude-baseline");
     await writeFakeClaudeCommand(baselineCommand);
@@ -721,6 +722,7 @@ describe("claude execute", () => {
     try {
       const result = await execute({
         runId: "run-resume-fallback",
+        getFreshSessionHandoff,
         agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
         runtime: { sessionId: "11111111-1111-4111-8111-111111111111", sessionParams: baseline.sessionParams ?? null, sessionDisplayId: null, taskKey: null },
         config: {
@@ -738,7 +740,7 @@ describe("claude execute", () => {
         authToken: "tok",
         onLog: async () => {},
         onMeta: async (meta) => {
-          prompts.push(meta.prompt ?? "");
+          prompts.push(String(meta.prompt ?? ""));
           metaEvents.push({
             commandArgs: ((meta.commandArgs as string[]) ?? []).slice(),
             commandNotes: ((meta.commandNotes as string[]) ?? []).slice(),
@@ -751,6 +753,9 @@ describe("claude execute", () => {
         appendedSystemPromptFileContents: string | null;
       }>;
       expect(captured).toHaveLength(2);
+      expect(getFreshSessionHandoff).toHaveBeenCalledOnce();
+      expect(prompts[0]).not.toContain("FRESH_HANDOFF");
+      expect(prompts[1]).toContain("FRESH_HANDOFF: original goal and prior decisions");
       expect(captured[0]?.argv).toContain("--resume");
       expect(captured[0]?.argv).not.toContain("--append-system-prompt-file");
       expect(captured[1]?.argv).not.toContain("--resume");
@@ -1244,7 +1249,7 @@ describe("claude execute", () => {
     })).toBe(false);
   });
 
-  it("reuses a stable Paperclip-managed Claude prompt bundle across equivalent runs", async () => {
+  it.each(["unchanged", "added", "removed"])("resumes a stable Claude prompt bundle with %s MCP tools", async (change) => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-bundle-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "claude");
@@ -1313,7 +1318,9 @@ describe("claude execute", () => {
       });
       expect(typeof first.sessionParams?.promptBundleKey).toBe("string");
 
+      const getFreshSessionHandoff = vi.fn(async () => "FRESH_HANDOFF_ONLY");
       const second = await execute({
+        getFreshSessionHandoff,
         runId: "run-2",
         agent: {
           id: "agent-1",
@@ -1346,6 +1353,7 @@ describe("claude execute", () => {
           taskId: "issue-1",
           wakeReason: "issue_commented",
           wakeCommentId: "comment-2",
+          refreshTools: change !== "unchanged",
           paperclipWake: {
             reason: "issue_commented",
             issue: {
@@ -1377,12 +1385,12 @@ describe("claude execute", () => {
           },
         },
         runtimeMcp: {
-          getServers: () => [{
+          getServers: () => change === "removed" ? [] : [{
             name: "Paperclip projects",
             url: "http://localhost:3100/api/mcp/project-tools",
             connectionId: "paperclip-project-tools",
             token: "next-run-jwt-token",
-          }],
+          }, ...(change === "added" ? [{ name: "GitHub", url: "https://example.test/github/mcp", connectionId: "github", token: "fresh-github-token" }] : [])],
         },
         authToken: "run-jwt-token",
         onLog: async () => {},
@@ -1414,7 +1422,14 @@ describe("claude execute", () => {
       expect(capture2.prompt).toContain(`Agent instructions for this run were loaded from ${instructionsPath}.`);
       expect(capture1.skillEntries).toContain("paperclip");
       expect(capture2.argv).toContain("--resume");
+      expect(getFreshSessionHandoff).not.toHaveBeenCalled();
       expect(capture2.argv).toContain("11111111-1111-4111-8111-111111111111");
+      if (change === "removed") expect(capture2.mcpConfigContents).toBeNull();
+      else {
+        expect(capture2.mcpConfigContents).toContain("next-run-jwt-token");
+        expect(capture2.mcpConfigContents).not.toContain('"run-jwt-token"');
+        if (change === "added") expect(capture2.mcpConfigContents).toContain("fresh-github-token");
+      }
       expect(capture2.prompt).toContain("## Paperclip Resume Delta");
       expect(capture2.prompt).not.toContain("Follow the paperclip heartbeat.");
     } finally {

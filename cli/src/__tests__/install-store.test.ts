@@ -1,8 +1,9 @@
 import fs from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   INSTALL_MANIFEST_VERSION,
   MANAGED_SHIM_MARKER,
@@ -10,6 +11,7 @@ import {
   buildNextManifest,
   flipCurrentAtomic,
   isManagedExecutable,
+  isInstallPayloadInUse,
   payloadPathFor,
   pruneInstallPayloads,
   readInstallManifest,
@@ -46,6 +48,7 @@ describe("managed install store", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     fs.rmSync(root, { recursive: true, force: true });
   });
 
@@ -100,9 +103,198 @@ describe("managed install store", () => {
     const next = buildNextManifest(record(payloads[3], "4"), previousManifest);
 
     expect(next.previous.map((entry) => entry.version)).toEqual(["3", "2"]);
-    expect(pruneInstallPayloads(next, paths)).toEqual([payloads[0]]);
+    expect(pruneInstallPayloads(next, paths, { checkPayloadInUse: () => false })).toEqual([payloads[0]]);
     expect(fs.existsSync(payloads[0])).toBe(false);
     expect(payloads.slice(1).every((payload) => fs.existsSync(payload))).toBe(true);
+  });
+
+  function pruningFixture() {
+    const current = payloadPathFor(paths, "npm", "4");
+    const old = payloadPathFor(paths, "git", "old-sha");
+    fs.mkdirSync(current, { recursive: true });
+    fs.mkdirSync(old, { recursive: true });
+    const procRoot = path.join(root, "proc");
+    const processRoot = path.join(procRoot, "123");
+    fs.mkdirSync(processRoot, { recursive: true });
+    const manifest: InstallManifest = {
+      schemaVersion: INSTALL_MANIFEST_VERSION,
+      ...record(current, "4"),
+      previous: [],
+    };
+    return { old, procRoot, processRoot, manifest };
+  }
+
+  it.each(["exe", "cwd"])("keeps a payload with a live %s and prunes it once free", (link) => {
+    const { old, procRoot, processRoot, manifest } = pruningFixture();
+    const nested = path.join(old, "node_modules", "postgres");
+    fs.mkdirSync(nested, { recursive: true });
+    fs.symlinkSync(link === "exe" ? nested : root, path.join(processRoot, "exe"));
+    fs.symlinkSync(link === "cwd" ? nested : root, path.join(processRoot, "cwd"));
+    const report = vi.fn();
+    const hooks = {
+      checkPayloadInUse: (payload: string) => isInstallPayloadInUse(payload, { platform: "linux", procRoot }),
+      report,
+    };
+    expect(pruneInstallPayloads(manifest, paths, hooks)).toEqual([]);
+    expect(fs.existsSync(old)).toBe(true);
+    expect(report).toHaveBeenCalledWith(`Kept install payload ${old}: a live process runs from this payload.`);
+
+    fs.rmSync(processRoot, { recursive: true });
+    fs.mkdirSync(path.join(procRoot, "456"));
+    fs.symlinkSync(root, path.join(procRoot, "456", "exe"));
+    fs.symlinkSync(root, path.join(procRoot, "456", "cwd"));
+    expect(pruneInstallPayloads(manifest, paths, hooks)).toEqual([old]);
+    expect(fs.existsSync(old)).toBe(false);
+  });
+
+  it("matches canonical payload paths without matching sibling prefixes", () => {
+    const { old, procRoot, processRoot } = pruningFixture();
+    const alias = path.join(root, "payload-alias");
+    fs.symlinkSync(old, alias, "dir");
+    fs.symlinkSync(`${old}-other`, path.join(processRoot, "exe"));
+    fs.symlinkSync(old, path.join(processRoot, "cwd"));
+    expect(isInstallPayloadInUse(alias, { platform: "linux", procRoot })).toBe(true);
+    fs.rmSync(path.join(processRoot, "cwd"));
+    fs.symlinkSync(`${old}-other`, path.join(processRoot, "cwd"));
+    expect(isInstallPayloadInUse(old, { platform: "linux", procRoot })).toBe(false);
+  });
+
+  function denyProcessLinks(processRoot: string, code: string) {
+    const readlink = fs.readlinkSync.bind(fs);
+    vi.spyOn(fs, "readlinkSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      if (String(target).startsWith(`${processRoot}${path.sep}`)) {
+        throw Object.assign(new Error("inspection denied"), { code });
+      }
+      return (readlink as (...args: unknown[]) => string)(target, ...rest);
+    }) as typeof fs.readlinkSync);
+  }
+
+  function addReadableProcess(procRoot: string, pid: string) {
+    fs.mkdirSync(path.join(procRoot, pid));
+    fs.symlinkSync(root, path.join(procRoot, pid, "exe"));
+    fs.symlinkSync(root, path.join(procRoot, pid, "cwd"));
+  }
+
+  it.each(["EACCES", "EPERM"])("skips a process whose links give %s and prunes a free payload", (code) => {
+    const { old, procRoot, processRoot, manifest } = pruningFixture();
+    addReadableProcess(procRoot, "456");
+    denyProcessLinks(processRoot, code);
+    const report = vi.fn();
+    expect(pruneInstallPayloads(manifest, paths, {
+      checkPayloadInUse: (payload) => isInstallPayloadInUse(payload, { platform: "linux", procRoot }),
+      report,
+    })).toEqual([old]);
+    expect(fs.existsSync(old)).toBe(false);
+    expect(report).not.toHaveBeenCalled();
+  });
+
+  it("still protects a payload in use next to a process that cannot be inspected", () => {
+    const { old, procRoot, processRoot } = pruningFixture();
+    fs.mkdirSync(path.join(procRoot, "456"));
+    fs.symlinkSync(root, path.join(procRoot, "456", "exe"));
+    fs.symlinkSync(old, path.join(procRoot, "456", "cwd"));
+    denyProcessLinks(processRoot, "EACCES");
+    expect(isInstallPayloadInUse(old, { platform: "linux", procRoot })).toBe(true);
+  });
+
+  it("keeps and reports a payload when no process can be inspected", () => {
+    const { old, procRoot, processRoot, manifest } = pruningFixture();
+    denyProcessLinks(processRoot, "EACCES");
+    const report = vi.fn();
+    expect(pruneInstallPayloads(manifest, paths, {
+      checkPayloadInUse: (payload) => isInstallPayloadInUse(payload, { platform: "linux", procRoot }),
+      report,
+    })).toEqual([]);
+    expect(fs.existsSync(old)).toBe(true);
+    expect(report).toHaveBeenCalledWith(
+      `Kept install payload ${old}: live-process check failed: No process in ${procRoot} could be inspected.`,
+    );
+  });
+
+  it("keeps and reports a payload when process inspection fails", () => {
+    const { old, procRoot, processRoot, manifest } = pruningFixture();
+    addReadableProcess(procRoot, "456");
+    denyProcessLinks(processRoot, "EIO");
+    const report = vi.fn();
+    expect(pruneInstallPayloads(manifest, paths, {
+      checkPayloadInUse: (payload) => isInstallPayloadInUse(payload, { platform: "linux", procRoot }),
+      report,
+    })).toEqual([]);
+    expect(fs.existsSync(old)).toBe(true);
+    expect(report).toHaveBeenCalledWith(`Kept install payload ${old}: live-process check failed: inspection denied`);
+  });
+
+  it.each(["darwin", "win32"] as const)("keeps and reports older payloads on %s", (platform) => {
+    const { old, manifest } = pruningFixture();
+    const report = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    expect(pruneInstallPayloads(manifest, paths, {
+      checkPayloadInUse: (payload) => isInstallPayloadInUse(payload, { platform }),
+    })).toEqual([]);
+    expect(fs.existsSync(old)).toBe(true);
+    expect(report).toHaveBeenCalledWith(
+      `Kept install payload ${old}: live-process check failed: Live-process checks are not supported on ${platform}.`,
+    );
+  });
+
+  it("keeps payloads if the process table cannot be listed", () => {
+    const { old, procRoot, manifest } = pruningFixture();
+    fs.rmSync(procRoot, { recursive: true });
+    const report = vi.fn();
+    expect(pruneInstallPayloads(manifest, paths, {
+      checkPayloadInUse: (payload) => isInstallPayloadInUse(payload, { platform: "linux", procRoot }),
+      report,
+    })).toEqual([]);
+    expect(fs.existsSync(old)).toBe(true);
+    expect(report.mock.calls[0][0]).toContain("live-process check failed");
+  });
+
+  it("fails safe if no processes are visible", () => {
+    const { old, procRoot, processRoot } = pruningFixture();
+    fs.rmSync(processRoot, { recursive: true });
+    expect(() => isInstallPayloadInUse(old, { platform: "linux", procRoot })).toThrow("No processes are visible");
+  });
+
+  it.each([
+    ["Z", 0, false],
+    ["S", 0x00200000, false],
+    ["S", 0, true],
+  ])("handles missing process links for state %s and flags %i", (state, flags, fails) => {
+    const { old, procRoot, processRoot } = pruningFixture();
+    fs.writeFileSync(path.join(processRoot, "stat"), `123 (process (name)) ${state} 1 1 1 0 -1 ${flags} 0\n`);
+    addReadableProcess(procRoot, "456");
+    const check = () => isInstallPayloadInUse(old, { platform: "linux", procRoot });
+    if (fails) expect(check).toThrow();
+    else expect(check()).toBe(false);
+  });
+
+  it("ignores a process that exits during inspection", () => {
+    const { old, procRoot } = pruningFixture();
+    addReadableProcess(procRoot, "456");
+    expect(isInstallPayloadInUse(old, { platform: "linux", procRoot })).toBe(false);
+  });
+
+  it.skipIf(process.platform !== "linux")("prunes a free payload against the real process table", () => {
+    const { old, manifest } = pruningFixture();
+    const report = vi.fn();
+    expect(pruneInstallPayloads(manifest, paths, { report })).toEqual([old]);
+    expect(fs.existsSync(old)).toBe(false);
+    expect(report).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(process.platform !== "linux")("protects a real child process working in an old payload", async () => {
+    const { old, manifest } = pruningFixture();
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd: old, stdio: "ignore" });
+    const exited = once(child, "exit");
+    try {
+      await once(child, "spawn");
+      const report = vi.fn();
+      expect(pruneInstallPayloads(manifest, paths, { report })).toEqual([]);
+      expect(fs.existsSync(old)).toBe(true);
+      expect(report).toHaveBeenCalledWith(`Kept install payload ${old}: a live process runs from this payload.`);
+    } finally {
+      child.kill();
+      await exited;
+    }
   });
 
   it("writes a stable shim with the validated runtime and custom store path", () => {
