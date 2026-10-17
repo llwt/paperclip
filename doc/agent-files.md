@@ -136,8 +136,9 @@ the current instruction location. The location uses the registered execution
 path and the entry's parent directory, including nested entry directories. It
 supersedes locations in earlier turns and asks the agent to re-read referenced
 siblings. It is not part of the cached system file. A missing or changed saved
-bundle key starts a fresh session; MCP identity, cwd, and target checks still
-apply. Writable copies remain separate for each run.
+bundle key starts a fresh session; cwd and target checks still apply. A changed
+MCP server set does not start a fresh session: the session resumes and loads the
+current tools. Writable copies remain separate for each run.
 
 For an unmanaged remote instruction source, the adapter maps paths inside the
 staged workspace to the execution workspace. A source outside that workspace
