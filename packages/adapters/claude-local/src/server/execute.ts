@@ -94,6 +94,7 @@ import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
 import { buildClaudeExecutionPermissionArgs, claudeSandboxPermissionEnv } from "./permissions.js";
+import { runtimeMcpToolNameFormat, savedMcpToolNameFormat } from "./tool-name-format.js";
 import { resolveClaudeModel, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import {
   createClaudeAcpExecutor,
@@ -806,6 +807,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     runtimeMcpServerIdentity.length === 0
       ? runtimeMcpServers.length === 0
       : runtimeMcpServerIdentity === runtimeMcpIdentity;
+  const hasMatchingToolNameFormat =
+    savedMcpToolNameFormat(runtimeMcpServerIdentity) === runtimeMcpToolNameFormat(runtimeMcpServers);
   const isValidUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(runtimeSessionId);
   const hasMatchingSessionCwd = claudeSessionCwdMatchesExecutionTarget({
     runtimeSessionCwd,
@@ -820,7 +823,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // Each CLI invocation loads --mcp-config, including --resume invocations.
     // Refreshing tools does not invalidate the saved conversation.
     hasMatchingSessionCwd &&
-    hasMatchingExecutionTarget;
+    hasMatchingExecutionTarget &&
+    hasMatchingToolNameFormat;
   const sessionId = canResumeSession ? runtimeSessionId : null;
   if (runtimeSessionId && !isValidUuid) {
     await onLog(
@@ -854,7 +858,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       `[paperclip] Claude session "${runtimeSessionId}" was saved for prompt bundle "${runtimePromptBundleKey}" and will not be resumed with "${promptBundle.bundleKey}".\n`,
     );
   }
-  if (runtimeSessionId && !hasMatchingMcpServers) {
+  if (runtimeSessionId && !hasMatchingToolNameFormat) {
+    await onLog(
+      "stdout",
+      `[paperclip] Claude session "${runtimeSessionId}" was saved with a different connection tool name format and will not be resumed.\n`,
+    );
+  } else if (runtimeSessionId && !hasMatchingMcpServers) {
     await onLog(
       "stdout",
       `[paperclip] Claude runtime MCP server set changed; loading current tools when resuming session "${runtimeSessionId}".\n`,
