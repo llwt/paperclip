@@ -2868,7 +2868,7 @@ function diffExecutionParticipants(
   };
 }
 
-function buildExecutionStageWakeup(input: {
+export function buildExecutionStageWakeup(input: {
   issueId: string;
   previousState: ParsedExecutionState | null;
   nextState: ParsedExecutionState | null;

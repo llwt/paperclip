@@ -7469,6 +7469,26 @@ function hasInteractionContinuationWakeContext(
   );
 }
 
+const EXECUTION_STAGE_HANDOFF_WAKE_REASONS = new Set([
+  "execution_review_requested",
+  "execution_approval_requested",
+  "execution_changes_requested",
+]);
+
+// Differs from upstream (fork, SX-1386): a stage decision hands the task to
+// the next participant exactly once. When the deciding run is still releasing
+// its environment lease, that hand-off must wait, not be dropped.
+function isExecutionStageHandoffWakeContext(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+) {
+  return (
+    contextSnapshot?.source === "issue.execution_stage" &&
+    EXECUTION_STAGE_HANDOFF_WAKE_REASONS.has(
+      String(contextSnapshot.wakeReason ?? ""),
+    )
+  );
+}
+
 function normalizeInteractionContinuationWakeContext(
   contextSnapshot: Record<string, unknown>,
   payload: Record<string, unknown> | null | undefined,
@@ -10536,6 +10556,61 @@ export function heartbeatService(
       );
     }
     await acknowledgeRemoteStop(input.runId, input.companyId);
+    // Differs from upstream (fork, SX-1386): a stage hand-off saved behind this
+    // run's lease can start now. Wake-queue promotion skips an acknowledged
+    // stop, and the route that decided the stage stops its own run.
+    const issueId = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot, nativeIssueId: heartbeatRuns.nativeIssueId })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId)))
+      .then((rows) => rows[0]
+        ? readNonEmptyString(parseObject(rows[0].contextSnapshot).issueId) ?? rows[0].nativeIssueId
+        : null)
+      .catch(() => null);
+    if (issueId) await resumeDeferredExecutionStageWakes(input.companyId, issueId);
+  }
+
+  // Differs from upstream (fork, SX-1386). A stage hand-off wake that met an
+  // execution blocker is saved as `deferred_issue_execution`. Start it through
+  // normal admission once the blocker is gone. Admission claims the saved row
+  // and writes its successor run in one transaction under the issue lock, so a
+  // failed or interrupted attempt leaves the row saved for the next retry, and
+  // a retry after a commit finds nothing left to start. Callers: the end of
+  // every lease release, the enqueue that saved the wake (the lease may have
+  // been released during its transaction), and `resumeQueuedRuns`.
+  async function resumeDeferredExecutionStageWakes(companyId: string, issueId: string) {
+    try {
+      const waits = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+        sql`${agentWakeupRequests.payload}->${DEFERRED_WAKE_CONTEXT_KEY}->>'source' = 'issue.execution_stage'`,
+      )).orderBy(asc(agentWakeupRequests.requestedAt));
+      for (const wake of waits) {
+        const payload = parseObject(wake.payload);
+        const context = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
+        if (!isExecutionStageHandoffWakeContext(context)) continue;
+        // Admission checks again under the issue lock; this only saves work.
+        if (await getExecutionBlocker(db, companyId, issueId)) return;
+        const wakePayload = { ...payload };
+        delete wakePayload[DEFERRED_WAKE_CONTEXT_KEY];
+        delete wakePayload.executionWait;
+        await enqueueWakeup(wake.agentId, {
+          source: wake.source as WakeupOptions["source"],
+          triggerDetail: (wake.triggerDetail ?? undefined) as WakeupOptions["triggerDetail"],
+          reason: wake.reason,
+          payload: wakePayload,
+          contextSnapshot: context,
+          requestedByActorType: (wake.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
+          requestedByActorId: wake.requestedByActorId,
+          idempotencyKey: wake.idempotencyKey,
+        }, wake.id).catch((err) => {
+          logger.warn({ err, wakeId: wake.id, issueId }, "failed to resume deferred execution stage wake");
+        });
+      }
+    } catch (err) {
+      logger.warn({ err, issueId }, "failed to resume deferred execution stage wakes");
+    }
   }
 
   // A run ended by a recovery path (stale-lock sweep, cancel without a process
@@ -19886,6 +19961,21 @@ export function heartbeatService(
         logger.warn({ err, queueId: wake.id }, "failed to resume interrupted comment queue");
       });
     }
+    // Differs from upstream (fork, SX-1386): a saved stage hand-off normally
+    // starts when the blocking run releases its lease. Retry it here after a
+    // restart, or when a different blocker cleared without a lease release.
+    const stageHandoffIssues = await db
+      .selectDistinct({ companyId: agentWakeupRequests.companyId, issueId: sql<string>`${agentWakeupRequests.payload}->>'issueId'` })
+      .from(agentWakeupRequests).innerJoin(companies, eq(companies.id, agentWakeupRequests.companyId))
+      .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        eq(companies.status, "active"),
+        sql`${agentWakeupRequests.payload}->${DEFERRED_WAKE_CONTEXT_KEY}->>'source' = 'issue.execution_stage'`,
+        lte(agentWakeupRequests.requestedAt, new Date(Date.now() - 30_000)),
+        cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
+      .limit(50);
+    for (const { companyId, issueId } of stageHandoffIssues) {
+      if (issueId) await resumeDeferredExecutionStageWakes(companyId, issueId);
+    }
     // A server restart or a message/cleanup race can leave a deferred wake
     // after its owner has released the issue lock. Revisit it through the same
     // release admission, so recovery holds and operator Stops still apply.
@@ -27815,14 +27905,70 @@ export function heartbeatService(
       const agentNameKey = normalizeAgentNameKey(agent.name);
 
       const cancelledRunsToEmit: (typeof heartbeatRuns.$inferSelect)[] = [];
+      // Set when a stage hand-off wake is saved behind a run that still owns
+      // execution (fork, SX-1386).
+      let stageHandoffDeferred = false;
+      // Differs from upstream (fork, SX-1386): resuming a saved stage hand-off.
+      // Its saved row is settled in the same transaction as the admission
+      // result, so it is never finished without a successor run or a decision.
+      const stageHandoffResumeId = executionWaitRequestId &&
+        !opts.queuedCommentInterruptId && !opts.queuedCommentRequestId &&
+        isExecutionStageHandoffWakeContext(enrichedContextSnapshot)
+        ? executionWaitRequestId : null;
+      const settleStageHandoffResume = async <T extends { kind: string }>(
+        tx: Parameters<Parameters<typeof db.transaction>[0]>[0], result: T,
+      ): Promise<T> => {
+        if (!stageHandoffResumeId || result.kind === "deferred") return result;
+        const run = "run" in result ? (result as { run?: { id: string } | null }).run ?? null : null;
+        await tx.update(agentWakeupRequests).set({
+          status: run ? "coalesced" : "skipped",
+          runId: run?.id ?? null,
+          error: run ? null : "Admission skipped the saved stage hand-off; see the skipped wake for the reason.",
+          finishedAt: new Date(),
+          updatedAt: new Date(),
+        }).where(and(
+          eq(agentWakeupRequests.id, stageHandoffResumeId), eq(agentWakeupRequests.companyId, agent.companyId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ));
+        return result;
+      };
 
       const outcome = await db
-        .transaction(async (tx) => {
+        .transaction(async (tx) => settleStageHandoffResume(tx, await (async () => {
+          stageHandoffDeferred = false;
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
 
-          if (executionWaitRequestId) {
+          if (stageHandoffResumeId) {
+            const [pending] = await tx.select().from(agentWakeupRequests).where(and(
+              eq(agentWakeupRequests.id, stageHandoffResumeId), eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+              sql`${agentWakeupRequests.payload}->${DEFERRED_WAKE_CONTEXT_KEY}->>'source' = 'issue.execution_stage'`,
+            ));
+            // Already started, dropped, or never saved: nothing left to resume.
+            if (!pending) return { kind: "deferred" as const };
+            const [current] = await tx.select({ status: issues.status, executionState: issues.executionState })
+              .from(issues).where(and(eq(issues.companyId, agent.companyId), eq(issues.id, issueId)));
+            const state = parseObject(current?.executionState);
+            const stage = parseObject(enrichedContextSnapshot.executionStage);
+            const isWakeAgent = (principal: unknown) => parseObject(principal).agentId === agentId;
+            const stillWaiting = Boolean(current) && !["done", "cancelled"].includes(current!.status) && (
+              enrichedContextSnapshot.wakeReason === "execution_changes_requested"
+                ? state.status === "changes_requested" && isWakeAgent(state.returnAssignee)
+                : state.status === "pending" && state.currentStageId === stage.stageId &&
+                  isWakeAgent(state.currentParticipant));
+            if (!stillWaiting) {
+              await tx.update(agentWakeupRequests).set({
+                status: "cancelled",
+                error: "The task no longer waits on this stage participant.",
+                finishedAt: new Date(),
+                updatedAt: new Date(),
+              }).where(eq(agentWakeupRequests.id, pending.id));
+              return { kind: "deferred" as const };
+            }
+          } else if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
               eq(agentWakeupRequests.id, executionWaitRequestId), eq(agentWakeupRequests.companyId, agent.companyId),
               eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
@@ -28211,9 +28357,14 @@ export function heartbeatService(
               }).where(eq(agentWakeupRequests.id, executionWaitRequestId));
               return { kind: "deferred" as const };
             }
-            if (durableRequest || wakeCommentId ||
+            // Differs from upstream (fork, SX-1386): a stage hand-off is saved
+            // as a deferred wake, like a message. A skipped receipt here was
+            // never resumed, so the next participant got no run.
+            const stageHandoff = isExecutionStageHandoffWakeContext(enrichedContextSnapshot);
+            if (durableRequest || wakeCommentId || stageHandoff ||
                 hasInteractionContinuationWakeContext(enrichedContextSnapshot) ||
                 readNonEmptyString(enrichedContextSnapshot.nativeStatusWakeIntentId)) {
+              stageHandoffDeferred = stageHandoff;
               await tx.insert(agentWakeupRequests).values({
                 ...durableReceiptFields,
                 companyId: agent.companyId, agentId, source, triggerDetail, reason,
@@ -29192,7 +29343,7 @@ export function heartbeatService(
           // transitions to "running" — Fix A (lazy locking).
 
           return { kind: "queued" as const, run: newRun };
-        })
+        })()))
         .catch((error) => {
           if (isExternalChatWaitAuthorizationContention(error))
             return { kind: "deferred" as const };
@@ -29209,6 +29360,11 @@ export function heartbeatService(
 
       if (outcome.kind === "durable") {
         return outcome.receipt.runId ? getRun(outcome.receipt.runId) : null;
+      }
+      if (outcome.kind === "deferred" && stageHandoffDeferred) {
+        // The run that held execution may have released it while this
+        // transaction held the issue lock; its own release found nothing then.
+        await resumeDeferredExecutionStageWakes(agent.companyId, issueId);
       }
       if (outcome.kind === "deferred" || outcome.kind === "skipped") {
         return null;
