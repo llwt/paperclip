@@ -204,7 +204,7 @@ git merge --no-ff <tag>
 
 ## CI gate
 
-`.github/workflows/somnex-ci.yml` runs on every pull request into `somnex-main`, on
+`.github/workflows/somnex-ci.yml` runs on every pull request into `somnex-main` and on every push to `somnex-main` (each merge), so the exact SHA to install has its own run, on
 GitHub-hosted runners: `pnpm install --frozen-lockfile`, `pnpm typecheck`,
 `pnpm build`, and the suites of `pnpm test:run` split into parallel lanes with
 upstream's own shard flags. Upstream's server shards pick files by path rules

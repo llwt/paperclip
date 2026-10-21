@@ -7,13 +7,16 @@ on:
   pull_request:
     branches:
       - somnex-main
+  push:
+    branches:
+      - somnex-main
 
 permissions:
   contents: read
 
 concurrency:
-  group: somnex-ci-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: somnex-ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   typecheck_build:
