@@ -189,14 +189,25 @@ function resolveClaudeTurn(
 }
 
 /** A Claude result event without modelUsage: invocation tokens, session cost. */
-function parseClaudeFallbackTurn(input: { inputTokens: number; costUsd: number }) {
+function parseClaudeFallbackTurn(input: {
+  inputTokens: number;
+  costUsd: number;
+  cacheCreationInputTokens?: number;
+}) {
   return parseClaudeStreamJson(JSON.stringify({
     type: "result",
     subtype: "success",
     session_id: "claude-session",
     result: "done",
     total_cost_usd: input.costUsd,
-    usage: { input_tokens: input.inputTokens, output_tokens: 0, cache_read_input_tokens: 0 },
+    usage: {
+      input_tokens: input.inputTokens,
+      output_tokens: 0,
+      cache_read_input_tokens: 0,
+      ...(input.cacheCreationInputTokens !== undefined
+        ? { cache_creation_input_tokens: input.cacheCreationInputTokens }
+        : {}),
+    },
   }));
 }
 
@@ -297,6 +308,54 @@ describe("resolveNormalizedUsageForSession for Claude CLI session totals", () =>
     expect(next.normalizedCostUsd).toBe(0.25);
     // Both resumes together add up to the session's real increment.
     expect(next.normalizedUsage!.inputTokens + fallbackResult.normalizedUsage!.inputTokens).toBe(200);
+  });
+
+  it("counts cache writes of a run without modelUsage like modelUsage does", async () => {
+    const previous = {
+      inputTokens: 1_000, cachedInputTokens: 0, outputTokens: 0,
+      rawInputTokens: 1_000, rawCachedInputTokens: 0, rawOutputTokens: 0,
+      costUsd: 4.75, rawCostUsd: 4.75,
+    };
+    const fallback = parseClaudeFallbackTurn({ inputTokens: 10, cacheCreationInputTokens: 100, costUsd: 5.25 });
+    const fallbackResult = await resolveNormalizedUsageForSession({
+      sessionId: "claude-session",
+      rawUsage: fallback.usage,
+      usageBasis: fallback.usageBasis,
+      costBasis: fallback.costBasis,
+      rawCostUsd: fallback.costUsd,
+      getPreviousUsageJson: async () => previous,
+    });
+    expect(fallbackResult.normalizedUsage).toEqual({ inputTokens: 110, cachedInputTokens: 0, outputTokens: 0 });
+    expect(fallbackResult.sessionRawUsage).toEqual({ inputTokens: 1_110, cachedInputTokens: 0, outputTokens: 0 });
+
+    // A failed run then reports the unchanged session snapshot through
+    // modelUsage (1010 input plus 100 cache writes) and the same cost.
+    const failed = parseClaudeStreamJson(JSON.stringify({
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      session_id: "claude-session",
+      total_cost_usd: 5.25,
+      usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 },
+      modelUsage: {
+        "claude-fable-5": {
+          inputTokens: 1_010,
+          outputTokens: 0,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 100,
+        },
+      },
+    }));
+    const next = await resolveNormalizedUsageForSession({
+      sessionId: "claude-session",
+      rawUsage: failed.usage,
+      usageBasis: failed.usageBasis,
+      costBasis: failed.costBasis,
+      rawCostUsd: failed.costUsd,
+      getPreviousUsageJson: async () => storedUsageJson(fallbackResult, 5.25),
+    });
+    expect(next.normalizedUsage).toEqual({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 });
+    expect(next.normalizedCostUsd).toBe(0);
   });
 
   it("stores zero for a failed run without modelUsage that did no work", async () => {

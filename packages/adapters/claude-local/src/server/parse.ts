@@ -54,6 +54,21 @@ export function claudeModelUsageTotals(modelUsage: unknown): UsageSummary | null
   return { inputTokens, outputTokens, cachedInputTokens };
 }
 
+/**
+ * Usage from a result event's top-level `usage` block (this invocation's main
+ * loop only). Counted like claudeModelUsageTotals, cache writes as input, so
+ * the server can add it to a modelUsage baseline without mixing definitions.
+ */
+export function claudeResultUsageTotals(usage: unknown): UsageSummary {
+  const usageObj = parseObject(usage);
+  return {
+    inputTokens:
+      asNumber(usageObj.input_tokens, 0) + asNumber(usageObj.cache_creation_input_tokens, 0),
+    cachedInputTokens: asNumber(usageObj.cache_read_input_tokens, 0),
+    outputTokens: asNumber(usageObj.output_tokens, 0),
+  };
+}
+
 export function parseClaudeStreamJson(stdout: string) {
   let sessionId: string | null = null;
   let model = "";
@@ -108,12 +123,7 @@ export function parseClaudeStreamJson(stdout: string) {
   }
 
   const modelUsageTotals = claudeModelUsageTotals(finalResult.modelUsage);
-  const usageObj = parseObject(finalResult.usage);
-  const usage: UsageSummary = modelUsageTotals ?? {
-    inputTokens: asNumber(usageObj.input_tokens, 0),
-    cachedInputTokens: asNumber(usageObj.cache_read_input_tokens, 0),
-    outputTokens: asNumber(usageObj.output_tokens, 0),
-  };
+  const usage: UsageSummary = modelUsageTotals ?? claudeResultUsageTotals(finalResult.usage);
   const costRaw = finalResult.total_cost_usd;
   const costUsd = typeof costRaw === "number" && Number.isFinite(costRaw) ? costRaw : null;
   const summary = asString(finalResult.result, assistantTexts.join("\n\n")).trim();

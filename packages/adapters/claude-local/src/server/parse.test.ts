@@ -613,6 +613,24 @@ describe("parseClaudeStreamJson usage extraction", () => {
     expect(parsed.costUsd).toBeCloseTo(1.25);
   });
 
+  it("counts cache writes as input in the result usage fallback, like modelUsage", () => {
+    const parsed = parseClaudeStreamJson(
+      `${resultEvent({
+        usage: {
+          input_tokens: 10,
+          output_tokens: 1_800,
+          cache_read_input_tokens: 20,
+          cache_creation_input_tokens: 100,
+        },
+      })}\n`,
+    );
+    expect(parsed.usage).toEqual({
+      inputTokens: 110,
+      outputTokens: 1_800,
+      cachedInputTokens: 20,
+    });
+  });
+
   it("falls back to the result usage block when modelUsage is absent", () => {
     const parsed = parseClaudeStreamJson(`${resultEvent({})}\n`);
     expect(parsed.usage).toEqual({

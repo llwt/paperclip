@@ -63,6 +63,7 @@ import {
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import {
   claudeModelUsageTotals,
+  claudeResultUsageTotals,
   parseClaudeStreamJson,
   describeClaudeFailure,
   detectClaudeLoginRequired,
@@ -1141,14 +1142,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const usage =
       parsedStream.usage ??
       fallbackModelUsageTotals ??
-      (() => {
-        const usageObj = parseObject(parsed.usage);
-        return {
-          inputTokens: asNumber(usageObj.input_tokens, 0),
-          cachedInputTokens: asNumber(usageObj.cache_read_input_tokens, 0),
-          outputTokens: asNumber(usageObj.output_tokens, 0),
-        };
-      })();
+      claudeResultUsageTotals(parsed.usage);
     const usageBasis = parsedStream.usage
       ? parsedStream.usageBasis
       : fallbackModelUsageTotals
