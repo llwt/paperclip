@@ -17,7 +17,7 @@ export const CheckAgainPasses: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await userEvent.click(await canvas.findByRole("button", { name: "Check again" }));
-    await expect(await canvas.findByText("Signed in. Runs can use this account again.")).toBeInTheDocument();
+    await expect(await canvas.findByText("Personal default")).toBeInTheDocument();
   },
 };
 
@@ -26,6 +26,6 @@ export const CheckAgainFails: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await userEvent.click(await canvas.findByRole("button", { name: "Check again" }));
-    await expect(await canvas.findByRole("alert")).toHaveTextContent("rejected");
+    await expect(await canvas.findByText(/The provider rejected this credential/)).toBeInTheDocument();
   },
 };
