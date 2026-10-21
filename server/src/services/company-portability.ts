@@ -138,6 +138,11 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
+function omitHandoffReceipt<T extends { handoff?: unknown }>(metadata: T): Omit<T, "handoff"> {
+  const { handoff: _handoff, ...rest } = metadata;
+  return rest;
+}
+
 /** Build OrgNode tree from manifest agent list (slug + reportsToSlug). */
 function buildOrgTreeFromManifest(agents: CompanyPortabilityManifest["agents"]): OrgNode[] {
   const ROLE_LABELS: Record<string, string> = {
@@ -918,7 +923,8 @@ function readPortableIssueComments(
       authorAgentSlug: asString(entry.authorAgentSlug),
       authorUserId: asString(entry.authorUserId),
       presentation: presentation ? presentation.data : null,
-      metadata: metadata ? metadata.data : null,
+      // A handoff receipt names agents of the source company and is server-authored; never import it.
+      metadata: metadata ? omitHandoffReceipt(metadata.data) : null,
       createdAt: createdAt && Number.isNaN(Date.parse(createdAt)) ? null : createdAt,
     });
   }
