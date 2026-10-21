@@ -34,6 +34,7 @@ import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
 import { issueService } from "./issues.js";
+import { issueExecutionHistoryService } from "./issue-execution-history.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { goalService } from "./goals.js";
 import { documentService } from "./documents.js";
@@ -748,6 +749,7 @@ export function buildHostServices(
   const projects = projectService(db);
   const executionWorkspaces = executionWorkspaceService(db);
   const issues = issueService(db);
+  const executionHistory = issueExecutionHistoryService(db);
   const documents = documentService(db);
   const goals = goalService(db);
   const access = accessService(db);
@@ -2486,6 +2488,11 @@ export function buildHostServices(
           },
         });
         return interaction as any;
+      },
+      async listExecutionDecisions(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        return executionHistory.list(params.issueId, companyId, params);
       },
       async listInteractions(params) {
         const companyId = ensureCompanyId(params.companyId);
