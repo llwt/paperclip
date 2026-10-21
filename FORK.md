@@ -5,12 +5,12 @@ submitted upstream (`paperclipai/paperclip`), per Steven's decision on NX-658
 (2026-10-17). An inventory row drops out only when an upstream release ships
 an equivalent fix on its own, or when Steven drops the patch.
 
-- Mainline: `nrwl-main`. Installs pin a full commit SHA on it. The branch is
+- Mainline: `somnex-main`. Installs pin a full commit SHA on it. The branch is
   protected: GitHub accepts a change only through a pull request with a green
-  `nrwl-ci` and rejects every direct push (see "CI gate").
+  `somnex-ci` and rejects every direct push (see "CI gate").
 - `master` is a pure mirror of upstream `master`. Never commit to it.
-- Fork-only files: this file, `.github/workflows/nrwl-ci.yml`,
-  `scripts/nrwl-ci-server-other.mjs` and the files named under "Localhost
+- Fork-only files: this file, `.github/workflows/somnex-ci.yml`,
+  `scripts/somnex-ci-server-other.mjs` and the files named under "Localhost
   sign-in". Everything else is upstream code plus the patches listed below.
 
 ## Inventory of fork-only commits
@@ -20,8 +20,8 @@ contains `v2026.1005.0`). The tag is upstream `master` at `22a3ea341` plus two
 release commits that are not on `master`. Last refreshed 2026-10-13 against
 upstream `master` `4b958ecbd`, which is 240 commits past that tag.
 `v2026.1012.0` was the latest stable tag on that day. The commits below are
-the ones on `nrwl-main` before the merge; what is left of each is the diff of
-`nrwl-main` against the tag.
+the ones on `somnex-main` before the merge; what is left of each is the diff of
+`somnex-main` against the tag.
 
 | Commit | What | Upstream status | Drops out when |
 | --- | --- | --- | --- |
@@ -49,15 +49,15 @@ the ones on `nrwl-main` before the merge; what is left of each is the diff of
 | fork PR #29 | UI: show all nine Google Workspace catalog entries and saved accounts on the Connectors page for this instance's customer-owned OAuth app | Local only (NX-658). Upstream plans to remove the filter itself after Google approval | The upstream release without the filter is merged |
 | NX-716 (this PR) | Interactions: a confirmation card whose source run ended without a `workspace_finalize` row can be accepted (`runWorkspaceIsFinalized` in `server/src/services/issues.ts`). Before, a card posted by a run that was then lost (`process_lost`) could never be accepted. A live run still blocks, and so does an ended native-runtime run whose finalization coordinator row has not reached `terminal_failure` (native recovery can still resume it) | Local only (NX-658). Upstream `master` has the same gap | An upstream release carries an equivalent fix |
 | NX-892 (this PR) | `pnpm-lock.yaml`: the `server` entries for `@modelcontextprotocol/sdk` and `light-my-request`, 27 added lines. The tag's `server/package.json` names both, its lockfile does not, and `pnpm install --frozen-lockfile` (fork CI and `paperclipai install`) fails without them | Upstream `master` has them since its lockfile refresh `03cf6a6ec` (2026-10-06), which is after the commit the tag was cut from | The next upstream merge. Take upstream's lockfile on a conflict |
-| fork PR #3, fork files | `FORK.md`, `.github/workflows/nrwl-ci.yml` and `scripts/nrwl-ci-server-other.mjs` | Fork-only by design, will not go upstream | The fork is retired |
+| fork PR #3, fork files | `FORK.md`, `.github/workflows/somnex-ci.yml` and `scripts/somnex-ci-server-other.mjs` | Fork-only by design, will not go upstream | The fork is retired |
 
 To refresh this table:
 
 ```sh
 git fetch upstream --tags && git fetch fork
-git log --oneline <base tag>..fork/nrwl-main        # fork-only commits
-git cherry upstream/master fork/nrwl-main           # "-" means upstream has it
-git rev-list --left-right --count fork/nrwl-main...upstream/master
+git log --oneline <base tag>..fork/somnex-main        # fork-only commits
+git cherry upstream/master fork/somnex-main           # "-" means upstream has it
+git rev-list --left-right --count fork/somnex-main...upstream/master
 gh pr view <number> -R paperclipai/paperclip        # each upstream PR
 ```
 
@@ -137,9 +137,9 @@ lines),
 and `ui/src/features/connections/ConnectionSetupFlow.tsx`. On a release merge,
 keep those marked blocks and rerun `tool-oauth-loopback.test.ts`.
 
-## Rules for a change to `nrwl-main`
+## Rules for a change to `somnex-main`
 
-1. **Fork first, local only.** A fix the instance needs lands on `nrwl-main`
+1. **Fork first, local only.** A fix the instance needs lands on `somnex-main`
    through a fork PR. Do not create a port branch on upstream `master` or
    prepare an upstream PR. A fix that is not urgent is not sent upstream
    either: it waits for upstream or becomes a fork fix.
@@ -151,31 +151,31 @@ keep those marked blocks and rerun `tool-oauth-loopback.test.ts`.
    from upstream" comment in `server/src/services/mcp-http.ts`). A release
    merge updates the tag named in such a comment.
 4. **Upstream release merges land as a merge commit, never squashed.** Fix PRs
-   may be squash-merged. No rebase and no force push on `nrwl-main`.
+   may be squash-merged. No rebase and no force push on `somnex-main`.
 5. Posting to `paperclipai/paperclip` (PR, issue, comment or push to an open PR)
    is external and needs Steven's go-ahead each time.
-6. **Every change goes through a fork pull request with a green `nrwl-ci`.**
+6. **Every change goes through a fork pull request with a green `somnex-ci`.**
    That covers fixes, upstream release merges, reverts and edits to this file.
-   Never push to `nrwl-main` directly. GitHub enforces this: branch protection
-   requires a pull request and a green `nrwl-ci` on its head, for admins too,
+   Never push to `somnex-main` directly. GitHub enforces this: branch protection
+   requires a pull request and a green `somnex-ci` on its head, for admins too,
    and rejects a direct push (see "CI gate").
 
 ## Taking upstream releases
 
-`nrwl-main` takes each upstream **stable release tag** by merge commit, within
+`somnex-main` takes each upstream **stable release tag** by merge commit, within
 7 days of the release.
 
 ```sh
 git fetch upstream --tags
-git switch -c merge/upstream-<tag> fork/nrwl-main
+git switch -c merge/upstream-<tag> fork/somnex-main
 git merge --no-ff <tag>
 ```
 
 - Push `merge/upstream-<tag>` to the fork and open a fork PR from it into
-  `nrwl-main`. Merge that PR with a merge commit. Never squash or rebase it
+  `somnex-main`. Merge that PR with a merge commit. Never squash or rebase it
   (rule 4). The release merge has no shortcut: branch protection requires a
   pull request, so GitHub rejects a push of the merge commit straight to
-  `nrwl-main`, and the PR merges only once `nrwl-ci` is green on its head
+  `somnex-main`, and the PR merges only once `somnex-ci` is green on its head
   (rule 6).
 - Conflicts only appear in files the fork patched. Resolve each conflict so
   the fork patch stays, and keep the "Differs from upstream" comments.
@@ -192,26 +192,26 @@ git merge --no-ff <tag>
 
 ## CI gate
 
-`.github/workflows/nrwl-ci.yml` runs on every pull request into `nrwl-main`, on
+`.github/workflows/somnex-ci.yml` runs on every pull request into `somnex-main`, on
 GitHub-hosted runners: `pnpm install --frozen-lockfile`, `pnpm typecheck`,
 `pnpm build`, and the suites of `pnpm test:run` split into parallel lanes with
 upstream's own shard flags. Upstream's server shards pick files by path rules
 and miss a few that the unsharded run includes, so one extra lane ("server
 other") runs every server project test file that no shard selects. The list is
-computed by `scripts/nrwl-ci-server-other.mjs` (fork-only) from vitest's own
+computed by `scripts/somnex-ci-server-other.mjs` (fork-only) from vitest's own
 collection minus the shards' dry-run selection; `--list` prints it. The
-`nrwl-ci` check is green only when every lane passed.
+`somnex-ci` check is green only when every lane passed.
 
-During the rename to `somnex-main` (SX-1119 Step 3) the workflow has two identical gate jobs, `nrwl-ci` and `somnex-ci`, and runs on pull requests into both branch names. GitHub requires `nrwl-ci` until the branch protection is switched to `somnex-ci`; a later PR removes the old names.
+Until 2026-10-21 the mainline was named `nrwl-main` and the required check `nrwl-ci` (renamed on SX-1119 Step 3). Older PRs, tasks and install notes use those names.
 
 `.github/workflows/pr.yml` is upstream's and calls upstream's reusable
 workflow at upstream `master` (`pr-trusted.yml@master`). It is left untouched
 so it never conflicts with an upstream merge. It does run on fork pull
 requests (it passed on fork PR #3), but its definition follows upstream
-`master`, not the code on `nrwl-main`, so it is extra signal and not the gate.
+`master`, not the code on `somnex-main`, so it is extra signal and not the gate.
 
 **Red test baseline: empty.** No test is allowed to fail. The two tests that
-were red on `nrwl-main` (`tool-access-service.test.ts`, "executes allowed test
+were red on `somnex-main` (`tool-access-service.test.ts`, "executes allowed test
 calls as a board user while attributing the selected agent" and "drives an
 ask-first test call through its live lifecycle") pass on clean `v2026.916.1`.
 They failed only with the fork's request ID selection (`0d78b3d67`), because
@@ -222,13 +222,13 @@ failures outside the baseline", and never skip or delete the test.
 
 ### Branch protection
 
-`nrwl-main` takes changes only through a pull request, and `nrwl-ci` is a
+`somnex-main` takes changes only through a pull request, and `somnex-ci` is a
 required status check on it. GitHub branch protection enforces both. Settings
 as of 2026-10-07:
 
 | Setting | Value |
 | --- | --- |
-| Required status checks | `nrwl-ci` only, pinned to GitHub Actions (app id 15368). It is the `gate` job of `nrwl-ci.yml` |
+| Required status checks | `somnex-ci` only, pinned to GitHub Actions (app id 15368). It is the `gate` job of `somnex-ci.yml` |
 | Branch up to date before merging (`strict`) | Off |
 | Enforced for admins (`enforce_admins`) | On |
 | Force pushes | Blocked |
@@ -241,28 +241,28 @@ as of 2026-10-07:
 
 What this means in practice:
 
-- A pull request into `nrwl-main` cannot be merged until `nrwl-ci` is green on
+- A pull request into `somnex-main` cannot be merged until `somnex-ci` is green on
   its head commit. That holds for everyone, including the admin account all
   agents use. There is no admin override.
-- A direct push to `nrwl-main` is rejected in every case, for admins too,
+- A direct push to `somnex-main` is rejected in every case, for admins too,
   because protection requires a pull request. That includes a push of a commit
-  that already has a green `nrwl-ci`, such as the head of an up to date pull
+  that already has a green `somnex-ci`, such as the head of an up to date pull
   request. The merged pull request is the only way in (rule 6).
-- `nrwl-main` cannot be force pushed or deleted. To take a commit back, open a
+- `somnex-main` cannot be force pushed or deleted. To take a commit back, open a
   revert pull request.
 - `strict` is off: a pull request does not have to contain the latest
-  `nrwl-main` to merge. Its `nrwl-ci` result is for the merge with the base as
+  `somnex-main` to merge. Its `somnex-ci` result is for the merge with the base as
   it was when the run started.
 - Zero approving reviews are required. All agents share one GitHub account and
   an account cannot approve its own pull request, so an approval requirement
   could not be met. The independent review and Steven's approval of the head
   SHA are process, not something GitHub enforces.
-- `master` has no part in this: the protection covers `nrwl-main` only.
+- `master` has no part in this: the protection covers `somnex-main` only.
 
 To inspect the live settings (read only):
 
 ```sh
-gh api repos/llwt/paperclip/branches/nrwl-main/protection
+gh api repos/llwt/paperclip/branches/somnex-main/protection
 ```
 
 If the output differs from the table, the table is stale: correct it in a pull
@@ -275,10 +275,10 @@ change to get one merge through.
 An install is a deployment. It is its own task, assigned by the Coordinator
 after Steven approves the SHA.
 
-1. The target is a full SHA on `nrwl-main` with a green `nrwl-ci` run. Never
-   install a branch name. GitHub lets a commit reach `nrwl-main` only through
+1. The target is a full SHA on `somnex-main` with a green `somnex-ci` run. Never
+   install a branch name. GitHub lets a commit reach `somnex-main` only through
    a merged pull request (rule 6), so an install never involves a push to
-   `nrwl-main`.
+   `somnex-main`.
 2. Record the current `sha` from `~/.paperclip/cli/install.json`. List the
    migrations the new commit adds: `git diff --stat <old> <new> -- packages/db/src/migrations`.
 3. Take a database backup: `paperclipai db:backup`. `install` takes none (only
@@ -338,10 +338,10 @@ Facts about `install --ref` on this host (found on NX-449 and NX-509):
    schema. Rollback then also means restoring the database backup from install
    step 3.
 
-A rollback changes the installed build only. It does not move `nrwl-main`,
+A rollback changes the installed build only. It does not move `somnex-main`,
 which cannot be reset, force pushed or pushed to directly. To take the bad
-commit off `nrwl-main`, open a revert pull request and wait for a green
-`nrwl-ci` like any other change.
+commit off `somnex-main`, open a revert pull request and wait for a green
+`somnex-ci` like any other change.
 
 `update --rollback` flips `current` to `previous[0]` in `install.json` for any
 managed install, npm or git, and restarts the active service. It does not
@@ -388,7 +388,7 @@ line into a procedure step without testing it first.
   person to click a card in the UI; an agent can only show that the UI is
   served from the new payload.
 - **Process, not a test result.** Steven's approval binds to one full SHA. A
-  new commit on `nrwl-main` after the approval is not covered: it needs a new
+  new commit on `somnex-main` after the approval is not covered: it needs a new
   approval before it is installed, and smoke step 2 checks the installed `sha`
   against the approved one.
 

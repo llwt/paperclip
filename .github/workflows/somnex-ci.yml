@@ -1,19 +1,18 @@
-name: Nrwl fork CI
+name: Somnex fork CI
 
 # Fork-only workflow (llwt/paperclip). pr.yml calls upstream's reusable
 # workflow and is left untouched so it never conflicts with an upstream merge.
-# This file is the gate for nrwl-main: see FORK.md.
+# This file is the gate for somnex-main: see FORK.md.
 on:
   pull_request:
     branches:
-      - nrwl-main
       - somnex-main
 
 permissions:
   contents: read
 
 concurrency:
-  group: nrwl-ci-${{ github.event.pull_request.number }}
+  group: somnex-ci-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
@@ -55,7 +54,7 @@ jobs:
   # route/authz names under server/src/__tests__ only), which leaves out some
   # files the unsharded run includes. The "server other" lane runs exactly the
   # server project test files that no shard selects, computed by
-  # scripts/nrwl-ci-server-other.mjs. The server vitest config pins maxWorkers
+  # scripts/somnex-ci-server-other.mjs. The server vitest config pins maxWorkers
   # to 1, so one unsplit job would take the sum of all lanes.
   #
   # Do not name this job "test": the runner exports the job id as GITHUB_JOB,
@@ -90,7 +89,7 @@ jobs:
             command: >-
               pnpm run preflight:workspace-links &&
               pnpm --filter @paperclipai/plugin-sdk ensure-build-deps &&
-              node scripts/nrwl-ci-server-other.mjs
+              node scripts/somnex-ci-server-other.mjs
           - label: workspaces-a 1/2
             script: test:run:general
             args: --group general-workspaces-a --shard-index 0 --shard-count 2
@@ -139,27 +138,9 @@ jobs:
       - name: Run tests
         run: ${{ matrix.command || format('pnpm {0} -- {1}', matrix.script, matrix.args) }}
 
-  # Single check to require on nrwl-main. There is no red test baseline: any
+  # Single check to require on somnex-main. There is no red test baseline: any
   # failing lane fails the gate.
   gate:
-    name: nrwl-ci
-    if: ${{ always() }}
-    needs: [typecheck_build, suites]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-
-    steps:
-      - name: Fail if any lane failed
-        env:
-          TYPECHECK_BUILD_RESULT: ${{ needs.typecheck_build.result }}
-          TEST_RESULT: ${{ needs.suites.result }}
-        run: |
-          test "$TYPECHECK_BUILD_RESULT" = "success"
-          test "$TEST_RESULT" = "success"
-
-  # Temporary second gate for the rename on SX-1119 Step 3.
-  # PR 2 removes gate (nrwl-ci) after GitHub requires somnex-ci.
-  gate_somnex:
     name: somnex-ci
     if: ${{ always() }}
     needs: [typecheck_build, suites]
