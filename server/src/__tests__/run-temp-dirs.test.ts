@@ -333,6 +333,67 @@ describe("run teardown and the sweep", () => {
   });
 });
 
+describe("run teardown with the provider still alive", () => {
+  it("keeps the pending write-back until the provider stops, so a later refresh is saved", async () => {
+    // Heartbeat order: cleanup({ keepHome: true }), then removeRunTempDir, then the sweep.
+    const home = await makeAiHome();
+    await writeFile(path.join(home, "provider", "auth.json"), "original");
+    await markWriteBackPending(home, "original");
+    const transaction = vi.fn(async () => undefined);
+    const db = { transaction } as unknown as Db;
+    const release = holdRunTempDirs(RUN);
+    let providerAlive = true;
+    const alive = () => providerAlive;
+
+    await writeBackManagedAiCredential(db, home, { keepPending: true });
+    expect(transaction).not.toHaveBeenCalled();
+    expect(await exists(path.join(home, MANAGED_AI_WRITEBACK_PENDING))).toBe(true);
+    const atTeardown = await removeRunTempDir({
+      dir: home,
+      owner,
+      process: { processPid: 4243, processGroupId: null },
+      isRunProcessAlive: alive,
+      writeBack: (dir) => writeBackManagedAiCredential(db, dir),
+      tmpRoot,
+    });
+    expect(atTeardown).toMatchObject({ removed: false, reason: "process_alive" });
+    release();
+
+    // The provider refreshes its credential, then exits.
+    await writeFile(path.join(home, "provider", "auth.json"), "refreshed");
+    expect((await sweepRunTempDirs({ lookupRuns: lookup([run("failed")]), isRunProcessAlive: alive, tmpRoot })).kept)
+      .toEqual([{ dir: home, reason: "process_alive" }]);
+    providerAlive = false;
+
+    const swept = await sweepRunTempDirs({
+      lookupRuns: lookup([run("failed")]),
+      isRunProcessAlive: alive,
+      writeBack: (dir) => writeBackManagedAiCredential(db, dir),
+      tmpRoot,
+    });
+    expect(transaction).toHaveBeenCalledTimes(1);
+    expect(swept.removed).toEqual([home]);
+  });
+
+  it("keeps the home when the final write-back of a refresh made after teardown fails", async () => {
+    const home = await makeAiHome();
+    await writeFile(path.join(home, "provider", "auth.json"), "original");
+    await markWriteBackPending(home, "original");
+    const noDb = { transaction: vi.fn(async () => { throw new Error("database unavailable"); }) } as unknown as Db;
+
+    await writeBackManagedAiCredential(noDb, home, { keepPending: true });
+    await writeFile(path.join(home, "provider", "auth.json"), "refreshed");
+    const swept = await sweepRunTempDirs({
+      lookupRuns: lookup([run("cancelled")]),
+      isRunProcessAlive: dead,
+      writeBack: (dir) => writeBackManagedAiCredential(noDb, dir),
+      tmpRoot,
+    });
+    expect(swept.kept).toEqual([{ dir: home, reason: "writeback_pending" }]);
+    expect(await readFile(path.join(home, "provider", "auth.json"), "utf8")).toBe("refreshed");
+  });
+});
+
 describe("writeBackManagedAiCredential", () => {
   const noDb = { transaction: vi.fn(async () => { throw new Error("database unavailable"); }) } as unknown as Db;
 
@@ -354,6 +415,23 @@ describe("writeBackManagedAiCredential", () => {
     expect(await removeRunTempDir({ dir: home, owner, isRunProcessAlive: dead, writeBack: (dir) => writeBackManagedAiCredential(noDb, dir), tmpRoot }))
       .toMatchObject({ removed: false, reason: "writeback_pending" });
     expect(await readFile(path.join(home, "provider", "auth.json"), "utf8")).toBe("refreshed");
+  });
+
+  it("with keepPending saves a refresh and keeps the record naming the saved credential", async () => {
+    const home = await makeAiHome();
+    await writeFile(path.join(home, "provider", "auth.json"), "refreshed");
+    await markWriteBackPending(home, "original");
+    const transaction = vi.fn(async () => undefined);
+    const db = { transaction } as unknown as Db;
+
+    await writeBackManagedAiCredential(db, home, { keepPending: true });
+    expect(transaction).toHaveBeenCalledTimes(1);
+    const pending = JSON.parse(await readFile(path.join(home, MANAGED_AI_WRITEBACK_PENDING), "utf8"));
+    expect(pending.credentialSha256).toBe(sha256("refreshed"));
+
+    await writeBackManagedAiCredential(db, home);
+    expect(transaction).toHaveBeenCalledTimes(1);
+    expect(await exists(path.join(home, MANAGED_AI_WRITEBACK_PENDING))).toBe(false);
   });
 
   it("does nothing for a home without a pending record", async () => {

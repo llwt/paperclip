@@ -229,8 +229,16 @@ async function readManagedAiWriteBackPending(home: string): Promise<ManagedAiWri
  * home whose cleanup never ran (server crash), by the run temp folder sweep
  * before it removes the home. Throws, and keeps the record, when the write-back
  * could not be decided, so the home is kept for a later retry.
+ *
+ * With `keepPending` the record stays, now naming the credential just saved,
+ * because the provider may still be running and refresh it again. The final
+ * write-back then runs in `removeRunTempDir`, after the provider has stopped.
  */
-export async function writeBackManagedAiCredential(db: Db, home: string): Promise<void> {
+export async function writeBackManagedAiCredential(
+  db: Db,
+  home: string,
+  options: { keepPending?: boolean } = {},
+): Promise<void> {
   const pending = await readManagedAiWriteBackPending(home);
   if (!pending) return;
   const providerHome = path.join(home, "provider");
@@ -315,7 +323,18 @@ export async function writeBackManagedAiCredential(db: Db, home: string): Promis
         .where(eq(connectionGrants.id, grant.id));
     });
   }
-  await rm(path.join(home, MANAGED_AI_WRITEBACK_PENDING), { force: true });
+  if (!options.keepPending) {
+    await rm(path.join(home, MANAGED_AI_WRITEBACK_PENDING), { force: true });
+  } else if (refreshed !== null) {
+    const credentialSha256 = createHash("sha256").update(refreshed).digest("hex");
+    if (credentialSha256 !== pending.credentialSha256) {
+      await writeFile(
+        path.join(home, MANAGED_AI_WRITEBACK_PENDING),
+        `${JSON.stringify({ ...pending, credentialSha256 })}\n`,
+        { mode: 0o600 },
+      );
+    }
+  }
 }
 
 export async function prepareManagedAiRuntime(
@@ -462,12 +481,14 @@ export async function prepareManagedAiRuntime(
       providerHome,
       /**
        * Write back a refreshed credential, then remove the home. A heartbeat
-       * passes `keepHome` and removes the home itself once the run's process
-       * group is gone; see `removeRunTempDir`.
+       * passes `keepHome` and removes the home itself once the run's provider
+       * has stopped; see `removeRunTempDir`. The pending write-back record
+       * stays with the home until then, so a credential the provider refreshes
+       * after this call is still saved before the home goes.
        */
       cleanup: async (options: { keepHome?: boolean } = {}) => {
         try {
-          if (home) await writeBackManagedAiCredential(db, home);
+          if (home) await writeBackManagedAiCredential(db, home, { keepPending: options.keepHome });
         } finally {
           if (home && !options.keepHome) await rm(home, { recursive: true, force: true });
         }

@@ -481,6 +481,7 @@ import {
   resolveManagedAiSessionStateDir,
 } from "./run-temp-dirs.js";
 import {
+  isPidAlive,
   isProcessGroupAlive,
   terminateLocalService,
 } from "./local-service-supervisor.js";
@@ -27010,6 +27011,8 @@ export function heartbeatService(
           try {
             scratchCleanup = await cleanupHeartbeatRunScratch({
               scratch: scratchForCleanup,
+              processPid: latestRun.processPid,
+              isPidAlive,
               processGroupId: latestRun.processGroupId,
               isProcessGroupAlive,
             });
