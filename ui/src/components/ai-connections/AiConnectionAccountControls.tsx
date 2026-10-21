@@ -49,7 +49,7 @@ export function AiConnectionAccountControls({
         </div>
         {!readOnly && grant.capabilities?.canRevoke && (
           <div className="flex flex-wrap items-center gap-2">
-            {account.status === "needs_attention" && <AiConnectionCheckAgain account={account} />}
+            {account.status === "needs_attention" && <AiConnectionCheckAgain account={account} showFailure={!account.healthMessage} />}
             {<Button variant="outline" size="sm" onClick={onReconnect}><RefreshCw className="size-4" aria-hidden />Reconnect</Button>}
             {account.status !== "revoked" && <Button variant="ghost" size="sm" className="text-destructive" onClick={() => setRevoking(true)}><Unplug className="size-4" aria-hidden />Revoke identity</Button>}
           </div>

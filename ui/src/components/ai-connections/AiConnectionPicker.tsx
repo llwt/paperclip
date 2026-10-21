@@ -134,7 +134,7 @@ export function AiConnectionPicker({
             </p>
           )}
           {!readOnly && (
-            <div className="flex justify-end gap-2">
+            <div className="flex flex-wrap justify-end gap-2">
               {onReconnect && reconnectActions}
               {onReconnect && <Button type="button" variant="outline" onClick={onReconnect}>Reconnect account</Button>}
               <Button

@@ -37,7 +37,11 @@ export function AiConnectionSetupTokenPaste({ companyId, connectionId, onComplet
 }
 
 /** "Check again": test the saved credential without a run, for an account that needs reconnect. */
-export function AiConnectionCheckAgain({ account }: { account: Pick<AiManagedConnectionSummary, "id" | "grantId" | "companyId" | "revalidationSupported"> }) {
+export function AiConnectionCheckAgain({ account, showFailure = true }: {
+  account: Pick<AiManagedConnectionSummary, "id" | "grantId" | "companyId" | "revalidationSupported">;
+  /** Off where the host already shows the saved reason (the account's health message). */
+  showFailure?: boolean;
+}) {
   const client = useQueryClient();
   const check = useMutation({
     mutationFn: () => aiConnectionsApi.revalidate(account.companyId, account.id, account.grantId),
@@ -50,6 +54,6 @@ export function AiConnectionCheckAgain({ account }: { account: Pick<AiManagedCon
       <RotateCw className="size-4" aria-hidden />{check.isPending ? "Checking…" : "Check again"}
     </Button>
     {check.error && <p role="alert" className="basis-full text-sm text-destructive">{check.error.message}</p>}
-    {check.data && <p role={failed ? "alert" : "status"} className={failed ? "basis-full text-sm text-destructive" : "basis-full text-sm text-muted-foreground"}>{check.data.message}</p>}
+    {check.data && (!failed || showFailure) && <p role={failed ? "alert" : "status"} className={failed ? "basis-full text-sm text-destructive" : "basis-full text-sm text-muted-foreground"}>{check.data.message}</p>}
   </>;
 }
