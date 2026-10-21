@@ -2436,6 +2436,7 @@ async function listPendingFinalizeBlockerIssueIds(
     .select({
       issueId: workspaceOperations.issueId,
       executionWorkspaceId: workspaceOperations.executionWorkspaceId,
+      heartbeatRunId: workspaceOperations.heartbeatRunId,
       phase: workspaceOperations.phase,
       status: workspaceOperations.status,
       startedAt: workspaceOperations.startedAt,
@@ -2451,13 +2452,19 @@ async function listPendingFinalizeBlockerIssueIds(
       ),
     );
 
+  type LatestWorkspaceOperation = {
+    heartbeatRunId: string | null;
+    phase: string;
+    status: string;
+    startedAt: Date;
+  };
   const latestAttributedByBlockerWorkspace = new Map<
     string,
-    { phase: string; status: string; startedAt: Date }
+    LatestWorkspaceOperation
   >();
   const latestUnattributedByWorkspace = new Map<
     string,
-    { phase: string; status: string; startedAt: Date }
+    LatestWorkspaceOperation
   >();
   const latestSuccessfulFinalizeByWorkspace = new Map<string, Date>();
   for (const row of rows) {
@@ -2479,6 +2486,7 @@ async function listPendingFinalizeBlockerIssueIds(
       const current = latestAttributedByBlockerWorkspace.get(key);
       if (!current || row.startedAt > current.startedAt) {
         latestAttributedByBlockerWorkspace.set(key, {
+          heartbeatRunId: row.heartbeatRunId,
           phase: row.phase,
           status: row.status,
           startedAt: row.startedAt,
@@ -2490,6 +2498,7 @@ async function listPendingFinalizeBlockerIssueIds(
     const current = latestUnattributedByWorkspace.get(row.executionWorkspaceId);
     if (!current || row.startedAt > current.startedAt) {
       latestUnattributedByWorkspace.set(row.executionWorkspaceId, {
+        heartbeatRunId: row.heartbeatRunId,
         phase: row.phase,
         status: row.status,
         startedAt: row.startedAt,
@@ -2497,6 +2506,11 @@ async function listPendingFinalizeBlockerIssueIds(
     }
   }
 
+  const candidates: Array<{
+    blockerIssueId: string;
+    runId: string;
+    finalizeRunning: boolean;
+  }> = [];
   for (const pair of blockerWorkspacePairs) {
     const latest =
       latestAttributedByBlockerWorkspace.get(
@@ -2510,10 +2524,88 @@ async function listPendingFinalizeBlockerIssueIds(
     );
     if (laterSuccessfulFinalize && laterSuccessfulFinalize > latest.startedAt)
       continue;
-    pending.add(pair.blockerIssueId);
+    // A finalize that ended (`failed`, `skipped`) will not retry: waiting on it
+    // would hold the dependent forever.
+    if (latest.phase === "workspace_finalize" && latest.status !== "running")
+      continue;
+    // Without a run nothing can record the finalize later.
+    if (!latest.heartbeatRunId) continue;
+    candidates.push({
+      blockerIssueId: pair.blockerIssueId,
+      runId: latest.heartbeatRunId,
+      finalizeRunning: latest.phase === "workspace_finalize",
+    });
+  }
+  if (candidates.length === 0) return pending;
+
+  // Fork (SX-1370): the barrier only holds while the run that touched the
+  // workspace can still finish its sync-back, the same rule as
+  // `runWorkspaceIsFinalized`. An ended run never records the missing
+  // finalize (a legacy run on a git worktree records none), so a done blocker
+  // used to block its dependents forever.
+  const { liveRunIds, resumableRunIds } =
+    await listRunIdsThatCanStillRecordWorkspaceFinalize(
+      dbOrTx,
+      candidates.map((candidate) => candidate.runId),
+    );
+  for (const candidate of candidates) {
+    if (liveRunIds.has(candidate.runId)) {
+      pending.add(candidate.blockerIssueId);
+      continue;
+    }
+    // A finalize left `running` by an ended run is stale.
+    if (candidate.finalizeRunning) continue;
+    if (resumableRunIds.has(candidate.runId))
+      pending.add(candidate.blockerIssueId);
   }
 
   return pending;
+}
+
+/**
+ * Batched form of `heartbeatRunIsTerminalOrMissing` and
+ * `heartbeatRunCanNoLongerRecordWorkspaceFinalize`. `liveRunIds` holds runs
+ * that have not ended. `resumableRunIds` holds ended native-runtime runs whose
+ * finalization coordinator row has not reached `terminal_failure`, which native
+ * recovery can still resume.
+ */
+async function listRunIdsThatCanStillRecordWorkspaceFinalize(
+  dbOrTx: Pick<Db, "select">,
+  runIds: string[],
+): Promise<{ liveRunIds: Set<string>; resumableRunIds: Set<string> }> {
+  const liveRunIds = new Set<string>();
+  const resumableRunIds = new Set<string>();
+  const uniqueRunIds = [...new Set(runIds)];
+  if (uniqueRunIds.length === 0) return { liveRunIds, resumableRunIds };
+  const runs = await dbOrTx
+    .select({
+      id: heartbeatRuns.id,
+      status: heartbeatRuns.status,
+      runtimeMode: heartbeatRuns.runtimeMode,
+    })
+    .from(heartbeatRuns)
+    .where(inArray(heartbeatRuns.id, uniqueRunIds));
+  const endedNativeRunIds: string[] = [];
+  for (const run of runs) {
+    if (!TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) {
+      liveRunIds.add(run.id);
+    } else if (run.runtimeMode === "native") {
+      endedNativeRunIds.push(run.id);
+    }
+  }
+  if (endedNativeRunIds.length === 0) return { liveRunIds, resumableRunIds };
+  const finalizations = await dbOrTx
+    .select({
+      runId: nativeRunFinalizations.runId,
+      phase: nativeRunFinalizations.phase,
+    })
+    .from(nativeRunFinalizations)
+    .where(inArray(nativeRunFinalizations.runId, endedNativeRunIds));
+  for (const finalization of finalizations) {
+    if (finalization.phase !== "terminal_failure")
+      resumableRunIds.add(finalization.runId);
+  }
+  return { liveRunIds, resumableRunIds };
 }
 
 /**
@@ -2674,6 +2766,68 @@ async function listIssueDependencyReadinessMap(
       ),
     );
 
+  return evaluateIssueDependencyReadiness(
+    dbOrTx,
+    companyId,
+    readinessMap,
+    blockerRows,
+  );
+}
+
+/**
+ * Readiness of one issue as if its blockers were exactly `blockerIssueIds`,
+ * with the same rules as `listIssueDependencyReadinessMap`. For a request that
+ * replaces the blocker links and changes the status together: the status
+ * checks must see the new link set, not the stored one (SX-1370).
+ */
+async function getIssueDependencyReadinessForBlockerIssueIds(
+  dbOrTx: Pick<Db, "select">,
+  companyId: string,
+  issueId: string,
+  blockerIssueIds: string[],
+) {
+  const readinessMap = new Map<string, IssueDependencyReadiness>([
+    [issueId, createIssueDependencyReadiness(issueId)],
+  ]);
+  const uniqueBlockerIssueIds = [...new Set(blockerIssueIds.filter(Boolean))];
+  const blockerRows =
+    uniqueBlockerIssueIds.length === 0
+      ? []
+      : (
+          await dbOrTx
+            .select({
+              blockerIssueId: issues.id,
+              blockerStatus: issues.status,
+              blockerExecutionWorkspaceId: issues.executionWorkspaceId,
+            })
+            .from(issues)
+            .where(
+              and(
+                eq(issues.companyId, companyId),
+                inArray(issues.id, uniqueBlockerIssueIds),
+              ),
+            )
+        ).map((row) => ({ issueId, ...row }));
+  const readiness = await evaluateIssueDependencyReadiness(
+    dbOrTx,
+    companyId,
+    readinessMap,
+    blockerRows,
+  );
+  return readiness.get(issueId) ?? createIssueDependencyReadiness(issueId);
+}
+
+async function evaluateIssueDependencyReadiness(
+  dbOrTx: Pick<Db, "select">,
+  companyId: string,
+  readinessMap: Map<string, IssueDependencyReadiness>,
+  blockerRows: Array<{
+    issueId: string;
+    blockerIssueId: string;
+    blockerStatus: string;
+    blockerExecutionWorkspaceId: string | null;
+  }>,
+) {
   // Collect issue/workspace pairs of "done" blockers — these are the only ones
   // subject to the workspace-finalize barrier. Blockers that aren't done already
   // mark the dependent as not-ready and don't need a finalize check.
@@ -2713,9 +2867,10 @@ async function listIssueDependencyReadinessMap(
       pendingFinalizeBlockerIssueIds.has(row.blockerIssueId)
     ) {
       // Workspace-finalize barrier: the blocker's most recent run on its
-      // execution workspace hasn't recorded a successful workspace_finalize.
-      // Treat the dependent as not-ready until sync-back lands (or the run
-      // finalizes); a subsequent finalize wake will re-evaluate readiness.
+      // execution workspace hasn't recorded a successful workspace_finalize
+      // and can still record one. Treat the dependent as not-ready until
+      // sync-back lands or the run ends; the run-end hook re-evaluates
+      // readiness and wakes the dependent.
       // `allBlockersDone` is cleared too so that callers using it as a
       // proxy for "this dependent can proceed" still see the gate.
       current.unresolvedBlockerIssueIds.push(row.blockerIssueId);
@@ -9185,6 +9340,19 @@ export function issueService(db: Db) {
       );
       return readiness.get(issueId) ?? createIssueDependencyReadiness(issueId);
     },
+
+    getDependencyReadinessForBlockerIssueIds: async (
+      companyId: string,
+      issueId: string,
+      blockerIssueIds: string[],
+      dbOrTx: any = db,
+    ) =>
+      getIssueDependencyReadinessForBlockerIssueIds(
+        dbOrTx,
+        companyId,
+        issueId,
+        blockerIssueIds,
+      ),
 
     listDependencyReadiness: async (
       companyId: string,
