@@ -5651,6 +5651,7 @@ export async function resolveNormalizedUsageForSession(input: {
   usageBasis?: "per_run" | "session_cumulative" | null;
   costBasis?: "per_run" | "session_cumulative" | null;
   rawCostUsd?: number | null;
+  invocationUsage?: UsageTotals | null;
   getPreviousUsageJson: (sessionId: string) => Promise<unknown>;
 }) {
   const { sessionId, rawUsage, usageBasis } = input;
@@ -5672,6 +5673,8 @@ export async function resolveNormalizedUsageForSession(input: {
       previousRawUsage: null as UsageTotals | null,
       previousRawCostUsd: null as number | null,
       derivedFromSessionTotals: false,
+      usageFromInvocation: false,
+      sessionRawUsageIncomplete: false,
     };
   }
 
@@ -5693,8 +5696,10 @@ export async function resolveNormalizedUsageForSession(input: {
   if (usageBasis === "per_run") {
     // Per-run tokens with a session-total cost (Claude CLI without
     // modelUsage): keep the tokens, delta only the cost. Store the session's
-    // running token total as the raw counters, so this row stays a valid
-    // baseline for the next run that reports session totals.
+    // running token total as the raw counters, so this row stays a baseline
+    // for the next run. These tokens miss subagents (main loop only), so the
+    // counters are only a lower bound; mark them, or the next delta would
+    // book this run's subagent tokens to that run.
     return {
       normalizedUsage: rawUsage,
       normalizedCostUsd,
@@ -5704,6 +5709,27 @@ export async function resolveNormalizedUsageForSession(input: {
       previousRawUsage,
       previousRawCostUsd,
       derivedFromSessionTotals: false,
+      usageFromInvocation: false,
+      sessionRawUsageIncomplete: true,
+    };
+  }
+  if (
+    previousRawUsage !== null &&
+    parseObject(previousUsageJson).rawUsageIncomplete === true &&
+    input.invocationUsage
+  ) {
+    // The baseline is a lower bound, so a delta would include tokens of the
+    // earlier run. Store this invocation's own tokens instead; the session
+    // totals reported now are complete again and become the next baseline.
+    return {
+      normalizedUsage: { ...input.invocationUsage },
+      normalizedCostUsd,
+      sessionRawUsage: rawUsage,
+      previousRawUsage,
+      previousRawCostUsd,
+      derivedFromSessionTotals: false,
+      usageFromInvocation: true,
+      sessionRawUsageIncomplete: false,
     };
   }
   return {
@@ -5713,6 +5739,8 @@ export async function resolveNormalizedUsageForSession(input: {
     previousRawUsage,
     previousRawCostUsd,
     derivedFromSessionTotals: previousRawUsage !== null,
+    usageFromInvocation: false,
+    sessionRawUsageIncomplete: false,
   };
 }
 
@@ -25835,6 +25863,7 @@ export function heartbeatService(
           usageBasis: adapterResult.usageBasis ?? null,
           costBasis,
           rawCostUsd,
+          invocationUsage: normalizeUsageTotals(adapterResult.invocationUsage),
           getPreviousUsageJson: (sessionId) =>
             getLatestSessionUsageJson(db, {
               companyId: agent.companyId,
@@ -25928,12 +25957,18 @@ export function heartbeatService(
                         sessionUsageResolution.sessionRawUsage.outputTokens,
                     }
                   : {}),
+                // Raw token counters miss subagent tokens (lower bound).
+                ...(sessionUsageResolution.sessionRawUsageIncomplete
+                  ? { rawUsageIncomplete: true }
+                  : {}),
                 // The next resumed run subtracts this cumulative cost.
                 ...(costBasis === "session_cumulative" && rawCostUsd != null
                   ? { rawCostUsd }
                   : {}),
                 ...(sessionUsageResolution.derivedFromSessionTotals
                   ? { usageSource: "session_delta" }
+                  : sessionUsageResolution.usageFromInvocation
+                    ? { usageSource: "invocation" }
                   : adapterResult.usageBasis === "per_run"
                     ? { usageSource: "per_run" }
                     : adapterResult.usageBasis === "session_cumulative"

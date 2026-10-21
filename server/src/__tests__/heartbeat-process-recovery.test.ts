@@ -7553,10 +7553,56 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       inputTokens: 10, cachedInputTokens: 0, outputTokens: 5,
       rawInputTokens: 1_010, rawCachedInputTokens: 10_000, rawOutputTokens: 355,
       costUsd: 0.5, rawCostUsd: 5.25, usageSource: "per_run", costSource: "session_delta",
+      // result.usage misses subagent tokens, so the counters are a lower bound.
+      rawUsageIncomplete: true,
     });
     const costs = await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId));
     expect(costs).toHaveLength(1);
     expect(costs[0]).toMatchObject({ costCents: 50, inputTokens: 10, outputTokens: 5 });
+  });
+
+  it("stores zero for a failed Claude run after a run without modelUsage whose subagent tokens were unseen", async () => {
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "claude_local", runtimeMode: "legacy", agentStatus: "idle", runStatus: "queued",
+    });
+    const sessionId = randomUUID();
+    // The earlier run had no modelUsage: 5 main-loop output tokens known, 100
+    // more from its subagent not visible.
+    await db.insert(heartbeatRuns).values({
+      companyId, agentId, invocationSource: "assignment", triggerDetail: "system", status: "succeeded",
+      sessionIdAfter: sessionId, createdAt: new Date("2026-03-18T00:00:00.000Z"),
+      usageJson: {
+        inputTokens: 110, cachedInputTokens: 0, outputTokens: 5,
+        rawInputTokens: 1_110, rawCachedInputTokens: 0, rawOutputTokens: 105,
+        rawUsageIncomplete: true, usageSource: "per_run", costSource: "session_delta",
+        costUsd: 0.5, rawCostUsd: 5.25,
+      },
+    });
+    // This run does no work; modelUsage now includes the subagent's tokens.
+    mockAdapterExecute.mockImplementationOnce((async () => ({
+      exitCode: 1, signal: null, timedOut: false, errorMessage: "Claude run failed",
+      summary: "", provider: "anthropic", model: "claude-opus-5-5",
+      sessionId, sessionDisplayId: sessionId, sessionParams: { sessionId },
+      usage: { inputTokens: 1_110, cachedInputTokens: 0, outputTokens: 205 },
+      invocationUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+      usageBasis: "session_cumulative", costBasis: "session_cumulative", costUsd: 5.25,
+    })) as typeof mockAdapterExecute);
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId);
+    await heartbeat.waitForRunExecutionDrain(runId);
+
+    const settled = await heartbeat.getRun(runId);
+    expect(settled?.status).toBe("failed");
+    expect(settled?.usageJson).toMatchObject({
+      inputTokens: 0, cachedInputTokens: 0, outputTokens: 0,
+      rawInputTokens: 1_110, rawCachedInputTokens: 0, rawOutputTokens: 205,
+      costUsd: 0, rawCostUsd: 5.25, usageSource: "invocation",
+    });
+    expect(settled?.usageJson).not.toHaveProperty("rawUsageIncomplete");
+    const costs = await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId));
+    expect(costs.every((cost) => cost.costCents === 0 && cost.outputTokens === 0)).toBe(true);
   });
 
   it("stops controller renewal and releases execution controls when teardown deadline cleanup throws", async () => {

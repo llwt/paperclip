@@ -193,6 +193,7 @@ function parseClaudeFallbackTurn(input: {
   inputTokens: number;
   costUsd: number;
   cacheCreationInputTokens?: number;
+  outputTokens?: number;
 }) {
   return parseClaudeStreamJson(JSON.stringify({
     type: "result",
@@ -202,7 +203,7 @@ function parseClaudeFallbackTurn(input: {
     total_cost_usd: input.costUsd,
     usage: {
       input_tokens: input.inputTokens,
-      output_tokens: 0,
+      output_tokens: input.outputTokens ?? 0,
       cache_read_input_tokens: 0,
       ...(input.cacheCreationInputTokens !== undefined
         ? { cache_creation_input_tokens: input.cacheCreationInputTokens }
@@ -221,9 +222,53 @@ function storedUsageJson(
     rawInputTokens: result.sessionRawUsage!.inputTokens,
     rawCachedInputTokens: result.sessionRawUsage!.cachedInputTokens,
     rawOutputTokens: result.sessionRawUsage!.outputTokens,
+    ...(result.sessionRawUsageIncomplete ? { rawUsageIncomplete: true } : {}),
     costUsd: result.normalizedCostUsd,
     rawCostUsd,
   };
+}
+
+/** Resolve a parsed Claude result against a stored previous row. */
+function resolveParsedClaude(
+  parsed: ReturnType<typeof parseClaudeStreamJson>,
+  previous: unknown,
+) {
+  return resolveNormalizedUsageForSession({
+    sessionId: "claude-session",
+    rawUsage: parsed.usage,
+    usageBasis: parsed.usageBasis,
+    costBasis: parsed.costBasis,
+    rawCostUsd: parsed.costUsd,
+    invocationUsage: parsed.invocationUsage,
+    getPreviousUsageJson: async () => previous,
+  });
+}
+
+/** A Claude result event with session-total modelUsage. */
+function parseClaudeModelUsageTurn(input: {
+  sessionInput: number;
+  sessionCacheWrites: number;
+  sessionOutput: number;
+  costUsd: number;
+  invocation: { input_tokens: number; output_tokens: number };
+  failed?: boolean;
+}) {
+  return parseClaudeStreamJson(JSON.stringify({
+    type: "result",
+    subtype: input.failed ? "error_during_execution" : "success",
+    is_error: Boolean(input.failed),
+    session_id: "claude-session",
+    total_cost_usd: input.costUsd,
+    usage: { ...input.invocation, cache_read_input_tokens: 0 },
+    modelUsage: {
+      "claude-fable-5": {
+        inputTokens: input.sessionInput,
+        outputTokens: input.sessionOutput,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: input.sessionCacheWrites,
+      },
+    },
+  }));
 }
 
 describe("resolveNormalizedUsageForSession for Claude CLI session totals", () => {
@@ -356,6 +401,76 @@ describe("resolveNormalizedUsageForSession for Claude CLI session totals", () =>
     });
     expect(next.normalizedUsage).toEqual({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 });
     expect(next.normalizedCostUsd).toBe(0);
+  });
+
+  it("does not book a fallback run's subagent tokens to the next zero-work run", async () => {
+    const previous = {
+      inputTokens: 1_000, cachedInputTokens: 0, outputTokens: 100,
+      rawInputTokens: 1_000, rawCachedInputTokens: 0, rawOutputTokens: 100,
+      costUsd: 4.75, rawCostUsd: 4.75,
+    };
+    // Without modelUsage: 5 main-loop output tokens are visible; its subagent
+    // wrote another 100 that result.usage does not show.
+    const fallback = parseClaudeFallbackTurn({
+      inputTokens: 10, cacheCreationInputTokens: 100, outputTokens: 5, costUsd: 5.25,
+    });
+    const fallbackResult = await resolveParsedClaude(fallback, previous);
+    expect(fallbackResult.normalizedUsage).toEqual({ inputTokens: 110, cachedInputTokens: 0, outputTokens: 5 });
+    expect(fallbackResult.sessionRawUsage).toEqual({ inputTokens: 1_110, cachedInputTokens: 0, outputTokens: 105 });
+    expect(fallbackResult.sessionRawUsageIncomplete).toBe(true);
+
+    // A failed run does no work and reports the complete session snapshot,
+    // which includes the subagent's 100 output tokens.
+    const failed = parseClaudeModelUsageTurn({
+      sessionInput: 1_010, sessionCacheWrites: 100, sessionOutput: 205, costUsd: 5.25,
+      invocation: { input_tokens: 0, output_tokens: 0 }, failed: true,
+    });
+    const failedResult = await resolveParsedClaude(failed, storedUsageJson(fallbackResult, 5.25));
+    expect(failedResult.normalizedUsage).toEqual({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 });
+    expect(failedResult.normalizedCostUsd).toBe(0);
+    expect(failedResult.usageFromInvocation).toBe(true);
+    // The complete snapshot is the next baseline again.
+    expect(failedResult.sessionRawUsage).toEqual({ inputTokens: 1_110, cachedInputTokens: 0, outputTokens: 205 });
+    expect(failedResult.sessionRawUsageIncomplete).toBe(false);
+
+    // The run after that deltas against the complete snapshot as usual.
+    const later = parseClaudeModelUsageTurn({
+      sessionInput: 1_030, sessionCacheWrites: 100, sessionOutput: 245, costUsd: 5.5,
+      invocation: { input_tokens: 20, output_tokens: 40 },
+    });
+    const laterResult = await resolveParsedClaude(later, storedUsageJson(failedResult, 5.25));
+    expect(laterResult.normalizedUsage).toEqual({ inputTokens: 20, cachedInputTokens: 0, outputTokens: 40 });
+    expect(laterResult.normalizedCostUsd).toBe(0.25);
+    expect(laterResult.derivedFromSessionTotals).toBe(true);
+  });
+
+  it("stores a working run's own tokens after a baseline without modelUsage", async () => {
+    const fallbackRow = {
+      inputTokens: 10, cachedInputTokens: 0, outputTokens: 5,
+      rawInputTokens: 1_010, rawCachedInputTokens: 0, rawOutputTokens: 105,
+      rawUsageIncomplete: true, costUsd: 0.5, rawCostUsd: 5.25,
+    };
+    // Session output went from 105 known (+100 unseen subagent) to 255: this
+    // run wrote 50, of which a delta would wrongly claim 150.
+    const next = parseClaudeModelUsageTurn({
+      sessionInput: 1_030, sessionCacheWrites: 0, sessionOutput: 255, costUsd: 5.5,
+      invocation: { input_tokens: 20, output_tokens: 50 },
+    });
+    const result = await resolveParsedClaude(next, fallbackRow);
+    expect(result.normalizedUsage).toEqual({ inputTokens: 20, cachedInputTokens: 0, outputTokens: 50 });
+    expect(result.normalizedCostUsd).toBe(0.25);
+  });
+
+  it("keeps the incomplete mark across consecutive runs without modelUsage", async () => {
+    const fallbackRow = {
+      inputTokens: 10, cachedInputTokens: 0, outputTokens: 5,
+      rawInputTokens: 1_010, rawCachedInputTokens: 0, rawOutputTokens: 105,
+      rawUsageIncomplete: true, costUsd: 0.5, rawCostUsd: 5.25,
+    };
+    const again = parseClaudeFallbackTurn({ inputTokens: 4, outputTokens: 1, costUsd: 5.3 });
+    const result = await resolveParsedClaude(again, fallbackRow);
+    expect(result.normalizedUsage).toEqual({ inputTokens: 4, cachedInputTokens: 0, outputTokens: 1 });
+    expect(result.sessionRawUsageIncomplete).toBe(true);
   });
 
   it("stores zero for a failed run without modelUsage that did no work", async () => {

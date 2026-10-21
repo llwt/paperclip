@@ -1148,6 +1148,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : fallbackModelUsageTotals
       ? ("session_cumulative" as const)
       : null;
+    const invocationUsage = parsedStream.usage
+      ? parsedStream.invocationUsage
+      : fallbackModelUsageTotals
+      ? claudeResultUsageTotals(parsed.usage)
+      : null;
 
     const rawResolvedSessionId =
       parsedStream.sessionId ??
@@ -1277,6 +1282,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       usage,
       ...(usageBasis ? { usageBasis } : {}),
       ...(parsedStream.costBasis ? { costBasis: parsedStream.costBasis } : {}),
+      ...(invocationUsage ? { invocationUsage } : {}),
       sessionId: resolvedSessionId,
       sessionParams: resolvedSessionParams,
       sessionDisplayId: resolvedSessionId,

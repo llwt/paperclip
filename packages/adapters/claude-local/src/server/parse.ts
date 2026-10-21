@@ -117,13 +117,15 @@ export function parseClaudeStreamJson(stdout: string) {
       usage: null as UsageSummary | null,
       usageBasis: null as "per_run" | "session_cumulative" | null,
       costBasis: null as "session_cumulative" | null,
+      invocationUsage: null as UsageSummary | null,
       summary: assistantTexts.join("\n\n").trim(),
       resultJson: null as Record<string, unknown> | null,
     };
   }
 
   const modelUsageTotals = claudeModelUsageTotals(finalResult.modelUsage);
-  const usage: UsageSummary = modelUsageTotals ?? claudeResultUsageTotals(finalResult.usage);
+  const invocationUsage = claudeResultUsageTotals(finalResult.usage);
+  const usage: UsageSummary = modelUsageTotals ?? invocationUsage;
   const costRaw = finalResult.total_cost_usd;
   const costUsd = typeof costRaw === "number" && Number.isFinite(costRaw) ? costRaw : null;
   const summary = asString(finalResult.result, assistantTexts.join("\n\n")).trim();
@@ -139,6 +141,7 @@ export function parseClaudeStreamJson(stdout: string) {
     // the per-invocation result.usage, but the cost is still the session total.
     usageBasis: modelUsageTotals ? ("session_cumulative" as const) : ("per_run" as const),
     costBasis: "session_cumulative" as const,
+    invocationUsage,
     summary,
     resultJson: finalResult,
   };

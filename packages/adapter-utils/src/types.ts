@@ -107,6 +107,12 @@ export interface AdapterExecutionResult {
    */
   costBasis?: "per_run" | "session_cumulative" | null;
   /**
+   * This invocation's own tokens, when `usage` holds session totals. The
+   * server stores these instead of a delta when the previous run's counters
+   * are only a lower bound (Claude CLI runs without modelUsage).
+   */
+  invocationUsage?: UsageSummary | null;
+  /**
    * Legacy single session id output. Prefer `sessionParams` + `sessionDisplayId`.
    */
   sessionId?: string | null;

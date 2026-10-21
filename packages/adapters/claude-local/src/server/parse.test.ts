@@ -611,6 +611,12 @@ describe("parseClaudeStreamJson usage extraction", () => {
     expect(parsed.usageBasis).toBe("session_cumulative");
     expect(parsed.costBasis).toBe("session_cumulative");
     expect(parsed.costUsd).toBeCloseTo(1.25);
+    // The invocation's own main-loop tokens travel alongside the totals.
+    expect(parsed.invocationUsage).toEqual({
+      inputTokens: 10,
+      outputTokens: 1_800,
+      cachedInputTokens: 20,
+    });
   });
 
   it("counts cache writes as input in the result usage fallback, like modelUsage", () => {
