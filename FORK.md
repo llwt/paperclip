@@ -213,7 +213,7 @@ and miss a few that the unsharded run includes, so one extra lane ("server
 other") runs every server project test file that no shard selects. The list is
 computed by `scripts/somnex-ci-server-other.mjs` (fork-only) from vitest's own
 collection minus the shards' dry-run selection; `--list` prints it. The
-"Git install (node 24)" job (`install_git`) builds the CLI from the commit under
+"Git install (node 24)" job (`install_git`) runs the CLI from the commit under
 test and runs its `install --repo llwt/paperclip --ref <sha> -y` with the node
 major of `.nvmrc`, `npm_config_ignore_scripts=true` and a scratch `HOME` and
 `PAPERCLIP_HOME`, then checks that the installed `paperclipai --version` runs and

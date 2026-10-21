@@ -168,10 +168,10 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build the CLI
-        run: pnpm --filter paperclipai build
-
-      - name: Install the commit with the built CLI
+      # The esbuild bundle in cli/dist resolves its npm dependencies from an
+      # installed package, not from the workspace, so run the CLI from source as
+      # FORK.md "Install" does for a checkout.
+      - name: Install the commit with the CLI from this checkout
         env:
           REF: ${{ github.event.pull_request.head.sha || github.sha }}
           GITHUB_TOKEN: ${{ github.token }}
@@ -186,7 +186,7 @@ jobs:
           export HOME="$scratch" PAPERCLIP_HOME="$scratch/.paperclip"
           node --version
           cargo --version
-          node cli/dist/index.js install --repo llwt/paperclip --ref "$REF" -y
+          node cli/node_modules/tsx/dist/cli.mjs cli/src/index.ts install --repo llwt/paperclip --ref "$REF" -y
 
       - name: Check the installed paperclipai runs
         run: |
