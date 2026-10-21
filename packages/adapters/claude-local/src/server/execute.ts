@@ -1152,7 +1152,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const usageBasis = parsedStream.usage
       ? parsedStream.usageBasis
       : fallbackModelUsageTotals
-      ? ("per_run" as const)
+      ? ("session_cumulative" as const)
       : null;
 
     const rawResolvedSessionId =

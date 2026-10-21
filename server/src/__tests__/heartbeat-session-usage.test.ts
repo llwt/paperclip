@@ -7,6 +7,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { parseCodexJsonl } from "../../../packages/adapters/codex-local/src/server/parse.js";
+import { parseClaudeStreamJson } from "../../../packages/adapters/claude-local/src/server/parse.js";
 import cliSessionUsage from "../../../packages/adapters/codex-local/src/server/__fixtures__/cli-session-usage.json" with { type: "json" };
 import { getLatestSessionUsageJson, resolveNormalizedUsageForSession } from "../services/heartbeat.js";
 
@@ -127,6 +128,123 @@ describe("resolveNormalizedUsageForSession", () => {
     });
     expect(result.normalizedUsage).toEqual(input.rawUsage);
     expect(getPreviousUsageJson).not.toHaveBeenCalled();
+  });
+});
+
+// Claude CLI result events on --resume: modelUsage and total_cost_usd are the
+// session totals so far, while result.usage covers only this invocation.
+// Figures are synthetic but follow that shape (SX-1378).
+const claudeTurns = {
+  first: { input: 200_000, cacheRead: 9_000_000, output: 34_000, costUsd: 4.75, invocationOutput: 34_000 },
+  resumed: { input: 213_000, cacheRead: 10_000_000, output: 37_500, costUsd: 5.25, invocationOutput: 3_500 },
+};
+
+function parseClaudeTurn(turn: keyof typeof claudeTurns, sessionId = "claude-session") {
+  const figures = claudeTurns[turn];
+  return parseClaudeStreamJson(JSON.stringify({
+    type: "result",
+    subtype: "success",
+    session_id: sessionId,
+    result: "done",
+    total_cost_usd: figures.costUsd,
+    usage: { input_tokens: 2, output_tokens: figures.invocationOutput, cache_read_input_tokens: 0 },
+    modelUsage: {
+      "claude-opus-5-5": {
+        inputTokens: 100,
+        cacheCreationInputTokens: figures.input - 100,
+        cacheReadInputTokens: figures.cacheRead,
+        outputTokens: figures.output,
+        costUSD: figures.costUsd,
+      },
+    },
+  }));
+}
+
+/** usage_json as the server stored it for a Claude run before SX-1378. */
+function preFixClaudeUsageJson(turn: keyof typeof claudeTurns) {
+  const parsed = parseClaudeTurn(turn);
+  return {
+    ...parsed.usage,
+    rawInputTokens: parsed.usage!.inputTokens,
+    rawCachedInputTokens: parsed.usage!.cachedInputTokens,
+    rawOutputTokens: parsed.usage!.outputTokens,
+    usageSource: "per_run",
+    costUsd: parsed.costUsd,
+  };
+}
+
+function resolveClaudeTurn(
+  turn: keyof typeof claudeTurns,
+  getPreviousUsageJson: (sessionId: string) => Promise<unknown>,
+) {
+  const parsed = parseClaudeTurn(turn);
+  return resolveNormalizedUsageForSession({
+    sessionId: parsed.sessionId,
+    rawUsage: parsed.usage,
+    usageBasis: parsed.usageBasis,
+    rawCostUsd: parsed.costUsd,
+    getPreviousUsageJson,
+  });
+}
+
+describe("resolveNormalizedUsageForSession for Claude CLI session totals", () => {
+  it("labels modelUsage figures as session totals", () => {
+    expect(parseClaudeTurn("resumed").usageBasis).toBe("session_cumulative");
+  });
+
+  it("stores a fresh session's full tokens and cost", async () => {
+    const result = await resolveClaudeTurn("first", async () => null);
+    expect(result.normalizedUsage).toEqual(parseClaudeTurn("first").usage);
+    expect(result.normalizedCostUsd).toBe(4.75);
+    expect(result.derivedFromSessionTotals).toBe(false);
+  });
+
+  it("stores only a resumed run's own tokens and cost against a pre-fix row", async () => {
+    const result = await resolveClaudeTurn("resumed", async () => preFixClaudeUsageJson("first"));
+    expect(result.normalizedUsage).toEqual({
+      inputTokens: 13_000,
+      cachedInputTokens: 1_000_000,
+      outputTokens: 3_500,
+    });
+    // The output delta matches the invocation's own result.usage block.
+    expect(result.normalizedUsage!.outputTokens).toBe(claudeTurns.resumed.invocationOutput);
+    expect(result.normalizedCostUsd).toBe(0.5);
+    expect(result.previousRawCostUsd).toBe(4.75);
+    expect(result.derivedFromSessionTotals).toBe(true);
+  });
+
+  it("subtracts the saved raw cost, not the previous run's delta cost", async () => {
+    const result = await resolveClaudeTurn("resumed", async () => ({
+      ...preFixClaudeUsageJson("first"),
+      inputTokens: 1,
+      costUsd: 0.25,
+      rawCostUsd: 4.75,
+      usageSource: "session_delta",
+    }));
+    expect(result.normalizedCostUsd).toBe(0.5);
+  });
+
+  it("stores zero for a failed run that repeats the previous session snapshot", async () => {
+    const result = await resolveClaudeTurn("resumed", async () => preFixClaudeUsageJson("resumed"));
+    expect(result.normalizedUsage).toEqual({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 });
+    expect(result.normalizedCostUsd).toBe(0);
+  });
+
+  it("keeps the current cost if the session cost went down", async () => {
+    const result = await resolveClaudeTurn("first", async () => preFixClaudeUsageJson("resumed"));
+    expect(result.normalizedCostUsd).toBe(4.75);
+  });
+
+  it.each(["per_run", null] as const)("does not subtract cost for usage basis %s", async (usageBasis) => {
+    const result = await resolveNormalizedUsageForSession({
+      sessionId: "claude-session",
+      rawUsage: parseClaudeTurn("resumed").usage,
+      usageBasis,
+      rawCostUsd: 5.25,
+      getPreviousUsageJson: async () => preFixClaudeUsageJson("first"),
+    });
+    expect(result.normalizedCostUsd).toBe(5.25);
+    expect(result.previousRawCostUsd).toBeNull();
   });
 });
 
@@ -258,6 +376,35 @@ describePostgres("session usage baseline lookup", () => {
       },
     ]);
     expect((await resolve()).normalizedUsage).toEqual(requestTotals("resumed"));
+  });
+
+  it("uses the stored baseline for a cold Claude resume after a restart", async () => {
+    // A new process has no in-memory state: the baseline comes only from the
+    // stored rows, including one written before SX-1378.
+    const { run, lookup } = await fixture();
+    await db.update(heartbeatRuns).set({ usageJson: null }).where(eq(heartbeatRuns.id, lookup.excludeRunId));
+    await db.insert(heartbeatRuns).values([
+      { ...run, usageJson: preFixClaudeUsageJson("first") },
+      // A failed run that repeated the snapshot: stored as zero, raw kept.
+      {
+        ...run,
+        status: "failed",
+        createdAt: new Date("2026-10-12T12:00:01Z"),
+        usageJson: {
+          inputTokens: 0, cachedInputTokens: 0, outputTokens: 0,
+          rawInputTokens: parseClaudeTurn("first").usage!.inputTokens,
+          rawCachedInputTokens: parseClaudeTurn("first").usage!.cachedInputTokens,
+          rawOutputTokens: parseClaudeTurn("first").usage!.outputTokens,
+          costUsd: 0,
+          rawCostUsd: 4.75,
+          usageSource: "session_delta",
+        },
+      },
+    ]);
+    // The parsed fixture names its own session; look up the fixture's rows.
+    const result = await resolveClaudeTurn("resumed", () => getLatestSessionUsageJson(db, lookup));
+    expect(result.normalizedUsage).toEqual({ inputTokens: 13_000, cachedInputTokens: 1_000_000, outputTokens: 3_500 });
+    expect(result.normalizedCostUsd).toBe(0.5);
   });
 
   it("excludes other agents, sessions, later runs, and the current run", async () => {

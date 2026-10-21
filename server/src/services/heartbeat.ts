@@ -5638,30 +5638,57 @@ export async function getLatestSessionUsageJson(
   }
 }
 
+function readRawCostUsd(usageJson: unknown): number | null {
+  const parsed = parseObject(usageJson);
+  // Rows written before rawCostUsd existed stored the reported cost directly.
+  const value = parsed.rawCostUsd ?? parsed.costUsd;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : null;
+}
+
 export async function resolveNormalizedUsageForSession(input: {
   sessionId: string | null;
   rawUsage: UsageTotals | null;
   usageBasis?: "per_run" | "session_cumulative" | null;
+  rawCostUsd?: number | null;
   getPreviousUsageJson: (sessionId: string) => Promise<unknown>;
 }) {
   const { sessionId, rawUsage, usageBasis } = input;
+  const rawCostUsd = input.rawCostUsd ?? null;
   // Adapters that declare per-run usage (e.g. the ACPX lane reports each
   // turn's tokens, not session totals) must not be session-delta'd, or
   // consecutive runs would be undercounted.
   if (!sessionId || !rawUsage || usageBasis === "per_run") {
     return {
       normalizedUsage: rawUsage,
+      normalizedCostUsd: rawCostUsd,
       previousRawUsage: null as UsageTotals | null,
+      previousRawCostUsd: null as number | null,
       derivedFromSessionTotals: false,
     };
   }
 
-  const previousRawUsage = readRawUsageTotals(
-    await input.getPreviousUsageJson(sessionId),
-  );
+  const previousUsageJson = await input.getPreviousUsageJson(sessionId);
+  const previousRawUsage = readRawUsageTotals(previousUsageJson);
+  // Only adapters that declare session totals report a cumulative cost (the
+  // Claude CLI's total_cost_usd on --resume). Without a declared basis the
+  // legacy heuristic deltas tokens only, as before.
+  const previousRawCostUsd =
+    usageBasis === "session_cumulative" && previousRawUsage !== null
+      ? readRawCostUsd(previousUsageJson)
+      : null;
+  const normalizedCostUsd =
+    rawCostUsd === null || previousRawCostUsd === null
+      ? rawCostUsd
+      : rawCostUsd >= previousRawCostUsd
+        ? rawCostUsd - previousRawCostUsd
+        : rawCostUsd;
   return {
     normalizedUsage: deriveNormalizedUsageDelta(rawUsage, previousRawUsage),
+    normalizedCostUsd,
     previousRawUsage,
+    previousRawCostUsd,
     derivedFromSessionTotals: previousRawUsage !== null,
   };
 }
@@ -25665,11 +25692,13 @@ export function heartbeatService(
           previousLegacySessionId: runtimeForAdapter.sessionId,
         });
         const rawUsage = normalizeUsageTotals(adapterResult.usage);
+        const rawCostUsd = adapterResult.costUsd ?? null;
         const sessionUsageResolution = await resolveNormalizedUsageForSession({
           sessionId:
             nextSessionState.displayId ?? nextSessionState.legacySessionId,
           rawUsage,
           usageBasis: adapterResult.usageBasis ?? null,
+          rawCostUsd,
           getPreviousUsageJson: (sessionId) =>
             getLatestSessionUsageJson(db, {
               companyId: agent.companyId,
@@ -25679,6 +25708,14 @@ export function heartbeatService(
             }),
         });
         const normalizedUsage = sessionUsageResolution.normalizedUsage;
+        if (sessionUsageResolution.normalizedCostUsd !== rawCostUsd) {
+          // A session-total cost must not be billed again on every resumed
+          // run; usage_json and the cost ledger below both read this field.
+          adapterResult = {
+            ...adapterResult,
+            costUsd: sessionUsageResolution.normalizedCostUsd,
+          };
+        }
         const runErrorMessage =
           outcome === "cancelled"
             ? redactCurrentUserText(latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled", currentUserRedactionOptions)
@@ -25751,11 +25788,20 @@ export function heartbeatService(
                       rawOutputTokens: rawUsage.outputTokens,
                     }
                   : {}),
+                // The next resumed run subtracts this cumulative cost.
+                ...(adapterResult.usageBasis === "session_cumulative" &&
+                rawCostUsd != null
+                  ? { rawCostUsd }
+                  : {}),
                 ...(sessionUsageResolution.derivedFromSessionTotals
                   ? { usageSource: "session_delta" }
                   : adapterResult.usageBasis === "per_run"
                     ? { usageSource: "per_run" }
-                    : {}),
+                    : adapterResult.usageBasis === "session_cumulative"
+                      ? // No earlier usage in this session to subtract:
+                        // stored as reported (a fresh session's own usage).
+                        { usageSource: "session_total" }
+                      : {}),
                 ...((nextSessionState.displayId ??
                 nextSessionState.legacySessionId)
                   ? {

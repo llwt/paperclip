@@ -535,7 +535,7 @@ describe("parseClaudeStreamJson usage extraction", () => {
       ...extra,
     });
 
-  it("prefers modelUsage totals over the main-loop usage block and marks them per-run", () => {
+  it("prefers modelUsage totals over the main-loop usage block and marks them session totals", () => {
     const parsed = parseClaudeStreamJson(
       `${resultEvent({
         modelUsage: {
@@ -553,7 +553,7 @@ describe("parseClaudeStreamJson usage extraction", () => {
       outputTokens: 77_000,
       cachedInputTokens: 300_000,
     });
-    expect(parsed.usageBasis).toBe("per_run");
+    expect(parsed.usageBasis).toBe("session_cumulative");
     expect(parsed.costUsd).toBeCloseTo(1.25);
   });
 
