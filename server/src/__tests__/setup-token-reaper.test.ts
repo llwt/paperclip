@@ -45,7 +45,7 @@ describe("setup-token lease cleanup guards", () => {
     });
   });
 
-  it.each([false, true])("logs the error class and SQLSTATE without messages (wrapped: %s)", async (wrapped) => {
+  it.each([false, true])("a real release failure stays retryable and logs only class and SQLSTATE (wrapped: %s)", async (wrapped) => {
     class PostgresError extends Error { code = "22P02"; }
     const databaseError = new PostgresError("synthetic-secret https://example.invalid/private");
     const error = wrapped ? new Error("query contains synthetic-secret", { cause: databaseError }) : databaseError;
