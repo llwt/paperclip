@@ -25,6 +25,7 @@ the ones on `somnex-main` before the merge; what is left of each is the diff of
 
 | Commit | What | Upstream status | Drops out when |
 | --- | --- | --- | --- |
+| Install smoke script (this PR) | Fork-only `scripts/somnex-smoke.mjs` checks health, installed SHA, UI assets and confirmation acceptance, then cancels its throwaway task; local fake-server coverage in `scripts/somnex-smoke.test.mjs` | Local only | An upstream release provides an equivalent install smoke check, or the fork drops this script |
 | SX-1457 (this PR) | Backups: both engines write to `.partial` files and publish the complete gzip by rename; server startup removes incomplete files; Install and Rollback check for a running backup before restart | Local only (SX-1456) | An upstream release writes backups to a temporary name |
 | Claude quota classification (this PR) | Claude login detection ignores stream-json objects in raw stdout and gives terminal quota or transient errors priority, so a tool's `unauthorized` output cannot turn a session limit into account reauthorization | Local only | An upstream release carries an equivalent fix |
 | NX-1092 (this PR) | Setup-token cleanup: exclude local subscription rows from scoped reads and writes, clear records with no lease without a provider release, and log only the error class and SQLSTATE on a failed release | Local only (NX-1092). Upstream `master` `f3af9887c` has the same fault | An upstream release carries an equivalent fix |
@@ -397,6 +398,8 @@ The health endpoint reports `commit: null`, so the SHA check reads
 4. One MCP gateway tool call succeeds (the tool timeout path).
 5. One pending card renders and accepts input in the UI (the card remount
    path).
+
+`node scripts/somnex-smoke.mjs --sha <sha>` runs items 1, 2 and 5 in one go (fork-only script).
 
 ## Record of the `98fa44c` install
 
