@@ -310,9 +310,21 @@ Steven's card on the exact SHA (Steven's decisions on SX-1481, 21 October 2026).
 The smoke checklist has no card for Steven (item 5 is an agent check).
 
 **Only the restart waits.** When Steven accepts the card, steps 0 to 5 start at
-once. Only the restart (step 7) waits: for the backup check (step 6) and for
-the Nx notice task of this install to be `done`. Until Nx agrees a standing
-install window (NX-1306), Hog Boss files that notice in Nx before each install.
+once. Only the restart (step 7) waits, for:
+
+- the backup check (step 6);
+- the restart window agreed with Nx (NX-1306, 22 October 2026): any time, also
+  during working hours, but not at minute :00 to :02 or :30 to :32 of the hour
+  (UTC). No check for an Nx merge or install in flight is needed;
+- only for an install with a database migration: the Nx notice. Before the
+  card is posted, the Engineering Lead creates a notice task for Hog Boss with
+  the SHA and the planned time, and the install task is blocked on it until
+  Nx Boss has answered. An install with no migration has no notice.
+
+**After the install.** The install task reports the installed SHA, the restart
+time (UTC) and any Nx run lost in the restart (run id and task) if it can be
+seen. The Sr. Engineer then creates one task with no parent for Hog Boss with
+these facts and what changed for Nx; Hog Boss sends it to Nx as an FYI.
 
 0. Test the combined SHA when it has no green `somnex-ci` run of its own (a
    pull request's run tests its own head, not `somnex-main` after a later
