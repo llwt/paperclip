@@ -3,12 +3,13 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
 import { activityLog, companies, companyMemberships, connectionGrants, createDb, toolConnections } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { aiConnectionService } from "../services/ai-connections.js";
+import { secretService } from "../services/secrets.js";
 import { checkAiCredential } from "../services/ai-credential-check.js";
 import { aiConnectionRoutes } from "../routes/ai-connections.js";
 import { secretRoutes } from "../routes/secrets.js";
@@ -242,6 +243,45 @@ describe("Check again", () => {
     expect(await marks(personal)).toMatchObject(MARKED);
     expect((await request(app).post(url(shared.connectionId)).set("x-test-user", manager).send({})).status).toBe(200);
     expect(await marks(shared)).toEqual(CLEARED);
+  });
+
+  it("does not clear the marks for a value rotated while the check ran", async () => {
+    const account = await markedAccount("shared");
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, account.grantId));
+    const secretId = grant!.credentialSecretRefs[0]!.secretId;
+    let answer!: () => void;
+    const answered = new Promise<void>((resolve) => { answer = resolve; });
+    const provider = vi.fn()
+      .mockImplementationOnce(async () => { await answered; return scopeDenied(); })
+      .mockImplementation(async () => unauthorized());
+    const checking = service.revalidate({
+      companyId, connectionId: account.connectionId, grantId: account.grantId, userId: owner,
+      trigger: "check_again", request: provider as unknown as typeof fetch,
+    }).then(() => "passed", (error: Error) => error.message);
+    await vi.waitFor(() => expect(provider).toHaveBeenCalledTimes(1));
+    // A rotation to a rejected value holds the secret row until it commits.
+    let commit!: () => void;
+    const committed = new Promise<void>((resolve) => { commit = resolve; });
+    let rotated!: () => void;
+    const rotating = new Promise<void>((resolve) => { rotated = resolve; });
+    const rotation = db.transaction(async (tx) => {
+      await secretService(tx).rotate(secretId, { value: "sk-ant-oat01-rotated-rotated-rotated-rotated" }, { userId: owner, agentId: null });
+      rotated();
+      await committed;
+    });
+    await rotating;
+    answer();
+    await vi.waitFor(async () => {
+      const waiting = await db.execute(sql`select count(*)::int as n from pg_stat_activity where wait_event_type = 'Lock' and datname = current_database()`);
+      expect((waiting as unknown as { rows?: Array<{ n: number }> }).rows?.[0]?.n ?? (waiting as unknown as Array<{ n: number }>)[0]?.n).toBeGreaterThan(0);
+    }, { timeout: 10000 });
+    commit();
+    await rotation;
+    expect(await checking).toContain("changed while it was checked");
+    expect(await marks(account)).toMatchObject(MARKED);
+    const [after] = await service.revalidateAfterSecretChange({ companyId, secretId, userId: owner, request: provider as unknown as typeof fetch });
+    expect(after).toMatchObject({ result: "failed" });
+    expect(await marks(account)).toMatchObject(MARKED);
   });
 
   it("refuses providers without a check and leaves them unchanged", async () => {

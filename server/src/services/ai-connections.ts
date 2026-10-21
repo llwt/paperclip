@@ -845,6 +845,14 @@ export function aiConnectionService(db: Db) {
       )).for("update");
       if (!grant || (grant.status !== "active" && grant.status !== "needs_reauthorization"))
         throw conflict("The account changed while it was checked. Check again.");
+      const ref = grant.credentialSecretRefs.find((candidate) => candidate.configPath === "ai.credential");
+      if (!ref) throw conflict("The credential changed while it was checked. Check again.");
+      // Lock the secret before reading it, as markAuthenticationFailed does: a
+      // rotation that commits after this read then waits for the clear, and a
+      // rotation that is already writing is seen here and fails the compare.
+      await tx.select({ id: companySecrets.id }).from(companySecrets).where(and(
+        eq(companySecrets.companyId, input.companyId), eq(companySecrets.id, ref.secretId),
+      )).for("update");
       const current = await aiConnectionService(tx as unknown as Db).credential({ connection: row.connection, grant });
       if (createHash("sha256").update(current).digest("hex") !== generation)
         throw conflict("The credential changed while it was checked. Check again.");
