@@ -2552,6 +2552,17 @@ export {
   type ParsedSkillMention,
   type ParsedUserMention,
 } from "./project-mentions.js";
+export {
+  ISSUE_COMMENT_HANDOFF_OUTCOMES,
+  ISSUE_COMMENT_HANDOFF_REASON_CODES,
+  ISSUE_COMMENT_HANDOFF_STATUSES,
+  describeIssueCommentHandoffReason,
+  hasLeadingHandoffCandidate,
+  parseLeadingAgentMention,
+  type IssueCommentHandoffOutcome,
+  type IssueCommentHandoffReasonCode,
+  type LeadingAgentMention,
+} from "./agent-mention-handoff.js";
 
 export {
   BUILTIN_ROUTINE_VARIABLE_NAMES,
