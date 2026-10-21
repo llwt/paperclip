@@ -9,6 +9,7 @@ import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-lo
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import {
   applyPersistedExecutionWorkspaceConfig,
+  applySharedWorkspaceRebindToConfigFreshness,
   assertGitSensitiveAdapterWorkspaceValid,
   assertGitWorktreeBaseWorkspaceReady,
   assertPushCapabilityCheckoutValid,
@@ -31,6 +32,7 @@ import {
   resolveExecutionWorkspaceReuseRequestForIssue,
   resolveExecutionWorkspaceReuseProvisioningPolicy,
   resolveNextSessionState,
+  resolveSharedProjectPrimaryWorkspaceRebindCwd,
   resolveTaskSessionConfigFreshness,
   isWorkspaceSyncConflictFailure,
   requiresPushCapabilityPreflight,
@@ -3213,5 +3215,95 @@ describe("reconcileReusedExecutionWorkspaceProjectWorkspaceId", () => {
     expect(
       reconcileReusedExecutionWorkspaceProjectWorkspaceId(undefined, "resolved-workspace"),
     ).toBe("resolved-workspace");
+  });
+});
+
+describe("resolveSharedProjectPrimaryWorkspaceRebindCwd", () => {
+  const sharedDefault = {
+    mode: "shared_workspace",
+    strategyType: "project_primary",
+    cwd: "/paperclip/projects/company/project/_default",
+  };
+  const repoAnchor = { cwd: "/paperclip/projects/company/project/repo", source: "project_primary", baseCwdFallback: false };
+
+  it("rebinds a shared project_primary workspace to the cwd the project now resolves to", () => {
+    expect(resolveSharedProjectPrimaryWorkspaceRebindCwd({
+      existingWorkspace: sharedDefault,
+      resolvedWorkspace: repoAnchor,
+      nativeExecutionBound: false,
+    })).toBe(repoAnchor.cwd);
+  });
+
+  it("keeps a shared workspace whose cwd still matches", () => {
+    expect(resolveSharedProjectPrimaryWorkspaceRebindCwd({
+      existingWorkspace: { ...sharedDefault, cwd: `${repoAnchor.cwd}/` },
+      resolvedWorkspace: repoAnchor,
+      nativeExecutionBound: false,
+    })).toBeNull();
+  });
+
+  it.each([
+    { name: "isolated task directory", existingWorkspace: { ...sharedDefault, mode: "isolated_workspace" } },
+    { name: "git worktree", existingWorkspace: { ...sharedDefault, mode: "isolated_workspace", strategyType: "git_worktree" } },
+    { name: "shared git worktree", existingWorkspace: { ...sharedDefault, strategyType: "git_worktree" } },
+    { name: "adapter-managed", existingWorkspace: { ...sharedDefault, mode: "adapter_managed" } },
+    { name: "cloud sandbox", existingWorkspace: { ...sharedDefault, mode: "cloud_sandbox", strategyType: "cloud_sandbox" } },
+  ])("never rebinds a $name workspace", ({ existingWorkspace }) => {
+    expect(resolveSharedProjectPrimaryWorkspaceRebindCwd({
+      existingWorkspace,
+      resolvedWorkspace: repoAnchor,
+      nativeExecutionBound: false,
+    })).toBeNull();
+  });
+
+  it.each([
+    { name: "the agent fallback for an unavailable project checkout", resolvedWorkspace: { ...repoAnchor, baseCwdFallback: true } },
+    { name: "a task session anchor", resolvedWorkspace: { ...repoAnchor, source: "task_session" } },
+    { name: "an agent home anchor", resolvedWorkspace: { ...repoAnchor, source: "agent_home" } },
+  ])("never rebinds to $name", ({ resolvedWorkspace }) => {
+    expect(resolveSharedProjectPrimaryWorkspaceRebindCwd({
+      existingWorkspace: sharedDefault,
+      resolvedWorkspace,
+      nativeExecutionBound: false,
+    })).toBeNull();
+  });
+
+  it("keeps the workspace bound to a native execution input", () => {
+    expect(resolveSharedProjectPrimaryWorkspaceRebindCwd({
+      existingWorkspace: sharedDefault,
+      resolvedWorkspace: repoAnchor,
+      nativeExecutionBound: true,
+    })).toBeNull();
+  });
+});
+
+describe("applySharedWorkspaceRebindToConfigFreshness", () => {
+  const replace = {
+    action: "replace" as const,
+    shouldReuseExisting: false,
+    shouldRefreshConfigSnapshot: false,
+    reasons: ["execution workspace configuration changed: project workspace, repository"],
+    changedCategories: ["projectWorkspace", "repo", "lifecycleCommands"] as Array<"projectWorkspace" | "repo" | "lifecycleCommands">,
+    storedFingerprint: "stored",
+    inferredFingerprint: null,
+    nextFingerprint: "next",
+    storedFingerprintPresent: true,
+  };
+
+  it("turns project workspace and repo drift into a refresh once the workspace is rebound", () => {
+    expect(applySharedWorkspaceRebindToConfigFreshness(replace, "/repo")).toMatchObject({
+      action: "refresh",
+      shouldReuseExisting: true,
+      shouldRefreshConfigSnapshot: true,
+    });
+  });
+
+  it("keeps replacement drift the rebind does not resolve", () => {
+    const environmentDrift = { ...replace, changedCategories: [...replace.changedCategories, "environment" as never] };
+    expect(applySharedWorkspaceRebindToConfigFreshness(environmentDrift, "/repo")).toBe(environmentDrift);
+  });
+
+  it("leaves the decision unchanged without a rebind", () => {
+    expect(applySharedWorkspaceRebindToConfigFreshness(replace, null)).toBe(replace);
   });
 });

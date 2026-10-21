@@ -6984,6 +6984,77 @@ export function resolveExecutionWorkspaceConfigFreshness(input: {
   };
 }
 
+/**
+ * A reused shared `project_primary` execution workspace is the project's
+ * primary checkout, not a task-owned directory. When the project's primary
+ * workspace now resolves to another cwd (typically a repo added to a project
+ * whose earlier tasks ran in the managed `_default` folder), the persisted cwd
+ * is stale and must follow the project. Returns the cwd to rebind to, or null
+ * to restore the persisted workspace as is.
+ *
+ * Only a real project primary anchor qualifies: an agent-home or task-session
+ * anchor, or the agent fallback used when the project checkout could not be
+ * materialized, never moves a shared workspace. Native recovery keeps the
+ * workspace bound to its admitted execution input.
+ */
+export function resolveSharedProjectPrimaryWorkspaceRebindCwd(input: {
+  existingWorkspace: {
+    mode: string | null | undefined;
+    strategyType: string | null | undefined;
+    cwd: string | null | undefined;
+  } | null;
+  resolvedWorkspace: {
+    cwd: string;
+    source: string;
+    baseCwdFallback: boolean;
+  };
+  nativeExecutionBound: boolean;
+}): string | null {
+  const existing = input.existingWorkspace;
+  if (!existing || input.nativeExecutionBound) return null;
+  if (existing.mode !== "shared_workspace") return null;
+  if (existing.strategyType !== "project_primary") return null;
+  if (input.resolvedWorkspace.source !== "project_primary") return null;
+  if (input.resolvedWorkspace.baseCwdFallback) return null;
+  const nextCwd = readNonEmptyString(input.resolvedWorkspace.cwd);
+  if (!nextCwd || sameResolvedPath(existing.cwd, nextCwd)) return null;
+  return nextCwd;
+}
+
+const SHARED_WORKSPACE_REBIND_CONFIG_CATEGORIES =
+  new Set<EffectiveRunWorkspaceConfigCategory>(["projectWorkspace", "repo"]);
+
+/**
+ * A rebind brings the persisted workspace's project workspace and repo in line
+ * with the current project, so drift limited to those categories is resolved
+ * by the rebind itself and the record takes the latest config metadata.
+ * Any other replacement-class drift keeps its "replace" decision.
+ */
+export function applySharedWorkspaceRebindToConfigFreshness(
+  decision: ExecutionWorkspaceConfigFreshnessDecision,
+  reboundCwd: string | null,
+): ExecutionWorkspaceConfigFreshnessDecision {
+  if (!reboundCwd || decision.action !== "replace") return decision;
+  // Missing or version-changed fingerprints report every category, including
+  // mode and strategy, so they keep their "replace" decision here.
+  const resolvedByRebind = decision.changedCategories.every(
+    (category) =>
+      SHARED_WORKSPACE_REBIND_CONFIG_CATEGORIES.has(category) ||
+      !WORKSPACE_REPLACEMENT_CONFIG_CATEGORIES.has(category),
+  );
+  if (!resolvedByRebind) return decision;
+  return {
+    ...decision,
+    action: "refresh",
+    shouldReuseExisting: true,
+    shouldRefreshConfigSnapshot: true,
+    reasons: [
+      ...decision.reasons,
+      `shared project workspace rebound to "${reboundCwd}"`,
+    ],
+  };
+}
+
 /** Read server-owned identity before adapter codecs discard unknown metadata. */
 export function isTaskSessionCredentialCompatible(
   storedSessionParams: Record<string, unknown> | null | undefined,
@@ -22363,8 +22434,17 @@ export function heartbeatService(
               evaluatedAt: latestWorkspaceConfigMetadata.evaluatedAt,
             })
           : null;
-      const workspaceConfigFreshness = resolveExecutionWorkspaceConfigFreshness(
-        {
+      const sharedWorkspaceRebindCwd = requestedShouldReuseExisting
+        ? resolveSharedProjectPrimaryWorkspaceRebindCwd({
+            existingWorkspace: reusableExistingExecutionWorkspace,
+            resolvedWorkspace,
+            nativeExecutionBound:
+              persistedNativeExecutionInput !== null ||
+              nativeChatWorkspaceScope !== null,
+          })
+        : null;
+      const workspaceConfigFreshness = applySharedWorkspaceRebindToConfigFreshness(
+        resolveExecutionWorkspaceConfigFreshness({
           hasExistingWorkspace:
             requestedShouldReuseExisting &&
             Boolean(reusableExistingExecutionWorkspace),
@@ -22372,7 +22452,8 @@ export function heartbeatService(
             reusableExistingExecutionWorkspace?.metadata ?? null,
           inferredMetadata: inferredExistingWorkspaceConfigMetadata,
           nextMetadata: latestWorkspaceConfigMetadata,
-        },
+        }),
+        sharedWorkspaceRebindCwd,
       );
       const workspaceReuseProvisioningPolicy =
         resolveExecutionWorkspaceReuseProvisioningPolicy({
@@ -22422,13 +22503,27 @@ export function heartbeatService(
                     mode: reusableExistingExecutionWorkspace.mode,
                     strategyType:
                       reusableExistingExecutionWorkspace.strategyType,
-                    cwd: reusableExistingExecutionWorkspace.cwd,
-                    providerRef: reusableExistingExecutionWorkspace.providerRef,
+                    // A rebound shared workspace takes the current project
+                    // checkout and its project workspace and repo; the update
+                    // below persists them on the same record.
+                    ...(sharedWorkspaceRebindCwd
+                      ? {
+                          cwd: sharedWorkspaceRebindCwd,
+                          providerRef: null,
+                          projectWorkspaceId: executionWorkspaceBase.workspaceId,
+                          repoUrl: executionWorkspaceBase.repoUrl,
+                          baseRef: executionWorkspaceBase.repoRef,
+                        }
+                      : {
+                          cwd: reusableExistingExecutionWorkspace.cwd,
+                          providerRef:
+                            reusableExistingExecutionWorkspace.providerRef,
+                          projectWorkspaceId:
+                            reusableExistingExecutionWorkspace.projectWorkspaceId,
+                          repoUrl: reusableExistingExecutionWorkspace.repoUrl,
+                          baseRef: reusableExistingExecutionWorkspace.baseRef,
+                        }),
                     projectId: reusableExistingExecutionWorkspace.projectId,
-                    projectWorkspaceId:
-                      reusableExistingExecutionWorkspace.projectWorkspaceId,
-                    repoUrl: reusableExistingExecutionWorkspace.repoUrl,
-                    baseRef: reusableExistingExecutionWorkspace.baseRef,
                     branchName: reusableExistingExecutionWorkspace.branchName,
                     metadata:
                       reusableExistingExecutionWorkspace.metadata as Record<
@@ -22669,11 +22764,13 @@ export function heartbeatService(
                   status: "active",
                   lastUsedAt: new Date(),
                   metadata: nextExecutionWorkspaceMetadata,
-                  projectWorkspaceId:
-                    reconcileReusedExecutionWorkspaceProjectWorkspaceId(
-                      reusableExistingExecutionWorkspace.projectWorkspaceId,
-                      resolvedProjectWorkspaceId,
-                    ),
+                  projectWorkspaceId: sharedWorkspaceRebindCwd
+                    ? (resolvedProjectWorkspaceId ??
+                      reusableExistingExecutionWorkspace.projectWorkspaceId)
+                    : reconcileReusedExecutionWorkspaceProjectWorkspaceId(
+                        reusableExistingExecutionWorkspace.projectWorkspaceId,
+                        resolvedProjectWorkspaceId,
+                      ),
                 },
               )
             : resolvedProjectId
