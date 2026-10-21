@@ -303,12 +303,34 @@ after Steven approves the SHA.
 4. Copy anything hand-made out of `~/.paperclip/cli/installs` first. `install`
    keeps the new payload and the two before it and deletes every other
    directory under `installs/npm` and `installs/git`, hand-made ones included.
-5. `GH_TOKEN="$(gh auth token)" paperclipai install --repo llwt/paperclip --ref <sha> -y`
+5. Run the install with node 24, not through the `paperclipai` shim:
+
+   ```sh
+   N24=/home/steven-bot/.local/share/mise/installs/node/24/bin
+   PATH="$N24:$PATH" GH_TOKEN="$(gh auth token)" "$N24/node" \
+     /home/steven-bot/.paperclip/cli/current/node_modules/paperclipai/dist/index.js \
+     install --repo llwt/paperclip --ref <sha> -y
+   ```
+
+   Then check that the new shim names node 24:
+   `grep -c 'installs/node/24' /home/steven-bot/.local/bin/paperclipai` prints a
+   number above 0. If it prints 0, stop and report before the restart.
 6. `paperclipai service restart`
 7. Run the smoke checklist.
 
 Facts about `install --ref` on this host (found on NX-449 and NX-509):
 
+- **Run the install CLI with node 24 (SX-1447, 21 October 2026).** The shim
+  `~/.local/bin/paperclipai` hard-codes the node that ran the last install and
+  puts its bin dir first on `PATH`. Node 25 and newer ship no `corepack`, and
+  `install` runs `corepack enable pnpm`, so an install through a shim pinned to
+  node 26 fails ("corepack is not a valid shim"). A `PATH` prefix alone does not
+  help: the shim still runs node 26 and writes node 26 into the new shim. Step 5
+  runs the CLI with node 24 (the line in `.nvmrc` and the fork CI), which has
+  `corepack` and re-pins the shim to node 24. The restart in step 6 then moves
+  the server to node 24 too; the install card says so. Use absolute paths:
+  agent runs have their own `HOME`, so `~` and `$HOME` do not point at
+  `/home/steven-bot` there.
 - **Run the fixed CLI from a checkout while the installed CLI is older than
   fork PR #7.** The installed CLI cannot build a git ref (see the next
   point). In a checkout of the target SHA, after `pnpm install`, replace
