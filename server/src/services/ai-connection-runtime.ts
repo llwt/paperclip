@@ -4,13 +4,14 @@ import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
-import { type Db, companySecrets, connectionGrants } from "@paperclipai/db";
+import { type Db, companySecrets, connectionGrants, toolConnections } from "@paperclipai/db";
 import {
   AI_CONNECTION_CAPABILITIES,
   type AiConnectionBinding,
 } from "@paperclipai/shared";
 import { aiConnectionService } from "./ai-connections.js";
 import { secretService } from "./secrets.js";
+import { MANAGED_AI_WRITEBACK_PENDING, writeRunTempDirMarker } from "./run-temp-dirs.js";
 import { decideCodexAuthMerge } from "@paperclipai/adapter-codex-local/server";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
@@ -198,11 +199,151 @@ export function managedAiSessionFingerprintConfig(
   return { ...config, env, ...(managed?.sessionIdentity ? { managedAiConnection: { ...managed, identity: managed.sessionIdentity } } : {}) };
 }
 
+interface ManagedAiWriteBackPending {
+  version: 1;
+  companyId: string;
+  connectionId: string;
+  grantId: string;
+  provider: string;
+  credentialSha256: string;
+}
+
+async function readManagedAiWriteBackPending(home: string): Promise<ManagedAiWriteBackPending | null> {
+  let raw: string;
+  try {
+    raw = await readFile(path.join(home, MANAGED_AI_WRITEBACK_PENDING), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  const rec = JSON.parse(raw) as Partial<ManagedAiWriteBackPending>;
+  for (const key of ["companyId", "connectionId", "grantId", "provider", "credentialSha256"] as const) {
+    if (typeof rec[key] !== "string") throw new Error(`Invalid managed AI write-back record in ${home}`);
+  }
+  return rec as ManagedAiWriteBackPending;
+}
+
+/**
+ * Save a credential the provider refreshed during the run back to its secret,
+ * then drop the pending record. Called by the run's own cleanup and, for a
+ * home whose cleanup never ran (server crash), by the run temp folder sweep
+ * before it removes the home. Throws, and keeps the record, when the write-back
+ * could not be decided, so the home is kept for a later retry.
+ *
+ * With `keepPending` the record stays, now naming the credential just saved,
+ * because the provider may still be running and refresh it again. The final
+ * write-back then runs in `removeRunTempDir`, after the provider has stopped.
+ */
+export async function writeBackManagedAiCredential(
+  db: Db,
+  home: string,
+  options: { keepPending?: boolean } = {},
+): Promise<void> {
+  const pending = await readManagedAiWriteBackPending(home);
+  if (!pending) return;
+  const providerHome = path.join(home, "provider");
+  const authFile = path.join(providerHome, "auth.json");
+  let refreshed: string | null = null;
+  try {
+    refreshed = await readFile(authFile, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  if (refreshed !== null && createHash("sha256").update(refreshed).digest("hex") !== pending.credentialSha256) {
+    const value = refreshed;
+    await db.transaction(async (tx) => {
+      const [grant] = await tx
+        .select()
+        .from(connectionGrants)
+        .where(
+          and(
+            eq(connectionGrants.id, pending.grantId),
+            eq(connectionGrants.companyId, pending.companyId),
+          ),
+        )
+        .for("update");
+      // A missing or revoked grant blocks the write-back. Among
+      // active copies, the merge decision below keeps the
+      // credential with the newest provider freshness field.
+      if (!grant || grant.status !== "active") return;
+      const ref = grant.credentialSecretRefs.find(
+        (r) => r.configPath === "ai.credential",
+      );
+      if (!ref) return;
+      // Lock the referenced secret row for the rest of this
+      // transaction. The grant-row lock above does not cover it,
+      // so an authorized rotation of this secret could otherwise
+      // land between the read and the write below and be
+      // overwritten by this stale write-back.
+      await tx
+        .select({ id: companySecrets.id })
+        .from(companySecrets)
+        .where(
+          and(
+            eq(companySecrets.id, ref.secretId),
+            eq(companySecrets.companyId, pending.companyId),
+          ),
+        )
+        .for("update");
+      const [connection] = await tx
+        .select()
+        .from(toolConnections)
+        .where(
+          and(
+            eq(toolConnections.id, pending.connectionId),
+            eq(toolConnections.companyId, pending.companyId),
+          ),
+        );
+      if (!connection) return;
+      const current = await aiConnectionService(
+        tx as unknown as Db,
+      ).credential({ connection, grant });
+      const destination = path.join(
+        providerHome,
+        "current-auth.json",
+      );
+      await writeFile(destination, current, { mode: 0o600 });
+      const decision =
+        pending.provider === "openai"
+          ? await decideCodexAuthMerge(authFile, destination, {
+              errorLabel: "AI account refresh",
+            })
+          : await decideGrokAuthMerge(authFile, destination, {
+              errorLabel: "AI account refresh",
+            });
+      if (decision !== 10) return;
+      await secretService(tx).rotate(
+        ref.secretId,
+        { value, preserveAiSessionEpoch: true },
+        { userId: grant.subjectUserId },
+      );
+      await tx
+        .update(connectionGrants)
+        .set({ updatedAt: new Date() })
+        .where(eq(connectionGrants.id, grant.id));
+    });
+  }
+  if (!options.keepPending) {
+    await rm(path.join(home, MANAGED_AI_WRITEBACK_PENDING), { force: true });
+  } else if (refreshed !== null) {
+    const credentialSha256 = createHash("sha256").update(refreshed).digest("hex");
+    if (credentialSha256 !== pending.credentialSha256) {
+      await writeFile(
+        path.join(home, MANAGED_AI_WRITEBACK_PENDING),
+        `${JSON.stringify({ ...pending, credentialSha256 })}\n`,
+        { mode: 0o600 },
+      );
+    }
+  }
+}
+
 export async function prepareManagedAiRuntime(
   db: Db,
   input: {
     companyId: string;
     agentId: string;
+    /** The heartbeat run that owns the home; null for adapter test routes. */
+    runId?: string | null;
     responsibleUserId: string | null;
     adapterType: string;
     binding: AiConnectionBinding;
@@ -271,6 +412,7 @@ export async function prepareManagedAiRuntime(
         `paperclip-ai-${input.companyId}-${selection.grant.id}-`,
       ),
     );
+    await writeRunTempDirMarker(home, { companyId: input.companyId, agentId: input.agentId, runId: input.runId ?? null });
     const providerHome = path.join(home, "provider");
     await mkdir(providerHome, { mode: 0o700 });
     const env: Record<string, unknown> = {
@@ -289,8 +431,20 @@ export async function prepareManagedAiRuntime(
         'cli_auth_credentials_store = "file"\n',
         { mode: 0o600 },
       );
-    if (subscriptionFile) await writeFile(authFile, value, { mode: 0o600 });
-    else env[capability.envKey] = value;
+    if (subscriptionFile) {
+      await writeFile(authFile, value, { mode: 0o600 });
+      // Read back by `writeBackManagedAiCredential`: by this run's cleanup, or
+      // by the run temp folder sweep when a crash skipped that cleanup.
+      const pending: ManagedAiWriteBackPending = {
+        version: 1,
+        companyId: input.companyId,
+        connectionId: selection.connection.id,
+        grantId: selection.grant.id,
+        provider: input.binding.provider,
+        credentialSha256: createHash("sha256").update(value).digest("hex"),
+      };
+      await writeFile(path.join(home, MANAGED_AI_WRITEBACK_PENDING), `${JSON.stringify(pending)}\n`, { mode: 0o600 });
+    } else env[capability.envKey] = value;
     if (
       input.binding.provider === "openai" &&
       selection.attribution.method === "api_key"
@@ -324,75 +478,19 @@ export async function prepareManagedAiRuntime(
       accountOwnerUserId: selection.grant.subjectUserId,
       identity,
       home,
-      cleanup: async () => {
+      providerHome,
+      /**
+       * Write back a refreshed credential, then remove the home. A heartbeat
+       * passes `keepHome` and removes the home itself once the run's provider
+       * has stopped; see `removeRunTempDir`. The pending write-back record
+       * stays with the home until then, so a credential the provider refreshes
+       * after this call is still saved before the home goes.
+       */
+      cleanup: async (options: { keepHome?: boolean } = {}) => {
         try {
-          if (subscriptionFile) {
-            const refreshed = await readFile(authFile, "utf8");
-            if (refreshed !== value)
-              await db.transaction(async (tx) => {
-                const [grant] = await tx
-                  .select()
-                  .from(connectionGrants)
-                  .where(
-                    and(
-                      eq(connectionGrants.id, selection.grant.id),
-                      eq(connectionGrants.companyId, input.companyId),
-                    ),
-                  )
-                  .for("update");
-                // A missing or revoked grant blocks the write-back. Among
-                // active copies, the merge decision below keeps the
-                // credential with the newest provider freshness field.
-                if (!grant || grant.status !== "active") return;
-                const ref = grant.credentialSecretRefs.find(
-                  (r) => r.configPath === "ai.credential",
-                );
-                if (!ref) return;
-                // Lock the referenced secret row for the rest of this
-                // transaction. The grant-row lock above does not cover it,
-                // so an authorized rotation of this secret could otherwise
-                // land between the read and the write below and be
-                // overwritten by this stale write-back.
-                await tx
-                  .select({ id: companySecrets.id })
-                  .from(companySecrets)
-                  .where(
-                    and(
-                      eq(companySecrets.id, ref.secretId),
-                      eq(companySecrets.companyId, input.companyId),
-                    ),
-                  )
-                  .for("update");
-                const current = await aiConnectionService(
-                  tx as unknown as Db,
-                ).credential({ ...selection, grant });
-                const destination = path.join(
-                  providerHome,
-                  "current-auth.json",
-                );
-                await writeFile(destination, current, { mode: 0o600 });
-                const decision =
-                  input.binding.provider === "openai"
-                    ? await decideCodexAuthMerge(authFile, destination, {
-                        errorLabel: "AI account refresh",
-                      })
-                    : await decideGrokAuthMerge(authFile, destination, {
-                        errorLabel: "AI account refresh",
-                      });
-                if (decision !== 10) return;
-                await secretService(tx).rotate(
-                  ref.secretId,
-                  { value: refreshed, preserveAiSessionEpoch: true },
-                  { userId: grant.subjectUserId },
-                );
-                await tx
-                  .update(connectionGrants)
-                  .set({ updatedAt: new Date() })
-                  .where(eq(connectionGrants.id, grant.id));
-              });
-          }
+          if (home) await writeBackManagedAiCredential(db, home, { keepPending: options.keepHome });
         } finally {
-          if (home) await rm(home, { recursive: true, force: true });
+          if (home && !options.keepHome) await rm(home, { recursive: true, force: true });
         }
       },
     };
