@@ -59,6 +59,8 @@ import type {
   PluginIssueRelationSummary,
   PluginIssueSubtree,
   PluginIssueAttachmentContent,
+  PluginIssueExecutionDecisionsPage,
+  PluginIssueExecutionDecisionsOptions,
   PluginIssueWakeupBatchResult,
   PluginIssueWakeupResult,
   PluginJobContext,
@@ -266,6 +268,8 @@ export const PLUGIN_RPC_ERROR_CODES = {
    * `multiCompanyConfig: true` on its definition.
    */
   CROSS_TENANT_CONFIG: -32006,
+  /** The worker→host request has invalid parameters. */
+  VALIDATION_ERROR: -32007,
   /** A catch-all for errors that do not fit other categories. */
   UNKNOWN: -32099,
 } as const;
@@ -2010,6 +2014,10 @@ export interface WorkerToHostMethods {
       authorAgentId?: string | null;
     },
     result: IssueThreadInteraction,
+  ];
+  "issues.listExecutionDecisions": [
+    { issueId: string; companyId: string } & PluginIssueExecutionDecisionsOptions,
+    PluginIssueExecutionDecisionsPage,
   ];
   "issues.listInteractions": [
     params: { issueId: string; companyId: string },
