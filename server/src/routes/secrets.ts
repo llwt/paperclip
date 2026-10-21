@@ -19,6 +19,8 @@ import { validate } from "../middleware/validate.js";
 import { assertBoard, assertBoardOrAgent, assertCompanyAccess, getAccessibleResource } from "./authz.js";
 import { logActivity, secretService } from "../services/index.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
+import { aiConnectionService } from "../services/ai-connections.js";
+import { logger } from "../middleware/logger.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
@@ -115,6 +117,20 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
   const heartbeat = deps.heartbeat ?? heartbeatService(db);
   const runRedactions = createRunSecretRedactionRegistry(db);
   const defaultProvider = getConfiguredSecretProvider();
+  const aiConnections = aiConnectionService(db);
+
+  // A new value for the `ai.credential` secret of a marked AI account is
+  // checked here, after the secret change has committed. It runs in the routes
+  // and not in `rotate()` because `rotate()` also runs inside other
+  // transactions (an AI reconnect among them), and the check is a provider
+  // request that must not hold their locks. The secret change never fails on it.
+  async function recheckAiConnections(companyId: string, secretId: string, userId: string) {
+    try {
+      await aiConnections.revalidateAfterSecretChange({ companyId, secretId, userId });
+    } catch (error) {
+      logger.warn({ secretId, errorName: error instanceof Error ? error.name : typeof error }, "AI connection re-check after a secret change failed");
+    }
+  }
 
   async function assertSecretCatalogReadAllowed(req: Parameters<typeof assertBoard>[0], companyId: string) {
     const decision = await access.decide({
@@ -811,6 +827,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
           status: updated.status,
         },
       });
+      if (req.body.value != null) await recheckAiConnections(companyId, updated.id, ownerUserId);
 
       res.json(updated);
     },
@@ -851,6 +868,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
           version: rotated.latestVersion,
         },
       });
+      await recheckAiConnections(companyId, rotated.id, ownerUserId);
 
       res.json(rotated);
     },
@@ -1025,6 +1043,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       entityId: rotated.id,
       details: { version: rotated.latestVersion },
     });
+    await recheckAiConnections(rotated.companyId, rotated.id, req.actor.userId ?? "board");
 
     res.json(rotated);
   });

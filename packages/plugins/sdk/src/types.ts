@@ -19,6 +19,7 @@ import type {
   Project,
   Issue,
   IssueComment,
+  IssueExecutionDecision,
   IssueDocument,
   IssueDocumentSummary,
   IssueRelationIssueSummary,
@@ -1401,6 +1402,32 @@ export interface PluginIssueAttachmentContent {
   contentBase64: string;
 }
 
+/** A retained execution decision, with JSON-safe ISO timestamps. */
+export type PluginIssueExecutionDecision = Omit<IssueExecutionDecision, "createdAt" | "updatedAt"> & {
+  createdAt: string;
+  updatedAt: string;
+};
+
+export interface PluginIssueExecutionDecisionsOptions {
+  cursor?: string;
+  /** Defaults to 50. Must be an integer from 1 through 100. */
+  limit?: number;
+}
+
+export interface PluginIssueExecutionPrincipalLabel {
+  type: "agent" | "user";
+  id: string;
+  /** Current display name, not a historical snapshot. */
+  label: string | null;
+}
+
+export interface PluginIssueExecutionDecisionsPage {
+  items: PluginIssueExecutionDecision[];
+  nextCursor: string | null;
+  /** Keys are `agent:<id>` or `user:<id>`. Only referenced principals appear. */
+  principalLabels: Record<string, PluginIssueExecutionPrincipalLabel>;
+}
+
 /**
  * `ctx.issues` — read and mutate issues plus comments.
  *
@@ -1416,6 +1443,7 @@ export interface PluginIssueAttachmentContent {
  * - `issue.comments.create_human_attributed` for `createComment` calls that pass `actorUserId`
  * - `issue.interactions.create` for `createInteraction`, `suggestTasks`, `askUserQuestions`, `requestConfirmation`, and `requestCheckboxConfirmation`
  * - `issue.interactions.read` for `listInteractions`
+ * - `issue.execution.read` for `listExecutionDecisions`
  * - `issue.interactions.respond` for `respondInteraction`
  * - `issue.attachments.read` for `listAttachments` and `getAttachmentContent`
  * - `issue.documents.read` for `documents.list` and `documents.get`
@@ -1579,6 +1607,16 @@ export interface PluginIssuesClient {
    * Requires `issue.interactions.read`.
    */
   listInteractions(issueId: string, companyId: string): Promise<IssueThreadInteraction[]>;
+  /**
+   * Read retained decisions in ascending (createdAt, id) order.
+   * Requires `issue.execution.read`. Cursors are opaque and company/issue-bound.
+   * Unknown or mismatched issues return an empty page. Invalid options fail.
+   */
+  listExecutionDecisions(
+    issueId: string,
+    companyId: string,
+    options?: PluginIssueExecutionDecisionsOptions,
+  ): Promise<PluginIssueExecutionDecisionsPage>;
   /**
    * Resolve (accept/reject) a pending issue-thread interaction on behalf of a
    * paired board user. Requires `issue.interactions.respond`.

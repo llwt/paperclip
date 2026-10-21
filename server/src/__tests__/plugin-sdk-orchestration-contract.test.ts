@@ -255,3 +255,55 @@ describe("plugin SDK orchestration contract", () => {
     ).rejects.toThrow("Issue is blocked by unresolved blockers");
   });
 });
+
+
+describe("execution history test harness", () => {
+  it("preserves policy/state and pages retained decisions with bounded labels", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    const stageId = randomUUID();
+    const agentId = randomUUID();
+    const executionPolicy = {
+      mode: "normal" as const, commentRequired: true,
+      stages: [{ id: stageId, type: "review" as const, approvalsNeeded: 1 as const,
+        participants: [{ id: randomUUID(), type: "agent" as const, agentId }] }],
+    };
+    const executionState = {
+      status: "pending" as const, currentStageId: stageId, currentStageIndex: 0, currentStageType: "review" as const,
+      currentParticipant: { type: "user" as const, userId: "member" },
+      returnAssignee: { type: "agent" as const, agentId },
+      reviewRequest: null, completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+    };
+    const harness = createTestHarness({ manifest: manifest(["issues.read", "issue.execution.read"]) });
+    const decisions = Array.from({ length: 3 }, () => randomUUID()).sort().map((id, index) => ({
+      id, companyId, issueId, stageId: index === 0 ? randomUUID() : stageId,
+      stageType: "review" as const, outcome: "approved" as const, body: "Retained round",
+      actorAgentId: null, actorUserId: index === 2 ? "page-only" : null, createdByRunId: null,
+      createdAt: "2026-10-21T08:00:00.000Z", updatedAt: "2026-10-21T08:00:00.000Z",
+    }));
+    harness.seed({
+      issues: [issue({ id: issueId, companyId, title: "History", executionPolicy, executionState })],
+      issueExecutionDecisions: decisions,
+      issueExecutionPrincipalLabels: [
+        { companyId, type: "user", id: "member", label: "Member name" },
+        { companyId, type: "user", id: "unrelated", label: "Do not expose" },
+      ],
+    });
+    expect(await harness.ctx.issues.get(issueId, companyId)).toMatchObject({ executionPolicy, executionState });
+    const first = await harness.ctx.issues.listExecutionDecisions(issueId, companyId, { limit: 2 });
+    expect(first.items).toEqual(decisions.slice(0, 2));
+    expect(first.principalLabels).toEqual({
+      [`agent:${agentId}`]: { type: "agent", id: agentId, label: null },
+      "user:member": { type: "user", id: "member", label: "Member name" },
+    });
+    const last = await harness.ctx.issues.listExecutionDecisions(issueId, companyId, { cursor: first.nextCursor!, limit: 2 });
+    expect(last.items).toEqual(decisions.slice(2));
+    expect(last.nextCursor).toBeNull();
+    expect(last.principalLabels["user:page-only"]).toEqual({ type: "user", id: "page-only", label: null });
+    expect(await harness.ctx.issues.listExecutionDecisions(issueId, randomUUID())).toEqual({ items: [], nextCursor: null, principalLabels: {} });
+    await expect(harness.ctx.issues.listExecutionDecisions(issueId, companyId, { limit: 101 })).rejects.toThrow("Invalid execution decision history options");
+    await expect(harness.ctx.issues.listExecutionDecisions(issueId, companyId, { cursor: "bad" })).rejects.toThrow("Invalid execution decision history cursor");
+    const denied = createTestHarness({ manifest: manifest(["issues.read"]) });
+    await expect(denied.ctx.issues.listExecutionDecisions(issueId, companyId)).rejects.toThrow("issue.execution.read");
+  });
+});

@@ -25,10 +25,12 @@ the ones on `somnex-main` before the merge; what is left of each is the diff of
 
 | Commit | What | Upstream status | Drops out when |
 | --- | --- | --- | --- |
+| SX-1457 (this PR) | Backups: both engines write to `.partial` files and publish the complete gzip by rename; server startup removes incomplete files; Install and Rollback check for a running backup before restart | Local only (SX-1456) | An upstream release writes backups to a temporary name |
 | Claude quota classification (this PR) | Claude login detection ignores stream-json objects in raw stdout and gives terminal quota or transient errors priority, so a tool's `unauthorized` output cannot turn a session limit into account reauthorization | Local only | An upstream release carries an equivalent fix |
 | NX-1092 (this PR) | Setup-token cleanup: exclude local subscription rows from scoped reads and writes, clear records with no lease without a provider release, and log only the error class and SQLSTATE on a failed release | Local only (NX-1092). Upstream `master` `f3af9887c` has the same fault | An upstream release carries an equivalent fix |
 | NX-834 (this PR) | Tools: opt-in `compact-v1` connection tool names for Claude runs. Pure helper `server/src/services/compact-connection-tool-names.ts`; narrow hooks in the named MCP route (`?toolNames=compact-v1`, unknown values rejected), `listToolsForNamedGateway` (alias projection), `findToolForSession` (alias resolution on the descriptors it already loads, after authentication) and `buildPaperclipRuntimeMcpServers` (label `p` and the versioned URL for `claude_local` agents with `runtimeConfig.connectionToolNames: "compact-v1"`), plus a Claude resume check (`packages/adapters/claude-local/src/server/tool-name-format.ts`) that starts a fresh session when the tool name format changes, because upstream now resumes across other MCP server changes. Stored names, policies, signatures and rate buckets keep the internal name. Kill switch `PAPERCLIP_COMPACT_CONNECTION_TOOL_NAMES_DISABLED=true`. Rollback: unset the agent opt-in (or set the kill switch), let compact sessions restart, then revert the binary | Local only (NX-658). Fork-specific implementation of the approved Nx plan. Related upstream: paperclipai/paperclip#15668 (open). | An upstream release provides equivalent presentation aliases without changing stored gateway identities, policy evaluation or signed approvals |
 | SX-1369 (this PR) | Runs: run temp folders (`paperclip-ai-*`, `paperclip-run-*`) are removed on every end path, and resume data survives. The managed AI home gets an owner marker (company, agent, run); at run end the heartbeat writes back the credential and removes the home only when the run is terminal and neither its process id nor its process group is alive (`server/src/services/run-temp-dirs.ts`). A home with a pending credential write-back (`.paperclip-ai-writeback.json`) is removed only after that write-back runs. A sweep at startup and every 10 minutes removes marked folders whose run the lookup shows as ended for the same company and agent, skips runs whose teardown is still in progress in this server, and runs a write-back left pending by a crash before removal; unmarked folders are left alone. For local runs `provider/projects`, `provider/sessions` and `provider/archived_sessions` link to `<instance>/companies/<company>/agents/<agent>/ai-session-state/`, so Claude `--resume`, agent memory and Codex sessions outlive the temp home; a run whose links cannot be verified fails before the provider starts. Credentials stay in `/tmp`. The sandbox mounts the link targets read-write | Local only. Not checked against upstream `master` and not raised upstream | An upstream release keeps managed session state outside the temp home and sweeps folders of runs cut off by a restart |
+| SX-1386 (this PR) | Heartbeat: a stage hand-off wake (`execution_review_requested`, `execution_approval_requested`, `execution_changes_requested`) that meets an execution blocker is saved as `deferred_issue_execution` instead of a skipped execution wait. It starts through normal admission when the blocking run releases its environment lease (`resumeDeferredExecutionStageWakes`, called from `releaseEnvironmentLeasesForRun` and `resumeQueuedRuns`), only if the task still waits on that participant. The saved row is settled in the same transaction that stores the successor run, so a failed or interrupted start leaves it saved for a retry and a retry never starts a second run. Before, the decision stopped the deciding run, its lease was still held, and the next participant got no run | Local only (NX-1092) | An upstream release saves or resumes stage hand-off wakes the same way |
 | SX-1120 (this PR) | Database: index for the `paperclipIssue` branch of `valuesForIssue`, so comment lists do not scan all `heartbeat_runs` | On upstream `master` since `e9b6c4d44` (paperclipai/paperclip#16278), also open PR paperclipai/paperclip#12499; not in a stable tag yet. Nothing to submit: upstream already has the fix | The first upstream release merge that contains #16278. On that merge drop the fork's 0306 migration, its journal entry and snapshot, and take upstream's |
 | SX-1361 (this PR) | Runs: `runsForIssue` reads the task run list through `heartbeat_runs.id IN (... UNION ...)` (context issue id plus activity log run ids) instead of an `OR` that scans every run of the company. The company run list reads the run context once per row, takes 200 rows by default and at most 1,000 (route, service, UI client); both agent detail pages fetch an older linked run by id. The fork matches the issue through `context_snapshot ->> 'issueId'` (no `heartbeat_runs.issue_id`) | `runsForIssue`: open upstream PR paperclipai/paperclip#16713 (head `df285a125`). Company run list: on upstream `master` since `ebeac833a` (paperclipai/paperclip#16286), not in a stable tag yet. Nothing to submit | The first upstream release merge that contains both #16713 and #16286. Take upstream's code on a conflict (upstream matches `heartbeat_runs.issue_id`) |
 | `2593ef230` | CLI: pruning preserves and reports older install payloads with a live executable or working directory on Linux. Processes the installing user may not inspect (`EACCES`, `EPERM`) are skipped and not protected. Unsupported platforms and failed process checks retain payloads without failing the install | Local only (NX-658) | An upstream release guards payload pruning against live processes and failed inspection |
@@ -54,7 +56,9 @@ the ones on `somnex-main` before the merge; what is left of each is the diff of
 | NX-716 (this PR) | Interactions: a confirmation card whose source run ended without a `workspace_finalize` row can be accepted (`runWorkspaceIsFinalized` in `server/src/services/issues.ts`). Before, a card posted by a run that was then lost (`process_lost`) could never be accepted. A live run still blocks, and so does an ended native-runtime run whose finalization coordinator row has not reached `terminal_failure` (native recovery can still resume it) | Local only (NX-658). Upstream `master` has the same gap | An upstream release carries an equivalent fix |
 | SX-1370 (this PR) | Dependencies: the workspace-finalize barrier on a `done` blocker holds only while the run that last touched the blocker's workspace can still record a `workspace_finalize` (a live run, or an ended native-runtime run native recovery can still resume, as in `runWorkspaceIsFinalized`). A finalize that ended `failed` or `skipped`, a stale `running` finalize of an ended run, a run that ended without one and an operation with no run no longer block the dependent; the run-end hook and the periodic dependency backstop then wake it. A `PATCH` that changes `blockedByIssueIds` and the status together checks the blockers against the new links (`getDependencyReadinessForBlockerIssueIds`). `cancelled` blockers still block, as upstream intends | Local only (NX-1092). Upstream `master` has the same barrier and route ordering | An upstream release carries an equivalent fix |
 | NX-892 (this PR) | `pnpm-lock.yaml`: the `server` entries for `@modelcontextprotocol/sdk` and `light-my-request`, 27 added lines. The tag's `server/package.json` names both, its lockfile does not, and `pnpm install --frozen-lockfile` (fork CI and `paperclipai install`) fails without them | Upstream `master` has them since its lockfile refresh `03cf6a6ec` (2026-10-06), which is after the commit the tag was cut from | The next upstream merge. Take upstream's lockfile on a conflict |
+| SX-1397 (this PR) | AI connections: repair a false "needs reconnect" mark. Reconnect a Claude subscription with a pasted setup-token (`POST .../ai-connections/:connectionId/setup-token`), "Check again" (`POST .../ai-connections/:connectionId/revalidate`), and a re-check after a board secret-value change. Each clears both the grant mark and the connection health mark in one transaction after a read-only provider check (`server/src/services/ai-credential-check.ts`); see "Repairing a needs reconnect mark" in `doc/connections/AI-CONNECTIONS.md` | Local only (NX-1092) | An upstream release offers an equivalent repair path for a marked AI account |
 | SX-1134 (this PR) | Workspaces: a reused shared `project_primary` execution workspace whose cwd differs from the cwd the project's primary workspace now resolves to is rebound to that cwd on the same record, with its project workspace and repo (`resolveSharedProjectPrimaryWorkspaceRebindCwd` in `server/src/services/heartbeat.ts`). Before, a task whose shared workspace was saved in the managed `_default` folder failed `missing_git_metadata` after a repo was added to the project. Isolated, worktree, adapter-managed and sandbox workspaces, the agent fallback cwd and native recovery are unchanged | Local only (NX-658). Upstream `master` (`cde944ed7`, 2026-10-20) still restores the persisted cwd as is in `heartbeat/workspace-preparation.ts` | An upstream release rebinds a stale shared project workspace on reuse |
+| SX-1431 (this PR) | Plugins: read-only `ctx.issues.listExecutionDecisions` with `issue.execution.read`, company/issue-bound cursor pagination over retained execution decisions, and a bounded projection of current principal names. SDK protocol, worker, host factory and test harness use the same public contract. No schema, route or write-path change | Fork-only extension approved for the execution flow plugin. No upstream PR or npm publication | An upstream release supplies the same scoped read contract, capability and safe principal-label projection |
 | fork PR #3, fork files | `FORK.md`, `.github/workflows/somnex-ci.yml` and `scripts/somnex-ci-server-other.mjs` | Fork-only by design, will not go upstream | The fork is retired |
 
 To refresh this table:
@@ -315,8 +319,21 @@ after Steven approves the SHA.
    Then check that the new shim names node 24:
    `grep -c 'installs/node/24' /home/steven-bot/.local/bin/paperclipai` prints a
    number above 0. If it prints 0, stop and report before the restart.
-6. `paperclipai service restart`
-7. Run the smoke checklist.
+6. Check that no database backup is running. A restart during a backup cuts the
+   dump off (SX-1455). Run:
+
+   ```sh
+   journalctl --user -u paperclipai --since "-2h" --no-pager \
+     | grep -E "database backup (starting|complete|failed)|database backups enabled" \
+     | tail -1
+   ```
+
+   If the last line says "database backup starting", a backup is running (it
+   takes about 5 minutes). Wait and run the check again until the last line says
+   "complete", "failed" or "backups enabled". Backups start each hour at about
+   the same minute; plan the restart away from that minute.
+7. `paperclipai service restart`
+8. Run the smoke checklist.
 
 Facts about `install --ref` on this host (found on NX-449 and NX-509):
 
@@ -327,7 +344,7 @@ Facts about `install --ref` on this host (found on NX-449 and NX-509):
   node 26 fails ("corepack is not a valid shim"). A `PATH` prefix alone does not
   help: the shim still runs node 26 and writes node 26 into the new shim. Step 5
   runs the CLI with node 24 (the line in `.nvmrc` and the fork CI), which has
-  `corepack` and re-pins the shim to node 24. The restart in step 6 then moves
+  `corepack` and re-pins the shim to node 24. The restart in step 7 then moves
   the server to node 24 too; the install card says so. Use absolute paths:
   agent runs have their own `HOME`, so `~` and `$HOME` do not point at
   `/home/steven-bot` there.
@@ -372,7 +389,8 @@ Facts about `install --ref` on this host (found on NX-449 and NX-509):
 
 1. `paperclipai update --rollback`, or
    `paperclipai install --repo llwt/paperclip --ref <previous sha> -y`.
-2. `paperclipai service restart`, then the smoke checklist.
+2. `paperclipai service restart`, then the smoke checklist. Run the backup check
+   of the Install section first, unless the server is already down.
 3. If the new build ran migrations, the old code may not work on the new
    schema. Rollback then also means restoring the database backup from install
    step 3.

@@ -12,6 +12,7 @@ import { instanceSettingsApi } from "@/api/instanceSettings";
 import { queryKeys } from "@/lib/queryKeys";
 import { resolveAdapterTestEnvironmentId, resolveLocalDefaultEnvironmentId, resolveManagedSandboxEnvironmentId } from "@/lib/adapter-test-environment";
 import { resolveForcedKubernetesEnvironment } from "@/lib/forced-kubernetes-environment";
+import { AiConnectionSetupTokenPaste } from "./AiConnectionRepair";
 
 type Props = {
   companyId: string;
@@ -81,6 +82,7 @@ function SubscriptionConnectionStep({ companyId, provider, initialMethod, fixedM
       <SelectTrigger aria-label="Sign-in environment"><SelectValue placeholder="Sign-in environment" /></SelectTrigger>
       <SelectContent>{loginEnvironments.map((env) => <SelectItem key={env.id} value={env.id}>{env.name}</SelectItem>)}</SelectContent>
     </Select>}
+    {provider === "anthropic" && connectionId && (initialMethod ?? "subscription") === "subscription" && <AiConnectionSetupTokenPaste companyId={companyId} connectionId={connectionId} onComplete={(result) => onComplete({ ...result, method: "subscription" })} />}
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
     {loading ? <p role="status" className="text-sm text-muted-foreground">Preparing sign-in…</p> : <AgentProviderConnection
       key={environmentId ?? "local"}

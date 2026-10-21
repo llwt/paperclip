@@ -247,6 +247,7 @@ export interface HostServices {
     listComments(params: WorkerToHostMethods["issues.listComments"][0]): Promise<WorkerToHostMethods["issues.listComments"][1]>;
     createComment(params: WorkerToHostMethods["issues.createComment"][0]): Promise<WorkerToHostMethods["issues.createComment"][1]>;
     createInteraction(params: WorkerToHostMethods["issues.createInteraction"][0]): Promise<WorkerToHostMethods["issues.createInteraction"][1]>;
+    listExecutionDecisions(params: WorkerToHostMethods["issues.listExecutionDecisions"][0]): Promise<WorkerToHostMethods["issues.listExecutionDecisions"][1]>;
     listInteractions(params: WorkerToHostMethods["issues.listInteractions"][0]): Promise<WorkerToHostMethods["issues.listInteractions"][1]>;
     respondInteraction(params: WorkerToHostMethods["issues.respondInteraction"][0]): Promise<WorkerToHostMethods["issues.respondInteraction"][1]>;
     listAttachments(params: WorkerToHostMethods["issues.listAttachments"][0]): Promise<WorkerToHostMethods["issues.listAttachments"][1]>;
@@ -469,6 +470,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "issues.createComment": "issue.comments.create",
   "issues.createInteraction": "issue.interactions.create",
   "issues.listInteractions": "issue.interactions.read",
+  "issues.listExecutionDecisions": "issue.execution.read",
   "issues.respondInteraction": "issue.interactions.respond",
   "issues.listAttachments": "issue.attachments.read",
   "issues.getAttachmentContent": "issue.attachments.read",
@@ -930,6 +932,9 @@ export function createHostClientHandlers(
     }),
     "issues.createInteraction": gated("issues.createInteraction", async (params) => {
       return services.issues.createInteraction(params);
+    }),
+    "issues.listExecutionDecisions": gated("issues.listExecutionDecisions", async (params) => {
+      return services.issues.listExecutionDecisions(params);
     }),
     "issues.listInteractions": gated("issues.listInteractions", async (params) => {
       return services.issues.listInteractions(params);

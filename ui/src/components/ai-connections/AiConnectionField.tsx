@@ -13,6 +13,7 @@ import { aiConnectionsApi } from "@/api/ai-connections";
 import { AiConnectionPicker } from "./AiConnectionPicker";
 import { AiConnectionLegacyNotice } from "./AiConnectionManagement";
 import { AiConnectionCredentialStep } from "./AiConnectionCredentialStep";
+import { AiConnectionCheckAgain } from "./AiConnectionRepair";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -149,6 +150,7 @@ export function AiConnectionField({
         }
         onConnect={() => openConnection()}
         onReconnect={(!value || value.mode === "responsible_user") && personalDefault && personalDefault.status !== "connected" ? () => openConnection(personalDefault) : undefined}
+        reconnectActions={personalDefault?.status === "needs_attention" ? <AiConnectionCheckAgain account={personalDefault} /> : undefined}
         onRetry={() => void accounts.refetch()}
       />}
       <Dialog

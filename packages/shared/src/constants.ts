@@ -1332,6 +1332,7 @@ export const PLUGIN_CAPABILITIES = [
   "issue.comments.read",
   // Read pending issue-thread interactions (decision cards) on an issue.
   "issue.interactions.read",
+  "issue.execution.read",
   // Read issue attachment metadata and, via the capability-scoped host
   // bridge, attachment content bytes (bytes-only, company-scoped, audit-logged).
   "issue.attachments.read",

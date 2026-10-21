@@ -36,6 +36,7 @@ export {
 export {
   parseSetupTokenPrompt,
   parseSetupTokenCredential,
+  isSetupTokenShape,
   SETUP_TOKEN_PROMPT,
   SETUP_TOKEN_AUTH_URLS,
   SETUP_TOKEN_REDIRECT_URI,
