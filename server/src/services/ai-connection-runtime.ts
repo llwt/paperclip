@@ -11,6 +11,7 @@ import {
 } from "@paperclipai/shared";
 import { aiConnectionService } from "./ai-connections.js";
 import { secretService } from "./secrets.js";
+import { writeRunTempDirMarker } from "./run-temp-dirs.js";
 import { decideCodexAuthMerge } from "@paperclipai/adapter-codex-local/server";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
@@ -203,6 +204,8 @@ export async function prepareManagedAiRuntime(
   input: {
     companyId: string;
     agentId: string;
+    /** The heartbeat run that owns the home; null for adapter test routes. */
+    runId?: string | null;
     responsibleUserId: string | null;
     adapterType: string;
     binding: AiConnectionBinding;
@@ -271,6 +274,7 @@ export async function prepareManagedAiRuntime(
         `paperclip-ai-${input.companyId}-${selection.grant.id}-`,
       ),
     );
+    await writeRunTempDirMarker(home, { companyId: input.companyId, agentId: input.agentId, runId: input.runId ?? null });
     const providerHome = path.join(home, "provider");
     await mkdir(providerHome, { mode: 0o700 });
     const env: Record<string, unknown> = {
@@ -324,7 +328,13 @@ export async function prepareManagedAiRuntime(
       accountOwnerUserId: selection.grant.subjectUserId,
       identity,
       home,
-      cleanup: async () => {
+      providerHome,
+      /**
+       * Write back a refreshed credential, then remove the home. A heartbeat
+       * passes `keepHome` and removes the home itself once the run's process
+       * group is gone; see `removeRunTempDir`.
+       */
+      cleanup: async (options: { keepHome?: boolean } = {}) => {
         try {
           if (subscriptionFile) {
             const refreshed = await readFile(authFile, "utf8");
@@ -392,7 +402,7 @@ export async function prepareManagedAiRuntime(
               });
           }
         } finally {
-          if (home) await rm(home, { recursive: true, force: true });
+          if (home && !options.keepHome) await rm(home, { recursive: true, force: true });
         }
       },
     };

@@ -474,6 +474,11 @@ import {
   type WorkspaceOperationRecorder,
 } from "./workspace-operations.js";
 import {
+  linkManagedAiSessionState,
+  removeRunTempDir,
+  resolveManagedAiSessionStateDir,
+} from "./run-temp-dirs.js";
+import {
   isProcessGroupAlive,
   terminateLocalService,
 } from "./local-service-supervisor.js";
@@ -21915,7 +21920,7 @@ export function heartbeatService(
       readFailureReportSecrets = () => collectRunFailureSecretValues(resolvedConfig.env, secretKeys);
       if (aiBinding) {
         try {
-          managedAiRuntime = await prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig });
+          managedAiRuntime = await prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, runId: run.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig });
         } catch (error) {
           // Only fresh executions can receive a pre-provider wait receipt. A
           // persisted native input may already have provider effects to recover.
@@ -22991,6 +22996,14 @@ export function heartbeatService(
         if (!saved) return;
         if (saved.state !== "superseded") await recordInstructionSave(saved);
       };
+      if (managedAiRuntime && (!executionTarget || executionTarget.kind === "local")) {
+        // The temp home is removed when the run ends. Session transcripts and
+        // agent memory live in a per-agent folder so the next run can resume.
+        await linkManagedAiSessionState({
+          providerHome: managedAiRuntime.providerHome,
+          stateDir: resolveManagedAiSessionStateDir(agent.companyId, agent.id),
+        }).catch((error) => logger.warn({ err: error, runId: run.id }, "failed to link managed AI session state; this run's session will not be resumable"));
+      }
       if (managedAiRuntime && aiBinding) {
         try { await assertManagedAiProjectAuth({ ...resolvedConfig, cwd: executionWorkspace.cwd }, aiBinding.provider, executionTarget); }
         catch { throw new ConfigurationIncompleteFailure("Project authentication conflicts with this agent’s managed AI connection", { configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` } }); }
@@ -26851,7 +26864,7 @@ export function heartbeatService(
       }
     } finally {
       await nativeInstructionReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));
-      if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
+      if (managedAiRuntime) await managedAiRuntime.cleanup({ keepHome: true }).catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
       let latestRun = await getRun(run.id).catch(() => null);
       try {
         if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
@@ -26955,6 +26968,26 @@ export function heartbeatService(
             nativeLifecycleTelemetry: nativeLifecycleTelemetryForRun,
           }));
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+        }
+        if (
+          managedAiRuntime &&
+          latestRun &&
+          isHeartbeatRunTerminalStatus(latestRun.status)
+        ) {
+          // Skipped homes (process group still alive, or a run that is not
+          // terminal yet) are removed later by the run temp folder sweep.
+          const homeCleanup = await removeRunTempDir({
+            dir: managedAiRuntime.home,
+            owner: { companyId: run.companyId, agentId: run.agentId, runId: run.id },
+            processGroupId: latestRun.processGroupId,
+            isProcessGroupAlive,
+          }).catch((error) => {
+            logger.warn({ err: error, runId: run.id, dir: managedAiRuntime?.home }, "failed to remove managed AI home");
+            return null;
+          });
+          if (homeCleanup && !homeCleanup.removed) {
+            logger.info({ runId: run.id, ...homeCleanup }, "managed AI home kept for the run temp folder sweep");
+          }
         }
         if (
           runScratch &&
