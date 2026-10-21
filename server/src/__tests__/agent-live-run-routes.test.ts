@@ -278,17 +278,6 @@ async function requestApp(
 }
 
 describe("agent live run routes", () => {
-  it.each([
-    ["", 200], ["?limit=10&agentId=agent-1&summary=true", 10],
-    ["?limit=99999", 1000], ["?limit=invalid", 200], ["?limit=-10", 1],
-  ])("bounds company history reads for %s", async (query, limit) => {
-    const app = await createApp({});
-    const response = await requestApp(app, baseUrl => request(baseUrl).get(`/api/companies/company-1/heartbeat-runs${query}`));
-    expect(response.status).toBe(200);
-    expect(mockHeartbeatService.list).toHaveBeenCalledWith("company-1", query.includes("agentId") ? "agent-1" : undefined,
-      limit, { summary: query.includes("summary=true") });
-    expect(mockRunSecretRedactionRegistry.redactForRuns).toHaveBeenCalled();
-  });
   beforeEach(() => {
     vi.resetModules();
     vi.doUnmock("../services/agents.js");
@@ -1941,5 +1930,18 @@ describe("agent live run routes", () => {
     expect(res.status).toBe(403);
     expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
     expect(mockWorkspaceDiffReprojection.persist).not.toHaveBeenCalled();
+  });
+
+  // Fork: last in the file, so it does not pay the one-time module transform cost (see vitest.config.ts).
+  it.each([
+    ["", 200], ["?limit=10&agentId=agent-1&summary=true", 10],
+    ["?limit=99999", 1000], ["?limit=invalid", 200], ["?limit=-10", 1],
+  ])("bounds company history reads for %s", async (query, limit) => {
+    const app = await createApp({});
+    const response = await requestApp(app, baseUrl => request(baseUrl).get(`/api/companies/company-1/heartbeat-runs${query}`));
+    expect(response.status).toBe(200);
+    expect(mockHeartbeatService.list).toHaveBeenCalledWith("company-1", query.includes("agentId") ? "agent-1" : undefined,
+      limit, { summary: query.includes("summary=true") });
+    expect(mockRunSecretRedactionRegistry.redactForRuns).toHaveBeenCalled();
   });
 });
