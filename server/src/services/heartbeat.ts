@@ -38,7 +38,7 @@ import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAs
 import { admitExplicitNativeContinuation, admitExplicitContinuationRetry, undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
 import { canRetryStoppedRun, isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { connectionIntentService } from "./connection-intents.js";
-import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
+import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, writeBackManagedAiCredential, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
 import { aiConnectionBindingSchema, aiRuntimeConnectionBindingSchema, type AiConnectionRouterSelection } from "@paperclipai/shared";
 import { aiConnectionRouterService, AiConnectionPoolExhausted, applyAiConnectionRouterTaskSettings } from "./ai-connection-router.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "./ai-connection-session.js";
@@ -474,6 +474,8 @@ import {
   type WorkspaceOperationRecorder,
 } from "./workspace-operations.js";
 import {
+  holdRunTempDirs,
+  isRunProcessAlive,
   linkManagedAiSessionState,
   removeRunTempDir,
   resolveManagedAiSessionStateDir,
@@ -20673,6 +20675,8 @@ export function heartbeatService(
         }
       | undefined;
     let managedAiRuntime: Awaited<ReturnType<typeof prepareManagedAiRuntime>> | undefined;
+    // Keeps the run temp folder sweep away from this run's home until teardown ends.
+    let releaseRunTempDirHold: (() => void) | undefined;
     let providerTraceCapture: Awaited<
       ReturnType<typeof traceStore.prepare>
     > | null = null;
@@ -21919,6 +21923,7 @@ export function heartbeatService(
         });
       readFailureReportSecrets = () => collectRunFailureSecretValues(resolvedConfig.env, secretKeys);
       if (aiBinding) {
+        releaseRunTempDirHold ??= holdRunTempDirs(run.id);
         try {
           managedAiRuntime = await prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, runId: run.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig });
         } catch (error) {
@@ -22999,10 +23004,12 @@ export function heartbeatService(
       if (managedAiRuntime && (!executionTarget || executionTarget.kind === "local")) {
         // The temp home is removed when the run ends. Session transcripts and
         // agent memory live in a per-agent folder so the next run can resume.
+        // A run whose links cannot be verified stops here, before the provider
+        // writes a session into the temp home.
         await linkManagedAiSessionState({
           providerHome: managedAiRuntime.providerHome,
           stateDir: resolveManagedAiSessionStateDir(agent.companyId, agent.id),
-        }).catch((error) => logger.warn({ err: error, runId: run.id }, "failed to link managed AI session state; this run's session will not be resumable"));
+        });
       }
       if (managedAiRuntime && aiBinding) {
         try { await assertManagedAiProjectAuth({ ...resolvedConfig, cwd: executionWorkspace.cwd }, aiBinding.provider, executionTarget); }
@@ -26974,13 +26981,15 @@ export function heartbeatService(
           latestRun &&
           isHeartbeatRunTerminalStatus(latestRun.status)
         ) {
-          // Skipped homes (process group still alive, or a run that is not
-          // terminal yet) are removed later by the run temp folder sweep.
+          // Skipped homes (provider still alive, credential write-back not
+          // done, or a run that is not terminal yet) are removed later by the
+          // run temp folder sweep.
           const homeCleanup = await removeRunTempDir({
             dir: managedAiRuntime.home,
             owner: { companyId: run.companyId, agentId: run.agentId, runId: run.id },
-            processGroupId: latestRun.processGroupId,
-            isProcessGroupAlive,
+            process: { processPid: latestRun.processPid, processGroupId: latestRun.processGroupId },
+            isRunProcessAlive,
+            writeBack: (dir) => writeBackManagedAiCredential(db, dir),
           }).catch((error) => {
             logger.warn({ err: error, runId: run.id, dir: managedAiRuntime?.home }, "failed to remove managed AI home");
             return null;
@@ -27065,6 +27074,7 @@ export function heartbeatService(
           }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "cancelled")));
         }
       } finally {
+        releaseRunTempDirHold?.();
         controllerLease.stop();
         activeRunExecutions.delete(run.id);
         // A failed owned Stop remains visible until this exact executor settles,

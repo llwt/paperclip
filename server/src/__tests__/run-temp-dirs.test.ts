@@ -1,12 +1,19 @@
-import { access, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { access, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { Db } from "@paperclipai/db";
 import { managedAiSessionStateMounts } from "@paperclipai/adapter-utils/local-process-sandbox";
 import { HEARTBEAT_RUN_SCRATCH_MARKER } from "../services/run-scratch.js";
+import { writeBackManagedAiCredential } from "../services/ai-connection-runtime.js";
 import {
   MANAGED_AI_HOME_MARKER,
+  MANAGED_AI_WRITEBACK_PENDING,
   RUNLESS_TEMP_DIR_MAX_AGE_MS,
+  UNTRACKED_RUN_SWEEP_GRACE_MS,
+  holdRunTempDirs,
+  isRunProcessAlive,
   linkManagedAiSessionState,
   readRunTempDirMarker,
   removeRunTempDir,
@@ -62,7 +69,28 @@ function lookup(runs: RunTempDirRunState[]) {
 }
 
 function run(status: string, overrides: Partial<RunTempDirRunState> = {}): RunTempDirRunState {
-  return { id: RUN, companyId: COMPANY, agentId: AGENT, status, processGroupId: 4242, ...overrides };
+  return {
+    id: RUN,
+    companyId: COMPANY,
+    agentId: AGENT,
+    status,
+    processPid: 4243,
+    processGroupId: 4242,
+    finishedAt: new Date("2026-10-21T10:00:00.000Z"),
+    updatedAt: new Date("2026-10-21T10:00:00.000Z"),
+    ...overrides,
+  };
+}
+
+const dead = () => false;
+
+const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
+
+async function markWriteBackPending(home: string, credential = "{}") {
+  await writeFile(
+    path.join(home, MANAGED_AI_WRITEBACK_PENDING),
+    JSON.stringify({ version: 1, companyId: COMPANY, connectionId: "conn", grantId: "grant", provider: "openai", credentialSha256: sha256(credential) }),
+  );
 }
 
 describe("run temp folder marker", () => {
@@ -76,21 +104,39 @@ describe("run temp folder marker", () => {
 describe("removeRunTempDir at run end", () => {
   it("removes the home of a run that ended normally", async () => {
     const home = await makeAiHome();
-    const result = await removeRunTempDir({ dir: home, owner, processGroupId: 4242, isProcessGroupAlive: () => false, tmpRoot });
+    const result = await removeRunTempDir({ dir: home, owner, process: { processPid: null, processGroupId: 4242 }, isRunProcessAlive: dead, tmpRoot });
     expect(result).toEqual({ removed: true, dir: home });
     expect(await exists(home)).toBe(false);
   });
 
   it("keeps the home while the run's process group is alive", async () => {
     const home = await makeAiHome();
-    const result = await removeRunTempDir({ dir: home, owner, processGroupId: 4242, isProcessGroupAlive: () => true, tmpRoot });
-    expect(result).toMatchObject({ removed: false, reason: "process_group_alive" });
+    const result = await removeRunTempDir({ dir: home, owner, process: { processPid: null, processGroupId: 4242 }, isRunProcessAlive: () => true, tmpRoot });
+    expect(result).toMatchObject({ removed: false, reason: "process_alive" });
+    expect(await exists(path.join(home, "provider", "auth.json"))).toBe(true);
+  });
+
+  it("keeps the home while the provider pid is alive and no process group was recorded", async () => {
+    const home = await makeAiHome();
+    // This test process stands in for a live provider (ACP reports a pid with no group).
+    const result = await removeRunTempDir({ dir: home, owner, process: { processPid: process.pid, processGroupId: null }, isRunProcessAlive, tmpRoot });
+    expect(result).toMatchObject({ removed: false, reason: "process_alive" });
+    expect(await exists(path.join(home, "provider", "auth.json"))).toBe(true);
+  });
+
+  it("keeps the home while a credential write-back is pending and nothing can run it", async () => {
+    const home = await makeAiHome();
+    await markWriteBackPending(home);
+    expect(await removeRunTempDir({ dir: home, owner, isRunProcessAlive: dead, tmpRoot })).toMatchObject({ removed: false, reason: "writeback_pending" });
+    const failing = vi.fn(async () => { throw new Error("database unavailable"); });
+    expect(await removeRunTempDir({ dir: home, owner, isRunProcessAlive: dead, writeBack: failing, tmpRoot })).toMatchObject({ removed: false, reason: "writeback_pending" });
+    expect(failing).toHaveBeenCalledWith(home);
     expect(await exists(path.join(home, "provider", "auth.json"))).toBe(true);
   });
 
   it("keeps a home whose marker names another owner", async () => {
     const home = await makeAiHome({ ...owner, companyId: OTHER_COMPANY });
-    const result = await removeRunTempDir({ dir: home, owner, isProcessGroupAlive: () => false, tmpRoot });
+    const result = await removeRunTempDir({ dir: home, owner, isRunProcessAlive: dead, tmpRoot });
     expect(result).toMatchObject({ removed: false, reason: "owner_mismatch" });
     expect(await exists(home)).toBe(true);
   });
@@ -111,7 +157,7 @@ describe("session state survives removal of the home", () => {
     const home = await makeAiHome();
     const providerHome = path.join(home, "provider");
     const stateDir = path.join(root, "instance", "companies", COMPANY, "agents", AGENT, "ai-session-state");
-    expect(await linkManagedAiSessionState({ providerHome, stateDir })).toEqual(["projects", "sessions", "archived_sessions"]);
+    await linkManagedAiSessionState({ providerHome, stateDir });
     expect(await readlink(path.join(providerHome, "projects"))).toBe(path.join(stateDir, "projects"));
 
     // The provider writes through the links during the run.
@@ -128,7 +174,7 @@ describe("session state survives removal of the home", () => {
       { path: path.join(stateDir, "archived_sessions"), access: "rw" },
     ]);
 
-    expect(await removeRunTempDir({ dir: home, owner, isProcessGroupAlive: () => false, tmpRoot })).toMatchObject({ removed: true });
+    expect(await removeRunTempDir({ dir: home, owner, isRunProcessAlive: dead, tmpRoot })).toMatchObject({ removed: true });
     expect(await exists(home)).toBe(false);
     expect(await readFile(path.join(stateDir, "projects", "-work-tree", "session-1.jsonl"), "utf8")).toContain("user");
     expect(await readFile(path.join(stateDir, "projects", "-work-tree", "memory", "MEMORY.md"), "utf8")).toBe("- fact\n");
@@ -147,7 +193,7 @@ describe("sweepRunTempDirs", () => {
   it.each(["succeeded", "failed", "cancelled", "timed_out", "interrupted"])("removes folders of a %s run", async (status) => {
     const home = await makeAiHome();
     const scratch = await makeScratch();
-    const result = await sweepRunTempDirs({ lookupRuns: lookup([run(status)]), isProcessGroupAlive: () => false, tmpRoot });
+    const result = await sweepRunTempDirs({ lookupRuns: lookup([run(status)]), isRunProcessAlive: dead, tmpRoot });
     expect(result.removed.sort()).toEqual([home, scratch].sort());
     expect(await exists(home)).toBe(false);
     expect(await exists(scratch)).toBe(false);
@@ -156,7 +202,7 @@ describe("sweepRunTempDirs", () => {
   it.each(["queued", "running"])("keeps folders of a %s run", async (status) => {
     const home = await makeAiHome();
     const scratch = await makeScratch();
-    const result = await sweepRunTempDirs({ lookupRuns: lookup([run(status)]), isProcessGroupAlive: () => false, tmpRoot });
+    const result = await sweepRunTempDirs({ lookupRuns: lookup([run(status)]), isRunProcessAlive: dead, tmpRoot });
     expect(result.removed).toEqual([]);
     expect(result.kept).toEqual(expect.arrayContaining([{ dir: home, reason: "run_active" }, { dir: scratch, reason: "run_active" }]));
     expect(await exists(home)).toBe(true);
@@ -164,19 +210,42 @@ describe("sweepRunTempDirs", () => {
 
   it("keeps folders of an ended run whose process group is alive", async () => {
     const home = await makeAiHome();
-    const result = await sweepRunTempDirs({ lookupRuns: lookup([run("failed")]), isProcessGroupAlive: (pg) => pg === 4242, tmpRoot });
-    expect(result.kept).toEqual([{ dir: home, reason: "process_group_alive" }]);
+    const result = await sweepRunTempDirs({ lookupRuns: lookup([run("failed")]), isRunProcessAlive: (p) => p.processGroupId === 4242, tmpRoot });
+    expect(result.kept).toEqual([{ dir: home, reason: "process_alive" }]);
     expect(await exists(home)).toBe(true);
+  });
+
+  it.each(["failed", "cancelled"])("keeps folders of a %s run whose provider pid is alive with no process group", async (status) => {
+    const home = await makeAiHome();
+    const scratch = await makeScratch();
+    const result = await sweepRunTempDirs({
+      lookupRuns: lookup([run(status, { processPid: process.pid, processGroupId: null })]),
+      isRunProcessAlive,
+      tmpRoot,
+    });
+    expect(result.removed).toEqual([]);
+    expect(result.kept).toEqual(expect.arrayContaining([{ dir: home, reason: "process_alive" }, { dir: scratch, reason: "process_alive" }]));
+    expect(await exists(path.join(home, "provider", "auth.json"))).toBe(true);
+  });
+
+  it("waits a grace period before removing folders of a run that recorded no process", async () => {
+    const finishedAt = new Date("2026-10-21T10:00:00.000Z");
+    const home = await makeAiHome();
+    const untracked = run("failed", { processPid: null, processGroupId: null, finishedAt });
+    const early = await sweepRunTempDirs({ lookupRuns: lookup([untracked]), isRunProcessAlive: dead, tmpRoot, now: new Date(finishedAt.getTime() + 60_000) });
+    expect(early.kept).toEqual([{ dir: home, reason: "untracked_process_recent" }]);
+    const late = await sweepRunTempDirs({ lookupRuns: lookup([untracked]), isRunProcessAlive: dead, tmpRoot, now: new Date(finishedAt.getTime() + UNTRACKED_RUN_SWEEP_GRACE_MS + 1) });
+    expect(late.removed).toEqual([home]);
   });
 
   it("keeps a folder when the run lookup does not prove the same company and agent", async () => {
     const otherCompany = await makeAiHome({ ...owner, companyId: OTHER_COMPANY });
-    const result = await sweepRunTempDirs({ lookupRuns: lookup([run("succeeded")]), isProcessGroupAlive: () => false, tmpRoot });
+    const result = await sweepRunTempDirs({ lookupRuns: lookup([run("succeeded")]), isRunProcessAlive: dead, tmpRoot });
     expect(result.kept).toEqual([{ dir: otherCompany, reason: "owner_mismatch" }]);
 
     const unknownRun = "55555555-5555-4555-8555-555555555555";
     const unknown = await makeAiHome({ ...owner, runId: unknownRun });
-    const second = await sweepRunTempDirs({ lookupRuns: lookup([]), isProcessGroupAlive: () => false, tmpRoot });
+    const second = await sweepRunTempDirs({ lookupRuns: lookup([]), isRunProcessAlive: dead, tmpRoot });
     expect(second.kept).toEqual(expect.arrayContaining([{ dir: unknown, reason: "run_unknown" }]));
     expect(await exists(otherCompany)).toBe(true);
     expect(await exists(unknown)).toBe(true);
@@ -197,5 +266,141 @@ describe("sweepRunTempDirs", () => {
     expect(early.kept).toEqual([{ dir: home, reason: "runless_recent" }]);
     const late = await sweepRunTempDirs({ lookupRuns: lookup([]), tmpRoot, now: new Date(created.getTime() + RUNLESS_TEMP_DIR_MAX_AGE_MS + 1) });
     expect(late.removed).toEqual([home]);
+  });
+});
+
+describe("run teardown and the sweep", () => {
+  it("does not remove a home while its run's teardown still has to write back the credential", async () => {
+    // The run is terminal and its provider has exited, but teardown has not
+    // reached the credential write-back yet.
+    const home = await makeAiHome();
+    await writeFile(path.join(home, "provider", "auth.json"), "refreshed");
+    await markWriteBackPending(home, "original");
+    const release = holdRunTempDirs(RUN);
+    let pendingWriteBack!: () => void;
+    const teardownPaused = new Promise<void>((resolve) => { pendingWriteBack = resolve; });
+    const savedCredentials: string[] = [];
+    const teardown = (async () => {
+      try {
+        await teardownPaused;
+        savedCredentials.push(await readFile(path.join(home, "provider", "auth.json"), "utf8"));
+        await rm(path.join(home, MANAGED_AI_WRITEBACK_PENDING));
+        return await removeRunTempDir({ dir: home, owner, process: { processPid: null, processGroupId: 4242 }, isRunProcessAlive: dead, tmpRoot });
+      } finally {
+        release();
+      }
+    })();
+
+    const swept = await sweepRunTempDirs({ lookupRuns: lookup([run("succeeded")]), isRunProcessAlive: dead, tmpRoot });
+    expect(swept.kept).toEqual([{ dir: home, reason: "teardown_active" }]);
+    expect(await exists(path.join(home, "provider", "auth.json"))).toBe(true);
+
+    pendingWriteBack();
+    expect(await teardown).toMatchObject({ removed: true });
+    expect(savedCredentials).toEqual(["refreshed"]);
+    expect(await exists(home)).toBe(false);
+  });
+
+  it("runs a write-back left pending by a crashed server before removing the home", async () => {
+    const home = await makeAiHome();
+    await writeFile(path.join(home, "provider", "auth.json"), "refreshed");
+    await markWriteBackPending(home, "original");
+
+    const withoutWriteBack = await sweepRunTempDirs({ lookupRuns: lookup([run("interrupted")]), isRunProcessAlive: dead, tmpRoot });
+    expect(withoutWriteBack.kept).toEqual([{ dir: home, reason: "writeback_pending" }]);
+
+    const failed = await sweepRunTempDirs({
+      lookupRuns: lookup([run("interrupted")]),
+      isRunProcessAlive: dead,
+      writeBack: async () => { throw new Error("database unavailable"); },
+      tmpRoot,
+    });
+    expect(failed.kept).toEqual([{ dir: home, reason: "writeback_pending" }]);
+    expect(await readFile(path.join(home, "provider", "auth.json"), "utf8")).toBe("refreshed");
+
+    const saved: string[] = [];
+    const recovered = await sweepRunTempDirs({
+      lookupRuns: lookup([run("interrupted")]),
+      isRunProcessAlive: dead,
+      writeBack: async (dir) => {
+        saved.push(await readFile(path.join(dir, "provider", "auth.json"), "utf8"));
+        await rm(path.join(dir, MANAGED_AI_WRITEBACK_PENDING));
+      },
+      tmpRoot,
+    });
+    expect(saved).toEqual(["refreshed"]);
+    expect(recovered.removed).toEqual([home]);
+  });
+});
+
+describe("writeBackManagedAiCredential", () => {
+  const noDb = { transaction: vi.fn(async () => { throw new Error("database unavailable"); }) } as unknown as Db;
+
+  it("drops the pending record without a database call when the credential did not change", async () => {
+    const home = await makeAiHome();
+    await writeFile(path.join(home, "provider", "auth.json"), "original");
+    await markWriteBackPending(home, "original");
+    await writeBackManagedAiCredential(noDb, home);
+    expect(noDb.transaction).not.toHaveBeenCalled();
+    expect(await exists(path.join(home, MANAGED_AI_WRITEBACK_PENDING))).toBe(false);
+  });
+
+  it("keeps the pending record when the refreshed credential could not be saved", async () => {
+    const home = await makeAiHome();
+    await writeFile(path.join(home, "provider", "auth.json"), "refreshed");
+    await markWriteBackPending(home, "original");
+    await expect(writeBackManagedAiCredential(noDb, home)).rejects.toThrow("database unavailable");
+    expect(await exists(path.join(home, MANAGED_AI_WRITEBACK_PENDING))).toBe(true);
+    expect(await removeRunTempDir({ dir: home, owner, isRunProcessAlive: dead, writeBack: (dir) => writeBackManagedAiCredential(noDb, dir), tmpRoot }))
+      .toMatchObject({ removed: false, reason: "writeback_pending" });
+    expect(await readFile(path.join(home, "provider", "auth.json"), "utf8")).toBe("refreshed");
+  });
+
+  it("does nothing for a home without a pending record", async () => {
+    const home = await makeAiHome();
+    await writeBackManagedAiCredential(noDb, home);
+    expect(await exists(path.join(home, "provider", "auth.json"))).toBe(true);
+  });
+});
+
+describe("linkManagedAiSessionState", () => {
+  function stateDirFor() {
+    return path.join(root, "instance", "companies", COMPANY, "agents", AGENT, "ai-session-state");
+  }
+
+  it("replaces an empty folder with the link and accepts an existing correct link", async () => {
+    const home = await makeAiHome();
+    const providerHome = path.join(home, "provider");
+    const stateDir = stateDirFor();
+    await mkdir(path.join(providerHome, "projects"));
+    await linkManagedAiSessionState({ providerHome, stateDir });
+    expect(await readlink(path.join(providerHome, "projects"))).toBe(path.join(stateDir, "projects"));
+    await expect(linkManagedAiSessionState({ providerHome, stateDir })).resolves.toBeUndefined();
+  });
+
+  it("fails on an existing folder with content and leaves that content in place", async () => {
+    const home = await makeAiHome();
+    const providerHome = path.join(home, "provider");
+    await mkdir(path.join(providerHome, "projects", "-work-tree"), { recursive: true });
+    await writeFile(path.join(providerHome, "projects", "-work-tree", "session-0.jsonl"), "{}\n");
+    await expect(linkManagedAiSessionState({ providerHome, stateDir: stateDirFor() })).rejects.toThrow("is not a link");
+    expect(await exists(path.join(providerHome, "projects", "-work-tree", "session-0.jsonl"))).toBe(true);
+  });
+
+  it("fails on a link that points somewhere else", async () => {
+    const home = await makeAiHome();
+    const providerHome = path.join(home, "provider");
+    const elsewhere = path.join(root, "elsewhere");
+    await mkdir(elsewhere);
+    await symlink(elsewhere, path.join(providerHome, "projects"), "dir");
+    await expect(linkManagedAiSessionState({ providerHome, stateDir: stateDirFor() })).rejects.toThrow("is not a link");
+  });
+
+  it("fails when the durable folder cannot be made", async () => {
+    const home = await makeAiHome();
+    const blocker = path.join(root, "blocker");
+    await writeFile(blocker, "");
+    await expect(linkManagedAiSessionState({ providerHome: path.join(home, "provider"), stateDir: path.join(blocker, "ai-session-state") }))
+      .rejects.toMatchObject({ code: "ENOTDIR" });
   });
 });

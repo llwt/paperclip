@@ -100,8 +100,8 @@ import {
 } from "./services/device-login-reaper.js";
 import { createProductionSetupTokenReaper } from "./services/setup-token-reaper.js";
 import { localAiLoginService } from "./services/local-ai-login.js";
-import { heartbeatRunTempDirLookup, sweepRunTempDirs } from "./services/run-temp-dirs.js";
-import { isProcessGroupAlive } from "./services/local-service-supervisor.js";
+import { heartbeatRunTempDirLookup, isRunProcessAlive, sweepRunTempDirs } from "./services/run-temp-dirs.js";
+import { writeBackManagedAiCredential } from "./services/ai-connection-runtime.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
 import {
   parseAdapterRegistryEnv,
@@ -1193,7 +1193,11 @@ async function startServerWithDatabaseTeardown(
   const sweepRunTempFolders = () => {
     if (heartbeatSchedulerStopped || isWarmStandby() || runTempDirSweepInFlight) return;
     runTempDirSweepInFlight = true;
-    trackHeartbeatSchedulerWork(sweepRunTempDirs({ lookupRuns: heartbeatRunTempDirLookup(db as any), isProcessGroupAlive })
+    trackHeartbeatSchedulerWork(sweepRunTempDirs({
+      lookupRuns: heartbeatRunTempDirLookup(db as any),
+      isRunProcessAlive,
+      writeBack: (dir) => writeBackManagedAiCredential(db as any, dir),
+    })
       .then((result) => {
         if (result.removed.length > 0) {
           logger.info({ removed: result.removed.length, scanned: result.scanned }, "removed temp folders of ended runs");

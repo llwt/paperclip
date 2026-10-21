@@ -1,3 +1,4 @@
+import type { Stats } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -6,6 +7,7 @@ import { type Db, heartbeatRuns } from "@paperclipai/db";
 import { MANAGED_AI_SESSION_STATE_ENTRIES } from "@paperclipai/adapter-utils/local-process-sandbox";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { HEARTBEAT_RUN_SCRATCH_MARKER } from "./run-scratch.js";
+import { isPidAlive, isProcessGroupAlive } from "./local-service-supervisor.js";
 
 /**
  * Run temp folders in the OS temp directory: the managed AI home
@@ -16,6 +18,12 @@ import { HEARTBEAT_RUN_SCRATCH_MARKER } from "./run-scratch.js";
 export const MANAGED_AI_HOME_PREFIX = "paperclip-ai-";
 export const MANAGED_AI_HOME_MARKER = ".paperclip-ai-home.json";
 export const RUN_SCRATCH_PREFIX = "paperclip-run-";
+/**
+ * Present in a managed AI home while a refreshed credential may still need to
+ * be saved back to its secret. A home with this record is never removed until
+ * the write-back has run.
+ */
+export const MANAGED_AI_WRITEBACK_PENDING = ".paperclip-ai-writeback.json";
 
 const RUN_TEMP_DIR_KINDS = [
   { prefix: MANAGED_AI_HOME_PREFIX, marker: MANAGED_AI_HOME_MARKER },
@@ -24,6 +32,11 @@ const RUN_TEMP_DIR_KINDS = [
 
 /** A home made outside a run (adapter test routes) is swept after this age. */
 export const RUNLESS_TEMP_DIR_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+/**
+ * A run that recorded no process id and no process group is swept only this
+ * long after it ended, since nothing else shows its provider has stopped.
+ */
+export const UNTRACKED_RUN_SWEEP_GRACE_MS = 30 * 60 * 1000;
 const REMOVE_ATTEMPTS = 3;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -42,8 +55,43 @@ export type RunTempDirRemoveResult =
   | {
       removed: false;
       dir: string;
-      reason: "missing" | "unmarked" | "owner_mismatch" | "process_group_alive" | "busy";
+      reason: "missing" | "unmarked" | "owner_mismatch" | "process_alive" | "writeback_pending" | "busy";
     };
+
+/** The provider process of a run, as recorded on the run row. */
+export interface RunTempDirProcess {
+  processPid: number | null;
+  processGroupId: number | null;
+}
+
+export type IsRunProcessAlive = (process: RunTempDirProcess) => boolean;
+
+/** A run's provider counts as alive while its process id or its process group is. */
+export const isRunProcessAlive: IsRunProcessAlive = (process) =>
+  (process.processPid !== null && isPidAlive(process.processPid)) || isProcessGroupAlive(process.processGroupId);
+
+/**
+ * Runs whose own teardown is still in progress in this server process. The
+ * sweep leaves their folders alone, so it cannot remove a home between the
+ * run turning terminal and its credential write-back.
+ */
+const heldRunTempDirRuns = new Map<string, number>();
+
+export function holdRunTempDirs(runId: string): () => void {
+  heldRunTempDirRuns.set(runId, (heldRunTempDirRuns.get(runId) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const count = (heldRunTempDirRuns.get(runId) ?? 1) - 1;
+    if (count <= 0) heldRunTempDirRuns.delete(runId);
+    else heldRunTempDirRuns.set(runId, count);
+  };
+}
+
+export function isRunTempDirHeld(runId: string): boolean {
+  return heldRunTempDirRuns.has(runId);
+}
 
 function kindForDir(dir: string) {
   const base = path.basename(dir);
@@ -85,12 +133,15 @@ export async function readRunTempDirMarker(dir: string): Promise<RunTempDirMarke
 /**
  * Remove a marked run temp folder. The marker goes last, so a folder that a
  * stray process keeps writing to stays marked and a later sweep retries it.
+ * A pending credential write-back runs first through `writeBack`; without it,
+ * or when it fails, the folder is kept.
  */
 export async function removeRunTempDir(input: {
   dir: string;
   owner: RunTempDirOwner;
-  processGroupId?: number | null;
-  isProcessGroupAlive?: (processGroupId: number | null | undefined) => boolean;
+  process?: RunTempDirProcess | null;
+  isRunProcessAlive?: IsRunProcessAlive;
+  writeBack?: (dir: string) => Promise<void>;
   tmpRoot?: string;
 }): Promise<RunTempDirRemoveResult> {
   const tmpRoot = path.resolve(input.tmpRoot ?? os.tmpdir());
@@ -116,8 +167,19 @@ export async function removeRunTempDir(input: {
   ) {
     return { removed: false, dir, reason: "owner_mismatch" };
   }
-  if (input.isProcessGroupAlive?.(input.processGroupId) === true) {
-    return { removed: false, dir, reason: "process_group_alive" };
+  if (input.process && input.isRunProcessAlive?.(input.process) === true) {
+    return { removed: false, dir, reason: "process_alive" };
+  }
+  if (await pathExists(path.join(dir, MANAGED_AI_WRITEBACK_PENDING))) {
+    if (!input.writeBack) return { removed: false, dir, reason: "writeback_pending" };
+    try {
+      await input.writeBack(dir);
+    } catch {
+      return { removed: false, dir, reason: "writeback_pending" };
+    }
+    if (await pathExists(path.join(dir, MANAGED_AI_WRITEBACK_PENDING))) {
+      return { removed: false, dir, reason: "writeback_pending" };
+    }
   }
 
   for (let attempt = 0; attempt < REMOVE_ATTEMPTS; attempt += 1) {
@@ -141,6 +203,16 @@ export async function removeRunTempDir(input: {
   return { removed: false, dir, reason: "busy" };
 }
 
+async function pathExists(target: string): Promise<boolean> {
+  try {
+    await fs.lstat(target);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 /** Durable per-agent session state (Claude projects and memory, Codex sessions), outside the OS temp directory. */
 export function resolveManagedAiSessionStateDir(companyId: string, agentId: string): string {
   for (const id of [companyId, agentId]) {
@@ -153,25 +225,38 @@ export function resolveManagedAiSessionStateDir(companyId: string, agentId: stri
  * Point the session-state entries of a managed provider home at the durable
  * per-agent folder, so removing the run's temp home keeps what `--resume` and
  * agent memory read. Credentials stay in the temp home.
+ *
+ * Throws unless every entry ends up as a link to its durable folder, so the
+ * caller can stop before the provider starts writing sessions into the temp
+ * home. An existing empty folder is replaced by the link; anything else that
+ * is already there (a folder with content, a file, a link elsewhere) is left
+ * as is and fails the call.
  */
 export async function linkManagedAiSessionState(input: {
   providerHome: string;
   stateDir: string;
-}): Promise<string[]> {
-  const linked: string[] = [];
+}): Promise<void> {
   await fs.mkdir(input.stateDir, { recursive: true, mode: 0o700 });
   for (const name of MANAGED_AI_SESSION_STATE_ENTRIES) {
     const target = path.join(input.stateDir, name);
     const link = path.join(input.providerHome, name);
     await fs.mkdir(target, { recursive: true, mode: 0o700 });
+    let existing: Stats | null = null;
     try {
-      await fs.symlink(target, link, "dir");
-      linked.push(name);
+      existing = await fs.lstat(link);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (existing?.isDirectory() && (await fs.readdir(link)).length === 0) {
+      await fs.rmdir(link);
+      existing = null;
+    }
+    if (!existing) await fs.symlink(target, link, "dir");
+    const stats = await fs.lstat(link);
+    if (!stats.isSymbolicLink() || path.resolve(input.providerHome, await fs.readlink(link)) !== target) {
+      throw new Error(`Session state entry '${name}' in ${input.providerHome} is not a link to ${target}`);
     }
   }
-  return linked;
 }
 
 export interface RunTempDirRunState {
@@ -179,7 +264,10 @@ export interface RunTempDirRunState {
   companyId: string;
   agentId: string;
   status: string;
+  processPid: number | null;
   processGroupId: number | null;
+  finishedAt: Date | null;
+  updatedAt: Date;
 }
 
 export interface RunTempDirSweepResult {
@@ -194,11 +282,14 @@ const TERMINAL_RUN_STATUSES = new Set(["succeeded", "interrupted", "failed", "ca
  * Remove run temp folders left by runs that ended without cleanup (a server
  * crash or restart mid-run, a cleanup skipped while the process group was
  * alive). A folder goes only when its marker names a run that the run lookup
- * shows as ended, for the same company and agent, with no live process group.
+ * shows as ended, for the same company and agent, with no live process id or
+ * process group, and whose teardown is not running in this server. A pending
+ * credential write-back runs through `writeBack` before removal.
  */
 export async function sweepRunTempDirs(input: {
   lookupRuns: (runIds: string[]) => Promise<RunTempDirRunState[]>;
-  isProcessGroupAlive?: (processGroupId: number | null | undefined) => boolean;
+  isRunProcessAlive?: IsRunProcessAlive;
+  writeBack?: (dir: string) => Promise<void>;
   tmpRoot?: string;
   now?: Date;
 }): Promise<RunTempDirSweepResult> {
@@ -222,7 +313,7 @@ export async function sweepRunTempDirs(input: {
   const runs = new Map((runIds.length > 0 ? await input.lookupRuns(runIds) : []).map((run) => [run.id, run]));
 
   for (const { dir, marker } of candidates) {
-    let processGroupId: number | null = null;
+    let runProcess: RunTempDirProcess | null = null;
     if (marker.runId === null) {
       const createdAt = Date.parse(marker.createdAt);
       if (!Number.isFinite(createdAt) || now.getTime() - createdAt < RUNLESS_TEMP_DIR_MAX_AGE_MS) {
@@ -243,14 +334,26 @@ export async function sweepRunTempDirs(input: {
         result.kept.push({ dir, reason: "run_active" });
         continue;
       }
-      processGroupId = run.processGroupId;
+      if (isRunTempDirHeld(run.id)) {
+        result.kept.push({ dir, reason: "teardown_active" });
+        continue;
+      }
+      if (run.processPid === null && run.processGroupId === null) {
+        const endedAt = (run.finishedAt ?? run.updatedAt).getTime();
+        if (now.getTime() - endedAt < UNTRACKED_RUN_SWEEP_GRACE_MS) {
+          result.kept.push({ dir, reason: "untracked_process_recent" });
+          continue;
+        }
+      }
+      runProcess = { processPid: run.processPid, processGroupId: run.processGroupId };
     }
     try {
       const removal = await removeRunTempDir({
         dir,
         owner: marker,
-        processGroupId,
-        isProcessGroupAlive: input.isProcessGroupAlive,
+        process: runProcess,
+        isRunProcessAlive: input.isRunProcessAlive,
+        writeBack: input.writeBack,
         tmpRoot,
       });
       if (removal.removed) result.removed.push(dir);
@@ -270,7 +373,10 @@ export function heartbeatRunTempDirLookup(db: Db) {
         companyId: heartbeatRuns.companyId,
         agentId: heartbeatRuns.agentId,
         status: heartbeatRuns.status,
+        processPid: heartbeatRuns.processPid,
         processGroupId: heartbeatRuns.processGroupId,
+        finishedAt: heartbeatRuns.finishedAt,
+        updatedAt: heartbeatRuns.updatedAt,
       })
       .from(heartbeatRuns)
       .where(inArray(heartbeatRuns.id, runIds));
