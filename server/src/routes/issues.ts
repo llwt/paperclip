@@ -13568,6 +13568,15 @@ export function issueRoutes(
         actorRunId: actor.agentId ? actor.runId : null,
         actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
+        // The stop above ran on a snapshot. A concurrent ownership or status
+        // change since then fails this request instead of being overwritten.
+        ...(assigneeWillChange
+          ? {
+              expectedAssigneeAgentId: existing.assigneeAgentId,
+              expectedStatusVersion: existing.statusVersion,
+              ownershipStopRunId: interruptedRunId,
+            }
+          : {}),
       };
       const shouldCollectCompletionPublication =
         actor.actorType === "user" &&
@@ -13716,6 +13725,8 @@ export function issueRoutes(
         Boolean(commentAttachmentIds?.length) ||
         commentWithAdapterOverrides ||
         Boolean(decision) ||
+        // A handoff commits the owner, comment and audit together.
+        assigneeWillChange ||
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
         reviewPolicySensitiveMutationRequested;

@@ -108,6 +108,7 @@ import {
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { assertNoLiveRunForPreviousOwner } from "./issue-assignment.js";
 import { isForeignKeyViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
@@ -10744,6 +10745,11 @@ export function issueService(db: Db) {
         actorRunStopId?: string | null;
         actorUserId?: string | null;
         companyGuard?: string;
+        /** Compared against the locked row; a mismatch is `issue_state_changed`. */
+        expectedAssigneeAgentId?: string | null;
+        expectedStatusVersion?: number;
+        /** The old owner's run this ownership change stopped; any other live one fails it. */
+        ownershipStopRunId?: string | null;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10791,6 +10797,9 @@ export function issueService(db: Db) {
         actorRunStopId,
         actorUserId,
         companyGuard,
+        expectedAssigneeAgentId,
+        expectedStatusVersion,
+        ownershipStopRunId,
         ...issueData
       } = data;
       // An explicit edit claims the title, even if it keeps the same text.
@@ -11064,6 +11073,28 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        // An ownership change is decided on a snapshot taken before the old
+        // run was stopped. A concurrent change since then must not be
+        // overwritten: A -> B and A -> C may not both commit.
+        if ((expectedAssigneeAgentId !== undefined && receiptExisting.assigneeAgentId !== expectedAssigneeAgentId)
+          || (expectedStatusVersion !== undefined && receiptExisting.statusVersion !== expectedStatusVersion)) {
+          throw conflict("The issue changed while this request was stopping its run. Reload and try again.", {
+            code: "issue_state_changed",
+            expected: { assigneeAgentId: expectedAssigneeAgentId, statusVersion: expectedStatusVersion },
+            actual: { assigneeAgentId: receiptExisting.assigneeAgentId, statusVersion: receiptExisting.statusVersion },
+          });
+        }
+        if (expectedAssigneeAgentId !== undefined && receiptExisting.assigneeAgentId &&
+            issueData.assigneeAgentId !== undefined && issueData.assigneeAgentId !== receiptExisting.assigneeAgentId) {
+          await assertNoLiveRunForPreviousOwner(tx, {
+            companyId: receiptExisting.companyId,
+            issueId: receiptExisting.id,
+            previousAssigneeAgentId: receiptExisting.assigneeAgentId,
+            executionRunId: receiptExisting.executionRunId,
+            checkoutRunId: receiptExisting.checkoutRunId,
+            stoppedRunId: ownershipStopRunId ?? null,
+          });
+        }
         if (actorAgentId && actorRunId) {
           // Recheck under a run lock: a request admitted before Stop must not
           // commit a late Done after cancellation revoked its credentials.

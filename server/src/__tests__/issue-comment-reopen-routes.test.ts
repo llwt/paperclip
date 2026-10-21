@@ -632,6 +632,7 @@ describe("issue comment reopen routes", () => {
         actorAgentId: null,
         actorUserId: "local-board",
       }),
+      mockTx,
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
@@ -669,6 +670,7 @@ describe("issue comment reopen routes", () => {
       expect.objectContaining({
         assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       }),
+      mockTx,
     );
   });
 
@@ -720,6 +722,7 @@ describe("issue comment reopen routes", () => {
         actorAgentId: null,
         actorUserId: "local-board",
       }),
+      mockTx,
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
@@ -1079,6 +1082,7 @@ describe("issue comment reopen routes", () => {
         assigneeAgentId: otherAgentId,
         status: "todo",
       }),
+      mockTx,
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),

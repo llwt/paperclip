@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, type Db } from "@paperclipai/db";
 import { parseObject } from "../adapters/utils.js";
 import { conflict } from "../errors.js";
@@ -255,3 +255,51 @@ export function buildAssignmentWakeup(input: {
   };
 }
 
+/**
+ * Runs inside `issueService.update` on the ownership commit's transaction,
+ * after the issue row is locked, so runs are locked second (issue-before-run
+ * order). Fails closed when a run other than the one this request stopped is
+ * executing the issue for the old owner: a recovery or promoted run that
+ * started after the stop. It is not cancelled here, so there is no
+ * cancel-and-retry loop. Queued and scheduled holders are left to the claim
+ * and promotion guards, which cancel them against the committed owner.
+ */
+export async function assertNoLiveRunForPreviousOwner(
+  tx: Db,
+  input: {
+    companyId: string;
+    issueId: string;
+    previousAssigneeAgentId: string | null;
+    executionRunId: string | null;
+    checkoutRunId: string | null;
+    stoppedRunId: string | null;
+  },
+): Promise<void> {
+  const holderIds = [input.executionRunId, input.checkoutRunId].filter((id): id is string => Boolean(id));
+  const ownedByIssue = [
+    ...(holderIds.length > 0 ? [inArray(heartbeatRuns.id, holderIds)] : []),
+    ...(input.previousAssigneeAgentId
+      ? [and(
+          eq(heartbeatRuns.agentId, input.previousAssigneeAgentId),
+          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`,
+        )]
+      : []),
+  ];
+  if (ownedByIssue.length === 0) return;
+  const live = await tx
+    .select({ id: heartbeatRuns.id })
+    .from(heartbeatRuns)
+    .where(and(
+      eq(heartbeatRuns.companyId, input.companyId),
+      eq(heartbeatRuns.status, "running"),
+      or(...ownedByIssue),
+      ...(input.stoppedRunId ? [ne(heartbeatRuns.id, input.stoppedRunId)] : []),
+    ))
+    .for("update");
+  if (live.length > 0) {
+    throw conflict("Another agent run started on this issue before the reassignment committed. The assignee was not changed.", {
+      code: "issue_state_changed",
+      runId: live[0]!.id,
+    });
+  }
+}

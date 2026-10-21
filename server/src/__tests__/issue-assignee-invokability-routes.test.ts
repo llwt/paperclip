@@ -164,7 +164,10 @@ function stubDb(): any {
     query[method] = () => query;
   }
   query.then = (resolve: (rows: unknown[]) => unknown) => Promise.resolve(resolve([]));
-  return { select: () => query };
+  const db: any = { select: () => query };
+  // A reassignment commits in one transaction.
+  db.transaction = async (callback: (tx: unknown) => Promise<unknown>) => callback(db);
+  return db;
 }
 
 function createApp(actor: Actor) {

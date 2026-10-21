@@ -3026,7 +3026,8 @@ describe("agent issue mutation checkout ownership", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(mockIssueService.update).toHaveBeenCalledWith(
         issueId,
-        expect.objectContaining({ assigneeAgentId: peerAgentId }),
+        expect.objectContaining({ assigneeAgentId: peerAgentId, expectedAssigneeAgentId: ownerAgentId }),
+        expect.anything(),
       );
     });
 
