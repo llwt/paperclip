@@ -49,15 +49,30 @@ describe("setup-token lease cleanup guards", () => {
     class PostgresError extends Error { code = "22P02"; }
     const databaseError = new PostgresError("synthetic-secret https://example.invalid/private");
     const error = wrapped ? new Error("query contains synthetic-secret", { cause: databaseError }) : databaseError;
-    const store = { listReapable: vi.fn().mockResolvedValue([cleanupRecord()]), remove: vi.fn() };
+    const record = cleanupRecord();
+    const records = new Map([[record.sessionId, record]]);
+    const store = {
+      listReapable: vi.fn(async () => [...records.values()]),
+      remove: vi.fn(async () => { records.clear(); }),
+    };
     const leases = { releaseById: vi.fn().mockRejectedValue(error) };
     const log = vi.fn();
 
     expect(await reapSetupTokenLeases({ store, leases, log }, Date.now())).toEqual({ released: 0, failed: 1 });
+    expect(leases.releaseById).toHaveBeenCalledExactlyOnceWith(record.leaseId);
     expect(store.remove).not.toHaveBeenCalled();
+    expect([...records.values()]).toEqual([record]);
     expect(log).toHaveBeenCalledExactlyOnceWith(
       `[paperclip] Setup-token reaper: a lease release failed (${wrapped ? "Error" : "PostgresError"} 22P02); it stays retryable.`,
     );
+
+    expect(await reapSetupTokenLeases({ store, leases, log }, Date.now())).toEqual({ released: 0, failed: 1 });
+    expect(store.listReapable).toHaveBeenCalledTimes(2);
+    expect(leases.releaseById).toHaveBeenCalledTimes(2);
+    expect(leases.releaseById).toHaveBeenNthCalledWith(2, record.leaseId);
+    expect(store.remove).not.toHaveBeenCalled();
+    expect([...records.values()]).toEqual([record]);
+    expect(log).toHaveBeenCalledTimes(2);
     expect(log.mock.calls.flat().join()).not.toContain("synthetic-secret");
     expect(log.mock.calls.flat().join()).not.toContain("https://");
   });
