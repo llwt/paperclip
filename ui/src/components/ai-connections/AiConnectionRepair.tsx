@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { RotateCw } from "lucide-react";
 import type { AiManagedConnectionSummary } from "@paperclipai/shared";
 import { aiConnectionsApi } from "@/api/ai-connections";
+import { invalidateAiConnectionStatus } from "@/lib/ai-connection-status-queries";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
@@ -17,7 +18,7 @@ export function AiConnectionSetupTokenPaste({ companyId, connectionId, onComplet
   const client = useQueryClient();
   const save = useMutation({
     mutationFn: () => aiConnectionsApi.reconnectWithSetupToken(companyId, connectionId, token.trim()),
-    onSuccess: (result) => { void client.invalidateQueries({ queryKey: ["ai-connections", companyId] }); onComplete(result); },
+    onSuccess: (result) => { void invalidateAiConnectionStatus(client, companyId, connectionId); onComplete(result); },
     onSettled: () => setToken(""),
   });
   if (!open)
@@ -45,7 +46,7 @@ export function AiConnectionCheckAgain({ account, showFailure = true }: {
   const client = useQueryClient();
   const check = useMutation({
     mutationFn: () => aiConnectionsApi.revalidate(account.companyId, account.id, account.grantId),
-    onSettled: () => client.invalidateQueries({ queryKey: ["ai-connections", account.companyId] }),
+    onSettled: () => invalidateAiConnectionStatus(client, account.companyId, account.id),
   });
   if (!account.revalidationSupported) return null;
   const failed = check.data?.result === "failed";

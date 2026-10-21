@@ -2,11 +2,12 @@
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import type { ReactNode } from "react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { AiManagedConnectionSummary, ConnectionGrant } from "@paperclipai/shared";
 import { AiConnectionCheckAgain, AiConnectionSetupTokenPaste } from "./AiConnectionRepair";
 import { AiConnectionAccountControls } from "./AiConnectionAccountControls";
+import { queryKeys } from "@/lib/queryKeys";
 
 const mocks = vi.hoisted(() => ({ reconnectWithSetupToken: vi.fn(), revalidate: vi.fn() }));
 vi.mock("@/api/ai-connections", () => ({ aiConnectionsApi: mocks }));
@@ -106,4 +107,31 @@ it("offers Check again next to Reconnect only for an account that needs reconnec
   expect(button("Check again")).toBeUndefined();
   render(controls(account({ provider: "openai", revalidationSupported: false })));
   expect(button("Check again")).toBeUndefined();
+});
+
+/** Stands in for the account page header, which reads the tool connection query. */
+function PageHeader({ load }: { load: () => Promise<{ healthStatus: string }> }) {
+  const connection = useQuery({ queryKey: queryKeys.tools.connection("connection"), queryFn: load });
+  return <h1>{connection.data?.healthStatus === "ok" ? "Connected" : "Needs attention"}</h1>;
+}
+
+it.each(["Check again", "a pasted setup-token"])("refreshes the account page header and attention counts after %s", async (path) => {
+  const load = vi.fn().mockResolvedValueOnce({ healthStatus: "error" }).mockResolvedValue({ healthStatus: "ok" });
+  mocks.revalidate.mockResolvedValue({ connectionId: "connection", grantId: "grant", result: "passed", limited: false, message: "Signed in." });
+  mocks.reconnectWithSetupToken.mockResolvedValue({ connectionId: "connection", grantId: "grant" });
+  const invalidate = vi.spyOn(client, "invalidateQueries");
+  render(<>
+    <PageHeader load={load} />
+    {path === "Check again"
+      ? <AiConnectionCheckAgain account={account()} />
+      : <AiConnectionSetupTokenPaste companyId="company" connectionId="connection" onComplete={vi.fn()} />}
+  </>);
+  await settle();
+  expect(container.querySelector("h1")?.textContent).toBe("Needs attention");
+  if (path === "Check again") click("Check again");
+  else { click("Paste a setup-token"); type(document.querySelector("input")!, TOKEN); click("Save token"); }
+  await settle();
+  expect(container.querySelector("h1")?.textContent).toBe("Connected");
+  for (const queryKey of [["ai-connections", "company"], queryKeys.tools.connections("company"), queryKeys.tools.applications("company"), queryKeys.apps.attention("company"), queryKeys.attention("company")])
+    expect(invalidate).toHaveBeenCalledWith({ queryKey });
 });
