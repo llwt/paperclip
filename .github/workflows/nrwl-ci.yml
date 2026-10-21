@@ -7,6 +7,7 @@ on:
   pull_request:
     branches:
       - nrwl-main
+      - somnex-main
 
 permissions:
   contents: read
@@ -142,6 +143,24 @@ jobs:
   # failing lane fails the gate.
   gate:
     name: nrwl-ci
+    if: ${{ always() }}
+    needs: [typecheck_build, suites]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Fail if any lane failed
+        env:
+          TYPECHECK_BUILD_RESULT: ${{ needs.typecheck_build.result }}
+          TEST_RESULT: ${{ needs.suites.result }}
+        run: |
+          test "$TYPECHECK_BUILD_RESULT" = "success"
+          test "$TEST_RESULT" = "success"
+
+  # Temporary second gate for the rename on SX-1119 Step 3.
+  # PR 2 removes gate (nrwl-ci) after GitHub requires somnex-ci.
+  gate_somnex:
+    name: somnex-ci
     if: ${{ always() }}
     needs: [typecheck_build, suites]
     runs-on: ubuntu-latest
