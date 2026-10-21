@@ -32,15 +32,15 @@
 //     testable.
 
 import { randomBytes } from "node:crypto";
-import { and, eq, gt, inArray, isNotNull, isNull, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNotNull, isNull, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { adapterAuthSessions } from "@paperclipai/db";
 import type { AgentAdapterType } from "@paperclipai/shared";
+import { LOCAL_LOGIN_METHOD } from "./local-ai-login-method.js";
 
 // The setup-token login flow supports only the `claude_local` adapter. The
-// unified `adapter_auth_sessions` table also holds the Codex device-login rows,
-// so every store scan filters by this adapter to reach only the setup-token
-// rows.
+// unified `adapter_auth_sessions` table also holds device-login and local
+// subscription rows, so scans filter by adapter and exclude local sign-ins.
 //
 // Three consumers share this one constant, and they must change together:
 //   1. The start-route guard in `agents.ts`, which rejects a request for any
@@ -313,6 +313,19 @@ export interface SetupTokenReapResult {
   failed: number;
 }
 
+function cleanupErrorDiagnostic(error: unknown): string {
+  const className = error instanceof Error ? error.constructor.name : "UnknownError";
+  const errorClass = /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(className) ? className : "UnknownError";
+  let current = error;
+  // Drizzle can wrap the Postgres error. Bound traversal also handles cycles.
+  for (let depth = 0; depth < 5 && typeof current === "object" && current !== null; depth += 1) {
+    const code = "code" in current ? current.code : null;
+    if (typeof code === "string" && /^[0-9A-Z]{5}$/.test(code)) return `${errorClass} ${code}`;
+    current = "cause" in current ? current.cause : null;
+  }
+  return errorClass;
+}
+
 /**
  * The shared setup-token reap logic. It reads the durable store and releases any
  * lease whose session is terminal, past its deadline, or already consumed. It
@@ -335,7 +348,8 @@ export async function reapSetupTokenLeases(
   let failed = 0;
   for (const record of records) {
     try {
-      await deps.leases.releaseById(record.leaseId);
+      // Differs from upstream (fork, NX-1092): a missing id holds no lease.
+      if (record.leaseId) await deps.leases.releaseById(record.leaseId);
       await deps.store.remove({
         sessionId: record.sessionId,
         companyId: record.companyId,
@@ -343,9 +357,11 @@ export async function reapSetupTokenLeases(
         adapterType: record.adapterType,
       });
       released += 1;
-    } catch {
+    } catch (error) {
       failed += 1;
-      log("[paperclip] Setup-token reaper: a lease release failed; it stays retryable.");
+      // Only class identifiers and SQLSTATE codes may enter this log. Never
+      // include a message, query, or row from the provider/database error.
+      log(`[paperclip] Setup-token reaper: a lease release failed (${cleanupErrorDiagnostic(error)}); it stays retryable.`);
     }
   }
   return { released, failed };
@@ -1449,10 +1465,19 @@ export class SetupTokenSessionService {
 //   - `leaseId`      -> `provider_lease_id`
 //   - `state`        -> `status`
 //   - `deadline`     -> `expires_at`
-// The table also holds the Codex device-login rows, so every scan filters by the
-// setup-token adapter to reach only the setup-token rows.
+// The table also holds device-login and local subscription rows, so every
+// predicate filters by adapter and excludes local sign-ins.
 
 type AdapterAuthSessionRow = typeof adapterAuthSessions.$inferSelect;
+
+// Differs from upstream (fork, NX-1092): Claude local sign-ins use the same
+// adapter type. Retain legacy NULL methods while excluding those local rows.
+function excludeLocalLogin() {
+  return or(
+    isNull(adapterAuthSessions.connectionMethod),
+    ne(adapterAuthSessions.connectionMethod, LOCAL_LOGIN_METHOD),
+  );
+}
 
 /** Maps a database row to the non-secret cleanup record. */
 function toCleanupRecord(row: AdapterAuthSessionRow): SetupTokenCleanupRecord {
@@ -1484,6 +1509,7 @@ function setupTokenScopeMatch(identity: SetupTokenCleanupIdentity) {
     eq(adapterAuthSessions.companyId, identity.companyId),
     eq(adapterAuthSessions.startedByUserId, identity.ownerUserId),
     eq(adapterAuthSessions.adapterType, identity.adapterType as AgentAdapterType),
+    excludeLocalLogin(),
   );
 }
 
@@ -1577,7 +1603,7 @@ export function createDbSetupTokenCleanupStore(db: Db): SetupTokenCleanupStore {
     async listReapable(now): Promise<SetupTokenCleanupRecord[]> {
       // A record is reapable when its session is terminal, its deadline is past,
       // or its claim is already consumed. The scan filters by the setup-token
-      // adapter, so it never reaps a Codex device-login row on the shared table.
+      // adapter and method, so other login flows stay untouched.
       // The deadline index supports the scan.
       const rows = await db
         .select()
@@ -1585,6 +1611,7 @@ export function createDbSetupTokenCleanupStore(db: Db): SetupTokenCleanupStore {
         .where(
           and(
             eq(adapterAuthSessions.adapterType, SETUP_TOKEN_ADAPTER_TYPE),
+            excludeLocalLogin(),
             or(
               inArray(adapterAuthSessions.status, [...SETUP_TOKEN_TERMINAL_STATES]),
               lte(adapterAuthSessions.expiresAt, new Date(now)),
@@ -1637,8 +1664,8 @@ export function createDbSetupTokenCleanupStore(db: Db): SetupTokenCleanupStore {
 
     async findActiveDurable(key, now): Promise<SetupTokenCleanupRecord | null> {
       // The active slot cap is one row per company, owner, and adapter, so at
-      // most one row can match. The scan filters by the setup-token adapter, so
-      // it never reads a Codex device-login row on the shared table.
+      // most one row can match. The scan filters by adapter and excludes local
+      // sign-ins on the shared table.
       const rows = await db
         .select()
         .from(adapterAuthSessions)
@@ -1647,6 +1674,7 @@ export function createDbSetupTokenCleanupStore(db: Db): SetupTokenCleanupStore {
             eq(adapterAuthSessions.companyId, key.companyId),
             eq(adapterAuthSessions.startedByUserId, key.ownerUserId),
             eq(adapterAuthSessions.adapterType, key.adapterType as AgentAdapterType),
+            excludeLocalLogin(),
             notInArray(adapterAuthSessions.status, [...SETUP_TOKEN_TERMINAL_STATES]),
             gt(adapterAuthSessions.expiresAt, new Date(now)),
           ),
