@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { AppLogo } from "@/pages/apps/AppLogo";
 import { ConnectionChoiceList } from "@/features/connections/ConnectionChoiceList";
 import { Button } from "@/components/ui/button";
@@ -27,6 +28,8 @@ export interface AiConnectionPickerProps {
   onChange: (binding: AiConnectionBinding) => void;
   onConnect: () => void;
   onReconnect?: () => void;
+  /** Shown next to Reconnect, for example "Check again". */
+  reconnectActions?: ReactNode;
   onRetry?: () => void;
 }
 
@@ -42,6 +45,7 @@ export function AiConnectionPicker({
   onChange,
   onConnect,
   onReconnect,
+  reconnectActions,
   onRetry,
 }: AiConnectionPickerProps) {
   const compatible = connections.filter((connection) =>
@@ -130,7 +134,8 @@ export function AiConnectionPicker({
             </p>
           )}
           {!readOnly && (
-            <div className="flex justify-end gap-2">
+            <div className="flex flex-wrap justify-end gap-2">
+              {onReconnect && reconnectActions}
               {onReconnect && <Button type="button" variant="outline" onClick={onReconnect}>Reconnect account</Button>}
               <Button
                 type="button"

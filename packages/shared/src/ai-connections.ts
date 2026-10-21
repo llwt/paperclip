@@ -173,6 +173,10 @@ export interface AiManagedConnectionSummary {
   status: "connected" | "needs_attention" | "expired" | "revoked";
   unavailableReason?: string;
   usageProbeSupported?: boolean;
+  /** "Check again" can test the saved credential without a run. */
+  revalidationSupported?: boolean;
+  /** Why the account needs attention, when Paperclip recorded a reason. */
+  healthMessage?: string;
 }
 export interface AiConnectionList {
   currentUserId: string;
@@ -223,6 +227,28 @@ export const aiConnectionLoginIntentSchema = z
 export type AiConnectionLoginIntent = z.infer<
   typeof aiConnectionLoginIntentSchema
 >;
+
+/** Reconnect an existing Claude subscription with a pasted `claude setup-token` value. */
+export const reconnectAiConnectionWithSetupTokenSchema = z
+  .object({ token: z.string().trim().min(1).max(4096) })
+  .strict();
+export const revalidateAiConnectionSchema = z
+  .object({ grantId: z.string().uuid().optional() })
+  .strict();
+
+/** A saved credential can be checked again without a run only where a check exists. */
+export function supportsAiConnectionRevalidation(provider: AiProvider, _method: AiAuthMethod): boolean {
+  return provider === "anthropic";
+}
+export interface AiConnectionRevalidation {
+  connectionId: string;
+  grantId: string;
+  result: "passed" | "failed";
+  /** The provider answered with a usage limit: signed in, but limited for now. */
+  limited: boolean;
+  code?: string;
+  message: string;
+}
 
 export const localAiConnectionSchema = aiConnectionLoginIntentSchema.extend({
   localSessionId: z.string().uuid().optional(),

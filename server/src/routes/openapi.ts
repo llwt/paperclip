@@ -7,6 +7,8 @@ import { Router } from "express";
 import { z } from "zod";
 import {
   createAiConnectionSchema,
+  reconnectAiConnectionWithSetupTokenSchema,
+  revalidateAiConnectionSchema,
   aiConnectionPoolConfigSchema,
   aiConnectionLoginIntentSchema,
   localAiConnectionSchema,
@@ -1354,6 +1356,8 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "PUT /api/companies/{companyId}/ai-connections/default",
   "GET /api/companies/{companyId}/ai-connections/{connectionId}/active-runs",
   "GET /api/companies/{companyId}/ai-connections/{connectionId}/usage",
+  "POST /api/companies/{companyId}/ai-connections/{connectionId}/setup-token",
+  "POST /api/companies/{companyId}/ai-connections/{connectionId}/revalidate",
   "GET /api/companies/{companyId}/ai-connections/login/{sessionId}",
   "GET /api/companies/{companyId}/ai-connection-pools",
   "POST /api/companies/{companyId}/ai-connection-pools",
@@ -10440,6 +10444,24 @@ registerCurrentRoute({
   summary: "Probe the selected AI account’s provider usage limits on demand",
   query: z.object({ grantId: z.string().uuid().optional() }),
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/ai-connections/{connectionId}/setup-token",
+  tags: ["ai-connections"],
+  summary: "Check a pasted Claude setup-token and save it on the existing subscription grant",
+  body: reconnectAiConnectionWithSetupTokenSchema,
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/ai-connections/{connectionId}/revalidate",
+  tags: ["ai-connections"],
+  summary: "Check the saved AI credential without a run and clear a needs-reconnect mark on a pass",
+  body: revalidateAiConnectionSchema,
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable },
 });
 
 registerCurrentRoute({

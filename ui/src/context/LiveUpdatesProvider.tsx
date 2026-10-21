@@ -45,6 +45,7 @@ import {
   removeLiveRunById,
 } from "../lib/optimistic-issue-runs";
 import { queryKeys } from "../lib/queryKeys";
+import { invalidateAiConnectionStatus } from "../lib/ai-connection-status-queries";
 import { extractCompanyPrefixFromPath, toCompanyRelativePath } from "../lib/company-routes";
 import { useLocation } from "../lib/router";
 import { agentRouteRef } from "../lib/utils";
@@ -1276,7 +1277,9 @@ function invalidateActivityQueries(
       actorId === currentActor.agentId);
 
   if (action?.startsWith("ai_connection.") || action?.startsWith("connection_grant.")) {
-    queryClient.invalidateQueries({ queryKey: ["ai-connections", companyId] });
+    // These events can set or clear the "needs reconnect" marks, which the
+    // account page header and the attention counts read from other queries.
+    void invalidateAiConnectionStatus(queryClient, companyId, entityType === "tool_connection" ? entityId : null);
   }
 
   if (action?.startsWith("resource_membership.")) {
