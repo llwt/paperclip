@@ -146,32 +146,51 @@ function assertStopVerified(
 }
 
 /**
- * A reassignment stop stays pending on the old run until an ownership change
- * commits. A refused attempt leaves it pending, so a retry finds the run even
- * though it is no longer active and cannot slip past the unverified stop.
+ * A reassignment stop stays pending on the stopped run until an ownership
+ * change commits. A refused attempt leaves it pending, so a retry finds the
+ * run even though it is no longer active and cannot slip past the unverified
+ * stop. The run is either cancelled by the reassignment (`issue_reassigned`)
+ * or by a board interrupt in the same request (`operator_interrupted`); the
+ * marker, not the error code, makes it pending.
  */
 export async function findPendingReassignmentStop(
   db: Db,
-  expectation: Pick<AssignmentExpectation, "companyId" | "issueId" | "assigneeAgentId">,
+  expectation: Pick<AssignmentExpectation, "companyId" | "issueId">,
 ): Promise<HeartbeatRunRow | null> {
-  if (!expectation.assigneeAgentId) return null;
   const pending: HeartbeatRunRow[] = await db
     .select()
     .from(heartbeatRuns)
     .where(and(
       eq(heartbeatRuns.companyId, expectation.companyId),
-      eq(heartbeatRuns.agentId, expectation.assigneeAgentId),
       eq(heartbeatRuns.status, "cancelled"),
-      eq(heartbeatRuns.errorCode, "issue_reassigned"),
       sql`${heartbeatRuns.resultJson}->>'reassignmentPendingIssueId' = ${expectation.issueId}`,
     ));
   // Few rows: every commit releases them. Latest stop first.
   const stoppedAt = (run: HeartbeatRunRow) => new Date(run.finishedAt ?? run.createdAt).getTime();
   return (pending ?? [])
     .filter((run) =>
-      run.agentId === expectation.assigneeAgentId && run.status === "cancelled" && run.errorCode === "issue_reassigned" &&
+      run.companyId === expectation.companyId && run.status === "cancelled" &&
       parseObject(run.resultJson).reassignmentPendingIssueId === expectation.issueId)
     .sort((a, b) => stoppedAt(b) - stoppedAt(a))[0] ?? null;
+}
+
+/** Marks a run an interrupt already cancelled as the pending stop of this reassignment. */
+async function markPendingReassignmentStop(
+  db: Db,
+  run: Pick<HeartbeatRunRow, "id" | "companyId">,
+  issueId: string,
+): Promise<void> {
+  await db
+    .update(heartbeatRuns)
+    .set({
+      resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || jsonb_build_object('reassignmentPendingIssueId', ${issueId}::text)`,
+      updatedAt: new Date(),
+    })
+    .where(and(
+      eq(heartbeatRuns.id, run.id),
+      eq(heartbeatRuns.companyId, run.companyId),
+      eq(heartbeatRuns.status, "cancelled"),
+    ));
 }
 
 /**
@@ -227,6 +246,11 @@ export async function stopIssueExecutionForOwnershipChange(
     if (stopped.status !== "cancelled" && TERMINAL_RUN_STATUSES.has(stopped.status)) {
       return { kind: "stopped", interruptedRunId: runId, issueMutationStopId };
     }
+    // The interrupt cancelled it without the reassignment marker. Mark it now,
+    // so a refused attempt stays refused on retry like a reassignment stop.
+    if (stopped.status === "cancelled") {
+      await markPendingReassignmentStop(deps.db, stopped, expectation.issueId);
+    }
     const override = assertStopVerified(await verifyOwnershipStop(deps.db, stopped), runId, { acceptUnverifiedStop });
     return withOverride({ kind: "stopped", interruptedRunId: runId, issueMutationStopId }, override);
   };
@@ -242,7 +266,9 @@ export async function stopIssueExecutionForOwnershipChange(
     return withOverride(receipt, override);
   };
   if (!expectation.assigneeAgentId) {
-    return input.interruptedRunId ? verifyEarlierStop(input.interruptedRunId) : { kind: "none" };
+    return verifyPendingStop(
+      input.interruptedRunId ? await verifyEarlierStop(input.interruptedRunId) : { kind: "none" },
+    );
   }
   await deps.stopRunnerGoal({
     companyId: expectation.companyId,

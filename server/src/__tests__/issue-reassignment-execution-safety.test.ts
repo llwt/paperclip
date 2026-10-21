@@ -45,6 +45,8 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
+const parseResult = (value: unknown) => (value && typeof value === "object" ? value as Record<string, unknown> : {});
+
 describeEmbeddedPostgres("issue reassignment execution safety", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -813,5 +815,98 @@ describeEmbeddedPostgres("issue reassignment execution safety", () => {
 
     expect(res.status).toBe(200);
     expect((await readIssue(issueId)).assigneeAgentId).toBe(otherAgentId);
+  });
+
+  // A board comment that interrupts and reassigns in one PATCH cancels the run
+  // as `operator_interrupted` before the shared assignment step. Its refusal
+  // must be as sticky as that of a reassignment stop.
+  const interruptHandoff = (successorAgentId: string, extra: Record<string, unknown> = {}) => ({
+    assigneeAgentId: successorAgentId,
+    comment: "Synthetic interrupt handoff",
+    interrupt: true,
+    ...extra,
+  });
+
+  it.each(["run_stop_unacknowledged", "run_stop_uncertain"] as const)("refuses a retry of an interrupting handoff refused with %s", async (code) => {
+    const { companyId, ownerAgentId, successorAgentId, issueId, runId } = await seed({
+      liveRun: code === "run_stop_uncertain" ? "tracked" : "untracked",
+    });
+    if (code === "run_stop_uncertain") await addRemoteLease(companyId, issueId, runId);
+    const app = createApp(companyId);
+
+    const first = await request(app).patch(`/api/issues/${issueId}`).send(interruptHandoff(successorAgentId));
+    const retry = await request(app).patch(`/api/issues/${issueId}`).send(interruptHandoff(successorAgentId));
+
+    expect(first.status).toBe(409);
+    expect(first.body.details).toMatchObject({ code, runId });
+    expect(await readRun(runId)).toMatchObject({
+      errorCode: "operator_interrupted",
+      resultJson: expect.objectContaining({ reassignmentPendingIssueId: issueId }),
+    });
+    expect(retry.status).toBe(409);
+    expect(retry.body.details).toMatchObject({ code, runId });
+    // A plain retry without the interrupt is refused as well.
+    const plain = await request(app).patch(`/api/issues/${issueId}`).send({ assigneeAgentId: successorAgentId });
+    expect(plain.status).toBe(409);
+    expect(plain.body.details).toMatchObject({ code, runId });
+    expect(await readIssue(issueId)).toMatchObject({ assigneeAgentId: ownerAgentId, status: "in_progress", statusVersion: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(await wakesFor(successorAgentId)).toEqual([]);
+  });
+
+  it("commits the retry of an interrupting handoff once the termination receipt arrived", async () => {
+    const { companyId, successorAgentId, issueId, runId } = await seed({ liveRun: "tracked" });
+    const lease = await addRemoteLease(companyId, issueId, runId);
+    const app = createApp(companyId);
+    expect((await request(app).patch(`/api/issues/${issueId}`).send(interruptHandoff(successorAgentId))).status).toBe(409);
+
+    await recordRemoteTerminationReceipt(lease);
+    const retry = await request(app).patch(`/api/issues/${issueId}`).send(interruptHandoff(successorAgentId));
+
+    expect(retry.status).toBe(200);
+    expect((await readIssue(issueId)).assigneeAgentId).toBe(successorAgentId);
+    expect((await readRun(runId)).resultJson).toMatchObject({ reassignmentPendingIssueId: null });
+    await expect.poll(() => wakesFor(successorAgentId)).toEqual([{ reason: "issue_assigned" }]);
+  });
+
+  it("commits a board override of an interrupting handoff and records it in the reassignment activity", async () => {
+    const { companyId, successorAgentId, issueId, runId } = await seed({ liveRun: "untracked" });
+    const app = createApp(companyId);
+    expect((await request(app).patch(`/api/issues/${issueId}`).send(interruptHandoff(successorAgentId))).status).toBe(409);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send(interruptHandoff(successorAgentId, { acceptUnverifiedStop: true }));
+
+    expect(res.status).toBe(200);
+    expect((await readIssue(issueId)).assigneeAgentId).toBe(successorAgentId);
+    const [activity] = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.updated")));
+    expect(activity?.details).toMatchObject({
+      unverifiedStopOverride: {
+        runId,
+        reason: "run_stop_unacknowledged",
+        acceptedByActorType: "user",
+        acceptedByActorId: "board-user",
+      },
+    });
+    expect((await readRun(runId)).resultJson).toMatchObject({ reassignmentPendingIssueId: null });
+    await expect.poll(() => wakesFor(successorAgentId)).toEqual([{ reason: "issue_assigned" }]);
+  });
+
+  it("leaves an ordinary interrupting comment without a reassignment unmarked", async () => {
+    const { companyId, ownerAgentId, issueId, runId } = await seed({ liveRun: "untracked" });
+
+    const res = await request(createApp(companyId))
+      .patch(`/api/issues/${issueId}`)
+      .send({ comment: "Synthetic interrupt", interrupt: true });
+
+    expect(res.status).toBe(200);
+    expect((await readIssue(issueId)).assigneeAgentId).toBe(ownerAgentId);
+    const run = await readRun(runId);
+    expect(run).toMatchObject({ status: "cancelled", errorCode: "operator_interrupted" });
+    expect(parseResult(run.resultJson).reassignmentPendingIssueId).toBeUndefined();
   });
 });
