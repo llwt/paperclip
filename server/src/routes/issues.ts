@@ -12885,8 +12885,15 @@ export function issueRoutes(
         deferWakeForGoal,
         hiddenAt: hiddenAtRaw,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
+        acceptUnverifiedStop,
         ...updateFields
       } = req.body;
+      if (acceptUnverifiedStop === true && req.actor.type !== "board") {
+        throw forbidden(
+          "Only a board user can reassign an issue whose run stop could not be verified.",
+          { code: "unverified_stop_override_forbidden" },
+        );
+      }
       if (existing.conversationAgentId && req.actor.type === "board" && commentBody) {
         throw unprocessable("Send conversation messages through the comments endpoint with a clientRequestId");
       }
@@ -13468,6 +13475,7 @@ export function issueRoutes(
       // Only this request may finish a mutation that intentionally stops its
       // own run (for example handing work to a signoff reviewer).
       const issueMutationStopId = randomUUID();
+      let unverifiedStopOverride: Record<string, unknown> | null = null;
       const assignmentExpectation: AssignmentExpectation = {
         issueId: existing.id,
         companyId: existing.companyId,
@@ -13485,9 +13493,21 @@ export function issueRoutes(
             stopRunnerGoal: stopRunnerGoalForOwnershipChange,
             resolveActiveRun: () => resolveActiveIssueRun(existing),
           },
-          { expectation: assignmentExpectation, issueMutationStopId, interruptedRunId },
+          {
+            expectation: assignmentExpectation,
+            issueMutationStopId,
+            interruptedRunId,
+            acceptUnverifiedStop: acceptUnverifiedStop === true,
+          },
         );
         if (stopReceipt.kind === "stopped") interruptedRunId = stopReceipt.interruptedRunId;
+        if (stopReceipt.unverifiedStopOverride) {
+          unverifiedStopOverride = {
+            ...stopReceipt.unverifiedStopOverride,
+            acceptedByActorType: actor.actorType,
+            acceptedByActorId: actor.actorId,
+          };
+        }
       }
 
       const terminalizingIssue =
@@ -13721,6 +13741,268 @@ export function issueRoutes(
       const transactionalCommentSourceTrust = commentAttachmentIds?.length || commentWithAdapterOverrides
         ? await sourceTrustForActorWrite(existing, actor)
         : undefined;
+      type UpdatedIssue = NonNullable<Awaited<ReturnType<typeof svc.update>>>;
+      type IssueComment = Awaited<ReturnType<typeof svc.addComment>>;
+      type ReferenceDiff = ReturnType<
+        typeof issueReferencesSvc.diffIssueReferenceSummary
+      >;
+      const deriveUpdateOutcome = (updated: UpdatedIssue) => {
+        const issueChanges = updated.changes ?? {};
+        const previous: Record<string, unknown> = Object.fromEntries(
+          Object.entries(issueChanges).map(([key, change]) => [key, change.from]),
+        );
+        const reopened =
+          commentBody &&
+          effectiveMoveToTodoRequested &&
+          (isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers)) &&
+          previous.status !== undefined &&
+          updated.status === "todo";
+        return {
+          issueChanges,
+          previous,
+          hasFieldChanges: Object.keys(issueChanges).length > 0,
+          reopened,
+          reopenFromStatus: reopened ? existing.status : null,
+          scheduledRetrySupersededByComment:
+            shouldResumeInProgressScheduledRetry &&
+            previous.status !== undefined &&
+            existing.status === "in_progress" &&
+            updated.status === "todo",
+        };
+      };
+      type UpdateOutcome = ReturnType<typeof deriveUpdateOutcome>;
+      const buildWorkspaceChange = async (
+        dbOrTx: Db,
+        updated: UpdatedIssue,
+        previous: Record<string, unknown>,
+      ) => {
+        if (!hasIssueWorkspaceAuditChange(previous)) return null;
+        try {
+          return await buildIssueWorkspaceChangeActivityDetails(
+            dbOrTx,
+            updated.companyId,
+            existing,
+            updated,
+          );
+        } catch (err) {
+          logger.warn(
+            { err, issueId: updated.id },
+            "failed to enrich issue workspace change activity details",
+          );
+          const fallbackNames = emptyWorkspaceNameMaps();
+          return {
+            from: summarizeIssueWorkspaceForActivity(existing, fallbackNames),
+            to: summarizeIssueWorkspaceForActivity(updated, fallbackNames),
+          };
+        }
+      };
+      const scheduledRetryActivityDetails = (outcome: UpdateOutcome) =>
+        outcome.scheduledRetrySupersededByComment
+          ? {
+              scheduledRetrySupersededByComment: true,
+              scheduledRetryRunId: scheduledRetryForHumanComment?.runId ?? null,
+              ...(cancelledScheduledRetryRunId
+                ? { cancelledScheduledRetryRunId }
+                : {}),
+            }
+          : {};
+      const issueUpdatedActivityInput = (
+        updated: UpdatedIssue,
+        outcome: UpdateOutcome,
+        extras: {
+          workspaceChange: Awaited<ReturnType<typeof buildWorkspaceChange>>;
+          referenceDiff: ReferenceDiff | null;
+          cancelledStatusRunId: string | null;
+        },
+      ) => ({
+        companyId: updated.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: updated.id,
+        details: {
+          ...updateFields,
+          identifier: updated.identifier,
+          authorizationReason: issueMutationAuthorizationReason,
+          changes: outcome.issueChanges,
+          ...(reviewInteractionId ? { reviewInteractionId } : {}),
+          ...(commentBody ? { source: "comment" } : {}),
+          ...(resumeRequested === true
+            ? { resumeIntent: true, followUpRequested: true }
+            : {}),
+          ...(outcome.reopened
+            ? { reopened: true, reopenedFrom: outcome.reopenFromStatus }
+            : {}),
+          ...scheduledRetryActivityDetails(outcome),
+          ...(interruptedRunId ? { interruptedRunId } : {}),
+          ...(unverifiedStopOverride ? { unverifiedStopOverride } : {}),
+          ...(extras.cancelledStatusRunId
+            ? { cancelledStatusRunId: extras.cancelledStatusRunId }
+            : {}),
+          ...(extras.workspaceChange
+            ? { workspaceChange: extras.workspaceChange }
+            : {}),
+          _previous: outcome.hasFieldChanges ? outcome.previous : undefined,
+          ...summarizeIssueReferenceActivityDetails(
+            extras.referenceDiff
+              ? {
+                  addedReferencedIssues:
+                    extras.referenceDiff.addedReferencedIssues.map(
+                      summarizeIssueRelationForActivity,
+                    ),
+                  removedReferencedIssues:
+                    extras.referenceDiff.removedReferencedIssues.map(
+                      summarizeIssueRelationForActivity,
+                    ),
+                  currentReferencedIssues:
+                    extras.referenceDiff.currentReferencedIssues.map(
+                      summarizeIssueRelationForActivity,
+                    ),
+                }
+              : null,
+          ),
+        },
+      });
+      const commentAddedActivityInput = (
+        updated: UpdatedIssue,
+        comment: IssueComment,
+        outcome: UpdateOutcome,
+        referenceDiff: ReferenceDiff,
+      ) => ({
+        companyId: updated.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+        action: "issue.comment_added",
+        entityType: "issue",
+        entityId: updated.id,
+        details: {
+          commentId: comment.id,
+          bodySnippet: comment.body.slice(0, 120),
+          identifier: updated.identifier,
+          issueTitle: updated.title,
+          authorizationReason: issueMutationAuthorizationReason,
+          ...(resumeRequested === true
+            ? { resumeIntent: true, followUpRequested: true }
+            : {}),
+          ...(outcome.reopened
+            ? {
+                reopened: true,
+                reopenedFrom: outcome.reopenFromStatus,
+                source: "comment",
+              }
+            : {}),
+          ...scheduledRetryActivityDetails(outcome),
+          ...(interruptedRunId ? { interruptedRunId } : {}),
+          ...(outcome.hasFieldChanges ? { updated: true } : {}),
+          ...summarizeIssueReferenceActivityDetails({
+            addedReferencedIssues: referenceDiff.addedReferencedIssues.map(
+              summarizeIssueRelationForActivity,
+            ),
+            removedReferencedIssues: referenceDiff.removedReferencedIssues.map(
+              summarizeIssueRelationForActivity,
+            ),
+            currentReferencedIssues: referenceDiff.currentReferencedIssues.map(
+              summarizeIssueRelationForActivity,
+            ),
+          }),
+        },
+      });
+      // A handoff commits the owner, its comment, their reference rows and
+      // their audit in one transaction: a failed write rolls the ownership
+      // change back. Activity is published only after the commit.
+      type ReferenceSummary = Awaited<
+        ReturnType<typeof issueReferencesSvc.listIssueReferenceSummary>
+      >;
+      const handoff: {
+        writes: {
+          referenceSummaryAfter: ReferenceSummary | null;
+          commentReferenceSummaryAfter: ReferenceSummary | null;
+        } | null;
+      } = { writes: null };
+      const writeHandoffCommentAndAudit = async (
+        tx: Db,
+        updated: UpdatedIssue,
+      ) => {
+        if (commentBody && !transactionalComment) {
+          transactionalComment = await svc.addComment(
+            id,
+            commentBody,
+            {
+              agentId: actor.agentId ?? undefined,
+              userId: actor.actorType === "user" ? actor.actorId : undefined,
+              runId: actor.runId,
+              onBehalfOfUserId: authenticatedActorResponsibleUserId(req),
+            },
+            {
+              authorizationReason: issueMutationAuthorizationReason,
+              clientRequestId:
+                actor.actorType === "user" ? commentClientRequestId : undefined,
+              mirrorToSlack: actor.actorType === "user",
+              sourceTrust: await sourceTrustForActorWrite(updated, actor),
+            },
+            tx,
+          );
+        }
+        let referenceSummaryAfter: ReferenceSummary | null = null;
+        if (titleOrDescriptionChanged) {
+          await issueReferencesSvc.syncIssue(updated.id, tx);
+          referenceSummaryAfter =
+            await issueReferencesSvc.listIssueReferenceSummary(updated.id, tx);
+        }
+        const outcome = deriveUpdateOutcome(updated);
+        await logActivity(
+          tx,
+          issueUpdatedActivityInput(updated, outcome, {
+            workspaceChange: await buildWorkspaceChange(
+              tx,
+              updated,
+              outcome.previous,
+            ),
+            referenceDiff:
+              updateReferenceSummaryBefore && referenceSummaryAfter
+                ? issueReferencesSvc.diffIssueReferenceSummary(
+                    updateReferenceSummaryBefore,
+                    referenceSummaryAfter,
+                  )
+                : null,
+            cancelledStatusRunId: null,
+          }),
+          postCommitActivityPublications,
+        );
+        let commentReferenceSummaryAfter: ReferenceSummary | null = null;
+        const comment = transactionalComment as IssueComment | null;
+        if (comment) {
+          const commentReferenceSummaryBefore =
+            referenceSummaryAfter ??
+            (await issueReferencesSvc.listIssueReferenceSummary(updated.id, tx));
+          await issueReferencesSvc.syncComment(comment.id, tx);
+          commentReferenceSummaryAfter =
+            await issueReferencesSvc.listIssueReferenceSummary(updated.id, tx);
+          await logActivity(
+            tx,
+            commentAddedActivityInput(
+              updated,
+              comment,
+              outcome,
+              issueReferencesSvc.diffIssueReferenceSummary(
+                commentReferenceSummaryBefore,
+                commentReferenceSummaryAfter,
+              ),
+            ),
+            postCommitActivityPublications,
+          );
+        }
+        handoff.writes = { referenceSummaryAfter, commentReferenceSummaryAfter };
+      };
       const shouldUseTransactionalIssueUpdate =
         Boolean(commentAttachmentIds?.length) ||
         commentWithAdapterOverrides ||
@@ -13786,7 +14068,11 @@ export function issueRoutes(
               );
             }
 
-            await persistReviewTransitionActivity(tx, updated);
+            if (assigneeWillChange) {
+              await writeHandoffCommentAndAudit(tx as unknown as Db, updated);
+            } else {
+              await persistReviewTransitionActivity(tx, updated);
+            }
 
             return updated;
           });
@@ -13912,11 +14198,14 @@ export function issueRoutes(
       }
 
       if (titleOrDescriptionChanged) {
-        await issueReferencesSvc.syncIssue(issue.id);
+        // A handoff already synced the issue's references in its transaction.
+        if (!handoff.writes) await issueReferencesSvc.syncIssue(issue.id);
         await externalObjectsSvc.syncIssueSafely(issue.id);
       }
+      const committedHandoffWrites = handoff.writes;
       const updateReferenceSummaryAfter = titleOrDescriptionChanged
-        ? await issueReferencesSvc.listIssueReferenceSummary(issue.id)
+        ? (committedHandoffWrites?.referenceSummaryAfter ??
+          (await issueReferencesSvc.listIssueReferenceSummary(issue.id)))
         : null;
       const updateReferenceDiff =
         updateReferenceSummaryBefore && updateReferenceSummaryAfter
@@ -13964,44 +14253,13 @@ export function issueRoutes(
       // Use the service's row-lock-backed receipt as the activity source of truth.
       // Requested fields alone miss server-side effects such as cleared run locks,
       // status timestamps, goal fallback, and normalized relation arrays.
-      const issueChanges = issue.changes ?? {};
-      const previous: Record<string, unknown> = Object.fromEntries(
-        Object.entries(issueChanges).map(([key, change]) => [key, change.from]),
-      );
-      const hasFieldChanges = Object.keys(issueChanges).length > 0;
-      let workspaceChange = null;
-      if (hasIssueWorkspaceAuditChange(previous)) {
-        try {
-          workspaceChange = await buildIssueWorkspaceChangeActivityDetails(
-            db,
-            issue.companyId,
-            existing,
-            issue,
-          );
-        } catch (err) {
-          logger.warn(
-            { err, issueId: issue.id },
-            "failed to enrich issue workspace change activity details",
-          );
-          const fallbackNames = emptyWorkspaceNameMaps();
-          workspaceChange = {
-            from: summarizeIssueWorkspaceForActivity(existing, fallbackNames),
-            to: summarizeIssueWorkspaceForActivity(issue, fallbackNames),
-          };
-        }
-      }
-      const reopened =
-        commentBody &&
-        effectiveMoveToTodoRequested &&
-        (isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers)) &&
-        previous.status !== undefined &&
-        issue.status === "todo";
-      const reopenFromStatus = reopened ? existing.status : null;
-      const scheduledRetrySupersededByComment =
-        shouldResumeInProgressScheduledRetry &&
-        previous.status !== undefined &&
-        existing.status === "in_progress" &&
-        issue.status === "todo";
+      const updateOutcome = deriveUpdateOutcome(issue);
+      const {
+        previous,
+        hasFieldChanges,
+        reopened,
+        reopenFromStatus,
+      } = updateOutcome;
       const statusChangedFromBlockedToTodo =
         existing.status === "blocked" &&
         issue.status === "todo" &&
@@ -14029,65 +14287,15 @@ export function issueRoutes(
           activeRecoveryAction: null,
         };
       }
-      if (!persistReviewActivityTransactionally)
-        await logActivity(db, {
-          companyId: issue.companyId,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          agentId: actor.agentId,
-          runId: actor.runId,
-          agentApiKeyId: actor.agentApiKeyId,
-          responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
-          action: "issue.updated",
-          entityType: "issue",
-          entityId: issue.id,
-          details: {
-            ...updateFields,
-            identifier: issue.identifier,
-            authorizationReason: issueMutationAuthorizationReason,
-            changes: issueChanges,
-            ...(reviewInteractionId ? { reviewInteractionId } : {}),
-            ...(commentBody ? { source: "comment" } : {}),
-            ...(resumeRequested === true
-              ? { resumeIntent: true, followUpRequested: true }
-              : {}),
-            ...(reopened
-              ? { reopened: true, reopenedFrom: reopenFromStatus }
-              : {}),
-            ...(scheduledRetrySupersededByComment
-              ? {
-                  scheduledRetrySupersededByComment: true,
-                  scheduledRetryRunId:
-                    scheduledRetryForHumanComment?.runId ?? null,
-                  ...(cancelledScheduledRetryRunId
-                    ? { cancelledScheduledRetryRunId }
-                    : {}),
-                }
-              : {}),
-            ...(interruptedRunId ? { interruptedRunId } : {}),
-            ...(cancelledStatusRunId ? { cancelledStatusRunId } : {}),
-            ...(workspaceChange ? { workspaceChange } : {}),
-            _previous: hasFieldChanges ? previous : undefined,
-            ...summarizeIssueReferenceActivityDetails(
-              updateReferenceDiff
-                ? {
-                    addedReferencedIssues:
-                      updateReferenceDiff.addedReferencedIssues.map(
-                        summarizeIssueRelationForActivity,
-                      ),
-                    removedReferencedIssues:
-                      updateReferenceDiff.removedReferencedIssues.map(
-                        summarizeIssueRelationForActivity,
-                      ),
-                    currentReferencedIssues:
-                      updateReferenceDiff.currentReferencedIssues.map(
-                        summarizeIssueRelationForActivity,
-                      ),
-                  }
-                : null,
-            ),
-          },
-        });
+      if (!persistReviewActivityTransactionally && !committedHandoffWrites)
+        await logActivity(
+          db,
+          issueUpdatedActivityInput(issue, updateOutcome, {
+            workspaceChange: await buildWorkspaceChange(db, issue, previous),
+            referenceDiff: updateReferenceDiff,
+            cancelledStatusRunId,
+          }),
+        );
 
       if (
         existing.status === "in_progress" &&
@@ -14351,9 +14559,10 @@ export function issueRoutes(
       let goalCommentSteered = false;
       let lostReviewPathRef: string | null = null;
       if (commentBody) {
-        const commentReferenceSummaryBefore =
-          updateReferenceSummaryAfter ??
-          (await issueReferencesSvc.listIssueReferenceSummary(issue.id));
+        const commentReferenceSummaryBefore = committedHandoffWrites
+          ? null
+          : (updateReferenceSummaryAfter ??
+            (await issueReferencesSvc.listIssueReferenceSummary(issue.id)));
         comment ??= await svc.addComment(
           id,
           commentBody,
@@ -14370,7 +14579,8 @@ export function issueRoutes(
             sourceTrust: await sourceTrustForActorWrite(issue, actor),
           },
         );
-        await issueReferencesSvc.syncComment(comment.id);
+        if (!committedHandoffWrites)
+          await issueReferencesSvc.syncComment(comment.id);
         await externalObjectsSvc.syncCommentSafely(comment.id);
         if (
           issue.assigneeAgentId &&
@@ -14416,12 +14626,8 @@ export function issueRoutes(
           }
         }
         const commentReferenceSummaryAfter =
-          await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-        const commentReferenceDiff =
-          issueReferencesSvc.diffIssueReferenceSummary(
-            commentReferenceSummaryBefore,
-            commentReferenceSummaryAfter,
-          );
+          committedHandoffWrites?.commentReferenceSummaryAfter ??
+          (await issueReferencesSvc.listIssueReferenceSummary(issue.id));
         issueResponse = {
           ...issueResponse,
           relatedWork: commentReferenceSummaryAfter,
@@ -14430,61 +14636,19 @@ export function issueRoutes(
           ),
         };
 
-        await logActivity(db, {
-          companyId: issue.companyId,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          agentId: actor.agentId,
-          runId: actor.runId,
-          agentApiKeyId: actor.agentApiKeyId,
-          responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
-          action: "issue.comment_added",
-          entityType: "issue",
-          entityId: issue.id,
-          details: {
-            commentId: comment.id,
-            bodySnippet: comment.body.slice(0, 120),
-            identifier: issue.identifier,
-            issueTitle: issue.title,
-            authorizationReason: issueMutationAuthorizationReason,
-            ...(resumeRequested === true
-              ? { resumeIntent: true, followUpRequested: true }
-              : {}),
-            ...(reopened
-              ? {
-                  reopened: true,
-                  reopenedFrom: reopenFromStatus,
-                  source: "comment",
-                }
-              : {}),
-            ...(scheduledRetrySupersededByComment
-              ? {
-                  scheduledRetrySupersededByComment: true,
-                  scheduledRetryRunId:
-                    scheduledRetryForHumanComment?.runId ?? null,
-                  ...(cancelledScheduledRetryRunId
-                    ? { cancelledScheduledRetryRunId }
-                    : {}),
-                }
-              : {}),
-            ...(interruptedRunId ? { interruptedRunId } : {}),
-            ...(hasFieldChanges ? { updated: true } : {}),
-            ...summarizeIssueReferenceActivityDetails({
-              addedReferencedIssues:
-                commentReferenceDiff.addedReferencedIssues.map(
-                  summarizeIssueRelationForActivity,
-                ),
-              removedReferencedIssues:
-                commentReferenceDiff.removedReferencedIssues.map(
-                  summarizeIssueRelationForActivity,
-                ),
-              currentReferencedIssues:
-                commentReferenceDiff.currentReferencedIssues.map(
-                  summarizeIssueRelationForActivity,
-                ),
-            }),
-          },
-        });
+        if (commentReferenceSummaryBefore)
+          await logActivity(
+            db,
+            commentAddedActivityInput(
+              issue,
+              comment,
+              updateOutcome,
+              issueReferencesSvc.diffIssueReferenceSummary(
+                commentReferenceSummaryBefore,
+                commentReferenceSummaryAfter,
+              ),
+            ),
+          );
 
         const expiredInteractions = await issueThreadInteractionService(
           db,

@@ -1,4 +1,4 @@
-import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, type Db } from "@paperclipai/db";
 import { parseObject } from "../adapters/utils.js";
 import { conflict } from "../errors.js";
@@ -37,9 +37,16 @@ export type AssignmentExpectation = {
   executionRunId: string | null;
 };
 
-export type StopReceipt =
+/** A board user accepted a stop that could not be verified. Audited. */
+export type UnverifiedStopOverride = {
+  runId: string;
+  reason: "run_stop_unacknowledged" | "run_stop_uncertain";
+};
+
+export type StopReceipt = (
   | { kind: "none" }
-  | { kind: "stopped"; interruptedRunId: string; issueMutationStopId: string };
+  | { kind: "stopped"; interruptedRunId: string; issueMutationStopId: string }
+) & { unverifiedStopOverride?: UnverifiedStopOverride };
 
 export type OwnershipStopVerdict = "stopped" | "unacknowledged" | "uncertain";
 
@@ -117,19 +124,70 @@ export type OwnershipStopDeps = {
   resolveActiveRun: (expectation: AssignmentExpectation) => Promise<{ id: string } | null>;
 };
 
-function assertStopVerified(verdict: OwnershipStopVerdict, runId: string) {
-  if (verdict === "unacknowledged") {
-    throw conflict(
-      "The active agent run was cancelled, but its executor did not acknowledge the stop. The assignee was not changed.",
-      { code: "run_stop_unacknowledged", runId },
-    );
-  }
-  if (verdict === "uncertain") {
-    throw conflict(
-      "The active agent run was cancelled, but its execution could not be verified as stopped. The assignee was not changed.",
-      { code: "run_stop_uncertain", runId },
-    );
-  }
+/**
+ * Fails closed on an unverified stop unless a board user accepted it, in
+ * which case the override is returned for the audit entry.
+ */
+function assertStopVerified(
+  verdict: OwnershipStopVerdict,
+  runId: string,
+  options: { acceptUnverifiedStop: boolean; earlierAttempt?: boolean },
+): UnverifiedStopOverride | null {
+  if (verdict === "stopped") return null;
+  const reason = verdict === "unacknowledged" ? "run_stop_unacknowledged" : "run_stop_uncertain";
+  if (options.acceptUnverifiedStop) return { runId, reason };
+  const subject = options.earlierAttempt
+    ? "An earlier reassignment attempt cancelled this agent run, but"
+    : "The active agent run was cancelled, but";
+  const problem = verdict === "unacknowledged"
+    ? "its executor did not acknowledge the stop"
+    : "its execution could not be verified as stopped";
+  throw conflict(`${subject} ${problem}. The assignee was not changed.`, { code: reason, runId });
+}
+
+/**
+ * A reassignment stop stays pending on the old run until an ownership change
+ * commits. A refused attempt leaves it pending, so a retry finds the run even
+ * though it is no longer active and cannot slip past the unverified stop.
+ */
+export async function findPendingReassignmentStop(
+  db: Db,
+  expectation: Pick<AssignmentExpectation, "companyId" | "issueId" | "assigneeAgentId">,
+): Promise<HeartbeatRunRow | null> {
+  if (!expectation.assigneeAgentId) return null;
+  return db
+    .select()
+    .from(heartbeatRuns)
+    .where(and(
+      eq(heartbeatRuns.companyId, expectation.companyId),
+      eq(heartbeatRuns.agentId, expectation.assigneeAgentId),
+      eq(heartbeatRuns.status, "cancelled"),
+      eq(heartbeatRuns.errorCode, "issue_reassigned"),
+      sql`${heartbeatRuns.resultJson}->>'reassignmentPendingIssueId' = ${expectation.issueId}`,
+    ))
+    .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.createdAt))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+}
+
+/**
+ * Runs inside the ownership commit, under the issue lock. A committed
+ * reassignment ends the stickiness of every earlier refused stop on the issue.
+ */
+export async function releasePendingReassignmentStops(
+  tx: Db,
+  input: { companyId: string; issueId: string },
+): Promise<void> {
+  await tx
+    .update(heartbeatRuns)
+    .set({
+      resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || '{"reassignmentPendingIssueId": null}'::jsonb`,
+      updatedAt: new Date(),
+    })
+    .where(and(
+      eq(heartbeatRuns.companyId, input.companyId),
+      sql`${heartbeatRuns.resultJson}->>'reassignmentPendingIssueId' = ${input.issueId}`,
+    ));
 }
 
 /**
@@ -144,9 +202,14 @@ export async function stopIssueExecutionForOwnershipChange(
     expectation: AssignmentExpectation;
     issueMutationStopId: string;
     interruptedRunId?: string | null;
+    /** Board users only; the route refuses it from agents. */
+    acceptUnverifiedStop?: boolean;
   },
 ): Promise<StopReceipt> {
   const { expectation, issueMutationStopId } = input;
+  const acceptUnverifiedStop = input.acceptUnverifiedStop === true;
+  const withOverride = (receipt: StopReceipt, override: UnverifiedStopOverride | null): StopReceipt =>
+    override && !receipt.unverifiedStopOverride ? { ...receipt, unverifiedStopOverride: override } : receipt;
   const verifyEarlierStop = async (runId: string): Promise<StopReceipt> => {
     const stopped = await deps.heartbeat.getRun(runId);
     if (!stopped) {
@@ -160,8 +223,19 @@ export async function stopIssueExecutionForOwnershipChange(
     if (stopped.status !== "cancelled" && TERMINAL_RUN_STATUSES.has(stopped.status)) {
       return { kind: "stopped", interruptedRunId: runId, issueMutationStopId };
     }
-    assertStopVerified(await verifyOwnershipStop(deps.db, stopped), runId);
-    return { kind: "stopped", interruptedRunId: runId, issueMutationStopId };
+    const override = assertStopVerified(await verifyOwnershipStop(deps.db, stopped), runId, { acceptUnverifiedStop });
+    return withOverride({ kind: "stopped", interruptedRunId: runId, issueMutationStopId }, override);
+  };
+  // A retry of a refused reassignment finds no active run. It must still see
+  // the unverified stop of the earlier attempt.
+  const verifyPendingStop = async (receipt: StopReceipt): Promise<StopReceipt> => {
+    const pending = await findPendingReassignmentStop(deps.db, expectation);
+    if (!pending || (receipt.kind === "stopped" && pending.id === receipt.interruptedRunId)) return receipt;
+    const override = assertStopVerified(await verifyOwnershipStop(deps.db, pending), pending.id, {
+      acceptUnverifiedStop,
+      earlierAttempt: true,
+    });
+    return withOverride(receipt, override);
   };
   if (!expectation.assigneeAgentId) {
     return input.interruptedRunId ? verifyEarlierStop(input.interruptedRunId) : { kind: "none" };
@@ -173,11 +247,14 @@ export async function stopIssueExecutionForOwnershipChange(
   });
   const runToStop = await deps.resolveActiveRun(expectation);
   if (!runToStop) {
-    return input.interruptedRunId ? verifyEarlierStop(input.interruptedRunId) : { kind: "none" };
+    return verifyPendingStop(
+      input.interruptedRunId ? await verifyEarlierStop(input.interruptedRunId) : { kind: "none" },
+    );
   }
   const cancelled = await deps.heartbeat.cancelRun(runToStop.id, "Cancelled before issue reassignment", {
     errorCode: "issue_reassigned",
-    resultJson: { reassignmentStopConfirmed: true, issueMutationStopId },
+    // Pending until an ownership change commits; see findPendingReassignmentStop.
+    resultJson: { reassignmentStopConfirmed: true, issueMutationStopId, reassignmentPendingIssueId: expectation.issueId },
     eventMessage: "run cancelled before issue reassignment",
     eventPayload: { issueId: expectation.issueId },
     // The old owner is still assigned until the commit. A recovery run queued
@@ -190,8 +267,10 @@ export async function stopIssueExecutionForOwnershipChange(
       runId: runToStop.id,
     });
   }
-  assertStopVerified(await verifyOwnershipStop(deps.db, cancelled), cancelled.id);
-  return { kind: "stopped", interruptedRunId: cancelled.id, issueMutationStopId };
+  const override = assertStopVerified(await verifyOwnershipStop(deps.db, cancelled), cancelled.id, { acceptUnverifiedStop });
+  return verifyPendingStop(
+    withOverride({ kind: "stopped", interruptedRunId: cancelled.id, issueMutationStopId }, override),
+  );
 }
 
 export type AssignmentWakeup = {

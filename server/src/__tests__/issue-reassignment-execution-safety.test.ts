@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -13,6 +13,7 @@ import {
   companyMemberships,
   companySkills,
   createDb,
+  environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
@@ -27,7 +28,8 @@ import { runningProcesses } from "../adapters/index.ts";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.ts";
-import { buildAssignmentWakeup } from "../services/issue-assignment.ts";
+import { buildAssignmentWakeup, verifyOwnershipStop } from "../services/issue-assignment.ts";
+import { remoteTerminationReceipt } from "../services/remote-execution-termination.ts";
 import { issueService } from "../services/issues.ts";
 
 // Concurrency review (SX-1213) section 7: each guard against two agents
@@ -54,7 +56,19 @@ describeEmbeddedPostgres("issue reassignment execution safety", () => {
 
   const children: ChildProcess[] = [];
 
+  // Scratch triggers a test installs to fail or interleave a write.
+  const triggers: Array<{ name: string; table: string }> = [];
+  async function installTrigger(input: { name: string; table: string; timing: "BEFORE INSERT" | "AFTER UPDATE"; body: string }) {
+    await db.execute(sql.raw(`CREATE OR REPLACE FUNCTION ${input.name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN ${input.body} RETURN NEW; END $$`));
+    await db.execute(sql.raw(`CREATE TRIGGER ${input.name} ${input.timing} ON ${input.table} FOR EACH ROW EXECUTE FUNCTION ${input.name}()`));
+    triggers.push({ name: input.name, table: input.table });
+  }
+
   afterEach(async () => {
+    for (const trigger of triggers.splice(0)) {
+      await db.execute(sql.raw(`DROP TRIGGER IF EXISTS ${trigger.name} ON ${trigger.table}`));
+      await db.execute(sql.raw(`DROP FUNCTION IF EXISTS ${trigger.name}()`));
+    }
     for (const child of children.splice(0)) child.kill("SIGKILL");
     runningProcesses.clear();
     await heartbeatService(db).drainActiveRunExecutions();
@@ -62,6 +76,7 @@ describeEmbeddedPostgres("issue reassignment execution safety", () => {
     await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
     await db.delete(nativeRunFinalizations);
+    await db.delete(environmentLeases);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
@@ -76,7 +91,7 @@ describeEmbeddedPostgres("issue reassignment execution safety", () => {
     await tempDb?.cleanup();
   });
 
-  function createApp(companyId: string, agent?: { agentId: string; runId: string }) {
+  function createApp(companyId: string, agent?: { agentId: string; runId: string }, routeDb: typeof db = db) {
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
@@ -92,7 +107,7 @@ describeEmbeddedPostgres("issue reassignment execution safety", () => {
           };
       next();
     });
-    app.use("/api", issueRoutes(db, {} as any));
+    app.use("/api", issueRoutes(routeDb, {} as any));
     app.use(errorHandler);
     return app;
   }
@@ -477,5 +492,326 @@ describeEmbeddedPostgres("issue reassignment execution safety", () => {
 
     expect(lateWrite.status).toBeGreaterThanOrEqual(400);
     expect((await readIssue(issueId)).title).toBe("Reassignment safety");
+  });
+
+  async function readRun(runId: string) {
+    return db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]!);
+  }
+
+  async function wakesFor(agentId: string) {
+    return db.select({ reason: agentWakeupRequests.reason }).from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+  }
+
+  // A remote execution lease of the old run. The local bridge process is
+  // killed and acknowledged, but only a provider receipt proves the stop.
+  async function addRemoteLease(companyId: string, issueId: string, runId: string) {
+    const [lease] = await db.insert(environmentLeases).values({
+      companyId,
+      issueId,
+      heartbeatRunId: runId,
+      provider: "test-remote",
+      providerLeaseId: `lease-${runId}`,
+    }).returning();
+    return lease!;
+  }
+
+  async function recordRemoteTerminationReceipt(lease: typeof environmentLeases.$inferSelect) {
+    await db.update(environmentLeases).set({
+      status: "released",
+      releasedAt: new Date(),
+      cleanupStatus: "success",
+      metadata: {
+        remoteExecutionTermination: remoteTerminationReceipt(lease, { providerLeaseId: lease.providerLeaseId, state: "stopped" }),
+      },
+    }).where(eq(environmentLeases.id, lease.id));
+  }
+
+  // Change 6: the owner, the plain handoff comment and their audit commit
+  // together. Any failed write leaves the old owner and wakes nobody.
+  it.each([
+    ["the plain handoff comment", "issue_comments", ""],
+    ["the issue.updated audit entry", "activity_log", "IF NEW.action = 'issue.updated' THEN "],
+    ["the issue.comment_added audit entry", "activity_log", "IF NEW.action = 'issue.comment_added' THEN "],
+  ] as const)("rolls the handoff back when %s cannot be written", async (_label, table, condition) => {
+    const { companyId, ownerAgentId, successorAgentId, issueId } = await seed();
+    const before = await readIssue(issueId);
+    await installTrigger({
+      name: "test_reject_handoff_write",
+      table,
+      timing: "BEFORE INSERT",
+      body: condition
+        ? `${condition}RAISE EXCEPTION 'synthetic write failure'; END IF;`
+        : "RAISE EXCEPTION 'synthetic write failure';",
+    });
+
+    const res = await request(createApp(companyId))
+      .patch(`/api/issues/${issueId}`)
+      .send({ assigneeAgentId: successorAgentId, comment: "Synthetic handoff instruction" });
+
+    expect(res.status).toBe(500);
+    expect(await readIssue(issueId)).toMatchObject({ assigneeAgentId: ownerAgentId, statusVersion: before.statusVersion });
+    expect(await db.select({ id: issueComments.id }).from(issueComments).where(eq(issueComments.issueId, issueId))).toEqual([]);
+    expect(await db.select({ id: activityLog.id }).from(activityLog).where(eq(activityLog.entityId, issueId))).toEqual([]);
+    // Give a stray post-response wake time to land before asserting none did.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(await wakesFor(successorAgentId)).toEqual([]);
+  });
+
+  it("commits the handoff comment and both audit entries with the new owner", async () => {
+    const { companyId, successorAgentId, issueId } = await seed();
+
+    const res = await request(createApp(companyId))
+      .patch(`/api/issues/${issueId}`)
+      .send({ assigneeAgentId: successorAgentId, comment: "Synthetic handoff instruction" });
+
+    expect(res.status).toBe(200);
+    const [comment] = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comment).toMatchObject({ body: "Synthetic handoff instruction" });
+    const activity = await db
+      .select({ action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId));
+    expect(activity.map((row) => row.action).sort()).toEqual(["issue.comment_added", "issue.updated"]);
+    expect(activity.find((row) => row.action === "issue.comment_added")!.details).toMatchObject({ commentId: comment!.id });
+    await expect.poll(async () =>
+      db
+        .select({ payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.agentId, successorAgentId), eq(agentWakeupRequests.reason, "issue_assigned"))),
+    ).toEqual([{ payload: expect.objectContaining({ issueId, commentId: comment!.id }) }]);
+  });
+
+  // Change 1, remote target: an acknowledged local stop is not enough while
+  // the provider has not confirmed the remote execution stopped.
+  it("returns 409 run_stop_uncertain and keeps the owner while a remote lease has no termination receipt", async () => {
+    const { companyId, ownerAgentId, successorAgentId, issueId, runId } = await seed({ liveRun: "tracked" });
+    await addRemoteLease(companyId, issueId, runId);
+
+    const res = await request(createApp(companyId))
+      .patch(`/api/issues/${issueId}`)
+      .send({ assigneeAgentId: successorAgentId });
+
+    expect(res.status).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "run_stop_uncertain", runId });
+    expect((await readRun(runId)).resultJson).toMatchObject({ executionCancellation: { state: "acknowledged" } });
+    expect(await readIssue(issueId)).toMatchObject({ assigneeAgentId: ownerAgentId, statusVersion: 0 });
+    expect(await wakesFor(successorAgentId)).toEqual([]);
+  });
+
+  // Change 1, native: an acknowledged reassignment intent proves nothing
+  // until the local lease and process cleanup finished.
+  it("treats an acknowledged native reassignment stop as uncertain until its cleanup finished", async () => {
+    const { companyId, issueId, runId } = await seed({ liveRun: "native" });
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    children.push(child);
+    await db.update(heartbeatRuns).set({
+      status: "cancelled",
+      errorCode: "issue_reassigned",
+      processPid: child.pid ?? null,
+      resultJson: {
+        reassignmentStopRequested: true,
+        nativeCancellation: {
+          schema: "paperclip.native-cancellation.v1",
+          runId,
+          companyId,
+          issueId,
+          scope: "run",
+          reasonCode: "cancellation_run_only",
+          dispatchState: "acknowledged",
+          dispatched: true,
+          intentAuditId: randomUUID(),
+          acknowledgementAuditId: randomUUID(),
+        },
+      },
+    }).where(eq(heartbeatRuns.id, runId));
+    const [lease] = await db.insert(environmentLeases).values({ companyId, issueId, heartbeatRunId: runId, provider: "local" }).returning();
+
+    // Lease still held and process alive.
+    expect(await verifyOwnershipStop(db, await readRun(runId), { verificationTimeoutMs: 0 })).toBe("uncertain");
+    await db.update(environmentLeases).set({ releasedAt: new Date(), cleanupStatus: "success", status: "released" })
+      .where(eq(environmentLeases.id, lease!.id));
+    // Lease released, process still alive.
+    expect(await verifyOwnershipStop(db, await readRun(runId), { verificationTimeoutMs: 0 })).toBe("uncertain");
+    const exited = new Promise((resolve) => child.once("exit", resolve));
+    child.kill("SIGKILL");
+    await exited;
+    expect(await verifyOwnershipStop(db, await readRun(runId), { verificationTimeoutMs: 0 })).toBe("stopped");
+  });
+
+  // The route's database, with `inject` run once in its own committed
+  // transaction before the first transaction that opens after `ready()`.
+  // That puts a concurrent writer between the stop and the ownership commit,
+  // where the real claimant would have to wait for the stop's issue lock.
+  function dbInjectingAfter(ready: () => Promise<boolean>, inject: () => Promise<void>): typeof db {
+    let injected = false;
+    return new Proxy(db, {
+      get(target, prop) {
+        const value = Reflect.get(target, prop, target);
+        if (prop !== "transaction") return typeof value === "function" ? value.bind(target) : value;
+        return async (...args: Parameters<typeof db.transaction>) => {
+          if (!injected && await ready()) {
+            injected = true;
+            await inject();
+          }
+          return target.transaction(...args);
+        };
+      },
+    });
+  }
+
+  // Criteria 3 and 5 through the real PATCH commit: after the request stopped
+  // the old run, a queued run of the old owner wins its claim (or a
+  // replacement run starts) and takes the execution lock. The commit fails
+  // closed and keeps that run and its lock.
+  it.each(["queued claimant", "replacement run"] as const)("fails the PATCH with issue_state_changed and keeps the live lock when a %s of the old owner starts after the stop", async (kind) => {
+    const { companyId, ownerAgentId, successorAgentId, issueId, runId } = await seed({ liveRun: "tracked" });
+    const otherRunId = randomUUID();
+    const otherRun = {
+      id: otherRunId,
+      companyId,
+      agentId: ownerAgentId,
+      invocationSource: "automation" as const,
+      triggerDetail: "system" as const,
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_continuation_needed" },
+    };
+    if (kind === "queued claimant") await db.insert(heartbeatRuns).values({ ...otherRun, status: "queued" });
+    const routeDb = dbInjectingAfter(
+      async () => (await readRun(runId)).status === "cancelled",
+      async () => {
+        await db.transaction(async (tx) => {
+          await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
+          if (kind === "queued claimant") {
+            await tx.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, otherRunId));
+          } else {
+            await tx.insert(heartbeatRuns).values({ ...otherRun, status: "running", startedAt: new Date() });
+          }
+          await tx.update(issues)
+            .set({ executionRunId: otherRunId, executionAgentNameKey: "owner", executionLockedAt: new Date() })
+            .where(eq(issues.id, issueId));
+        });
+      },
+    );
+
+    const res = await request(createApp(companyId, undefined, routeDb))
+      .patch(`/api/issues/${issueId}`)
+      .send({ assigneeAgentId: successorAgentId });
+
+    expect(res.status).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "issue_state_changed", runId: otherRunId });
+    expect(await readIssue(issueId)).toMatchObject({
+      assigneeAgentId: ownerAgentId,
+      statusVersion: 0,
+      executionRunId: otherRunId,
+    });
+    expect((await readRun(runId)).status).toBe("cancelled");
+    expect((await readRun(otherRunId)).status).toBe("running");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(await wakesFor(successorAgentId)).toEqual([]);
+  });
+
+  // Sticky refusal (SX-1442): a retry finds no active run, because the first
+  // attempt already cancelled it, and must still refuse while the stop of
+  // that run is unverified.
+  it.each(["run_stop_unacknowledged", "run_stop_uncertain"] as const)("refuses a retry of a reassignment refused with %s", async (code) => {
+    const { companyId, ownerAgentId, successorAgentId, issueId, runId } = await seed({
+      liveRun: code === "run_stop_uncertain" ? "tracked" : "untracked",
+    });
+    if (code === "run_stop_uncertain") await addRemoteLease(companyId, issueId, runId);
+    const app = createApp(companyId);
+
+    const first = await request(app).patch(`/api/issues/${issueId}`).send({ assigneeAgentId: successorAgentId });
+    const retry = await request(app).patch(`/api/issues/${issueId}`).send({ assigneeAgentId: successorAgentId });
+
+    expect(first.status).toBe(409);
+    expect(first.body.details).toMatchObject({ code, runId });
+    expect(retry.status).toBe(409);
+    expect(retry.body.details).toMatchObject({ code, runId });
+    expect(await readIssue(issueId)).toMatchObject({ assigneeAgentId: ownerAgentId, status: "in_progress", statusVersion: 0 });
+    expect(await wakesFor(successorAgentId)).toEqual([]);
+  });
+
+  it.each(["acknowledgement", "termination receipt"] as const)("commits the retry once the %s of the earlier stop arrived", async (proof) => {
+    const { companyId, successorAgentId, issueId, runId } = await seed({
+      liveRun: proof === "termination receipt" ? "tracked" : "untracked",
+    });
+    const lease = proof === "termination receipt" ? await addRemoteLease(companyId, issueId, runId) : null;
+    const app = createApp(companyId);
+    expect((await request(app).patch(`/api/issues/${issueId}`).send({ assigneeAgentId: successorAgentId })).status).toBe(409);
+
+    if (lease) {
+      await recordRemoteTerminationReceipt(lease);
+    } else {
+      await db.update(heartbeatRuns).set({
+        resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || '{"executionCancellation": {"state": "acknowledged"}}'::jsonb`,
+      }).where(eq(heartbeatRuns.id, runId));
+    }
+    const retry = await request(app).patch(`/api/issues/${issueId}`).send({ assigneeAgentId: successorAgentId });
+
+    expect(retry.status).toBe(200);
+    expect((await readIssue(issueId)).assigneeAgentId).toBe(successorAgentId);
+    expect((await readRun(runId)).resultJson).toMatchObject({ reassignmentPendingIssueId: null });
+    await expect.poll(() => wakesFor(successorAgentId)).toEqual([{ reason: "issue_assigned" }]);
+  });
+
+  it("commits a board override of an unverified stop and records it in the reassignment activity", async () => {
+    const { companyId, successorAgentId, issueId, runId } = await seed({ liveRun: "untracked" });
+    const app = createApp(companyId);
+    expect((await request(app).patch(`/api/issues/${issueId}`).send({ assigneeAgentId: successorAgentId })).status).toBe(409);
+
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ assigneeAgentId: successorAgentId, acceptUnverifiedStop: true });
+
+    expect(res.status).toBe(200);
+    expect((await readIssue(issueId)).assigneeAgentId).toBe(successorAgentId);
+    const [activity] = await db
+      .select({ actorType: activityLog.actorType, actorId: activityLog.actorId, details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.updated")));
+    expect(activity).toMatchObject({
+      actorType: "user",
+      actorId: "board-user",
+      details: {
+        unverifiedStopOverride: {
+          runId,
+          reason: "run_stop_unacknowledged",
+          acceptedByActorType: "user",
+          acceptedByActorId: "board-user",
+        },
+      },
+    });
+    await expect.poll(() => wakesFor(successorAgentId)).toEqual([{ reason: "issue_assigned" }]);
+  });
+
+  it("refuses the unverified-stop override from an agent with its own code and changes nothing", async () => {
+    const { companyId, ownerAgentId, successorAgentId, issueId, runId } = await seed({ liveRun: "tracked" });
+
+    const res = await request(createApp(companyId, { agentId: ownerAgentId, runId }))
+      .patch(`/api/issues/${issueId}`)
+      .set("x-paperclip-run-id", runId)
+      .send({ assigneeAgentId: successorAgentId, acceptUnverifiedStop: true });
+
+    expect(res.status).toBe(403);
+    expect(res.body.details).toMatchObject({ code: "unverified_stop_override_forbidden" });
+    expect(await readIssue(issueId)).toMatchObject({ assigneeAgentId: ownerAgentId, statusVersion: 0, executionRunId: runId });
+    expect((await readRun(runId)).status).toBe("running");
+    expect(await wakesFor(successorAgentId)).toEqual([]);
+  });
+
+  it("ends the stickiness once a reassignment committed", async () => {
+    const { companyId, ownerAgentId, successorAgentId, otherAgentId, issueId, runId } = await seed({ liveRun: "untracked" });
+    const app = createApp(companyId);
+    expect((await request(app).patch(`/api/issues/${issueId}`).send({ assigneeAgentId: successorAgentId })).status).toBe(409);
+    expect((await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ assigneeAgentId: successorAgentId, acceptUnverifiedStop: true })).status).toBe(200);
+    expect((await readRun(runId)).resultJson).toMatchObject({ reassignmentPendingIssueId: null });
+
+    // Back to the old owner, then on: the older unverified run no longer blocks.
+    expect((await request(app).patch(`/api/issues/${issueId}`).send({ assigneeAgentId: ownerAgentId })).status).toBe(200);
+    const res = await request(app).patch(`/api/issues/${issueId}`).send({ assigneeAgentId: otherAgentId });
+
+    expect(res.status).toBe(200);
+    expect((await readIssue(issueId)).assigneeAgentId).toBe(otherAgentId);
   });
 });
