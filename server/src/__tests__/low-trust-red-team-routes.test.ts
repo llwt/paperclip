@@ -1,3 +1,4 @@
+import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import express from "express";
@@ -47,6 +48,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { parseWakePayloadFromMessage } from "./helpers/wake-message.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { runningProcesses } from "../adapters/index.js";
 import { errorHandler } from "../middleware/index.js";
 import { agentRoutes } from "../routes/agents.js";
 import { issueRoutes } from "../routes/issues.js";
@@ -887,7 +889,11 @@ describeEmbeddedPostgres(
       db = createDb(tempDb.connectionString);
     }, 20_000);
 
+    const children: ChildProcess[] = [];
+
     afterEach(async () => {
+      for (const child of children.splice(0)) child.kill("SIGKILL");
+      runningProcesses.clear();
       // Await every in-flight background heartbeat run to quiescence before the
       // deletes below. A route dispatches a wakeup fire-and-forget, so a run can
       // still be writing issues, issue_comments, and heartbeat_runs rows when
@@ -947,6 +953,11 @@ describeEmbeddedPostgres(
       expect(wake).toMatchObject({ requestedByActorType: "user", requestedByActorId: "board-user" });
       const [directRun] = await db.update(heartbeatRuns).set({ status: "running" })
         .where(eq(heartbeatRuns.id, wake.runId!)).returning();
+      // A child process this server owns, so the handoff's stop is acknowledged.
+      // An untracked run fails the handoff closed (run_stop_unacknowledged).
+      const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+      children.push(child);
+      runningProcesses.set(directRun.id, { child, graceSec: 1, processGroupId: null });
       await db.update(issues).set({ status: "in_progress", checkoutRunId: directRun.id, executionRunId: directRun.id })
         .where(eq(issues.id, created.body.id));
       const directedAgent = createApp(db, { ...agentActor(fixture), runId: directRun.id });
