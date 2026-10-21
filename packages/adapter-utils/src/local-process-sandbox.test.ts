@@ -140,9 +140,11 @@ describe("local process sandbox", () => {
       },
     });
 
-    expect(target.args).toEqual(expect.arrayContaining(["--ro-bind", dataDir, dataDir, "--ro-bind", hostInstalls, hostInstalls]));
+    const flagFor = (dir: string) => target.args[target.args.indexOf(dir) - 1];
+    expect(flagFor(dataDir)).toBe("--ro-bind");
+    expect(flagFor(hostInstalls)).toBe("--ro-bind");
+    expect(target.args.filter((arg) => arg === dataDir)).toHaveLength(2);
     expect(target.args).not.toContain(path.join(root, "mise", "missing-cache"));
-    expect(target.args).not.toEqual(expect.arrayContaining(["--bind", dataDir, dataDir]));
   });
 
   it.runIf(process.platform === "linux")("binds a confined absolute alias to the synchronized workspace", async () => {
