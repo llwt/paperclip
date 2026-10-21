@@ -9,8 +9,8 @@ import { notFound, unprocessable } from "../errors.js";
 import { aiConnectionService } from "./ai-connections.js";
 import { readVerifiedLocalAiCredential } from "./local-ai-credentials.js";
 import { logActivity } from "./activity-log.js";
+import { LOCAL_LOGIN_METHOD } from "./local-ai-login-method.js";
 
-const LOCAL_LOGIN_METHOD = "local_subscription";
 const ATTEMPT_DURATION_MS = 30 * 60 * 1000;
 function loginHome(id: string) {
   return path.join(resolvePaperclipInstanceRoot(), "ai-local-logins", id);
