@@ -25,6 +25,7 @@ the ones on `somnex-main` before the merge; what is left of each is the diff of
 
 | Commit | What | Upstream status | Drops out when |
 | --- | --- | --- | --- |
+| SX-1457 (this PR) | Backups: both engines write to `.partial` files and publish the complete gzip by rename; server startup removes incomplete files; Install and Rollback check for a running backup before restart | Local only (SX-1456) | An upstream release writes backups to a temporary name |
 | Claude quota classification (this PR) | Claude login detection ignores stream-json objects in raw stdout and gives terminal quota or transient errors priority, so a tool's `unauthorized` output cannot turn a session limit into account reauthorization | Local only | An upstream release carries an equivalent fix |
 | NX-1092 (this PR) | Setup-token cleanup: exclude local subscription rows from scoped reads and writes, clear records with no lease without a provider release, and log only the error class and SQLSTATE on a failed release | Local only (NX-1092). Upstream `master` `f3af9887c` has the same fault | An upstream release carries an equivalent fix |
 | NX-834 (this PR) | Tools: opt-in `compact-v1` connection tool names for Claude runs. Pure helper `server/src/services/compact-connection-tool-names.ts`; narrow hooks in the named MCP route (`?toolNames=compact-v1`, unknown values rejected), `listToolsForNamedGateway` (alias projection), `findToolForSession` (alias resolution on the descriptors it already loads, after authentication) and `buildPaperclipRuntimeMcpServers` (label `p` and the versioned URL for `claude_local` agents with `runtimeConfig.connectionToolNames: "compact-v1"`), plus a Claude resume check (`packages/adapters/claude-local/src/server/tool-name-format.ts`) that starts a fresh session when the tool name format changes, because upstream now resumes across other MCP server changes. Stored names, policies, signatures and rate buckets keep the internal name. Kill switch `PAPERCLIP_COMPACT_CONNECTION_TOOL_NAMES_DISABLED=true`. Rollback: unset the agent opt-in (or set the kill switch), let compact sessions restart, then revert the binary | Local only (NX-658). Fork-specific implementation of the approved Nx plan. Related upstream: paperclipai/paperclip#15668 (open). | An upstream release provides equivalent presentation aliases without changing stored gateway identities, policy evaluation or signed approvals |
@@ -304,8 +305,21 @@ after Steven approves the SHA.
    keeps the new payload and the two before it and deletes every other
    directory under `installs/npm` and `installs/git`, hand-made ones included.
 5. `GH_TOKEN="$(gh auth token)" paperclipai install --repo llwt/paperclip --ref <sha> -y`
-6. `paperclipai service restart`
-7. Run the smoke checklist.
+6. Check that no database backup is running. A restart during a backup cuts the
+   dump off (SX-1455). Run:
+
+   ```sh
+   journalctl --user -u paperclipai --since "-2h" --no-pager \
+     | grep -E "database backup (starting|complete|failed)|database backups enabled" \
+     | tail -1
+   ```
+
+   If the last line says "database backup starting", a backup is running (it
+   takes about 5 minutes). Wait and run the check again until the last line says
+   "complete", "failed" or "backups enabled". Backups start each hour at about
+   the same minute; plan the restart away from that minute.
+7. `paperclipai service restart`
+8. Run the smoke checklist.
 
 Facts about `install --ref` on this host (found on NX-449 and NX-509):
 
@@ -350,7 +364,8 @@ Facts about `install --ref` on this host (found on NX-449 and NX-509):
 
 1. `paperclipai update --rollback`, or
    `paperclipai install --repo llwt/paperclip --ref <previous sha> -y`.
-2. `paperclipai service restart`, then the smoke checklist.
+2. `paperclipai service restart`, then the smoke checklist. Run the backup check
+   of the Install section first, unless the server is already down.
 3. If the new build ran migrations, the old code may not work on the new
    schema. Rollback then also means restoring the database backup from install
    step 3.

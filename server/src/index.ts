@@ -27,6 +27,7 @@ import { pathToFileURL } from "node:url";
 import type { Request as ExpressRequest, RequestHandler } from "express";
 import { warnIfUnsupportedNodeVersion } from "@paperclipai/shared/node-version";
 import { and, eq } from "drizzle-orm";
+import { removeIncompleteBackupFiles } from "@paperclipai/db/backup-lib";
 import {
   createDb,
   ensurePostgresDatabase,
@@ -1886,6 +1887,16 @@ async function startServerWithDatabaseTeardown(
   
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
+
+    // Differs from upstream: discard dumps interrupted before publication.
+    try {
+      const files = removeIncompleteBackupFiles(config.databaseBackupDir, "paperclip");
+      if (files.length > 0) {
+        logger.info({ backupDir: config.databaseBackupDir, files }, "Removed incomplete database backup files");
+      }
+    } catch (err) {
+      logger.warn({ err, backupDir: config.databaseBackupDir }, "Failed to remove incomplete database backup files");
+    }
 
     logger.info(
       {
