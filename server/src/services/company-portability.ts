@@ -138,12 +138,12 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
-/** Build OrgNode tree from manifest agent list (slug + reportsToSlug). */
 function omitHandoffReceipt<T extends { handoff?: unknown }>(metadata: T): Omit<T, "handoff"> {
   const { handoff: _handoff, ...rest } = metadata;
   return rest;
 }
 
+/** Build OrgNode tree from manifest agent list (slug + reportsToSlug). */
 function buildOrgTreeFromManifest(agents: CompanyPortabilityManifest["agents"]): OrgNode[] {
   const ROLE_LABELS: Record<string, string> = {
     ceo: "Chief Executive", cto: "Technology", cmo: "Marketing",
