@@ -6,6 +6,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   buildLocalProcessSandboxSpawnTarget,
+  miseToolInstallMounts,
   parseLocalProcessFilesystemScope,
   parseLocalProcessNetworkAllowlist,
   parseLocalProcessNetworkScope,
@@ -101,6 +102,47 @@ describe("local process sandbox", () => {
     expect(target.args).toContain(workspace);
     expect(target.args).toContain(managedHome);
     expect(target.args.slice(-3)).toEqual([process.execPath, "-e", "console.log('ok')"]);
+  });
+
+  it("mounts the mise tool dirs of a run env read-only", () => {
+    expect(miseToolInstallMounts({
+      MISE_DATA_DIR: "/srv/paperclip/runtime/mise/data",
+      MISE_CACHE_DIR: "/srv/paperclip/runtime/mise/cache/",
+      MISE_SHARED_INSTALL_DIRS: ["/home/user/.local/share/mise/installs", "relative/installs", "", "/srv/paperclip/runtime/mise/data"].join(path.delimiter),
+    })).toEqual([
+      { path: "/srv/paperclip/runtime/mise/data", access: "ro" },
+      { path: "/srv/paperclip/runtime/mise/cache", access: "ro" },
+      { path: "/home/user/.local/share/mise/installs", access: "ro" },
+    ]);
+    expect(miseToolInstallMounts({ HOME: "/home/user" })).toEqual([]);
+  });
+
+  it.runIf(process.platform === "linux")("binds the mise tool dirs read-only into a workspace sandbox", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-mise-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const dataDir = path.join(root, "mise", "data");
+    const hostInstalls = path.join(root, "host", "installs");
+    await Promise.all([workspace, dataDir, hostInstalls].map((dir) => fs.mkdir(dir, { recursive: true })));
+
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        filesystemScope: "workspace",
+        managedPaths: miseToolInstallMounts({
+          MISE_DATA_DIR: dataDir,
+          MISE_CACHE_DIR: path.join(root, "mise", "missing-cache"),
+          MISE_SHARED_INSTALL_DIRS: hostInstalls,
+        }),
+      },
+    });
+
+    expect(target.args).toEqual(expect.arrayContaining(["--ro-bind", dataDir, dataDir, "--ro-bind", hostInstalls, hostInstalls]));
+    expect(target.args).not.toContain(path.join(root, "mise", "missing-cache"));
+    expect(target.args).not.toEqual(expect.arrayContaining(["--bind", dataDir, dataDir]));
   });
 
   it.runIf(process.platform === "linux")("binds a confined absolute alias to the synchronized workspace", async () => {

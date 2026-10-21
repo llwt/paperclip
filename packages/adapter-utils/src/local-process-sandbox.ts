@@ -54,6 +54,23 @@ export async function managedAiSessionStateMounts(providerHome: string): Promise
   return mounts;
 }
 
+/**
+ * Read-only mounts for the mise tool installs a run env points at: its data
+ * and cache dirs and each MISE_SHARED_INSTALL_DIRS entry. A confined run
+ * reuses tools installed outside the sandbox but cannot change them for other
+ * runs or for the host user.
+ */
+export function miseToolInstallMounts(env: Record<string, string | undefined>): LocalProcessSandboxPath[] {
+  const paths = [
+    env.MISE_DATA_DIR,
+    env.MISE_CACHE_DIR,
+    ...(env.MISE_SHARED_INSTALL_DIRS ?? "").split(path.delimiter),
+  ]
+    .map((entry) => entry?.trim() ?? "")
+    .filter((entry) => path.isAbsolute(entry));
+  return Array.from(new Set(paths.map((entry) => path.resolve(entry)))).map((entry) => ({ path: entry, access: "ro" }));
+}
+
 export interface LocalProcessSandboxSpawnTarget {
   command: string;
   args: string[];

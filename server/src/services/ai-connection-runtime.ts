@@ -12,6 +12,7 @@ import {
 import { aiConnectionService } from "./ai-connections.js";
 import { secretService } from "./secrets.js";
 import { MANAGED_AI_WRITEBACK_PENDING, writeRunTempDirMarker } from "./run-temp-dirs.js";
+import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { decideCodexAuthMerge } from "@paperclipai/adapter-codex-local/server";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
@@ -179,6 +180,38 @@ function managedAiHomeEnvironment(home: string): Record<string, string> {
   };
 }
 
+/**
+ * mise tool installs shared by all managed AI runs. A run's HOME and XDG dirs
+ * point at its temp home, so without these mise looks for tools in the empty
+ * `data/mise` there and reinstalls each one on every run (SX-1444). New
+ * installs and the download cache go to a Paperclip-owned dir that outlives
+ * the run; the host user's own installs are only read, through
+ * MISE_SHARED_INSTALL_DIRS. mise state (config trust, incomplete installs)
+ * stays in the run's home.
+ */
+export function managedAiToolEnvironment(
+  sourceEnv: NodeJS.ProcessEnv = process.env,
+  instanceRoot: string = resolvePaperclipInstanceRoot(),
+): Record<string, string> {
+  const shared = path.join(instanceRoot, "runtime", "mise");
+  const dataDir = path.join(shared, "data");
+  const hostHome = sourceEnv.HOME?.trim() || os.homedir();
+  const hostDataDir =
+    sourceEnv.MISE_DATA_DIR?.trim() ||
+    path.join(sourceEnv.XDG_DATA_HOME?.trim() || path.join(hostHome, ".local", "share"), "mise");
+  const installDirs = [
+    ...(sourceEnv.MISE_SHARED_INSTALL_DIRS ?? "").split(path.delimiter),
+    path.join(hostDataDir, "installs"),
+  ]
+    .map((entry) => entry.trim())
+    .filter((entry) => path.isAbsolute(entry) && path.resolve(entry) !== path.join(dataDir, "installs"));
+  return {
+    MISE_DATA_DIR: dataDir,
+    MISE_CACHE_DIR: path.join(shared, "cache"),
+    MISE_SHARED_INSTALL_DIRS: Array.from(new Set(installDirs.map((entry) => path.resolve(entry)))).join(path.delimiter),
+  };
+}
+
 /** Only the server-created credential home is volatile; retain all other config. */
 export function managedAiSessionFingerprintConfig(
   config: Record<string, unknown>,
@@ -189,6 +222,11 @@ export function managedAiSessionFingerprintConfig(
   const stable = managedAiHomeEnvironment("<managed-ai-home>");
   for (const [key, value] of Object.entries(managedAiHomeEnvironment(managedHome))) {
     if (env[key] === value) env[key] = stable[key];
+  }
+  // Server-set and the same for every run; left out so adding them did not
+  // change the fingerprint of existing sessions.
+  for (const [key, value] of Object.entries(managedAiToolEnvironment())) {
+    if (env[key] === value) delete env[key];
   }
   const managed = config.managedAiConnection as Record<string, unknown> | undefined;
   if (managed?.sessionIdentity) {
@@ -415,7 +453,12 @@ export async function prepareManagedAiRuntime(
     await writeRunTempDirMarker(home, { companyId: input.companyId, agentId: input.agentId, runId: input.runId ?? null });
     const providerHome = path.join(home, "provider");
     await mkdir(providerHome, { mode: 0o700 });
+    const toolEnv = managedAiToolEnvironment();
+    await mkdir(toolEnv.MISE_DATA_DIR, { recursive: true, mode: 0o700 });
+    await mkdir(toolEnv.MISE_CACHE_DIR, { recursive: true, mode: 0o700 });
     const env: Record<string, unknown> = {
+      // An agent's own mise settings win over the shared defaults.
+      ...toolEnv,
       ...stripAiAuthBindings(input.config.env),
       ...Object.fromEntries(AI_AUTH_ENV_KEYS.map((key) => [key, ""])),
       ...managedAiHomeEnvironment(home),
