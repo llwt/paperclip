@@ -8,8 +8,8 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 
 // The legacy login-prompt markers. The Claude CLI prints these words when it
-// asks the user to log in. The detector matches them against any probe output
-// line, which includes the raw stdout and stderr. This scope is pre-existing.
+// asks the user to log in. Raw stream-json events can contain tool output, so
+// the detector excludes those lines from the login-prompt scan.
 const CLAUDE_LOGIN_PROMPT_RE =
   /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+(?:`?claude\s+login`?|\/login)|login\s+required|requires\s+login|unauthorized|authentication\s+required|invalid\s+api\s+key[\s\S]{0,120}(?:\/login|claude\s+login|log\s+in))/i;
 
@@ -214,11 +214,20 @@ export function detectClaudeLoginRequired(input: {
 }): { requiresLogin: boolean; loginUrl: string | null } {
   const parsed = input.parsed ?? null;
   const resultText = asString(parsed?.result, "").trim();
+  const errors = extractClaudeErrorMessages(parsed ?? {});
+  const loginUrl = extractClaudeLoginUrl([input.stdout, input.stderr].join("\n"));
+  const terminalText = [resultText, ...errors, input.stderr].join("\n");
+  if (CLAUDE_PROVIDER_QUOTA_RE.test(terminalText) || CLAUDE_TRANSIENT_UPSTREAM_RE.test(terminalText)) {
+    return { requiresLogin: false, loginUrl };
+  }
 
-  // The legacy login-prompt markers keep their broad scope. They match against
-  // every output line, which includes the parsed result, the parsed errors, and
-  // the raw stdout and stderr.
-  const promptLines = [resultText, ...extractClaudeErrorMessages(parsed ?? {}), input.stdout, input.stderr]
+  // Keep plain-text CLI prompts, but ignore JSON objects that can carry tool
+  // output. Parsed terminal results and errors remain authoritative.
+  const stdoutLines = input.stdout.split(/\r?\n/).filter((line) => {
+    const event = parseJson(line);
+    return event === null || typeof event !== "object" || Array.isArray(event);
+  });
+  const promptLines = [resultText, ...errors, ...stdoutLines, input.stderr]
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -235,7 +244,7 @@ export function detectClaudeLoginRequired(input: {
 
   return {
     requiresLogin: loginPrompt || tokenFailure,
-    loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),
+    loginUrl,
   };
 }
 

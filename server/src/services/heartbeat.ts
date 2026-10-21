@@ -18,6 +18,7 @@ import {
 import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import { HEARTBEAT_RUN_LIST_DEFAULT_LIMIT, HEARTBEAT_RUN_LIST_MAX_LIMIT } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
 import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
 import { publicChatTaskUrl } from "./chat-task-url.js";
@@ -3390,35 +3391,24 @@ const heartbeatRunSummaryListColumns = {
   resultJson: sql<Record<string, unknown> | null>`NULL`.as("resultJson"),
 } as const;
 
+const heartbeatRunListContextRecord = sql`lateral jsonb_to_record(
+  case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object'
+    then ${heartbeatRuns.contextSnapshot} else '{}'::jsonb end
+) as run_context("issueId" text, "taskId" text, "taskKey" text,
+  "commentId" text, "wakeCommentId" text, "wakeReason" text,
+  "wakeSource" text, "wakeTriggerDetail" text)`;
+
 const heartbeatRunListContextColumns = {
-  contextIssueId: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'issueId'`.as("contextIssueId"),
-  contextTaskId: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'taskId'`.as("contextTaskId"),
-  contextTaskKey: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'taskKey'`.as("contextTaskKey"),
-  contextCommentId: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'commentId'`.as("contextCommentId"),
-  contextWakeCommentId: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'wakeCommentId'`.as(
-    "contextWakeCommentId",
-  ),
-  contextWakeReason: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'wakeReason'`.as("contextWakeReason"),
-  contextWakeSource: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'wakeSource'`.as("contextWakeSource"),
-  contextWakeTriggerDetail: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'wakeTriggerDetail'`.as(
-    "contextWakeTriggerDetail",
-  ),
+  // Differs from upstream (paperclipai/paperclip#16286, ebeac833a): upstream prefers the
+  // heartbeat_runs.issue_id column, which this fork does not have.
+  contextIssueId: sql<string | null>`run_context."issueId"`.as("contextIssueId"),
+  contextTaskId: sql<string | null>`run_context."taskId"`.as("contextTaskId"),
+  contextTaskKey: sql<string | null>`run_context."taskKey"`.as("contextTaskKey"),
+  contextCommentId: sql<string | null>`run_context."commentId"`.as("contextCommentId"),
+  contextWakeCommentId: sql<string | null>`run_context."wakeCommentId"`.as("contextWakeCommentId"),
+  contextWakeReason: sql<string | null>`run_context."wakeReason"`.as("contextWakeReason"),
+  contextWakeSource: sql<string | null>`run_context."wakeSource"`.as("contextWakeSource"),
+  contextWakeTriggerDetail: sql<string | null>`run_context."wakeTriggerDetail"`.as("contextWakeTriggerDetail"),
 } as const;
 
 const heartbeatRunListResultColumns = {
@@ -7041,6 +7031,77 @@ export function resolveExecutionWorkspaceConfigFreshness(input: {
       : (input.inferredMetadata?.fingerprint ?? null),
     nextFingerprint: input.nextMetadata.fingerprint,
     storedFingerprintPresent: Boolean(stored),
+  };
+}
+
+/**
+ * A reused shared `project_primary` execution workspace is the project's
+ * primary checkout, not a task-owned directory. When the project's primary
+ * workspace now resolves to another cwd (typically a repo added to a project
+ * whose earlier tasks ran in the managed `_default` folder), the persisted cwd
+ * is stale and must follow the project. Returns the cwd to rebind to, or null
+ * to restore the persisted workspace as is.
+ *
+ * Only a real project primary anchor qualifies: an agent-home or task-session
+ * anchor, or the agent fallback used when the project checkout could not be
+ * materialized, never moves a shared workspace. Native recovery keeps the
+ * workspace bound to its admitted execution input.
+ */
+export function resolveSharedProjectPrimaryWorkspaceRebindCwd(input: {
+  existingWorkspace: {
+    mode: string | null | undefined;
+    strategyType: string | null | undefined;
+    cwd: string | null | undefined;
+  } | null;
+  resolvedWorkspace: {
+    cwd: string;
+    source: string;
+    baseCwdFallback: boolean;
+  };
+  nativeExecutionBound: boolean;
+}): string | null {
+  const existing = input.existingWorkspace;
+  if (!existing || input.nativeExecutionBound) return null;
+  if (existing.mode !== "shared_workspace") return null;
+  if (existing.strategyType !== "project_primary") return null;
+  if (input.resolvedWorkspace.source !== "project_primary") return null;
+  if (input.resolvedWorkspace.baseCwdFallback) return null;
+  const nextCwd = readNonEmptyString(input.resolvedWorkspace.cwd);
+  if (!nextCwd || sameResolvedPath(existing.cwd, nextCwd)) return null;
+  return nextCwd;
+}
+
+const SHARED_WORKSPACE_REBIND_CONFIG_CATEGORIES =
+  new Set<EffectiveRunWorkspaceConfigCategory>(["projectWorkspace", "repo"]);
+
+/**
+ * A rebind brings the persisted workspace's project workspace and repo in line
+ * with the current project, so drift limited to those categories is resolved
+ * by the rebind itself and the record takes the latest config metadata.
+ * Any other replacement-class drift keeps its "replace" decision.
+ */
+export function applySharedWorkspaceRebindToConfigFreshness(
+  decision: ExecutionWorkspaceConfigFreshnessDecision,
+  reboundCwd: string | null,
+): ExecutionWorkspaceConfigFreshnessDecision {
+  if (!reboundCwd || decision.action !== "replace") return decision;
+  // Missing or version-changed fingerprints report every category, including
+  // mode and strategy, so they keep their "replace" decision here.
+  const resolvedByRebind = decision.changedCategories.every(
+    (category) =>
+      SHARED_WORKSPACE_REBIND_CONFIG_CATEGORIES.has(category) ||
+      !WORKSPACE_REPLACEMENT_CONFIG_CATEGORIES.has(category),
+  );
+  if (!resolvedByRebind) return decision;
+  return {
+    ...decision,
+    action: "refresh",
+    shouldReuseExisting: true,
+    shouldRefreshConfigSnapshot: true,
+    reasons: [
+      ...decision.reasons,
+      `shared project workspace rebound to "${reboundCwd}"`,
+    ],
   };
 }
 
@@ -22423,8 +22484,17 @@ export function heartbeatService(
               evaluatedAt: latestWorkspaceConfigMetadata.evaluatedAt,
             })
           : null;
-      const workspaceConfigFreshness = resolveExecutionWorkspaceConfigFreshness(
-        {
+      const sharedWorkspaceRebindCwd = requestedShouldReuseExisting
+        ? resolveSharedProjectPrimaryWorkspaceRebindCwd({
+            existingWorkspace: reusableExistingExecutionWorkspace,
+            resolvedWorkspace,
+            nativeExecutionBound:
+              persistedNativeExecutionInput !== null ||
+              nativeChatWorkspaceScope !== null,
+          })
+        : null;
+      const workspaceConfigFreshness = applySharedWorkspaceRebindToConfigFreshness(
+        resolveExecutionWorkspaceConfigFreshness({
           hasExistingWorkspace:
             requestedShouldReuseExisting &&
             Boolean(reusableExistingExecutionWorkspace),
@@ -22432,7 +22502,8 @@ export function heartbeatService(
             reusableExistingExecutionWorkspace?.metadata ?? null,
           inferredMetadata: inferredExistingWorkspaceConfigMetadata,
           nextMetadata: latestWorkspaceConfigMetadata,
-        },
+        }),
+        sharedWorkspaceRebindCwd,
       );
       const workspaceReuseProvisioningPolicy =
         resolveExecutionWorkspaceReuseProvisioningPolicy({
@@ -22482,13 +22553,27 @@ export function heartbeatService(
                     mode: reusableExistingExecutionWorkspace.mode,
                     strategyType:
                       reusableExistingExecutionWorkspace.strategyType,
-                    cwd: reusableExistingExecutionWorkspace.cwd,
-                    providerRef: reusableExistingExecutionWorkspace.providerRef,
+                    // A rebound shared workspace takes the current project
+                    // checkout and its project workspace and repo; the update
+                    // below persists them on the same record.
+                    ...(sharedWorkspaceRebindCwd
+                      ? {
+                          cwd: sharedWorkspaceRebindCwd,
+                          providerRef: null,
+                          projectWorkspaceId: executionWorkspaceBase.workspaceId,
+                          repoUrl: executionWorkspaceBase.repoUrl,
+                          baseRef: executionWorkspaceBase.repoRef,
+                        }
+                      : {
+                          cwd: reusableExistingExecutionWorkspace.cwd,
+                          providerRef:
+                            reusableExistingExecutionWorkspace.providerRef,
+                          projectWorkspaceId:
+                            reusableExistingExecutionWorkspace.projectWorkspaceId,
+                          repoUrl: reusableExistingExecutionWorkspace.repoUrl,
+                          baseRef: reusableExistingExecutionWorkspace.baseRef,
+                        }),
                     projectId: reusableExistingExecutionWorkspace.projectId,
-                    projectWorkspaceId:
-                      reusableExistingExecutionWorkspace.projectWorkspaceId,
-                    repoUrl: reusableExistingExecutionWorkspace.repoUrl,
-                    baseRef: reusableExistingExecutionWorkspace.baseRef,
                     branchName: reusableExistingExecutionWorkspace.branchName,
                     metadata:
                       reusableExistingExecutionWorkspace.metadata as Record<
@@ -22729,11 +22814,13 @@ export function heartbeatService(
                   status: "active",
                   lastUsedAt: new Date(),
                   metadata: nextExecutionWorkspaceMetadata,
-                  projectWorkspaceId:
-                    reconcileReusedExecutionWorkspaceProjectWorkspaceId(
-                      reusableExistingExecutionWorkspace.projectWorkspaceId,
-                      resolvedProjectWorkspaceId,
-                    ),
+                  projectWorkspaceId: sharedWorkspaceRebindCwd
+                    ? (resolvedProjectWorkspaceId ??
+                      reusableExistingExecutionWorkspace.projectWorkspaceId)
+                    : reconcileReusedExecutionWorkspaceProjectWorkspaceId(
+                        reusableExistingExecutionWorkspace.projectWorkspaceId,
+                        resolvedProjectWorkspaceId,
+                      ),
                 },
               )
             : resolvedProjectId
@@ -30401,6 +30488,7 @@ export function heartbeatService(
                   },
           )
           .from(heartbeatRuns)
+          .leftJoin(heartbeatRunListContextRecord, sql`true`)
           .where(
             agentId
               ? and(
@@ -30411,7 +30499,10 @@ export function heartbeatService(
           )
           .orderBy(desc(heartbeatRuns.createdAt));
 
-        return limit ? await query.limit(limit) : await query;
+        const boundedLimit = Number.isFinite(limit)
+          ? Math.max(1, Math.min(HEARTBEAT_RUN_LIST_MAX_LIMIT, Math.trunc(limit!)))
+          : HEARTBEAT_RUN_LIST_DEFAULT_LIMIT;
+        return await query.limit(boundedLimit);
       });
       return rows.map((row) => {
         const {
