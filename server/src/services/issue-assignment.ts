@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
+import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, type Db } from "@paperclipai/db";
 import { parseObject } from "../adapters/utils.js";
 import { conflict } from "../errors.js";
@@ -155,7 +155,7 @@ export async function findPendingReassignmentStop(
   expectation: Pick<AssignmentExpectation, "companyId" | "issueId" | "assigneeAgentId">,
 ): Promise<HeartbeatRunRow | null> {
   if (!expectation.assigneeAgentId) return null;
-  return db
+  const pending: HeartbeatRunRow[] = await db
     .select()
     .from(heartbeatRuns)
     .where(and(
@@ -164,10 +164,10 @@ export async function findPendingReassignmentStop(
       eq(heartbeatRuns.status, "cancelled"),
       eq(heartbeatRuns.errorCode, "issue_reassigned"),
       sql`${heartbeatRuns.resultJson}->>'reassignmentPendingIssueId' = ${expectation.issueId}`,
-    ))
-    .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.createdAt))
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
+    ));
+  // Few rows: every commit releases them. Latest stop first.
+  const stoppedAt = (run: HeartbeatRunRow) => new Date(run.finishedAt ?? run.createdAt).getTime();
+  return [...(pending ?? [])].sort((a, b) => stoppedAt(b) - stoppedAt(a))[0] ?? null;
 }
 
 /**

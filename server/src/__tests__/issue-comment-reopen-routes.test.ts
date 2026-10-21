@@ -530,11 +530,13 @@ describe("issue comment reopen routes", () => {
       "33333333-3333-4333-8333-333333333333",
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
+      // A handoff writes its audit in the ownership transaction.
+      mockTx,
       expect.objectContaining({
         action: "issue.updated",
         details: expect.not.objectContaining({ reopened: true }),
       }),
+      expect.any(Array),
     );
   });
 
@@ -635,7 +637,8 @@ describe("issue comment reopen routes", () => {
       mockTx,
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
+      // A handoff writes its audit in the ownership transaction.
+      mockTx,
       expect.objectContaining({
         action: "issue.updated",
         details: expect.objectContaining({
@@ -644,6 +647,7 @@ describe("issue comment reopen routes", () => {
           status: "todo",
         }),
       }),
+      expect.any(Array),
     );
   });
 
@@ -725,7 +729,8 @@ describe("issue comment reopen routes", () => {
       mockTx,
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
+      // A handoff writes its audit in the ownership transaction.
+      mockTx,
       expect.objectContaining({
         action: "issue.updated",
         details: expect.objectContaining({
@@ -734,6 +739,7 @@ describe("issue comment reopen routes", () => {
           status: "todo",
         }),
       }),
+      expect.any(Array),
     );
   });
 
@@ -1085,7 +1091,8 @@ describe("issue comment reopen routes", () => {
       mockTx,
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
+      // A handoff writes its audit in the ownership transaction.
+      mockTx,
       expect.objectContaining({
         action: "issue.updated",
         details: expect.objectContaining({
@@ -1094,6 +1101,7 @@ describe("issue comment reopen routes", () => {
           status: "todo",
         }),
       }),
+      expect.any(Array),
     );
   });
 
