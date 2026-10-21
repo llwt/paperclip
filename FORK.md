@@ -187,6 +187,8 @@ git merge --no-ff <tag>
   (`pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile`) and
   give it an inventory row.
 - Sync the fork's `master` from upstream in the same task.
+- After the merge, disable each upstream workflow that the merge added (see
+  "Upstream workflows are disabled" under "CI gate").
 - Exception: merge a specific upstream `master` commit only when one upstream
   fix is needed early, and record the reason in the PR.
 
@@ -204,11 +206,20 @@ collection minus the shards' dry-run selection; `--list` prints it. The
 
 Until 2026-10-21 the mainline was named `nrwl-main` and the required check `nrwl-ci` (renamed on SX-1119 Step 3). Older PRs, tasks and install notes use those names.
 
-`.github/workflows/pr.yml` is upstream's and calls upstream's reusable
-workflow at upstream `master` (`pr-trusted.yml@master`). It is left untouched
-so it never conflicts with an upstream merge. It does run on fork pull
-requests (it passed on fork PR #3), but its definition follows upstream
-`master`, not the code on `somnex-main`, so it is extra signal and not the gate.
+### Upstream workflows are disabled
+
+Every upstream workflow in `.github/workflows/` is disabled in the fork's
+Actions settings (21 October 2026, SX-1363). They need upstream secrets,
+runners or registry access, or they call upstream `master` (`pr.yml` runs
+`pr-trusted.yml@master`), so on the fork they only failed and sent notices.
+Only `somnex-ci.yml` (and `nrwl-ci.yml`, for branches made before the rename)
+is active. The files stay untouched, so upstream merges stay clean.
+
+- See the state: `gh workflow list --all -R llwt/paperclip`.
+- Turn one back on: `gh workflow enable <name or id> -R llwt/paperclip`.
+- A workflow file that is new in an upstream merge starts as `active`. After
+  each upstream merge, run the list and disable each new upstream workflow
+  with `gh workflow disable <name or id> -R llwt/paperclip`.
 
 **Red test baseline: empty.** No test is allowed to fail. The two tests that
 were red on `somnex-main` (`tool-access-service.test.ts`, "executes allowed test
