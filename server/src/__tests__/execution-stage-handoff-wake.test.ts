@@ -370,6 +370,76 @@ describeEmbeddedPostgres("execution stage hand-off wake when the deciding run is
       .filter((wake) => wake.status === "deferred_issue_execution")).toHaveLength(0);
   });
 
+  it("keeps the saved hand-off when starting its run fails, and a retry starts exactly one run", async () => {
+    const ids = await seedDecision({ transition: "review_to_approval", leaseHeld: true });
+    const reason = ids.stageWakeup.wakeup.reason!;
+    expect(await heartbeat.wakeup(ids.nextAgentId, ids.stageWakeup.wakeup)).toBeNull();
+    const [saved] = await wakesFor(ids.nextAgentId, ids.issueId, reason);
+
+    // Fail the successor run's insert: the same point as a crash after the
+    // saved row is claimed and before the successor run is stored.
+    await db.execute(sql.raw(`
+      create function fail_stage_handoff_run() returns trigger language plpgsql as $$
+      begin raise exception 'injected failure before the successor run is saved'; end $$;
+      create trigger fail_stage_handoff_run before insert on heartbeat_runs for each row
+        when (new.agent_id = '${ids.nextAgentId}') execute function fail_stage_handoff_run();
+    `));
+    try {
+      expect(await heartbeat.sweepEndedTerminalRunLeases()).toMatchObject({ released: 1 });
+      expect(await runsFor(ids.nextAgentId, reason)).toHaveLength(0);
+      // The failed attempt rolled back: the saved row is still there to retry,
+      // and no other receipt for it was stored.
+      expect(await wakesFor(ids.nextAgentId, ids.issueId, reason)).toEqual([
+        expect.objectContaining({ id: saved!.id, status: "deferred_issue_execution", runId: null }),
+      ]);
+    } finally {
+      await db.execute(sql.raw(`
+        drop trigger fail_stage_handoff_run on heartbeat_runs;
+        drop function fail_stage_handoff_run();
+      `));
+    }
+
+    // The queued-run resume retries it (after a restart this is the only path).
+    await db.update(agentWakeupRequests).set({ requestedAt: new Date(Date.now() - 60_000) })
+      .where(eq(agentWakeupRequests.id, saved!.id));
+    await heartbeat.resumeQueuedRuns();
+    const runs = await runsFor(ids.nextAgentId, reason);
+    expect(runs).toHaveLength(1);
+    const wakes = await wakesFor(ids.nextAgentId, ids.issueId, reason);
+    expect(wakes.find((wake) => wake.id === saved!.id)).toMatchObject({ status: "coalesced", runId: runs[0]!.id });
+
+    // A retry after the admission committed finds nothing left to start.
+    await heartbeat.resumeQueuedRuns();
+    expect(await heartbeat.sweepEndedTerminalRunLeases()).toMatchObject({ released: 0 });
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    expect(await runsFor(ids.nextAgentId, reason)).toHaveLength(1);
+  });
+
+  it("concurrent retries of one saved hand-off start exactly one run", async () => {
+    const ids = await seedDecision({ transition: "approval_to_changes_requested", leaseHeld: true });
+    const reason = ids.stageWakeup.wakeup.reason!;
+    expect(await heartbeat.wakeup(ids.nextAgentId, ids.stageWakeup.wakeup)).toBeNull();
+
+    // Lease gone without the release hook, and the row old enough for the
+    // queued-run resume: every caller below sees the same saved row.
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date() })
+      .where(eq(environmentLeases.id, ids.leaseId));
+    await db.update(agentWakeupRequests).set({ requestedAt: new Date(Date.now() - 60_000) })
+      .where(eq(agentWakeupRequests.agentId, ids.nextAgentId));
+    await Promise.all([
+      heartbeat.resumeQueuedRuns(),
+      heartbeat.resumeQueuedRuns(),
+      heartbeatService(db).resumeQueuedRuns(),
+    ]);
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+    const runs = await runsFor(ids.nextAgentId, reason);
+    expect(runs).toHaveLength(1);
+    const wakes = await wakesFor(ids.nextAgentId, ids.issueId, reason);
+    expect(wakes.filter((wake) => wake.status === "deferred_issue_execution")).toHaveLength(0);
+    expect(wakes.every((wake) => wake.runId === runs[0]!.id)).toBe(true);
+  });
+
   it("drops a saved hand-off when the task no longer waits on that participant", async () => {
     const ids = await seedDecision({ transition: "review_to_approval", leaseHeld: true });
     expect(await heartbeat.wakeup(ids.nextAgentId, ids.stageWakeup.wakeup)).toBeNull();
