@@ -167,7 +167,11 @@ export async function findPendingReassignmentStop(
     ));
   // Few rows: every commit releases them. Latest stop first.
   const stoppedAt = (run: HeartbeatRunRow) => new Date(run.finishedAt ?? run.createdAt).getTime();
-  return [...(pending ?? [])].sort((a, b) => stoppedAt(b) - stoppedAt(a))[0] ?? null;
+  return (pending ?? [])
+    .filter((run) =>
+      run.agentId === expectation.assigneeAgentId && run.status === "cancelled" && run.errorCode === "issue_reassigned" &&
+      parseObject(run.resultJson).reassignmentPendingIssueId === expectation.issueId)
+    .sort((a, b) => stoppedAt(b) - stoppedAt(a))[0] ?? null;
 }
 
 /**
