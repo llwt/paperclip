@@ -293,8 +293,33 @@ change to get one merge through.
 
 ## Install
 
-An install is a deployment. It is its own task, assigned by the Coordinator
-after Steven approves the SHA.
+An install is a deployment. It is its own task for the Sr. Engineer, with
+Steven's card on the exact SHA (Steven's decisions on SX-1481, 21 October 2026).
+
+**When an install starts.**
+
+- A high-priority fork fix is installed as soon as it is merged: the
+  Engineering Lead creates the install task right after the merge.
+- Every other merged fix waits for the fixed install at 09:00 and 15:00 UTC on
+  weekdays. A routine creates a task for the Engineering Lead at those times.
+  When `somnex-main` has merged commits that are not installed, the
+  Engineering Lead creates the install task for the head SHA; otherwise the
+  routine task is closed with no install.
+
+**One card per install.** Steven's card on the install SHA is the only card.
+The smoke checklist has no card for Steven (item 5 is an agent check).
+
+**Only the restart waits.** When Steven accepts the card, steps 0 to 5 start at
+once. Only the restart (step 7) waits: for the backup check (step 6) and for
+the Nx notice task of this install to be `done`. Until Nx agrees a standing
+install window (NX-1306), Hog Boss files that notice in Nx before each install.
+
+0. Test the combined SHA when it has no green `somnex-ci` run of its own (a
+   pull request's run tests its own head, not `somnex-main` after a later
+   merge). Extract the SHA into the task scratch dir with `git archive`, not a
+   new worktree, and run `pnpm install --frozen-lockfile`, `pnpm typecheck`
+   and the test files that the new pull requests add or change. Stop on any
+   failure.
 
 1. The target is a full SHA on `somnex-main` with a green `somnex-ci` run. Never
    install a branch name. GitHub lets a commit reach `somnex-main` only through
@@ -395,8 +420,12 @@ The health endpoint reports `commit: null`, so the SHA check reads
 2. `sha` in `~/.paperclip/cli/install.json` equals the approved SHA.
 3. One agent heartbeat run completes on a throwaway task.
 4. One MCP gateway tool call succeeds (the tool timeout path).
-5. One pending card renders and accepts input in the UI (the card remount
-   path).
+5. The UI and cards work, checked by an agent (no card for Steven, SX-1481):
+   `GET /` returns 200 HTML and the `/assets/*.js` file it references returns
+   200; on a throwaway task, a `request_confirmation` interaction with
+   `resolverPolicy: "anyone"` is posted and accepted through
+   `POST /api/issues/{id}/interactions/{interactionId}/accept`, and reads
+   `accepted` afterwards. Cancel the throwaway task.
 
 ## Record of the `98fa44c` install
 
