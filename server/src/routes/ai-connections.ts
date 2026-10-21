@@ -404,7 +404,6 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
   // connection manager.
   router.post(
     "/companies/:companyId/ai-connections/:connectionId/revalidate",
-    validate(revalidateAiConnectionSchema),
     async (req, res) => {
       const companyId = req.params.companyId as string;
       assertBoard(req);

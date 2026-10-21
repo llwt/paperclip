@@ -213,7 +213,8 @@ describe("Check again", () => {
   it("counts a usage-limit answer as signed in", async () => {
     const account = await markedAccount("personal");
     vi.spyOn(globalThis, "fetch").mockImplementation(async () => usageLimit());
-    const response = await request(app).post(url(account.connectionId)).send({});
+    // No request body at all.
+    const response = await request(app).post(url(account.connectionId));
     expect(response.body).toMatchObject({ result: "passed", limited: true });
     expect(await marks(account)).toEqual(CLEARED);
   });
