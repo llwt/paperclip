@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  agentWakeupRequests,
   agents,
   approvals,
   companies,
@@ -45,6 +46,7 @@ const noGates: HandoffGateFacts = {
   pendingStage: false,
   pendingConfirmation: false,
   pendingInteraction: false,
+  queuedInteractionResponse: false,
   pendingApproval: false,
   recoveryHold: false,
   pauseHold: false,
@@ -180,6 +182,7 @@ describe("decideCommentHandoff", () => {
     ["pending stage", { pendingStage: true }, "review_pending"],
     ["pending confirmation", { pendingConfirmation: true }, "confirmation_pending"],
     ["pending question", { pendingInteraction: true }, "interaction_pending"],
+    ["queued interaction response", { queuedInteractionResponse: true }, "interaction_pending"],
     ["pending approval", { pendingApproval: true }, "interaction_pending"],
   ] as const)("refuses with a %s", async (_name, gates, reasonCode) => {
     expect(await decide({ gates })).toEqual({ outcome: "context_only", reasonCode, targetAgentId: TARGET });
@@ -302,6 +305,7 @@ describeEmbeddedPostgres("comment handoff gate reads", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(agentWakeupRequests);
     await db.delete(issueRecoveryActions);
     await db.delete(issueApprovals);
     await db.delete(approvals);
@@ -340,6 +344,25 @@ describeEmbeddedPostgres("comment handoff gate reads", () => {
     expect(await isHandoffTargetAssignable(db, companyId, ids.pending)).toBe(false);
     expect(await isHandoffTargetAssignable(db, companyId, ids.foreign)).toBe(false);
     expect(await isHandoffTargetAssignable(db, companyId, randomUUID())).toBe(false);
+    expect(await isHandoffTargetAssignable(db, companyId, "not-a-uuid")).toBe(false);
+  });
+
+  it("propagates a database failure instead of reading it as an unavailable target", async () => {
+    const { companyId, ids } = await seed();
+    const failing = {
+      select: () => {
+        throw new Error("synthetic_db_connection_failure");
+      },
+    } as never;
+    await expect(isHandoffTargetAssignable(failing, companyId, ids.active)).rejects.toThrow("synthetic_db_connection_failure");
+    await expect(decideCommentHandoff(failing, {
+      companyId,
+      issue: issueState({ companyId, assigneeAgentId: null }),
+      actor: board,
+      candidate: { targetAgentId: ids.active },
+      explicitMutation: false,
+      canAssign: async () => true,
+    })).rejects.toThrow("synthetic_db_connection_failure");
   });
 
   it("reports no gates on a clean issue", async () => {
@@ -368,6 +391,82 @@ describeEmbeddedPostgres("comment handoff gate reads", () => {
     await db.insert(issueThreadInteractions).values({ companyId, issueId: issue.id, kind: "request_confirmation", payload: {} as never });
     const gates = await readCommentHandoffGates(db, { companyId: otherCompanyId, issueId: issue.id, executionState: null });
     expect(gates.pendingConfirmation).toBe(false);
+  });
+
+  async function seedQueuedResponse(input: {
+    companyId: string;
+    issueId: string;
+    agentId: string;
+    wakeStatus: string;
+    interactionStatus?: "accepted" | "answered" | "rejected" | "pending";
+    wakeCompanyId?: string;
+  }) {
+    const [interaction] = await db.insert(issueThreadInteractions).values({
+      companyId: input.companyId,
+      issueId: input.issueId,
+      kind: "ask_user_questions",
+      status: input.interactionStatus ?? "answered",
+      payload: {} as never,
+    }).returning();
+    await db.insert(agentWakeupRequests).values({
+      companyId: input.wakeCompanyId ?? input.companyId,
+      agentId: input.agentId,
+      source: "automation",
+      reason: "issue_interaction_response",
+      status: input.wakeStatus,
+      payload: {
+        issueId: input.issueId,
+        mutation: "interaction",
+        interactionId: interaction!.id,
+        interactionStatus: input.interactionStatus ?? "answered",
+      },
+    });
+    return interaction!;
+  }
+
+  it.each(["queued", "deferred_issue_execution"])(
+    "sees a resolved card whose response wake is %s",
+    async (wakeStatus) => {
+      const { companyId, ids, issue } = await seed();
+      await seedQueuedResponse({ companyId, issueId: issue.id, agentId: ids.active, wakeStatus });
+      const gates = await readCommentHandoffGates(db, { companyId, issueId: issue.id, executionState: null });
+      expect(gates).toEqual({ ...noGates, queuedInteractionResponse: true });
+    },
+  );
+
+  it("refuses a handoff away from the owner while its answered card's response is queued", async () => {
+    const { companyId, ids, issue } = await seed();
+    const [owner2] = await db.insert(agents).values({
+      companyId, name: "Target", role: "engineer", status: "idle", adapterType: "codex_local",
+    }).returning();
+    await seedQueuedResponse({ companyId, issueId: issue.id, agentId: ids.active, wakeStatus: "deferred_issue_execution" });
+    const decision = await decideCommentHandoff(db, {
+      companyId,
+      issue: issueState({ issueId: issue.id, companyId, assigneeAgentId: ids.active }),
+      actor: board,
+      candidate: { targetAgentId: owner2!.id },
+      explicitMutation: false,
+      canAssign: async () => true,
+    });
+    expect(decision).toEqual({ outcome: "context_only", reasonCode: "interaction_pending", targetAgentId: owner2!.id });
+  });
+
+  it("ignores consumed responses and another company's response wakes", async () => {
+    const { companyId, otherCompanyId, ids, issue } = await seed();
+    // Consumed: the run already claimed the response wake.
+    await seedQueuedResponse({ companyId, issueId: issue.id, agentId: ids.active, wakeStatus: "claimed" });
+    // Foreign: a queued wake filed under the other company for this issue's card.
+    await seedQueuedResponse({
+      companyId,
+      issueId: issue.id,
+      agentId: ids.foreign,
+      wakeStatus: "queued",
+      wakeCompanyId: otherCompanyId,
+    });
+    for (const readCompanyId of [companyId, otherCompanyId]) {
+      expect((await readCommentHandoffGates(db, { companyId: readCompanyId, issueId: issue.id, executionState: null }))
+        .queuedInteractionResponse).toBe(false);
+    }
   });
 
   it("sees a linked pending approval but not a decided one", async () => {

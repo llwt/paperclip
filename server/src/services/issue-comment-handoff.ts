@@ -1,5 +1,6 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import {
+  agentWakeupRequests,
   approvals,
   issueApprovals,
   issueRecoveryActions,
@@ -15,6 +16,7 @@ import {
   type IssueStatus,
   type LeadingAgentMention,
 } from "@paperclipai/shared";
+import { HttpError } from "../errors.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { executionBlockerPredicate } from "./execution-blocker.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
@@ -69,6 +71,8 @@ export type HandoffGateFacts = {
   pendingConfirmation: boolean;
   /** Any other pending thread interaction (questions, suggested tasks, verdicts, connection intents). */
   pendingInteraction: boolean;
+  /** A resolved card whose response continuation is still queued or deferred for any agent. */
+  queuedInteractionResponse: boolean;
   pendingApproval: boolean;
   recoveryHold: boolean;
   pauseHold: boolean;
@@ -81,6 +85,9 @@ export type CommentHandoffDeps = {
 
 const CONFIRMATION_INTERACTION_KINDS = new Set(["request_confirmation", "request_checkbox_confirmation"]);
 const HANDOFF_STATUSES = new Set<string>(ISSUE_COMMENT_HANDOFF_STATUSES);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** `assertAssignableAgent` policy denials: unknown (404), ineligible (409), foreign (422). */
+const ASSIGNABILITY_DENIAL_STATUSES = new Set([404, 409, 422]);
 
 export function toHandoffCandidate(mention: LeadingAgentMention): HandoffCandidate {
   if (mention.kind === "target") return { targetAgentId: mention.agentId };
@@ -94,12 +101,15 @@ export function issueLifecycleOwner(issue: { originKind: string | null }): strin
 }
 
 export async function isHandoffTargetAssignable(tx: Tx, companyId: string, agentId: string): Promise<boolean> {
+  if (!UUID_RE.test(agentId)) return false;
   try {
     await assertAssignableAgent(tx as Db, companyId, agentId);
     return true;
-  } catch {
+  } catch (error) {
     // Unknown, foreign, terminated and pending-approval targets all read the same.
-    return false;
+    // Anything else (database, network) is an infrastructure failure and propagates.
+    if (error instanceof HttpError && ASSIGNABILITY_DENIAL_STATUSES.has(error.status)) return false;
+    throw error;
   }
 }
 
@@ -123,6 +133,26 @@ export async function readCommentHandoffGates(
     ));
   const pendingConfirmation = interactions.some((row) => CONFIRMATION_INTERACTION_KINDS.has(row.kind));
   const pendingInteraction = interactions.some((row) => !CONFIRMATION_INTERACTION_KINDS.has(row.kind));
+
+  // A card leaves "pending" before its response continuation runs. Same join as
+  // `hasQueuedInteractionResponse`, but for any agent (the current owner included)
+  // and on the caller's transaction.
+  const [queuedResponse] = await tx
+    .select({ id: agentWakeupRequests.id })
+    .from(agentWakeupRequests)
+    .innerJoin(issueThreadInteractions, and(
+      eq(issueThreadInteractions.companyId, agentWakeupRequests.companyId),
+      sql`${issueThreadInteractions.id}::text = ${agentWakeupRequests.payload}->>'interactionId'`,
+      eq(issueThreadInteractions.issueId, issueId),
+      inArray(issueThreadInteractions.status, ["accepted", "answered", "rejected"]),
+    ))
+    .where(and(
+      eq(agentWakeupRequests.companyId, companyId),
+      inArray(agentWakeupRequests.status, ["deferred_issue_execution", "queued"]),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+      sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,
+    ))
+    .limit(1);
 
   const [approval] = await tx
     .select({ id: approvals.id })
@@ -151,6 +181,7 @@ export async function readCommentHandoffGates(
     pendingStage,
     pendingConfirmation,
     pendingInteraction,
+    queuedInteractionResponse: Boolean(queuedResponse),
     pendingApproval: Boolean(approval),
     recoveryHold: Boolean(recovery),
     pauseHold: Boolean(pauseHold),
@@ -217,7 +248,9 @@ export async function decideCommentHandoff(
   if (gates.pauseHold || gates.recoveryHold) return refuse("lifecycle_owned");
   if (gates.pendingStage) return refuse("review_pending");
   if (gates.pendingConfirmation) return refuse("confirmation_pending");
-  if (gates.pendingInteraction || gates.pendingApproval) return refuse("interaction_pending");
+  if (gates.pendingInteraction || gates.queuedInteractionResponse || gates.pendingApproval) {
+    return refuse("interaction_pending");
+  }
 
   if (!(await input.canAssign(targetAgentId))) return refuse("assignment_not_allowed");
 
