@@ -49,6 +49,11 @@ describe("decidePreDrain", () => {
       expected: { kind: "released" },
     },
     {
+      name: "released: an unacknowledged reassignment stop promotes nothing for the old owner",
+      facts: { ...basePreDrainFacts, reassignmentStop: true },
+      expected: { kind: "released" },
+    },
+    {
       name: "blocked: a workspace-validation failure on an eligible todo issue",
       facts: { ...basePreDrainFacts, isWorkspaceValidationFailedRun: true, issueStatus: "todo" },
       expected: { kind: "blocked", noticeKind: "workspace_validation" },

@@ -254,6 +254,11 @@ import {
 } from "../attachment-types.js";
 import { retainBacklogHumanAssignment } from "../services/human-directed-work.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
+import {
+  buildAssignmentWakeup,
+  stopIssueExecutionForOwnershipChange,
+  type AssignmentExpectation,
+} from "../services/issue-assignment.js";
 import { shouldWakeAssigneeForIssueComment } from "../services/issue-comment-wakeup.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { notifySecretProposalResolution } from "../services/secret-proposal-notifications.js";
@@ -13463,35 +13468,26 @@ export function issueRoutes(
       // Only this request may finish a mutation that intentionally stops its
       // own run (for example handing work to a signoff reviewer).
       const issueMutationStopId = randomUUID();
-      if (assigneeWillChange && existing.assigneeAgentId) {
-        await stopRunnerGoalForOwnershipChange({
-          companyId: existing.companyId,
-          issueId: existing.id,
-          agentId: existing.assigneeAgentId,
-        });
-        const runToStopForReassignment = await resolveActiveIssueRun(existing);
-        if (runToStopForReassignment) {
-          const cancelled = await heartbeat.cancelRun(
-            runToStopForReassignment.id,
-            "Cancelled before issue reassignment",
-            {
-              errorCode: "issue_reassigned",
-              resultJson: { reassignmentStopConfirmed: true, issueMutationStopId },
-              eventMessage: "run cancelled before issue reassignment",
-              eventPayload: { issueId: existing.id },
-            },
-          );
-          if (!cancelled || cancelled.status !== "cancelled") {
-            throw conflict(
-              "The active agent run could not be stopped before reassignment",
-              {
-                code: "runner_goal_reassignment_stop_unconfirmed",
-                runId: runToStopForReassignment.id,
-              },
-            );
-          }
-          interruptedRunId = cancelled.id;
-        }
+      const assignmentExpectation: AssignmentExpectation = {
+        issueId: existing.id,
+        companyId: existing.companyId,
+        assigneeAgentId: existing.assigneeAgentId,
+        assigneeUserId: existing.assigneeUserId,
+        status: existing.status,
+        statusVersion: existing.statusVersion,
+        executionRunId: existing.executionRunId,
+      };
+      if (assigneeWillChange) {
+        const stopReceipt = await stopIssueExecutionForOwnershipChange(
+          {
+            db,
+            heartbeat,
+            stopRunnerGoal: stopRunnerGoalForOwnershipChange,
+            resolveActiveRun: () => resolveActiveIssueRun(existing),
+          },
+          { expectation: assignmentExpectation, issueMutationStopId, interruptedRunId },
+        );
+        if (stopReceipt.kind === "stopped") interruptedRunId = stopReceipt.interruptedRunId;
       }
 
       const terminalizingIssue =
@@ -14639,37 +14635,18 @@ export function issueRoutes(
           !isClosedIssueStatus(issue.status) &&
           deferWakeForGoal !== true
         ) {
-          addWakeup(issue.assigneeAgentId, {
-            source: "assignment",
-            triggerDetail: "system",
-            reason: "issue_assigned",
-            payload: {
-              issueId: issue.id,
-              ...(comment ? { commentId: comment.id } : {}),
-              mutation: "update",
-              ...(resumeRequested === true
-                ? { resumeIntent: true, followUpRequested: true }
-                : {}),
-              ...(interruptedRunId ? { interruptedRunId } : {}),
-            },
-            requestedByActorType: actor.actorType,
-            requestedByActorId: actor.actorId,
-            contextSnapshot: {
-              issueId: issue.id,
-              ...(comment
-                ? {
-                    taskId: issue.id,
-                    commentId: comment.id,
-                    wakeCommentId: comment.id,
-                  }
-                : {}),
-              source: "issue.update",
-              ...(resumeRequested === true
-                ? { resumeIntent: true, followUpRequested: true }
-                : {}),
-              ...(interruptedRunId ? { interruptedRunId } : {}),
-            },
+          // Guarded by the committed owner and version: a later
+          // reassignment makes this wake stale before it can queue a run.
+          const assignmentWakeup = buildAssignmentWakeup({
+            issue,
+            commentId: comment?.id ?? null,
+            interruptedRunId,
+            actor,
+            resumeRequested: resumeRequested === true,
           });
+          if (assignmentWakeup) {
+            addWakeup(assignmentWakeup.agentId, assignmentWakeup.wakeup);
+          }
         }
 
         if (

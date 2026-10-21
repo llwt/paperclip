@@ -2742,6 +2742,7 @@ describe("issue comment reopen routes", () => {
       companyId: "company-1",
       agentId: "22222222-2222-4222-8222-222222222222",
       status: "cancelled",
+      resultJson: { executionCancellation: { state: "acknowledged" } },
     });
 
     const res = await request(await installActor(createApp()))

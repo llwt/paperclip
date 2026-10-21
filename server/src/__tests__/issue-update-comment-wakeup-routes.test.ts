@@ -220,8 +220,15 @@ async function createApp(transaction: (callback: (tx: Record<string, never>) => 
     };
     next();
   });
+  // Stop verification reads environment leases; none exist in these tests.
+  const emptyRows = (): any => ({
+    from: emptyRows, where: emptyRows, for: emptyRows,
+    then: (resolve: (rows: unknown[]) => unknown, reject?: (reason: unknown) => unknown) =>
+      Promise.resolve([]).then(resolve, reject),
+  });
   app.use("/api", issueRoutes({
     transaction,
+    select: emptyRows,
   } as any, {} as any));
   app.use(errorHandler);
   return app;
@@ -447,6 +454,7 @@ describe("issue update comment wakeups", () => {
       companyId: existing.companyId,
       agentId: PREVIOUS_AGENT_ID,
       status: "cancelled",
+      resultJson: { executionCancellation: { state: "acknowledged" } },
     });
 
     const res = await request(await createApp())
@@ -533,6 +541,7 @@ describe("issue update comment wakeups", () => {
       companyId: existing.companyId,
       agentId: PREVIOUS_AGENT_ID,
       status: "cancelled",
+      resultJson: { executionCancellation: { state: "acknowledged" } },
     });
 
     const res = await request(await createApp())

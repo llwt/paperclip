@@ -18,6 +18,7 @@ export interface IssueAssignmentWakeupDeps {
       requestedByActorId?: string | null;
       contextSnapshot?: Record<string, unknown>;
       durableChatRequest?: DurableChatWakeupRequest;
+      issueStateGuard?: { statuses: string[]; assigneeAgentId: string; statusVersion?: number };
     },
   ) => Promise<unknown>;
 }
@@ -39,6 +40,9 @@ export function queueIssueAssignmentWakeup(input: {
   attachmentOmissionReasons?: Record<string, number> | null;
   rethrowOnError?: boolean;
   durableChatRequest?: DurableChatWakeupRequest;
+  /** Binds the wake to the committed owner and version (see issue-assignment.ts). */
+  issueStateGuard?: { statuses: string[]; assigneeAgentId: string; statusVersion?: number };
+  idempotencyKey?: string | null;
 }) {
   if (!input.issue.assigneeAgentId || input.issue.status === "backlog") return;
 
@@ -55,6 +59,8 @@ export function queueIssueAssignmentWakeup(input: {
       },
       requestedByActorType: input.requestedByActorType,
       requestedByActorId: input.requestedByActorId ?? null,
+      ...(input.issueStateGuard ? { issueStateGuard: input.issueStateGuard } : {}),
+      ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
       ...(input.durableChatRequest
         ? { durableChatRequest: input.durableChatRequest }
         : {}),

@@ -42,6 +42,10 @@ function fakeWriter(overrides: Partial<RunDispatchWriter> = {}): RunDispatchWrit
       cancelCalls.push(input);
       return { outcome: "not_stale" };
     },
+    async cancelStaleQueuedRunUnderIssueLock(_tx, input) {
+      cancelCalls.push(input);
+      return { outcome: "not_stale" };
+    },
     async dispatchResolvedInteractionIfCurrent(input) {
       dispatchCalls.push(input);
       return { dispatched: true, resultPromise: input.dispatch(() => {}) };

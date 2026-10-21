@@ -1,3 +1,4 @@
+import type { Db } from "@paperclipai/db";
 import type { GateDecision } from "../domain/policy.js";
 import type {
   CancelStaleQueuedRunOutcome,
@@ -53,6 +54,15 @@ export type DispatchResolvedInteractionOutcome<T> =
 export interface RunDispatchWriter {
   promoteOrCancelDueRetry(input: PromoteOrCancelDueRetryInput): Promise<PromoteScheduledRetryOutcome>;
   cancelStaleQueuedRun(input: CancelStaleQueuedRunInput): Promise<CancelStaleQueuedRunOutcome>;
+  /**
+   * The one operation that runs on a caller's transaction: the queued-run
+   * claim already holds the issue lock, and the owner check must run under
+   * that same lock or a reassignment can land between check and claim.
+   */
+  cancelStaleQueuedRunUnderIssueLock(
+    tx: Db,
+    input: Omit<CancelStaleQueuedRunInput, "expectedStatus">,
+  ): Promise<CancelStaleQueuedRunOutcome>;
   dispatchResolvedInteractionIfCurrent<T>(
     input: DispatchResolvedInteractionInput<T>,
   ): Promise<DispatchResolvedInteractionOutcome<T>>;

@@ -1006,6 +1006,24 @@ export function createPostgresRunDispatchAdapter(
     );
   }
 
+  async function cancelStaleQueuedRunUnderIssueLock(
+    tx: Db,
+    input: Omit<CancelStaleQueuedRunInput, "expectedStatus">,
+  ): Promise<CancelStaleQueuedRunOutcome> {
+    // The caller holds the issue lock; take the run lock second, as
+    // withIssueThenRunLocks does.
+    const run = await tx
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)))
+      .for("update")
+      .then((rows) => rows[0] ?? null);
+    if (!run || run.status !== "queued") return { outcome: "lost_race" };
+    const { issueId, decision } = await decideCurrentRunStaleness(tx, run, input.now);
+    if (!decision.stale || !issueId) return { outcome: "not_stale" };
+    return cancelStaleRunInTx(tx, run, issueId, decision, "queued", input.now);
+  }
+
   async function dispatchResolvedInteractionIfCurrent<T>(
     input: DispatchResolvedInteractionInput<T>,
   ): Promise<DispatchResolvedInteractionOutcome<T>> {
@@ -1081,6 +1099,7 @@ export function createPostgresRunDispatchAdapter(
     evaluateScheduledRetryGate,
     listDueRetries,
     cancelStaleQueuedRun,
+    cancelStaleQueuedRunUnderIssueLock,
     dispatchResolvedInteractionIfCurrent,
     promoteOrCancelDueRetry,
   };

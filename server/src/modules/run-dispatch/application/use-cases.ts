@@ -57,6 +57,13 @@ export function createCancelStaleQueuedRun(deps: { writer: RunDispatchWriter }) 
   }) => deps.writer.cancelStaleQueuedRun({ ...input, now: input.now ?? new Date() });
 }
 
+export function createCancelStaleQueuedRunUnderIssueLock(deps: { writer: RunDispatchWriter }) {
+  return (
+    tx: Parameters<RunDispatchWriter["cancelStaleQueuedRunUnderIssueLock"]>[0],
+    input: { runId: string; companyId: string; now?: Date },
+  ) => deps.writer.cancelStaleQueuedRunUnderIssueLock(tx, { ...input, now: input.now ?? new Date() });
+}
+
 export function createDispatchResolvedInteractionIfCurrent(deps: { writer: RunDispatchWriter }) {
   return <T>(input: {
     runId: string;

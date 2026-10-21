@@ -74,6 +74,12 @@ export type PreDrainFacts = {
   legacyExecutionNeedsReconciliation: boolean;
   /** True when the finishing run is cancelled and its stored result carries an acknowledged execution cancellation. */
   executionCancellationAcknowledged: boolean;
+  /**
+   * True when the finishing run was cancelled to change the issue owner. The
+   * old owner is still assigned until that change commits, so nothing may be
+   * promoted for it now, acknowledged or not.
+   */
+  reassignmentStop?: boolean;
 };
 
 export type PreDrainDecision =
@@ -113,6 +119,10 @@ export function decidePreDrain(facts: PreDrainFacts): PreDrainDecision {
   }
 
   if (facts.executionCancellationAcknowledged) {
+    return { kind: "released" };
+  }
+
+  if (facts.reassignmentStop) {
     return { kind: "released" };
   }
 

@@ -17707,6 +17707,13 @@ export function heartbeatService(
         responsibleUserId: null,
       },
     });
+    // Set inside the claim transaction; its effects apply only after commit.
+    const claimSeam: {
+      cancellation: Extract<
+        Awaited<ReturnType<typeof runDispatch.cancelStaleQueuedRunUnderIssueLock>>,
+        { outcome: "cancelled" }
+      > | null;
+    } = { cancellation: null };
     // All ordinary and comment claims use the same company-scoped issue
     // lock. A batch may claim several runs before executeRun tracks any owner.
     async function lockIssueExecutionClaim(tx: Db) {
@@ -17719,6 +17726,20 @@ export function heartbeatService(
       )).for("update") : [];
       const ownsIssue = owner?.assigneeAgentId === run.agentId &&
         context.wakeReason !== "source_scoped_recovery_action";
+      if (owner && !ownsIssue) {
+        // The staleness pass above committed before this lock. Repeat it under
+        // the claim's issue lock so a reassignment in between cannot start
+        // the old owner's run. Non-owner runs the policy allows still claim.
+        const staleAtClaim = await runDispatch.cancelStaleQueuedRunUnderIssueLock(tx, {
+          runId: run.id,
+          companyId: run.companyId,
+          now: claimedAt,
+        });
+        if (staleAtClaim.outcome === "cancelled") {
+          claimSeam.cancellation = staleAtClaim;
+          return { ownsIssue, blocked: true };
+        }
+      }
       if (ownsIssue && ["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? "") &&
           owner.checkoutRunId && owner.checkoutRunId !== run.id) {
         return { ownsIssue, blocked: true };
@@ -18127,7 +18148,16 @@ export function heartbeatService(
             return claimedRun;
           });
         });
-    if (!claimed) return null;
+    if (!claimed) {
+      if (claimSeam.cancellation) {
+        applyRunDispatchPostCommitEffects(claimSeam.cancellation.postCommitEffects);
+        logger.info(
+          { runId: run.id, issueId, errorCode: claimSeam.cancellation.errorCode },
+          "claimQueuedRun: cancelled stale queued run at claim",
+        );
+      }
+      return null;
+    }
 
     publishLiveEvent({
       companyId: claimed.companyId,

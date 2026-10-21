@@ -1113,6 +1113,10 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
             (run.status === "cancelled" &&
             (parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
             !interruptedQueue),
+          reassignmentStop:
+            run.status === "cancelled" &&
+            run.errorCode === "issue_reassigned" &&
+            run.resultJson?.reassignmentStopConfirmed === true,
         };
         const preDrain = decidePreDrain(preDrainFacts);
 

@@ -2,6 +2,7 @@ import type { Db } from "@paperclipai/db";
 import { createPostgresRunDispatchAdapter } from "./adapters/postgres.js";
 import {
   createCancelStaleQueuedRun,
+  createCancelStaleQueuedRunUnderIssueLock,
   createDispatchResolvedInteractionIfCurrent,
   createEvaluateScheduledRetryGate,
   createPromoteDueScheduledRetries,
@@ -71,6 +72,9 @@ export function createRunDispatch(db: Db, deps: RunDispatchDeps = {}) {
       promoteScheduledRetry,
     }),
     cancelStaleQueuedRun: createCancelStaleQueuedRun({
+      writer: adapter,
+    }),
+    cancelStaleQueuedRunUnderIssueLock: createCancelStaleQueuedRunUnderIssueLock({
       writer: adapter,
     }),
     dispatchResolvedInteractionIfCurrent: createDispatchResolvedInteractionIfCurrent({
