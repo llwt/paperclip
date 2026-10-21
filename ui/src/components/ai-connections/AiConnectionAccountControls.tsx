@@ -5,6 +5,7 @@ import { RevokeGrantDialog } from "@/pages/apps/app-detail/IdentitiesSection";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { AiConnectionSummary } from "./model";
+import { AiConnectionCheckAgain } from "./AiConnectionRepair";
 
 /** AI-only account controls; identity, access and navigation belong to AppDetail. */
 export function AiConnectionAccountControls({
@@ -44,9 +45,11 @@ export function AiConnectionAccountControls({
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="min-w-0 text-sm">
           <p className="break-words text-xs text-muted-foreground">{account.method === "subscription" ? "Subscription" : "API key"}{account.accountLabel ? ` · ${account.accountLabel}` : ""}</p>
+          {account.status === "needs_attention" && account.healthMessage && <p className="break-words text-xs text-destructive">{account.healthMessage}</p>}
         </div>
         {!readOnly && grant.capabilities?.canRevoke && (
           <div className="flex flex-wrap items-center gap-2">
+            {account.status === "needs_attention" && <AiConnectionCheckAgain account={account} />}
             {<Button variant="outline" size="sm" onClick={onReconnect}><RefreshCw className="size-4" aria-hidden />Reconnect</Button>}
             {account.status !== "revoked" && <Button variant="ghost" size="sm" className="text-destructive" onClick={() => setRevoking(true)}><Unplug className="size-4" aria-hidden />Revoke identity</Button>}
           </div>
