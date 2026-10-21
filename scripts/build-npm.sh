@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-echo "SX-1495 throwaway break: build-npm.sh fails on purpose" >&2; exit 1
 set -euo pipefail
 
 # build-npm.sh — Build the paperclipai CLI package for npm publishing.
