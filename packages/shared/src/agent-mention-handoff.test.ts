@@ -5,6 +5,12 @@ import {
   parseLeadingAgentMention,
 } from "./agent-mention-handoff.js";
 import { buildAgentMentionHref, buildUserMentionHref } from "./project-mentions.js";
+import {
+  addIssueCommentSchema,
+  issueCommentHandoffReceiptSchema,
+  issueCommentMetadataSchema,
+  issueCommentRequestMetadataSchema,
+} from "./validators/issue.js";
 
 const A = "11111111-1111-4111-8111-111111111111";
 const B = "22222222-2222-4222-8222-222222222222";
@@ -192,5 +198,54 @@ describe("describeIssueCommentHandoffReason", () => {
     for (const code of ISSUE_COMMENT_HANDOFF_REASON_CODES) {
       expect(describeIssueCommentHandoffReason(code).length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("metadata.handoff receipt", () => {
+  const RUN = "33333333-3333-4333-8333-333333333333";
+  const sections = [{ title: "Handoff", rows: [{ type: "text", text: "Comment saved." }] }];
+  const assigned = { version: 1, outcome: "assigned", targetAgentId: A, statusVersion: 4, interruptedRunId: RUN } as const;
+  const refused = { version: 1, outcome: "context_only", reasonCode: "confirmation_pending", targetAgentId: A } as const;
+
+  it.each([
+    ["assigned", assigned],
+    ["assigned without a stopped run", { version: 1, outcome: "assigned", targetAgentId: A, statusVersion: 0 }],
+    ["context only", refused],
+    ["context only without a target", { version: 1, outcome: "context_only", reasonCode: "target_unavailable" }],
+    ["unchanged", { version: 1, outcome: "unchanged", targetAgentId: A }],
+  ])("accepts a consistent %s receipt", (_name, receipt) => {
+    expect(issueCommentHandoffReceiptSchema.safeParse(receipt).success).toBe(true);
+  });
+
+  it.each([
+    ["assigned with a reason", { ...assigned, reasonCode: "state_changed" }],
+    ["assigned without a version", { version: 1, outcome: "assigned", targetAgentId: A }],
+    ["assigned without a target", { version: 1, outcome: "assigned", statusVersion: 1 }],
+    ["context only without a reason", { version: 1, outcome: "context_only" }],
+    ["context only with a version", { ...refused, statusVersion: 2 }],
+    ["context only with a stopped run", { ...refused, interruptedRunId: RUN }],
+    ["unchanged with a reason", { version: 1, outcome: "unchanged", reasonCode: "ambiguous_prefix" }],
+    ["unknown reason", { ...refused, reasonCode: "because" }],
+    ["unknown field", { ...assigned, grantedBy: "board" }],
+    ["non-UUID target", { ...refused, targetAgentId: "qa" }],
+  ])("rejects %s", (_name, receipt) => {
+    expect(issueCommentHandoffReceiptSchema.safeParse(receipt).success).toBe(false);
+  });
+
+  it("stored metadata keeps a server-authored receipt", () => {
+    const parsed = issueCommentMetadataSchema.parse({ version: 1, handoff: assigned, sections });
+    expect(parsed.handoff).toEqual(assigned);
+  });
+
+  it("request metadata rejects a caller-supplied receipt", () => {
+    expect(issueCommentRequestMetadataSchema.safeParse({ version: 1, sections }).success).toBe(true);
+    expect(issueCommentRequestMetadataSchema.safeParse({ version: 1, handoff: assigned, sections }).success).toBe(false);
+  });
+
+  it("POST comment bodies cannot carry a receipt", () => {
+    const body = { body: `${mA} take this`, metadata: { version: 1, handoff: assigned, sections } };
+    const result = addIssueCommentSchema.safeParse(body);
+    expect(result.success).toBe(false);
+    expect(addIssueCommentSchema.safeParse({ ...body, metadata: { version: 1, sections } }).success).toBe(true);
   });
 });
