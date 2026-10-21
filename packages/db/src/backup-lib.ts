@@ -1,4 +1,4 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
@@ -70,6 +70,32 @@ const DEFAULT_BACKUP_WRITE_BUFFER_BYTES = 1024 * 1024;
 const BACKUP_DATA_CURSOR_ROWS = 100;
 const BACKUP_CLI_STDERR_BYTES = 64 * 1024;
 const BACKUP_BREAKPOINT_DETECT_BYTES = 64 * 1024;
+export const BACKUP_TEMP_SUFFIX = ".partial";
+
+// Differs from upstream: interrupted dumps must never look like finished backups.
+export function removeIncompleteBackupFiles(backupDir: string, filenamePrefix: string): string[] {
+  let entries;
+  try {
+    entries = readdirSync(backupDir, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+
+  const removed: string[] = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.startsWith(`${filenamePrefix}-`) || !entry.name.endsWith(BACKUP_TEMP_SUFFIX)) {
+      continue;
+    }
+    try {
+      unlinkSync(resolve(backupDir, entry.name));
+      removed.push(entry.name);
+    } catch {
+      // One inaccessible file must not prevent cleanup of the others.
+    }
+  }
+  return removed;
+}
 
 const STATEMENT_BREAKPOINT = "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900";
 
@@ -346,10 +372,14 @@ async function runPgDumpBackup(opts: {
     throw new Error("pg_dump did not expose stdout");
   }
 
-  await Promise.all([
+  // Wait for both before cleanup or fallback can reuse the temporary path.
+  const results = await Promise.allSettled([
     pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile)),
     waitForChildExit(child, pgDumpBin),
   ]);
+  for (const result of results) {
+    if (result.status === "rejected") throw result.reason;
+  }
 }
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
@@ -541,8 +571,11 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     await sql.end();
   };
   mkdirSync(opts.backupDir, { recursive: true });
-  const sqlFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
-  const backupFile = `${sqlFile}.gz`;
+  const backupBase = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
+  const backupFile = `${backupBase}.gz`;
+  // Differs from upstream: publish only a completed gzip by atomic rename.
+  const sqlFile = `${backupBase}${BACKUP_TEMP_SUFFIX}`;
+  const partialBackupFile = `${backupFile}${BACKUP_TEMP_SUFFIX}`;
   const writer = createBufferedTextFileWriter(sqlFile);
 
   try {
@@ -552,20 +585,12 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         await closeSql();
         await runPgDumpBackup({
           connectionString: opts.connectionString,
-          backupFile,
+          backupFile: partialBackupFile,
           connectTimeout,
         });
-        await writer.abort();
-        const sizeBytes = statSync(backupFile).size;
-        const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
-        return {
-          backupFile,
-          sizeBytes,
-          prunedCount,
-        };
       } catch (error) {
-        if (existsSync(backupFile)) {
-          try { unlinkSync(backupFile); } catch { /* ignore */ }
+        if (existsSync(partialBackupFile)) {
+          unlinkSync(partialBackupFile);
         }
         if (backupEngine === "pg_dump") {
           throw error;
@@ -573,6 +598,17 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         effectiveBackupEngine = "javascript";
         sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
         sqlClosed = false;
+      }
+      if (effectiveBackupEngine !== "javascript") {
+        await writer.abort();
+        renameSync(partialBackupFile, backupFile);
+        const sizeBytes = statSync(backupFile).size;
+        const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
+        return {
+          backupFile,
+          sizeBytes,
+          prunedCount,
+        };
       }
     }
 
@@ -1022,10 +1058,11 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     // Compress the SQL file with gzip
     const sqlReadStream = createReadStream(sqlFile);
-    const gzWriteStream = createWriteStream(backupFile);
+    const gzWriteStream = createWriteStream(partialBackupFile);
     await pipeline(sqlReadStream, createGzip(), gzWriteStream);
     unlinkSync(sqlFile);
 
+    renameSync(partialBackupFile, backupFile);
     const sizeBytes = statSync(backupFile).size;
     const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
 
@@ -1036,8 +1073,8 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     };
   } catch (error) {
     await writer.abort();
-    if (existsSync(backupFile)) {
-      try { unlinkSync(backupFile); } catch { /* ignore */ }
+    if (existsSync(partialBackupFile)) {
+      try { unlinkSync(partialBackupFile); } catch { /* ignore */ }
     }
     if (existsSync(sqlFile)) {
       try { unlinkSync(sqlFile); } catch { /* ignore */ }
