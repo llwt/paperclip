@@ -1,16 +1,16 @@
 # llwt/paperclip fork
 
-This fork exists only to run a few fixes on the Nrwl instance before upstream
-(`paperclipai/paperclip`) ships them. It is temporary. The target is an empty
-inventory below, at which point the instance returns to plain upstream releases
-and this fork is retired.
+This fork carries the fixes the Nrwl instance needs. Fork fixes are not
+submitted upstream (`paperclipai/paperclip`), per Steven's decision on NX-658
+(2026-10-17). An inventory row drops out only when an upstream release ships
+an equivalent fix on its own, or when Steven drops the patch.
 
-- Mainline: `nrwl-main`. Installs pin a full commit SHA on it. The branch is
+- Mainline: `somnex-main`. Installs pin a full commit SHA on it. The branch is
   protected: GitHub accepts a change only through a pull request with a green
-  `nrwl-ci` and rejects every direct push (see "CI gate").
+  `somnex-ci` and rejects every direct push (see "CI gate").
 - `master` is a pure mirror of upstream `master`. Never commit to it.
-- Fork-only files: this file, `.github/workflows/nrwl-ci.yml`,
-  `scripts/nrwl-ci-server-other.mjs` and the files named under "Localhost
+- Fork-only files: this file, `.github/workflows/somnex-ci.yml`,
+  `scripts/somnex-ci-server-other.mjs` and the files named under "Localhost
   sign-in". Everything else is upstream code plus the patches listed below.
 
 ## Inventory of fork-only commits
@@ -20,43 +20,45 @@ contains `v2026.1005.0`). The tag is upstream `master` at `22a3ea341` plus two
 release commits that are not on `master`. Last refreshed 2026-10-13 against
 upstream `master` `4b958ecbd`, which is 240 commits past that tag.
 `v2026.1012.0` was the latest stable tag on that day. The commits below are
-the ones on `nrwl-main` before the merge; what is left of each is the diff of
-`nrwl-main` against the tag.
+the ones on `somnex-main` before the merge; what is left of each is the diff of
+`somnex-main` against the tag.
 
 | Commit | What | Upstream status | Drops out when |
 | --- | --- | --- | --- |
-| `2593ef230` | CLI: pruning preserves and reports older install payloads with a live executable or working directory on Linux. Processes the installing user may not inspect (`EACCES`, `EPERM`) are skipped and not protected. Unsupported platforms and failed process checks retain payloads without failing the install | Not submitted | An upstream release guards payload pruning against live processes and failed inspection |
-| `d6ca4706f` | A future scheduled check covers an agent-owned `in_progress` or `in_review` blocker with no user assignee and marks its dependency path live. Checks that cannot fire, overdue, cleared, timed out, exhausted checks and checks owned by uninvokable agents keep the previous attention result | Not submitted | An upstream release carries the same scheduled-check blocker coverage |
-| `25fcf9633` | Gateway: configurable tool timeout, connection stays listed after a tool timeout | Not submitted. Port branch `gateway-tool-timeout-upstream` (`014ad6cb0`) is ready | The upstream PR from the port branch lands |
-| `669a157cb` | Gateway: approved execution budget stays fixed, timeout env values bounded | Not submitted. Same port branch | Same PR |
-| `0d78b3d67` | Gateway: summarize the stream when no message matches the `tools/call` request ID | The selection by request ID is upstream since `v2026.1001.0` and the fork's own copy was dropped in the `v2026.1005.0` merge. The stream summary is not upstream. As upstream does, a malformed `tools/call` response marks the connection errored | Same PR |
-| `ba2e6f933` | Gateway: known method labels only, skip non-JSON stream events | Not submitted. Same port branch | Same PR |
-| fork PR #24 | Gateway: an oversized tool response leaves connection health unchanged, so its other tools stay listed and callable. The 502 error includes the byte limit and asks the caller to narrow the request | Not submitted | An upstream release carries the same response-size health handling |
-| fork PR #27 | Tools: oversized discovery and session initialization preserve health status and diagnostics. Health probes advance only the check timestamp to retain the sweep interval. Size errors retain their reason and byte limit in caller errors and failure audits. Catalog refresh still fails and retains cached tools, or no catalog if discovery has never succeeded | Not submitted | An upstream release carries the same discovery and initialization size handling |
-| `0fc5dd88b` | UI: remount the composer takeover card per pending input (fork PR #1) | Open upstream as paperclipai/paperclip#15121, no review yet | #15121 lands and that release is merged |
-| `200a198f0` | Tools: offer sign-in when a custom MCP server answers 401 without `WWW-Authenticate` (fork PR #2) | Open upstream as paperclipai/paperclip#15450, from port branch `fix/mcp-401-sign-in-without-challenge` (`e0ffbf2f6`) | #15450 lands and that release is merged |
-| fork PR #12 | Tools: the `x-amzn-remapped-www-authenticate` hint is reduced to its metadata address, so endpoints and scopes it names directly are dropped (`metadataOnlyChallenge`) | Open upstream as part of paperclipai/paperclip#15450 (port branch commits `9f13a7dc8` and `e0ffbf2f6`) | #15450 lands and that release is merged |
-| fork PR #6 | UI: Enter on an empty last line of a quote block, and Backspace at its start, leave the quote in the editor (`ui/src/lib/quote-exit.ts`) | Not submitted. Port branch `fix/editor-leave-quote-block` (`eecb1eec6`) is ready | The upstream PR from that port branch lands and that release is merged |
-| fork PR #21 | UI: a quote typed with `> ` gets the paragraph shape of a quote loaded from markdown, so Enter on a line with text continues the quote and only Enter on an empty last line leaves it (`ui/src/lib/quote-exit.ts`) | Not submitted. The port branch `fix/editor-leave-quote-block` does not carry it yet | Same upstream PR as fork PR #6 |
-| fork PR #7 | CLI: `install --ref` builds `server/ui-dist`, copies `skills`, stages real workspace dependency versions, and works with `ignore-scripts=true` (see "Install") | Not submitted. Upstream `master` (`a1ab55a56`) has the same code. Upstream issue #15026 and open upstream PR #13928 cover the staging faults, not the `ignore-scripts` ones. Port branch `nx-509-git-install-upstream` is ready, local only on chungus | The upstream PR from that port branch lands and that release is merged |
-| fork PR #14 | Recovery: release the local environment lease of a terminal run once its process is gone (stale-lock sweep, cancel without a process handle, healing sweep at startup and on the recovery tick). Without it a run kept across a restart, or orphaned by a hard stop, blocks every later wake on its task | Not submitted. Upstream `master` has the same gap as of `v2026.1005.0`. Upstream PR text is prepared on NX-612 | The upstream PR lands and that release is merged |
-| fork PR #17 | Documents: same-company agents can upsert documents on another agent's idle issue; access decisions, the active run lock, recovery restrictions, revision checks and document locks still apply | Not submitted. Upstream `master` (`71cd0a262`) still lacks the open-write option as of 2026-10-08. Upstream PR text is prepared on NX-657 | The upstream fix lands and that release is merged |
-| fork PR #19 | Tools: one remote tool discovery (the handshake and every catalog page) has a total budget of 60 seconds and fails with `remote_http_response_timeout`. `readMcpHttpResponse` and `initializeMcpHttpSession` take an optional `signal`. Without it a server that keeps the `tools/list` stream alive and never answers holds a catalog refresh or a health check open until the 8 MiB limit | Prepared as the Greptile review fix for paperclipai/paperclip#15448: commit `2deb0c002` on fork branch `fix/mcp-gateway-tool-call-connection-health-review-1`, not on the upstream PR yet | #15448 lands with that commit and that release is merged |
-| NX-617 (this PR) | Tools: per-connection "Sign in through localhost" and "Scopes to request" for a pasted MCP URL (see "Localhost sign-in") | Not submitted. Upstream PR text is prepared on NX-617, no port branch yet | An upstream release carries an equivalent setting, or the Atlassian connection no longer needs a localhost callback |
-| NX-668 (this PR) | CLI tests: a setup guard blocks `systemctl`, `loginctl`, `journalctl` and `launchctl` in every CLI test and fails the test that reached them; the two `uninstallCommand` tests and the `doctor` test no longer look up the host service manager. Test-only, no runtime change | Not submitted. Upstream `master` (`9f4acc8f1`) has the same unguarded tests. Port branch `fix/cli-tests-never-reach-service-manager` is ready and the upstream PR text is prepared on NX-668 | The upstream PR from that port branch lands and that release is merged |
-| fork PR #29 | UI: show all nine Google Workspace catalog entries and saved accounts on the Connectors page for this instance's customer-owned OAuth app | Not submitted: upstream removes the filter itself after Google approval. No port branch or upstream PR because upstream already plans this removal, so rule 1 does not apply | The upstream release without the filter is merged |
-| NX-716 (this PR) | Interactions: a confirmation card whose source run ended without a `workspace_finalize` row can be accepted (`runWorkspaceIsFinalized` in `server/src/services/issues.ts`). Before, a card posted by a run that was then lost (`process_lost`) could never be accepted. A live run still blocks, and so does an ended native-runtime run whose finalization coordinator row has not reached `terminal_failure` (native recovery can still resume it) | Not submitted. Upstream `master` has the same gap. Upstream PR text is prepared on NX-716, no port branch yet | The upstream PR lands and that release is merged |
+| NX-834 (this PR) | Tools: opt-in `compact-v1` connection tool names for Claude runs. Pure helper `server/src/services/compact-connection-tool-names.ts`; narrow hooks in the named MCP route (`?toolNames=compact-v1`, unknown values rejected), `listToolsForNamedGateway` (alias projection), `findToolForSession` (alias resolution on the descriptors it already loads, after authentication) and `buildPaperclipRuntimeMcpServers` (label `p` and the versioned URL for `claude_local` agents with `runtimeConfig.connectionToolNames: "compact-v1"`), plus a Claude resume check (`packages/adapters/claude-local/src/server/tool-name-format.ts`) that starts a fresh session when the tool name format changes, because upstream now resumes across other MCP server changes. Stored names, policies, signatures and rate buckets keep the internal name. Kill switch `PAPERCLIP_COMPACT_CONNECTION_TOOL_NAMES_DISABLED=true`. Rollback: unset the agent opt-in (or set the kill switch), let compact sessions restart, then revert the binary | Local only (NX-658). Fork-specific implementation of the approved Nx plan. Related upstream: paperclipai/paperclip#15668 (open). | An upstream release provides equivalent presentation aliases without changing stored gateway identities, policy evaluation or signed approvals |
+| SX-1120 (this PR) | Database: index for the `paperclipIssue` branch of `valuesForIssue`, so comment lists do not scan all `heartbeat_runs` | On upstream `master` since `e9b6c4d44` (paperclipai/paperclip#16278), also open PR paperclipai/paperclip#12499; not in a stable tag yet. Nothing to submit: upstream already has the fix | The first upstream release merge that contains #16278. On that merge drop the fork's 0306 migration, its journal entry and snapshot, and take upstream's |
+| `2593ef230` | CLI: pruning preserves and reports older install payloads with a live executable or working directory on Linux. Processes the installing user may not inspect (`EACCES`, `EPERM`) are skipped and not protected. Unsupported platforms and failed process checks retain payloads without failing the install | Local only (NX-658) | An upstream release guards payload pruning against live processes and failed inspection |
+| `d6ca4706f` | A future scheduled check covers an agent-owned `in_progress` or `in_review` blocker with no user assignee and marks its dependency path live. Checks that cannot fire, overdue, cleared, timed out, exhausted checks and checks owned by uninvokable agents keep the previous attention result | Local only (NX-658) | An upstream release carries the same scheduled-check blocker coverage |
+| `25fcf9633` | Gateway: configurable tool timeout, connection stays listed after a tool timeout | Local only (NX-658). Port branch `gateway-tool-timeout-upstream` (`014ad6cb0`) is kept as a record, not to be submitted | An upstream release carries an equivalent fix |
+| `669a157cb` | Gateway: approved execution budget stays fixed, timeout env values bounded | Local only (NX-658). Port branch `gateway-tool-timeout-upstream` (`014ad6cb0`) is kept as a record, not to be submitted | An upstream release carries an equivalent fix |
+| `0d78b3d67` | Gateway: summarize the stream when no message matches the `tools/call` request ID | Local only (NX-658) for the stream summary. The selection by request ID is upstream since `v2026.1001.0` and the fork's own copy was dropped in the `v2026.1005.0` merge. The stream summary is not upstream. As upstream does, a malformed `tools/call` response marks the connection errored | An upstream release carries an equivalent fix |
+| `ba2e6f933` | Gateway: known method labels only, skip non-JSON stream events | Local only (NX-658). Port branch `gateway-tool-timeout-upstream` (`014ad6cb0`) is kept as a record, not to be submitted | An upstream release carries an equivalent fix |
+| fork PR #24 | Gateway: an oversized tool response leaves connection health unchanged, so its other tools stay listed and callable. The 502 error includes the byte limit and asks the caller to narrow the request | Local only (NX-658) | An upstream release carries the same response-size health handling |
+| fork PR #27 | Tools: oversized discovery and session initialization preserve health status and diagnostics. Health probes advance only the check timestamp to retain the sweep interval. Size errors retain their reason and byte limit in caller errors and failure audits. Catalog refresh still fails and retains cached tools, or no catalog if discovery has never succeeded | Local only (NX-658) | An upstream release carries the same discovery and initialization size handling |
+| `0fc5dd88b` | UI: remount the composer takeover card per pending input (fork PR #1) | Open upstream as paperclipai/paperclip#15121, no review yet. It stays open as it is. Nothing more is pushed without Steven's go-ahead | #15121 lands and that release is merged |
+| `200a198f0` | Tools: offer sign-in when a custom MCP server answers 401 without `WWW-Authenticate` (fork PR #2) | Open upstream as paperclipai/paperclip#15450, from port branch `fix/mcp-401-sign-in-without-challenge` (`e0ffbf2f6`). It stays open as it is. Nothing more is pushed without Steven's go-ahead | #15450 lands and that release is merged |
+| fork PR #12 | Tools: the `x-amzn-remapped-www-authenticate` hint is reduced to its metadata address, so endpoints and scopes it names directly are dropped (`metadataOnlyChallenge`) | Open upstream as part of paperclipai/paperclip#15450 (port branch commits `9f13a7dc8` and `e0ffbf2f6`). It stays open as it is. Nothing more is pushed without Steven's go-ahead | #15450 lands and that release is merged |
+| fork PR #6 | UI: Enter on an empty last line of a quote block, and Backspace at its start, leave the quote in the editor (`ui/src/lib/quote-exit.ts`) | Local only (NX-658). Port branch `fix/editor-leave-quote-block` (`eecb1eec6`) is kept as a record, not to be submitted | An upstream release carries an equivalent fix |
+| fork PR #21 | UI: a quote typed with `> ` gets the paragraph shape of a quote loaded from markdown, so Enter on a line with text continues the quote and only Enter on an empty last line leaves it (`ui/src/lib/quote-exit.ts`) | Local only (NX-658). Port branch `fix/editor-leave-quote-block` does not carry this fix and is kept as a record, not to be submitted | An upstream release carries an equivalent fix |
+| fork PR #7 | CLI: `install --ref` builds `server/ui-dist`, copies `skills`, stages real workspace dependency versions, and works with `ignore-scripts=true` (see "Install") | Local only (NX-658). Upstream issue #15026 tracks the staging faults. Open upstream PR paperclipai/paperclip#13928 (not ours) covers `server/ui-dist`, the `skills` copy, workspace dependency versions and `npm pack --ignore-scripts`. The two `ignore-scripts=true` faults, root `tsc` missing from the build PATH and embedded PostgreSQL library links, remain local only. Port branch `fix/git-install-ignore-scripts` (`bbc8ccaf4`) is kept as a record, not to be submitted | An upstream release carries an equivalent fix |
+| fork PR #14 | Recovery: release the local environment lease of a terminal run once its process is gone (stale-lock sweep, cancel without a process handle, healing sweep at startup and on the recovery tick). Without it a run kept across a restart, or orphaned by a hard stop, blocks every later wake on its task | Local only (NX-658). Upstream #13515 (`e1f245a66`, in `v2026.1005.0`) releases the active lease of a terminal run after a restart or on its sweep (about 5 minutes). The fork keeps immediate release and starts wakes saved behind the lease (Steven: keep, NX-658) | An upstream release both releases the lease immediately and starts wakes saved behind it |
+| fork PR #17 | Documents: same-company agents can upsert documents on another agent's idle issue; access decisions, the active run lock, recovery restrictions, revision checks and document locks still apply | Local only (NX-658). Upstream `master` (`71cd0a262`) still lacks the open-write option as of 2026-10-08 | An upstream release carries an equivalent fix |
+| fork PR #19 | Tools: one remote tool discovery (the handshake and every catalog page) has a total budget of 60 seconds and fails with `remote_http_response_timeout`. `readMcpHttpResponse` and `initializeMcpHttpSession` take an optional `signal`. Without it a server that keeps the `tools/list` stream alive and never answers holds a catalog refresh or a health check open until the 8 MiB limit | Open upstream as part of paperclipai/paperclip#15448 (commit `2deb0c002`). It stays open as it is. Nothing more is pushed without Steven's go-ahead | #15448 lands and that release is merged |
+| NX-617 (this PR) | Tools: per-connection "Sign in through localhost" and "Scopes to request" for a pasted MCP URL (see "Localhost sign-in") | Local only (NX-658) | An upstream release carries an equivalent setting, or the Atlassian connection no longer needs a localhost callback |
+| NX-668 (this PR) | CLI tests: a setup guard blocks `systemctl`, `loginctl`, `journalctl` and `launchctl` in every CLI test and fails the test that reached them; the two `uninstallCommand` tests and the `doctor` test no longer look up the host service manager. Test-only, no runtime change | Local only (NX-658). Upstream `master` (`9f4acc8f1`) has the same unguarded tests. Port branch `fix/cli-tests-never-reach-service-manager` is kept as a record, not to be submitted | An upstream release carries an equivalent fix |
+| fork PR #29 | UI: show all nine Google Workspace catalog entries and saved accounts on the Connectors page for this instance's customer-owned OAuth app | Local only (NX-658). Upstream plans to remove the filter itself after Google approval | The upstream release without the filter is merged |
+| NX-716 (this PR) | Interactions: a confirmation card whose source run ended without a `workspace_finalize` row can be accepted (`runWorkspaceIsFinalized` in `server/src/services/issues.ts`). Before, a card posted by a run that was then lost (`process_lost`) could never be accepted. A live run still blocks, and so does an ended native-runtime run whose finalization coordinator row has not reached `terminal_failure` (native recovery can still resume it) | Local only (NX-658). Upstream `master` has the same gap | An upstream release carries an equivalent fix |
 | NX-892 (this PR) | `pnpm-lock.yaml`: the `server` entries for `@modelcontextprotocol/sdk` and `light-my-request`, 27 added lines. The tag's `server/package.json` names both, its lockfile does not, and `pnpm install --frozen-lockfile` (fork CI and `paperclipai install`) fails without them | Upstream `master` has them since its lockfile refresh `03cf6a6ec` (2026-10-06), which is after the commit the tag was cut from | The next upstream merge. Take upstream's lockfile on a conflict |
-| SX-1134 (this PR) | Workspaces: a reused shared `project_primary` execution workspace whose cwd differs from the cwd the project's primary workspace now resolves to is rebound to that cwd on the same record, with its project workspace and repo (`resolveSharedProjectPrimaryWorkspaceRebindCwd` in `server/src/services/heartbeat.ts`). Before, a task whose shared workspace was saved in the managed `_default` folder failed `missing_git_metadata` after a repo was added to the project. Isolated, worktree, adapter-managed and sandbox workspaces, the agent fallback cwd and native recovery are unchanged | Not submitted. Upstream `master` (`cde944ed7`, 2026-10-20) still restores the persisted cwd as is in `heartbeat/workspace-preparation.ts`. Upstream PR text is prepared on SX-1134, no port branch yet | An upstream release rebinds a stale shared project workspace on reuse |
-| fork PR #3, fork files | `FORK.md`, `.github/workflows/nrwl-ci.yml` and `scripts/nrwl-ci-server-other.mjs` | Fork-only by design, will not go upstream | The fork is retired |
+| SX-1134 (this PR) | Workspaces: a reused shared `project_primary` execution workspace whose cwd differs from the cwd the project's primary workspace now resolves to is rebound to that cwd on the same record, with its project workspace and repo (`resolveSharedProjectPrimaryWorkspaceRebindCwd` in `server/src/services/heartbeat.ts`). Before, a task whose shared workspace was saved in the managed `_default` folder failed `missing_git_metadata` after a repo was added to the project. Isolated, worktree, adapter-managed and sandbox workspaces, the agent fallback cwd and native recovery are unchanged | Local only (NX-658). Upstream `master` (`cde944ed7`, 2026-10-20) still restores the persisted cwd as is in `heartbeat/workspace-preparation.ts` | An upstream release rebinds a stale shared project workspace on reuse |
+| fork PR #3, fork files | `FORK.md`, `.github/workflows/somnex-ci.yml` and `scripts/somnex-ci-server-other.mjs` | Fork-only by design, will not go upstream | The fork is retired |
 
 To refresh this table:
 
 ```sh
 git fetch upstream --tags && git fetch fork
-git log --oneline <base tag>..fork/nrwl-main        # fork-only commits
-git cherry upstream/master fork/nrwl-main           # "-" means upstream has it
-git rev-list --left-right --count fork/nrwl-main...upstream/master
+git log --oneline <base tag>..fork/somnex-main        # fork-only commits
+git cherry upstream/master fork/somnex-main           # "-" means upstream has it
+git rev-list --left-right --count fork/somnex-main...upstream/master
 gh pr view <number> -R paperclipai/paperclip        # each upstream PR
 ```
 
@@ -136,49 +138,48 @@ lines),
 and `ui/src/features/connections/ConnectionSetupFlow.tsx`. On a release merge,
 keep those marked blocks and rerun `tool-oauth-loopback.test.ts`.
 
-## Rules for a change to `nrwl-main`
+## Rules for a change to `somnex-main`
 
-1. **Fork first, upstream in the same task.** A fix the instance needs now lands
-   on `nrwl-main` first. The same task also produces a port branch on upstream
-   `master` and the prepared upstream PR. A fix that is not urgent goes upstream
-   only and arrives with a release.
-2. **Every fork-only commit has an inventory row** above, with the upstream PR
-   link or the reason it will not go upstream. A fork PR without its row is not
-   ready for review.
+1. **Fork first, local only.** A fix the instance needs lands on `somnex-main`
+   through a fork PR. Do not create a port branch on upstream `master` or
+   prepare an upstream PR. A fix that is not urgent is not sent upstream
+   either: it waits for upstream or becomes a fork fix.
+2. **Every fork-only commit has an inventory row** above, with its upstream
+   status: whether upstream already has an equivalent fix, with its commit or
+   PR when one exists. A fork PR without its row is not ready for review.
 3. **Mark deliberate differences in the code.** Where a patched line differs
    from upstream on purpose, say so in a comment next to it (see the "Differs
    from upstream" comment in `server/src/services/mcp-http.ts`). A release
    merge updates the tag named in such a comment.
 4. **Upstream release merges land as a merge commit, never squashed.** Fix PRs
-   may be squash-merged. No rebase and no force push on `nrwl-main`.
-5. Posting to `paperclipai/paperclip` (PR, issue or comment) is external and
-   needs Steven's go-ahead each time.
-6. **Every change goes through a fork pull request with a green `nrwl-ci`.**
+   may be squash-merged. No rebase and no force push on `somnex-main`.
+5. Posting to `paperclipai/paperclip` (PR, issue, comment or push to an open PR)
+   is external and needs Steven's go-ahead each time.
+6. **Every change goes through a fork pull request with a green `somnex-ci`.**
    That covers fixes, upstream release merges, reverts and edits to this file.
-   Never push to `nrwl-main` directly. GitHub enforces this: branch protection
-   requires a pull request and a green `nrwl-ci` on its head, for admins too,
+   Never push to `somnex-main` directly. GitHub enforces this: branch protection
+   requires a pull request and a green `somnex-ci` on its head, for admins too,
    and rejects a direct push (see "CI gate").
 
 ## Taking upstream releases
 
-`nrwl-main` takes each upstream **stable release tag** by merge commit, within
+`somnex-main` takes each upstream **stable release tag** by merge commit, within
 7 days of the release.
 
 ```sh
 git fetch upstream --tags
-git switch -c merge/upstream-<tag> fork/nrwl-main
+git switch -c merge/upstream-<tag> fork/somnex-main
 git merge --no-ff <tag>
 ```
 
 - Push `merge/upstream-<tag>` to the fork and open a fork PR from it into
-  `nrwl-main`. Merge that PR with a merge commit. Never squash or rebase it
+  `somnex-main`. Merge that PR with a merge commit. Never squash or rebase it
   (rule 4). The release merge has no shortcut: branch protection requires a
   pull request, so GitHub rejects a push of the merge commit straight to
-  `nrwl-main`, and the PR merges only once `nrwl-ci` is green on its head
+  `somnex-main`, and the PR merges only once `somnex-ci` is green on its head
   (rule 6).
-- Conflicts only appear in files the fork patched. Where a port branch exists
-  for the file, take the port branch version, and keep the "Differs from
-  upstream" comments.
+- Conflicts only appear in files the fork patched. Resolve each conflict so
+  the fork patch stays, and keep the "Differs from upstream" comments.
 - After the merge, refresh the inventory: remove rows that upstream now carries.
 - Upstream keeps `pnpm-lock.yaml` current with a bot on `master`, so a tag can
   carry a lockfile that lags its `package.json`. If
@@ -192,24 +193,26 @@ git merge --no-ff <tag>
 
 ## CI gate
 
-`.github/workflows/nrwl-ci.yml` runs on every pull request into `nrwl-main`, on
+`.github/workflows/somnex-ci.yml` runs on every pull request into `somnex-main`, on
 GitHub-hosted runners: `pnpm install --frozen-lockfile`, `pnpm typecheck`,
 `pnpm build`, and the suites of `pnpm test:run` split into parallel lanes with
 upstream's own shard flags. Upstream's server shards pick files by path rules
 and miss a few that the unsharded run includes, so one extra lane ("server
 other") runs every server project test file that no shard selects. The list is
-computed by `scripts/nrwl-ci-server-other.mjs` (fork-only) from vitest's own
+computed by `scripts/somnex-ci-server-other.mjs` (fork-only) from vitest's own
 collection minus the shards' dry-run selection; `--list` prints it. The
-`nrwl-ci` check is green only when every lane passed.
+`somnex-ci` check is green only when every lane passed.
+
+Until 2026-10-21 the mainline was named `nrwl-main` and the required check `nrwl-ci` (renamed on SX-1119 Step 3). Older PRs, tasks and install notes use those names.
 
 `.github/workflows/pr.yml` is upstream's and calls upstream's reusable
 workflow at upstream `master` (`pr-trusted.yml@master`). It is left untouched
 so it never conflicts with an upstream merge. It does run on fork pull
 requests (it passed on fork PR #3), but its definition follows upstream
-`master`, not the code on `nrwl-main`, so it is extra signal and not the gate.
+`master`, not the code on `somnex-main`, so it is extra signal and not the gate.
 
 **Red test baseline: empty.** No test is allowed to fail. The two tests that
-were red on `nrwl-main` (`tool-access-service.test.ts`, "executes allowed test
+were red on `somnex-main` (`tool-access-service.test.ts`, "executes allowed test
 calls as a board user while attributing the selected agent" and "drives an
 ask-first test call through its live lifecycle") pass on clean `v2026.916.1`.
 They failed only with the fork's request ID selection (`0d78b3d67`), because
@@ -220,13 +223,13 @@ failures outside the baseline", and never skip or delete the test.
 
 ### Branch protection
 
-`nrwl-main` takes changes only through a pull request, and `nrwl-ci` is a
+`somnex-main` takes changes only through a pull request, and `somnex-ci` is a
 required status check on it. GitHub branch protection enforces both. Settings
 as of 2026-10-07:
 
 | Setting | Value |
 | --- | --- |
-| Required status checks | `nrwl-ci` only, pinned to GitHub Actions (app id 15368). It is the `gate` job of `nrwl-ci.yml` |
+| Required status checks | `somnex-ci` only, pinned to GitHub Actions (app id 15368). It is the `gate` job of `somnex-ci.yml` |
 | Branch up to date before merging (`strict`) | Off |
 | Enforced for admins (`enforce_admins`) | On |
 | Force pushes | Blocked |
@@ -239,28 +242,28 @@ as of 2026-10-07:
 
 What this means in practice:
 
-- A pull request into `nrwl-main` cannot be merged until `nrwl-ci` is green on
+- A pull request into `somnex-main` cannot be merged until `somnex-ci` is green on
   its head commit. That holds for everyone, including the admin account all
   agents use. There is no admin override.
-- A direct push to `nrwl-main` is rejected in every case, for admins too,
+- A direct push to `somnex-main` is rejected in every case, for admins too,
   because protection requires a pull request. That includes a push of a commit
-  that already has a green `nrwl-ci`, such as the head of an up to date pull
+  that already has a green `somnex-ci`, such as the head of an up to date pull
   request. The merged pull request is the only way in (rule 6).
-- `nrwl-main` cannot be force pushed or deleted. To take a commit back, open a
+- `somnex-main` cannot be force pushed or deleted. To take a commit back, open a
   revert pull request.
 - `strict` is off: a pull request does not have to contain the latest
-  `nrwl-main` to merge. Its `nrwl-ci` result is for the merge with the base as
+  `somnex-main` to merge. Its `somnex-ci` result is for the merge with the base as
   it was when the run started.
 - Zero approving reviews are required. All agents share one GitHub account and
   an account cannot approve its own pull request, so an approval requirement
   could not be met. The independent review and Steven's approval of the head
   SHA are process, not something GitHub enforces.
-- `master` has no part in this: the protection covers `nrwl-main` only.
+- `master` has no part in this: the protection covers `somnex-main` only.
 
 To inspect the live settings (read only):
 
 ```sh
-gh api repos/llwt/paperclip/branches/nrwl-main/protection
+gh api repos/llwt/paperclip/branches/somnex-main/protection
 ```
 
 If the output differs from the table, the table is stale: correct it in a pull
@@ -273,10 +276,10 @@ change to get one merge through.
 An install is a deployment. It is its own task, assigned by the Coordinator
 after Steven approves the SHA.
 
-1. The target is a full SHA on `nrwl-main` with a green `nrwl-ci` run. Never
-   install a branch name. GitHub lets a commit reach `nrwl-main` only through
+1. The target is a full SHA on `somnex-main` with a green `somnex-ci` run. Never
+   install a branch name. GitHub lets a commit reach `somnex-main` only through
    a merged pull request (rule 6), so an install never involves a push to
-   `nrwl-main`.
+   `somnex-main`.
 2. Record the current `sha` from `~/.paperclip/cli/install.json`. List the
    migrations the new commit adds: `git diff --stat <old> <new> -- packages/db/src/migrations`.
 3. Take a database backup: `paperclipai db:backup`. `install` takes none (only
@@ -336,10 +339,10 @@ Facts about `install --ref` on this host (found on NX-449 and NX-509):
    schema. Rollback then also means restoring the database backup from install
    step 3.
 
-A rollback changes the installed build only. It does not move `nrwl-main`,
+A rollback changes the installed build only. It does not move `somnex-main`,
 which cannot be reset, force pushed or pushed to directly. To take the bad
-commit off `nrwl-main`, open a revert pull request and wait for a green
-`nrwl-ci` like any other change.
+commit off `somnex-main`, open a revert pull request and wait for a green
+`somnex-ci` like any other change.
 
 `update --rollback` flips `current` to `previous[0]` in `install.json` for any
 managed install, npm or git, and restarts the active service. It does not
@@ -386,7 +389,7 @@ line into a procedure step without testing it first.
   person to click a card in the UI; an agent can only show that the UI is
   served from the new payload.
 - **Process, not a test result.** Steven's approval binds to one full SHA. A
-  new commit on `nrwl-main` after the approval is not covered: it needs a new
+  new commit on `somnex-main` after the approval is not covered: it needs a new
   approval before it is installed, and smoke step 2 checks the installed `sha`
   against the approved one.
 

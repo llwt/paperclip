@@ -2820,6 +2820,23 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(first.result.sessionParams?.configFingerprint).toBe(rotatedToken.result.sessionParams?.configFingerprint);
     expect(first.result.sessionParams?.configFingerprint).not.toBe(changedSet.result.sessionParams?.configFingerprint);
   });
+
+  // Fork-only (NX-834): the compact tool-name label and versioned URL are part
+  // of the ACP session identity, so enabling or disabling them never resumes.
+  it("changes the session fingerprint when compact connection tool names are toggled", async () => {
+    const root = await makeTempRoot();
+    const baseConfig = { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state") };
+    const gatewayUrl = "https://paperclip.example/mcp/gateways/gw_0123456789abcdef0123456789abcdef";
+    const legacy = { name: "paperclip-assigned", url: gatewayUrl, connectionId: "assignment:abc", token: "t" };
+    const compact = { name: "p", url: `${gatewayUrl}?toolNames=compact-v1`, connectionId: "assignment:abc", token: "t" };
+    const before = await runExecutor(baseConfig, { runtimeMcp: { getServers: () => [legacy] } });
+    const enabled = await runExecutor(baseConfig, { runtimeMcp: { getServers: () => [compact] } });
+    const disabled = await runExecutor(baseConfig, { runtimeMcp: { getServers: () => [legacy] } });
+    expect(enabled.runtimeOptions[0]?.mcpServers).toEqual([{ type: "http", name: "p", url: compact.url,
+      headers: [{ name: "Authorization", value: "Bearer t" }] }]);
+    expect(enabled.result.sessionParams?.configFingerprint).not.toBe(before.result.sessionParams?.configFingerprint);
+    expect(disabled.result.sessionParams?.configFingerprint).toBe(before.result.sessionParams?.configFingerprint);
+  });
 });
 
 describe("findAncestorBin", () => {

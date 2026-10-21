@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Fork-only (llwt/paperclip), used by .github/workflows/nrwl-ci.yml.
+// Fork-only (llwt/paperclip), used by .github/workflows/somnex-ci.yml.
 //
 // Runs every test file of the server vitest project that none of the server
 // shards select. The shards (run-vitest-stable.mjs general-server and
@@ -24,7 +24,7 @@ function capture(command, args) {
     stdio: ["ignore", "pipe", "inherit"],
   });
   if (result.status !== 0) {
-    console.error(`[nrwl-ci-server-other] ${command} ${args.join(" ")} failed`);
+    console.error(`[somnex-ci-server-other] ${command} ${args.join(" ")} failed`);
     process.exit(result.status ?? 1);
   }
   return JSON.parse(result.stdout);
@@ -64,7 +64,7 @@ const collectedSet = new Set(collected);
 const unknown = [...sharded].filter((file) => !collectedSet.has(file));
 if (collected.length === 0 || sharded.size === 0 || unknown.length > 0) {
   console.error(
-    `[nrwl-ci-server-other] cannot compare: ${collected.length} collected, ${sharded.size} sharded, ` +
+    `[somnex-ci-server-other] cannot compare: ${collected.length} collected, ${sharded.size} sharded, ` +
       `${unknown.length} sharded files vitest did not collect${unknown.length > 0 ? `: ${unknown.join(", ")}` : ""}`,
   );
   process.exit(1);
@@ -72,7 +72,7 @@ if (collected.length === 0 || sharded.size === 0 || unknown.length > 0) {
 
 const remaining = collected.filter((file) => !sharded.has(file));
 console.log(
-  `[nrwl-ci-server-other] ${collected.length} server test files, ${sharded.size} in the shards, ${remaining.length} here`,
+  `[somnex-ci-server-other] ${collected.length} server test files, ${sharded.size} in the shards, ${remaining.length} here`,
 );
 for (const file of remaining) {
   console.log(`  ${file}`);
