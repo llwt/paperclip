@@ -554,6 +554,7 @@ describe("parseClaudeStreamJson usage extraction", () => {
       cachedInputTokens: 300_000,
     });
     expect(parsed.usageBasis).toBe("session_cumulative");
+    expect(parsed.costBasis).toBe("session_cumulative");
     expect(parsed.costUsd).toBeCloseTo(1.25);
   });
 
@@ -565,5 +566,7 @@ describe("parseClaudeStreamJson usage extraction", () => {
       cachedInputTokens: 20,
     });
     expect(parsed.usageBasis).toBe("per_run");
+    // total_cost_usd is still the session total on --resume.
+    expect(parsed.costBasis).toBe("session_cumulative");
   });
 });

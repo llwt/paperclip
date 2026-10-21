@@ -101,6 +101,12 @@ export interface AdapterExecutionResult {
    */
   usageBasis?: "per_run" | "session_cumulative" | null;
   /**
+   * How `costUsd` is scoped, when it differs from `usageBasis`. The Claude CLI
+   * reports `total_cost_usd` as a session total even when its tokens cover
+   * only this invocation. Absent means the cost follows `usageBasis`.
+   */
+  costBasis?: "per_run" | "session_cumulative" | null;
+  /**
    * Legacy single session id output. Prefer `sessionParams` + `sessionDisplayId`.
    */
   sessionId?: string | null;

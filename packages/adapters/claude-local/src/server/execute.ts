@@ -1282,6 +1282,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       errorMeta,
       usage,
       ...(usageBasis ? { usageBasis } : {}),
+      ...(parsedStream.costBasis ? { costBasis: parsedStream.costBasis } : {}),
       sessionId: resolvedSessionId,
       sessionParams: resolvedSessionParams,
       sessionDisplayId: resolvedSessionId,

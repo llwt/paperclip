@@ -182,9 +182,37 @@ function resolveClaudeTurn(
     sessionId: parsed.sessionId,
     rawUsage: parsed.usage,
     usageBasis: parsed.usageBasis,
+    costBasis: parsed.costBasis,
     rawCostUsd: parsed.costUsd,
     getPreviousUsageJson,
   });
+}
+
+/** A Claude result event without modelUsage: invocation tokens, session cost. */
+function parseClaudeFallbackTurn(input: { inputTokens: number; costUsd: number }) {
+  return parseClaudeStreamJson(JSON.stringify({
+    type: "result",
+    subtype: "success",
+    session_id: "claude-session",
+    result: "done",
+    total_cost_usd: input.costUsd,
+    usage: { input_tokens: input.inputTokens, output_tokens: 0, cache_read_input_tokens: 0 },
+  }));
+}
+
+/** The usage_json fields the heartbeat stores from a resolution. */
+function storedUsageJson(
+  result: Awaited<ReturnType<typeof resolveNormalizedUsageForSession>>,
+  rawCostUsd: number,
+) {
+  return {
+    ...result.normalizedUsage,
+    rawInputTokens: result.sessionRawUsage!.inputTokens,
+    rawCachedInputTokens: result.sessionRawUsage!.cachedInputTokens,
+    rawOutputTokens: result.sessionRawUsage!.outputTokens,
+    costUsd: result.normalizedCostUsd,
+    rawCostUsd,
+  };
 }
 
 describe("resolveNormalizedUsageForSession for Claude CLI session totals", () => {
@@ -233,6 +261,71 @@ describe("resolveNormalizedUsageForSession for Claude CLI session totals", () =>
   it("keeps the current cost if the session cost went down", async () => {
     const result = await resolveClaudeTurn("first", async () => preFixClaudeUsageJson("resumed"));
     expect(result.normalizedCostUsd).toBe(4.75);
+  });
+
+  it("deltas the session cost of a run without modelUsage and keeps the token baseline", async () => {
+    const previous = {
+      inputTokens: 1_000, cachedInputTokens: 0, outputTokens: 0,
+      rawInputTokens: 1_000, rawCachedInputTokens: 0, rawOutputTokens: 0,
+      costUsd: 4.75, rawCostUsd: 4.75,
+    };
+    const fallback = parseClaudeFallbackTurn({ inputTokens: 10, costUsd: 5.25 });
+    expect(fallback.usageBasis).toBe("per_run");
+    const fallbackResult = await resolveNormalizedUsageForSession({
+      sessionId: "claude-session",
+      rawUsage: fallback.usage,
+      usageBasis: fallback.usageBasis,
+      costBasis: fallback.costBasis,
+      rawCostUsd: fallback.costUsd,
+      getPreviousUsageJson: async () => previous,
+    });
+    expect(fallbackResult.normalizedUsage).toEqual({ inputTokens: 10, cachedInputTokens: 0, outputTokens: 0 });
+    expect(fallbackResult.normalizedCostUsd).toBe(0.5);
+    // Stored raw counters stay a session total: 1000 before plus 10 now.
+    expect(fallbackResult.sessionRawUsage).toEqual({ inputTokens: 1_010, cachedInputTokens: 0, outputTokens: 0 });
+
+    // The next run reports session totals again: input 1200, cost 5.50.
+    const next = await resolveNormalizedUsageForSession({
+      sessionId: "claude-session",
+      rawUsage: { inputTokens: 1_200, cachedInputTokens: 0, outputTokens: 0 },
+      usageBasis: "session_cumulative",
+      costBasis: "session_cumulative",
+      rawCostUsd: 5.5,
+      getPreviousUsageJson: async () => storedUsageJson(fallbackResult, 5.25),
+    });
+    expect(next.normalizedUsage!.inputTokens).toBe(190);
+    expect(next.normalizedCostUsd).toBe(0.25);
+    // Both resumes together add up to the session's real increment.
+    expect(next.normalizedUsage!.inputTokens + fallbackResult.normalizedUsage!.inputTokens).toBe(200);
+  });
+
+  it("stores zero for a failed run without modelUsage that did no work", async () => {
+    const failed = parseClaudeFallbackTurn({ inputTokens: 0, costUsd: 5.25 });
+    const result = await resolveNormalizedUsageForSession({
+      sessionId: "claude-session",
+      rawUsage: failed.usage,
+      usageBasis: failed.usageBasis,
+      costBasis: failed.costBasis,
+      rawCostUsd: failed.costUsd,
+      getPreviousUsageJson: async () => preFixClaudeUsageJson("resumed"),
+    });
+    expect(result.normalizedUsage).toEqual({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 });
+    expect(result.normalizedCostUsd).toBe(0);
+    expect(result.sessionRawUsage).toEqual(parseClaudeTurn("resumed").usage);
+  });
+
+  it("stores a fresh session's full cost when modelUsage is absent", async () => {
+    const fresh = parseClaudeFallbackTurn({ inputTokens: 10, costUsd: 0.4 });
+    const result = await resolveNormalizedUsageForSession({
+      sessionId: "claude-session",
+      rawUsage: fresh.usage,
+      usageBasis: fresh.usageBasis,
+      costBasis: fresh.costBasis,
+      rawCostUsd: fresh.costUsd,
+      getPreviousUsageJson: async () => null,
+    });
+    expect(result.normalizedCostUsd).toBe(0.4);
+    expect(result.sessionRawUsage).toEqual(fresh.usage);
   });
 
   it.each(["per_run", null] as const)("does not subtract cost for usage basis %s", async (usageBasis) => {
