@@ -18,6 +18,7 @@ import {
 import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import { HEARTBEAT_RUN_LIST_DEFAULT_LIMIT, HEARTBEAT_RUN_LIST_MAX_LIMIT } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
 import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
 import { publicChatTaskUrl } from "./chat-task-url.js";
@@ -38,7 +39,7 @@ import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAs
 import { admitExplicitNativeContinuation, admitExplicitContinuationRetry, undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
 import { canRetryStoppedRun, isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { connectionIntentService } from "./connection-intents.js";
-import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
+import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, writeBackManagedAiCredential, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
 import { aiConnectionBindingSchema, aiRuntimeConnectionBindingSchema, type AiConnectionRouterSelection } from "@paperclipai/shared";
 import { aiConnectionRouterService, AiConnectionPoolExhausted, applyAiConnectionRouterTaskSettings } from "./ai-connection-router.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "./ai-connection-session.js";
@@ -474,6 +475,14 @@ import {
   type WorkspaceOperationRecorder,
 } from "./workspace-operations.js";
 import {
+  holdRunTempDirs,
+  isRunProcessAlive,
+  linkManagedAiSessionState,
+  removeRunTempDir,
+  resolveManagedAiSessionStateDir,
+} from "./run-temp-dirs.js";
+import {
+  isPidAlive,
   isProcessGroupAlive,
   terminateLocalService,
 } from "./local-service-supervisor.js";
@@ -3390,35 +3399,24 @@ const heartbeatRunSummaryListColumns = {
   resultJson: sql<Record<string, unknown> | null>`NULL`.as("resultJson"),
 } as const;
 
+const heartbeatRunListContextRecord = sql`lateral jsonb_to_record(
+  case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object'
+    then ${heartbeatRuns.contextSnapshot} else '{}'::jsonb end
+) as run_context("issueId" text, "taskId" text, "taskKey" text,
+  "commentId" text, "wakeCommentId" text, "wakeReason" text,
+  "wakeSource" text, "wakeTriggerDetail" text)`;
+
 const heartbeatRunListContextColumns = {
-  contextIssueId: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'issueId'`.as("contextIssueId"),
-  contextTaskId: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'taskId'`.as("contextTaskId"),
-  contextTaskKey: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'taskKey'`.as("contextTaskKey"),
-  contextCommentId: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'commentId'`.as("contextCommentId"),
-  contextWakeCommentId: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'wakeCommentId'`.as(
-    "contextWakeCommentId",
-  ),
-  contextWakeReason: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'wakeReason'`.as("contextWakeReason"),
-  contextWakeSource: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'wakeSource'`.as("contextWakeSource"),
-  contextWakeTriggerDetail: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'wakeTriggerDetail'`.as(
-    "contextWakeTriggerDetail",
-  ),
+  // Differs from upstream (paperclipai/paperclip#16286, ebeac833a): upstream prefers the
+  // heartbeat_runs.issue_id column, which this fork does not have.
+  contextIssueId: sql<string | null>`run_context."issueId"`.as("contextIssueId"),
+  contextTaskId: sql<string | null>`run_context."taskId"`.as("contextTaskId"),
+  contextTaskKey: sql<string | null>`run_context."taskKey"`.as("contextTaskKey"),
+  contextCommentId: sql<string | null>`run_context."commentId"`.as("contextCommentId"),
+  contextWakeCommentId: sql<string | null>`run_context."wakeCommentId"`.as("contextWakeCommentId"),
+  contextWakeReason: sql<string | null>`run_context."wakeReason"`.as("contextWakeReason"),
+  contextWakeSource: sql<string | null>`run_context."wakeSource"`.as("contextWakeSource"),
+  contextWakeTriggerDetail: sql<string | null>`run_context."wakeTriggerDetail"`.as("contextWakeTriggerDetail"),
 } as const;
 
 const heartbeatRunListResultColumns = {
@@ -20829,6 +20827,8 @@ export function heartbeatService(
         }
       | undefined;
     let managedAiRuntime: Awaited<ReturnType<typeof prepareManagedAiRuntime>> | undefined;
+    // Keeps the run temp folder sweep away from this run's home until teardown ends.
+    let releaseRunTempDirHold: (() => void) | undefined;
     let providerTraceCapture: Awaited<
       ReturnType<typeof traceStore.prepare>
     > | null = null;
@@ -22075,8 +22075,9 @@ export function heartbeatService(
         });
       readFailureReportSecrets = () => collectRunFailureSecretValues(resolvedConfig.env, secretKeys);
       if (aiBinding) {
+        releaseRunTempDirHold ??= holdRunTempDirs(run.id);
         try {
-          managedAiRuntime = await prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig });
+          managedAiRuntime = await prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, runId: run.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig });
         } catch (error) {
           // Only fresh executions can receive a pre-provider wait receipt. A
           // persisted native input may already have provider effects to recover.
@@ -23178,6 +23179,16 @@ export function heartbeatService(
         if (!saved) return;
         if (saved.state !== "superseded") await recordInstructionSave(saved);
       };
+      if (managedAiRuntime && (!executionTarget || executionTarget.kind === "local")) {
+        // The temp home is removed when the run ends. Session transcripts and
+        // agent memory live in a per-agent folder so the next run can resume.
+        // A run whose links cannot be verified stops here, before the provider
+        // writes a session into the temp home.
+        await linkManagedAiSessionState({
+          providerHome: managedAiRuntime.providerHome,
+          stateDir: resolveManagedAiSessionStateDir(agent.companyId, agent.id),
+        });
+      }
       if (managedAiRuntime && aiBinding) {
         try { await assertManagedAiProjectAuth({ ...resolvedConfig, cwd: executionWorkspace.cwd }, aiBinding.provider, executionTarget); }
         catch { throw new ConfigurationIncompleteFailure("Project authentication conflicts with this agent’s managed AI connection", { configurationIncomplete: { reason: "ai_connection_incompatible", actionUrl: `/agents/${agent.id}/runtime` } }); }
@@ -27038,7 +27049,7 @@ export function heartbeatService(
       }
     } finally {
       await nativeInstructionReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));
-      if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
+      if (managedAiRuntime) await managedAiRuntime.cleanup({ keepHome: true }).catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
       let latestRun = await getRun(run.id).catch(() => null);
       try {
         if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
@@ -27144,6 +27155,28 @@ export function heartbeatService(
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
         }
         if (
+          managedAiRuntime &&
+          latestRun &&
+          isHeartbeatRunTerminalStatus(latestRun.status)
+        ) {
+          // Skipped homes (provider still alive, credential write-back not
+          // done, or a run that is not terminal yet) are removed later by the
+          // run temp folder sweep.
+          const homeCleanup = await removeRunTempDir({
+            dir: managedAiRuntime.home,
+            owner: { companyId: run.companyId, agentId: run.agentId, runId: run.id },
+            process: { processPid: latestRun.processPid, processGroupId: latestRun.processGroupId },
+            isRunProcessAlive,
+            writeBack: (dir) => writeBackManagedAiCredential(db, dir),
+          }).catch((error) => {
+            logger.warn({ err: error, runId: run.id, dir: managedAiRuntime?.home }, "failed to remove managed AI home");
+            return null;
+          });
+          if (homeCleanup && !homeCleanup.removed) {
+            logger.info({ runId: run.id, ...homeCleanup }, "managed AI home kept for the run temp folder sweep");
+          }
+        }
+        if (
           runScratch &&
           latestRun &&
           isHeartbeatRunTerminalStatus(latestRun.status)
@@ -27155,6 +27188,8 @@ export function heartbeatService(
           try {
             scratchCleanup = await cleanupHeartbeatRunScratch({
               scratch: scratchForCleanup,
+              processPid: latestRun.processPid,
+              isPidAlive,
               processGroupId: latestRun.processGroupId,
               isProcessGroupAlive,
             });
@@ -27219,6 +27254,7 @@ export function heartbeatService(
           }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "cancelled")));
         }
       } finally {
+        releaseRunTempDirHold?.();
         controllerLease.stop();
         activeRunExecutions.delete(run.id);
         // A failed owned Stop remains visible until this exact executor settles,
@@ -30544,6 +30580,7 @@ export function heartbeatService(
                   },
           )
           .from(heartbeatRuns)
+          .leftJoin(heartbeatRunListContextRecord, sql`true`)
           .where(
             agentId
               ? and(
@@ -30554,7 +30591,10 @@ export function heartbeatService(
           )
           .orderBy(desc(heartbeatRuns.createdAt));
 
-        return limit ? await query.limit(limit) : await query;
+        const boundedLimit = Number.isFinite(limit)
+          ? Math.max(1, Math.min(HEARTBEAT_RUN_LIST_MAX_LIMIT, Math.trunc(limit!)))
+          : HEARTBEAT_RUN_LIST_DEFAULT_LIMIT;
+        return await query.limit(boundedLimit);
       });
       return rows.map((row) => {
         const {

@@ -31,6 +31,29 @@ export interface LocalProcessSandboxOptions {
   command?: string;
 }
 
+/**
+ * Provider-home entries the server links to durable per-agent storage outside
+ * the run's temp home: Claude `projects` (sessions and memory) and Codex
+ * `sessions`/`archived_sessions`.
+ */
+export const MANAGED_AI_SESSION_STATE_ENTRIES = ["projects", "sessions", "archived_sessions"] as const;
+
+/** Read-write mounts for the linked session state of a managed provider home. */
+export async function managedAiSessionStateMounts(providerHome: string): Promise<LocalProcessSandboxPath[]> {
+  const mounts: LocalProcessSandboxPath[] = [];
+  for (const name of MANAGED_AI_SESSION_STATE_ENTRIES) {
+    const entry = path.join(providerHome, name);
+    try {
+      if (!(await fs.lstat(entry)).isSymbolicLink()) continue;
+      const target = await fs.realpath(entry);
+      if ((await fs.stat(target)).isDirectory()) mounts.push({ path: target, access: "rw" });
+    } catch {
+      // Missing entry or dangling link: nothing to mount.
+    }
+  }
+  return mounts;
+}
+
 export interface LocalProcessSandboxSpawnTarget {
   command: string;
   args: string[];

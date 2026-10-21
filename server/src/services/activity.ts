@@ -1,5 +1,5 @@
 import { executionProjectionsForRuns } from "./execution-projection.js";
-import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -434,16 +434,28 @@ export function activityService(db: Db) {
         .where(
           and(
             eq(heartbeatRuns.companyId, companyId),
-            or(
-              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-              sql`exists (
-                select 1
-                from ${activityLog}
-                where ${activityLog.companyId} = ${companyId}
-                  and ${activityLog.entityType} = 'issue'
-                  and ${activityLog.entityId} = ${issueId}
-                  and ${activityLog.runId} = ${heartbeatRuns.id}
-              )`,
+            inArray(
+              heartbeatRuns.id,
+              db
+                .select({ runId: heartbeatRuns.id })
+                .from(heartbeatRuns)
+                // Differs from upstream (paperclipai/paperclip#16713, open): upstream matches the
+                // heartbeat_runs.issue_id column, which this fork does not have. The context key
+                // uses heartbeat_runs_company_ctx_issue_created_idx.
+                .where(and(eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`))
+                .union(
+                  db
+                    .select({ runId: sql<string>`${activityLog.runId}` })
+                    .from(activityLog)
+                    .where(
+                      and(
+                        eq(activityLog.companyId, companyId),
+                        eq(activityLog.entityType, "issue"),
+                        eq(activityLog.entityId, issueId),
+                        isNotNull(activityLog.runId),
+                      ),
+                    ),
+                ),
             ),
           ),
         )

@@ -1,11 +1,16 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
+import { sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { boundHeartbeatRunEventPayloadForStorage, heartbeatService } from "../services/heartbeat.ts";
+import {
+  boundHeartbeatRunEventPayloadForStorage,
+  heartbeatService,
+  summarizeHeartbeatRunContextSnapshot,
+} from "../services/heartbeat.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -337,6 +342,77 @@ describeEmbeddedPostgres("heartbeat list", () => {
     expect(Buffer.byteLength(diagnostic.details)).toBeLessThanOrEqual(8192);
     expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(64 * 1024);
     expect(run?.error).toBe(terminalSessionFailure.details);
+  });
+
+  // Ported from paperclipai/paperclip#16286 (ebeac833a, run-state.test.ts). The fork has no
+  // heartbeat_runs.issue_id column, so the context issue id is the only issue source here.
+  async function listFixture() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    return { companyId, agentId };
+  }
+
+  it("bounds history at the service boundary and keeps company and agent scope", async () => {
+    const { companyId, agentId } = await listFixture();
+    await db.execute(sql`insert into heartbeat_runs (company_id, agent_id, created_at)
+      select ${companyId}::uuid, ${agentId}::uuid, '2026-01-01'::timestamptz + n * interval '1 second'
+      from generate_series(1, 1005) n`);
+    const foreign = await listFixture();
+    await db.insert(heartbeatRuns).values({ companyId: foreign.companyId, agentId: foreign.agentId });
+    const service = heartbeatService(db);
+    const rows = await service.list(companyId);
+    expect(rows).toHaveLength(200);
+    expect(rows.every(row => row.companyId === companyId && row.agentId === agentId)).toBe(true);
+    expect(rows[0].createdAt.getTime()).toBeGreaterThan(rows[199].createdAt.getTime());
+    expect(await service.list(companyId, agentId, 10000)).toHaveLength(1000);
+    expect(await service.list(companyId, agentId, 1.9)).toHaveLength(1);
+    expect(await service.list(companyId, agentId, -10)).toHaveLength(1);
+    expect(await service.list(companyId, agentId, NaN)).toHaveLength(200);
+    expect(await service.list(companyId, foreign.agentId)).toEqual([]);
+  });
+
+  it("preserves legacy context text and summary privacy", async () => {
+    const { companyId, agentId } = await listFixture();
+    const service = heartbeatService(db);
+    const contexts: unknown[] = [null, [], "legacy", 3, true, {}, {
+      issueId: "legacy-issue", taskId: 17, taskKey: { nested: true }, commentId: ["one", 2],
+      wakeCommentId: null, wakeReason: false, wakeSource: "   ", wakeTriggerDetail: "héllo\nworld",
+      secret: "never return this", prompt: randomBytes(96 * 1024).toString("hex"),
+    }];
+    for (const contextSnapshot of contexts) {
+      const [run] = await db.insert(heartbeatRuns).values({
+        companyId, agentId,
+        contextSnapshot: contextSnapshot as Record<string, unknown>,
+      }).returning();
+      const expected = (await db.execute(sql`select context_snapshot->>'issueId' as "issueId",
+        context_snapshot->>'taskId' as "taskId", context_snapshot->>'taskKey' as "taskKey",
+        context_snapshot->>'commentId' as "commentId", context_snapshot->>'wakeCommentId' as "wakeCommentId",
+        context_snapshot->>'wakeReason' as "wakeReason", context_snapshot->>'wakeSource' as "wakeSource",
+        context_snapshot->>'wakeTriggerDetail' as "wakeTriggerDetail" from heartbeat_runs where id = ${run.id}::uuid`))[0];
+      for (const summary of [false, true]) {
+        const actual = (await service.list(companyId, agentId, 100, { summary })).find(row => row.id === run.id)!;
+        expect(actual.contextSnapshot).toEqual(summarizeHeartbeatRunContextSnapshot(expected as Record<string, unknown>));
+        expect(actual.contextSnapshot ?? {}).not.toHaveProperty("secret");
+        expect(actual.contextSnapshot ?? {}).not.toHaveProperty("prompt");
+      }
+    }
   });
 });
 
