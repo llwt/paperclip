@@ -203,6 +203,8 @@ computed by `scripts/nrwl-ci-server-other.mjs` (fork-only) from vitest's own
 collection minus the shards' dry-run selection; `--list` prints it. The
 `nrwl-ci` check is green only when every lane passed.
 
+During the rename to `somnex-main` (SX-1119 Step 3) the workflow has two identical gate jobs, `nrwl-ci` and `somnex-ci`, and runs on pull requests into both branch names. GitHub requires `nrwl-ci` until the branch protection is switched to `somnex-ci`; a later PR removes the old names.
+
 `.github/workflows/pr.yml` is upstream's and calls upstream's reusable
 workflow at upstream `master` (`pr-trusted.yml@master`). It is left untouched
 so it never conflicts with an upstream merge. It does run on fork pull
