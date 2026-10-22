@@ -15367,7 +15367,6 @@ export function heartbeatService(
         await record(stream, decoders[stream].end());
       }
       await flushProgress(true);
-      adoptedOutputTails.delete(run.id);
       const current = await getRun(run.id);
       if (current) {
         const ended = relay?.status === "ended";
@@ -15382,6 +15381,8 @@ export function heartbeatService(
         });
       }
       await fs.rm(relayDir, { recursive: true, force: true });
+      // Last, so the reaper settles the run only after its output is in.
+      adoptedOutputTails.delete(run.id);
     };
 
     const runTick = async () => {
