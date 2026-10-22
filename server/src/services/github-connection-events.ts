@@ -110,6 +110,7 @@ function normalizeLeasedPayload(event: LeasedEvent): Record<string, unknown> {
       url: githubUrl(payload.url),
       state: boundedString(payload.state, 40),
       merged: payload.merged === true,
+      draft: payload.draft === true,
       mergedAt: isoDate(payload.mergedAt),
       updatedAt: isoDate(payload.updatedAt),
       headRef: boundedString(payload.headRef, 300),
@@ -174,6 +175,8 @@ function githubSnapshotUpdate(payload: Record<string, unknown>) {
   if (!repository || !number) return null;
   const state = stringValue(payload.state) ?? "unknown";
   const merged = payload.merged === true;
+  // Mirrors the poller's pull request snapshot: only an open pull request shows Draft.
+  const draft = state === "open" && payload.draft === true;
   const [owner, repo, ...extra] = repository.split("/");
   if (!owner || !repo || extra.length > 0) return null;
   return {
@@ -184,11 +187,11 @@ function githubSnapshotUpdate(payload: Record<string, unknown>) {
     externalId: `${repository}#pull/${number}`,
     state,
     merged,
-    statusKey: merged ? "merged" : state === "closed" ? "closed" : "open",
-    statusLabel: merged ? "Merged" : state === "closed" ? "Closed" : "Open",
-    statusCategory: merged ? "succeeded" : state === "closed" ? "closed" : "open",
-    statusTone: merged ? "success" : state === "closed" ? "muted" : "info",
-    statusIconKey: merged ? "git-merge" : state === "closed" ? "x-circle" : "git-pull-request",
+    statusKey: merged ? "merged" : state === "closed" ? "closed" : draft ? "draft" : "open",
+    statusLabel: merged ? "Merged" : state === "closed" ? "Closed" : draft ? "Draft" : "Open",
+    statusCategory: merged ? "succeeded" : state === "closed" ? "closed" : draft ? "waiting" : "open",
+    statusTone: merged ? "success" : state === "closed" ? "muted" : draft ? "warning" : "info",
+    statusIconKey: merged ? "git-merge" : state === "closed" ? "x-circle" : draft ? "clock" : "git-pull-request",
     data: {
       provider: "github",
       owner,
@@ -196,6 +199,7 @@ function githubSnapshotUpdate(payload: Record<string, unknown>) {
       number,
       state,
       merged,
+      draft,
       ...(stringValue(payload.url) ? { url: stringValue(payload.url) } : {}),
       ...(stringValue(payload.mergedAt) ? { mergedAt: stringValue(payload.mergedAt) } : {}),
       ...(stringValue(payload.headRef) ? { headRef: stringValue(payload.headRef) } : {}),
@@ -246,8 +250,14 @@ export function githubConnectionEventService(
       statusTone: snapshot.statusTone,
       statusIconKey: snapshot.statusIconKey,
       isTerminal: snapshot.merged || snapshot.state === "closed",
-      data: sql`${externalObjects.data} || ${JSON.stringify(snapshot.data)}::jsonb`,
+      // A webhook carries the real state, so an earlier "Not found" verdict from the poller
+      // (notFound/probeVerified) and its auth or reachability error no longer apply.
+      data: sql`(${externalObjects.data} - 'notFound' - 'probeVerified') || ${JSON.stringify(snapshot.data)}::jsonb`,
       remoteVersion: snapshot.remoteVersion,
+      liveness: "fresh",
+      lastErrorAt: null,
+      lastErrorCode: null,
+      lastErrorMessage: null,
       lastResolvedAt: appliedAt,
       lastChangedAt: appliedAt,
       nextRefreshAt: appliedAt,
