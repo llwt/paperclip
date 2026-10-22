@@ -24,13 +24,13 @@ export function legacyExecutionNeedsReconciliation(
     !["failed", "timed_out", "interrupted", "cancelled"].includes(run.status)
   )
     return false;
+  // A fresh model turn cannot repair or verify unrestored files.
+  if (run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive") return true;
   // The issue route stopped this run on purpose to hand the task to someone
   // else. The stop happens while the issue is still assigned to the run's
   // agent, so a hold would block the successor's wake and every later comment.
   if (run.status === "cancelled" && run.errorCode === "issue_reassigned" &&
       run.resultJson?.reassignmentStopConfirmed === true) return false;
-  // A fresh model turn cannot repair or verify unrestored files.
-  if (run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive") return true;
   // A fresh conversation turn lets the agent decide what remains. The retry
   // scheduler, not an action-outcome hold, owns the automatic attempt limit.
   if (hasConversationContinuationPolicy(run.resultJson)) return false;

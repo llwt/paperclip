@@ -117,4 +117,8 @@ it("does not hold a run the issue route stopped on purpose for a reassignment", 
   expect(legacyExecutionNeedsReconciliation({ ...reassigned, resultJson: {} })).toBe(true);
   expect(legacyExecutionNeedsReconciliation({ ...reassigned, status: "failed" })).toBe(true);
   expect(legacyExecutionNeedsReconciliation({ ...reassigned, errorCode: "cancelled" })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({
+    ...reassigned,
+    resultJson: { reassignmentStopConfirmed: true, workspaceRestoreFailure: "restore_unsafe_archive" },
+  })).toBe(true);
 });
