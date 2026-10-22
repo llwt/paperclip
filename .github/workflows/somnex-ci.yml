@@ -142,7 +142,8 @@ jobs:
   # commit under test, the way an install on chungus does: same node major
   # (.nvmrc), npm ignore-scripts on, and a scratch HOME and PAPERCLIP_HOME so the
   # runner starts with no install store. The installer downloads the commit from
-  # GitHub, so it builds what is pushed, not this checkout.
+  # GitHub, so it builds what is pushed. The checkout is the same commit (not the
+  # PR merge ref), so the CLI and the expected version come from it too.
   install_git:
     name: Git install (node 24)
     runs-on: ubuntu-latest
@@ -152,6 +153,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - name: Setup Node.js
