@@ -1006,7 +1006,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             managedPaths: [
               { path: effectiveCodexHome, access: "rw" },
               ...(config.managedAiConnection ? await managedAiSessionStateMounts(effectiveCodexHome) : []),
-              ...miseToolInstallMounts(effectiveEnv),
+              ...(await miseToolInstallMounts(effectiveEnv)),
             ],
             extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
             pathAliases: targetWorkspaceRealization?.mode === "copy"

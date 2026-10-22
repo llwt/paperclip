@@ -579,7 +579,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             { path: promptBundle.addDir, access: "ro" },
             { path: localMcpConfigDir, access: "ro" },
             ...(config.managedAiConnection ? await managedAiSessionStateMounts(sharedClaudeConfigDir) : []),
-            ...miseToolInstallMounts(effectiveEnv),
+            ...(await miseToolInstallMounts(effectiveEnv)),
           ],
           extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
           homeDir: filesystemScope ? path.dirname(sharedClaudeConfigDir) : null,
