@@ -102,7 +102,7 @@ pnpm storybook:with 6199 -- curl -sf http://127.0.0.1:6199/index.json
 
 The wrapper rejects an occupied port, waits up to 180 seconds for Storybook,
 and sets `STORYBOOK_URL` for the command. It stops the server process group
-when the command exits or the wrapper receives SIGINT or SIGTERM. Processes
+when the command exits or the wrapper receives SIGINT, SIGTERM, or SIGHUP. Processes
 that do not stop within five seconds receive SIGKILL. Run the command in the
 foreground. Process-group cleanup requires a POSIX system.
 

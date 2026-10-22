@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
+import { constants, tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
@@ -113,7 +113,7 @@ test("cleans up when command spawn fails", async (t) => {
   await assertPortFree(ctx.port);
 });
 
-for (const signal of ["SIGINT", "SIGTERM"]) {
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
   for (const phase of ["readiness", "command"]) {
     test(`${signal} during ${phase} stops server and command`, async (t) => {
       const ctx = await setup(t);
@@ -121,7 +121,7 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
       await until(async () => phase === "command" ? job.output().includes("INNER STARTED") : readFile(join(ctx.dir, "started.json")).then(() => true, () => false));
       job.child.kill(signal);
       const result = await job.done;
-      assert.equal(result.code, signal === "SIGINT" ? 130 : 143, result.output);
+      assert.equal(result.code, 128 + constants.signals[signal], result.output);
       await assertPortFree(ctx.port);
     });
   }

@@ -102,6 +102,7 @@ export async function withStorybook(port, command, {
   });
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
+  process.on("SIGHUP", onSignal);
   try {
     server = start(process.execPath, [bin, "dev", "--exact-port", "--ci", "--no-open",
       "--host", "127.0.0.1", "-c", "storybook/.storybook", "-p", String(port)], { cwd });
@@ -123,6 +124,7 @@ export async function withStorybook(port, command, {
     } finally {
       process.off("SIGINT", onSignal);
       process.off("SIGTERM", onSignal);
+      process.off("SIGHUP", onSignal);
     }
   }
   return interruptedCode ?? code;
