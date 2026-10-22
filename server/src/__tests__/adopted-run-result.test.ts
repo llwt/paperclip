@@ -201,7 +201,7 @@ describe("adopted run output reader", () => {
     expect(await reasonOf(open(handle))).toBe("conflicting_duplicate_sequence");
   });
 
-  it("is inconclusive on a sequence gap or a seq that goes back to an unseen number", async () => {
+  it("is inconclusive on a sequence gap or a repeated seq with other content", async () => {
     const gap = await begin();
     await write(gap, [
       { stream: "stdout", chunk: "one\n", seq: 1 },
@@ -212,25 +212,55 @@ describe("adopted run output reader", () => {
     await fs.rm(dir, { recursive: true, force: true });
     const back = await begin();
     await write(back, [
-      { stream: "stdout", chunk: "five\n", seq: 5 },
-      { stream: "stdout", chunk: "six\n", seq: 6 },
+      { stream: "stdout", chunk: "five\n", seq: 1 },
+      { stream: "stdout", chunk: "six\n", seq: 2 },
     ]);
     await fs.appendFile(
       path.join(dir, back.logRef),
       `${JSON.stringify({ ts: "t", stream: "stdout", chunk: "x\n", seq: 2 })}\n`,
     );
-    expect(await reasonOf(open(back))).toBe("sequence_out_of_order");
+    expect(await reasonOf(open(back))).toBe("conflicting_duplicate_sequence");
   });
 
-  it("starts at any seq and can skip output before a later one", async () => {
+  it("skips output before fromSeq and starts there", async () => {
     const handle = await begin();
     await write(handle, [
-      { stream: "stdout", chunk: "old\n", seq: 7 },
-      { stream: "stdout", chunk: "new\n", seq: 8 },
-      { stream: "stdout", chunk: "newer\n", seq: 9 },
+      { stream: "stdout", chunk: "old\n", seq: 1 },
+      { stream: "stdout", chunk: "new\n", seq: 2 },
+      { stream: "stdout", chunk: "newer\n", seq: 3 },
     ]);
     expect(lines(await collect(open(handle)), "stdout")).toEqual(["old\n", "new\n", "newer\n"]);
-    expect(lines(await collect(open(handle, { fromSeq: 8 })), "stdout")).toEqual(["new\n", "newer\n"]);
+    expect(lines(await collect(open(handle, { fromSeq: 2 })), "stdout")).toEqual(["new\n", "newer\n"]);
+  });
+
+  it("is intact when the log holds fromSeq 100 as the first kept record", async () => {
+    const handle = await begin();
+    await write(handle, [
+      { stream: "stdout", chunk: "before\n", seq: 99 },
+      { stream: "stdout", chunk: "a\n", seq: 100 },
+      { stream: "stdout", chunk: "b\n", seq: 101 },
+    ]);
+    const reader = open(handle, { fromSeq: 100 });
+    expect(lines(await collect(reader), "stdout")).toEqual(["a\n", "b\n"]);
+    expect(await reader.settle()).toMatchObject({ kind: "intact", lastSeq: 101 });
+  });
+
+  it("is inconclusive when records from fromSeq on are missing at the start", async () => {
+    const handle = await begin();
+    await write(handle, [
+      { stream: "stdout", chunk: "x\n", seq: 105 },
+      { stream: "stdout", chunk: "y\n", seq: 106 },
+    ]);
+    expect(await reasonOf(open(handle, { fromSeq: 100 }))).toBe("sequence_gap");
+  });
+
+  it("is inconclusive when a whole-log read is missing the first record", async () => {
+    const handle = await begin();
+    await write(handle, [
+      { stream: "stdout", chunk: "two\n", seq: 2 },
+      { stream: "stdout", chunk: "three\n", seq: 3 },
+    ]);
+    expect(await reasonOf(open(handle))).toBe("sequence_gap");
   });
 
   it("is inconclusive when a chunk was compacted by the run log", async () => {

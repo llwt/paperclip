@@ -28,7 +28,6 @@ export type AdoptedRunOutputInconclusiveReason =
   | "malformed_outer_record"
   | "conflicting_duplicate_sequence"
   | "sequence_gap"
-  | "sequence_out_of_order"
   | "compaction_marker"
   | "over_limit_line"
   | "unterminated_final_line";
@@ -77,7 +76,7 @@ export interface OpenAdoptedRunOutputInput {
   runLogStore: RunLogStore;
   run: AdoptedRunLogRow;
   expected: AdoptedRunIdentity;
-  /** Ignore outer records below this seq, for example output of an earlier invocation. */
+  /** First seq to read (default 1); records below it are skipped and the first kept record must be this seq. */
   fromSeq?: number;
   limits?: {
     pageBytes?: number;
@@ -188,7 +187,8 @@ export function openAdoptedRunOutput(input: OpenAdoptedRunOutputInput): AdoptedR
     input.limits?.maxOuterLineBytes ?? ADOPTED_OUTPUT_MAX_OUTER_LINE_BYTES,
     pageBytes,
   );
-  const fromSeq = input.fromSeq ?? 0;
+  // The log writers in heartbeat.ts number the first record of a run 1.
+  const firstSeq = input.fromSeq ?? 1;
 
   let failure: AdoptedRunOutputInconclusiveError | null = null;
   let records = 0;
@@ -201,6 +201,7 @@ export function openAdoptedRunOutput(input: OpenAdoptedRunOutputInput): AdoptedR
       stdout: { parts: [] as string[], bytes: 0 },
       stderr: { parts: [] as string[], bytes: 0 },
     };
+    // One digest per seq, so memory grows with the record count.
     const seen = new Map<number, string>();
     let previousSeq: number | null = null;
 
@@ -209,18 +210,22 @@ export function openAdoptedRunOutput(input: OpenAdoptedRunOutputInput): AdoptedR
       maxOuterLineBytes,
     })) {
       const outer = parseOuterRecord(line);
-      if (outer.seq < fromSeq) continue;
+      if (outer.seq < firstSeq) continue;
 
       const digest = digestRecord(outer);
       if (previousSeq !== null && outer.seq <= previousSeq) {
+        // Every seq in [firstSeq, previousSeq] was seen: records are contiguous.
         const earlier = seen.get(outer.seq);
-        if (earlier === undefined) {
-          throw new AdoptedRunOutputInconclusiveError("sequence_out_of_order", `seq ${outer.seq}`);
-        }
         if (earlier !== digest) {
           throw new AdoptedRunOutputInconclusiveError("conflicting_duplicate_sequence", `seq ${outer.seq}`);
         }
         continue;
+      }
+      if (previousSeq === null && outer.seq !== firstSeq) {
+        throw new AdoptedRunOutputInconclusiveError(
+          "sequence_gap",
+          `first record is seq ${outer.seq}, expected seq ${firstSeq}`,
+        );
       }
       if (previousSeq !== null && outer.seq !== previousSeq + 1) {
         throw new AdoptedRunOutputInconclusiveError("sequence_gap", `after seq ${previousSeq}`);
