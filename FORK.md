@@ -26,6 +26,7 @@ the ones on `somnex-main` before the merge; what is left of each is the diff of
 | Commit | What | Upstream status | Drops out when |
 | --- | --- | --- | --- |
 | SX-1378 (this PR) | Usage: a resumed Claude CLI run stores and bills only its own tokens and cost. On `--resume` the CLI's `modelUsage` and `total_cost_usd` are session totals (only `result.usage` covers the invocation), but the adapter labelled them `per_run`, so every resumed run stored the session total and a failed run repeated the previous run's figures. The adapter now labels `modelUsage` figures `session_cumulative` (`packages/adapters/claude-local/src/server/parse.ts`, `execute.ts`), and `resolveNormalizedUsageForSession` in `server/src/services/heartbeat.ts` subtracts the newest earlier run of the same session from the cost as well as the tokens, for `session_cumulative` only. Without `modelUsage` the tokens are per invocation but the cost is still the session total: the adapter sets `costBasis: "session_cumulative"` (`packages/adapter-utils/src/types.ts`), the server deltas only the cost (`costSource`), and stores the previous raw tokens plus this invocation's as the raw counters. Those invocation tokens count cache writes as input, as `modelUsage` does (`claudeResultUsageTotals`), so the rebuilt baseline uses the same definitions. `result.usage` misses subagent tokens, so those raw counters are marked `rawUsageIncomplete`; the next run that reports `modelUsage` then stores its own `result.usage` tokens (`usageSource: "invocation"`, adapter field `invocationUsage`) instead of a delta, and its complete totals become the baseline again. Subagent tokens of such runs go uncounted, never onto another run. A run that clears its session for the next run (max turns) is still deltaed against the session it resumed. `usage_json` keeps the cumulative cost as `rawCostUsd` for the next run; `usageSource` is `session_delta`, or `session_total` when there is no earlier usage to subtract. The baseline comes from stored rows, so it holds after a restart and for sessions started before the install (their rows hold the totals). Old rows are not rewritten. At install, set `CLAUDE_SESSION_TOTALS_UNTIL` in `maintenance/usage-audit.mjs` (SX-1376 interim script) to the install time, so the audit stops subtracting for runs after it. | Local only. Upstream `master` (`53732c811`, 2026-10-21) still labels Claude CLI `modelUsage` `per_run` | An upstream release stores per-run usage for resumed Claude CLI runs |
+| SX-1495 (this PR) | CI: `somnex-ci.yml` job `install_git` runs `paperclipai install --ref` for the commit under test on node 24 with npm ignore-scripts on, and the `somnex-ci` gate needs it (see "CI gate") | Local only. Fork-only workflow, nothing to submit | The fork stops installing from git refs |
 | SX-1457 (this PR) | Backups: both engines write to `.partial` files and publish the complete gzip by rename; server startup removes incomplete files; Install and Rollback check for a running backup before restart | Local only (SX-1456) | An upstream release writes backups to a temporary name |
 | Claude quota classification (this PR) | Claude login detection ignores stream-json objects in raw stdout and gives terminal quota or transient errors priority, so a tool's `unauthorized` output cannot turn a session limit into account reauthorization | Local only | An upstream release carries an equivalent fix |
 | NX-1092 (this PR) | Setup-token cleanup: exclude local subscription rows from scoped reads and writes, clear records with no lease without a provider release, and log only the error class and SQLSTATE on a failed release | Local only (NX-1092). Upstream `master` `f3af9887c` has the same fault | An upstream release carries an equivalent fix |
@@ -206,7 +207,7 @@ git merge --no-ff <tag>
 
 ## CI gate
 
-`.github/workflows/somnex-ci.yml` runs on every pull request into `somnex-main`, on
+`.github/workflows/somnex-ci.yml` runs on every pull request into `somnex-main` and on every push to `somnex-main` (each merge), so the exact SHA to install has its own run, on
 GitHub-hosted runners: `pnpm install --frozen-lockfile`, `pnpm typecheck`,
 `pnpm build`, and the suites of `pnpm test:run` split into parallel lanes with
 upstream's own shard flags. Upstream's server shards pick files by path rules
@@ -214,7 +215,12 @@ and miss a few that the unsharded run includes, so one extra lane ("server
 other") runs every server project test file that no shard selects. The list is
 computed by `scripts/somnex-ci-server-other.mjs` (fork-only) from vitest's own
 collection minus the shards' dry-run selection; `--list` prints it. The
-`somnex-ci` check is green only when every lane passed.
+"Git install (node 24)" job (`install_git`) runs the CLI from the commit under
+test and runs its `install --repo llwt/paperclip --ref <sha> -y` with the node
+major of `.nvmrc`, `npm_config_ignore_scripts=true` and a scratch `HOME` and
+`PAPERCLIP_HOME`, then checks that the installed `paperclipai --version` runs and
+reports the CLI version (SX-1495). The `somnex-ci` check is green only when
+every lane passed.
 
 Until 2026-10-21 the mainline was named `nrwl-main` and the required check `nrwl-ci` (renamed on SX-1119 Step 3). Older PRs, tasks and install notes use those names.
 
@@ -295,8 +301,45 @@ change to get one merge through.
 
 ## Install
 
-An install is a deployment. It is its own task, assigned by the Coordinator
-after Steven approves the SHA.
+An install is a deployment. It is its own task for the Sr. Engineer, with
+Steven's card on the exact SHA (Steven's decisions on SX-1481, 21 October 2026).
+
+**When an install starts.**
+
+- A high-priority fork fix is installed as soon as it is merged: the
+  Engineering Lead creates the install task right after the merge.
+- Every other merged fix waits for the fixed install at 09:00 and 15:00 UTC on
+  weekdays. A routine creates a task for the Engineering Lead at those times.
+  When `somnex-main` has merged commits that are not installed, the
+  Engineering Lead creates the install task for the head SHA; otherwise the
+  routine task is closed with no install.
+
+**One card per install.** Steven's card on the install SHA is the only card.
+The smoke checklist has no card for Steven (item 5 is an agent check).
+
+**Only the restart waits.** When Steven accepts the card, steps 0 to 5 start at
+once. Only the restart (step 7) waits, for:
+
+- the backup check (step 6);
+- the restart window agreed with Nx (NX-1306, 22 October 2026): any time, also
+  during working hours, but not at minute :00 to :02 or :30 to :32 of the hour
+  (UTC). No check for an Nx merge or install in flight is needed;
+- only for an install with a database migration: the Nx notice. Before the
+  card is posted, the Engineering Lead creates a notice task for Hog Boss with
+  the SHA and the planned time, and the install task is blocked on it until
+  Nx Boss has answered. An install with no migration has no notice.
+
+**After the install.** The install task reports the installed SHA, the restart
+time (UTC) and any Nx run lost in the restart (run id and task) if it can be
+seen. The Sr. Engineer then creates one task with no parent for Hog Boss with
+these facts and what changed for Nx; Hog Boss sends it to Nx as an FYI.
+
+0. Test the combined SHA when it has no green `somnex-ci` run of its own (a
+   pull request's run tests its own head, not `somnex-main` after a later
+   merge). Extract the SHA into the task scratch dir with `git archive`, not a
+   new worktree, and run `pnpm install --frozen-lockfile`, `pnpm typecheck`
+   and the test files that the new pull requests add or change. Stop on any
+   failure.
 
 1. The target is a full SHA on `somnex-main` with a green `somnex-ci` run. Never
    install a branch name. GitHub lets a commit reach `somnex-main` only through
@@ -419,8 +462,12 @@ The health endpoint reports `commit: null`, so the SHA check reads
 2. `sha` in `~/.paperclip/cli/install.json` equals the approved SHA.
 3. One agent heartbeat run completes on a throwaway task.
 4. One MCP gateway tool call succeeds (the tool timeout path).
-5. One pending card renders and accepts input in the UI (the card remount
-   path).
+5. The UI and cards work, checked by an agent (no card for Steven, SX-1481):
+   `GET /` returns 200 HTML and the `/assets/*.js` file it references returns
+   200; on a throwaway task, a `request_confirmation` interaction with
+   `resolverPolicy: "anyone"` is posted and accepted through
+   `POST /api/issues/{id}/interactions/{interactionId}/accept`, and reads
+   `accepted` afterwards. Cancel the throwaway task.
 
 ## Record of the `98fa44c` install
 

@@ -1222,6 +1222,12 @@ browser polling starts after the first send or upload creates a persisted task
 UUID. Saved chats retain the task browser's company and credential access checks.
 Task browser routes reject malformed task IDs with `404` before querying PostgreSQL.
 
+Issue-thread interaction routes share a UUID parameter guard. A malformed
+`interactionId` returns `404` with `Interaction not found` before the interaction
+lookup. A valid UUID that does not exist returns the same response. This applies
+to `accept`, `reject`, `respond`, `verdicts`, `withdraw`, `skip`, `cancel`, and
+`resolve-from-comment`.
+
 A native continuation that requires reconciliation shows **Recovery needed**
 with **Inspect run**; inspect the original outcome before resolving its recovery
 hold. A generic retry cannot resolve this incident. The runner's

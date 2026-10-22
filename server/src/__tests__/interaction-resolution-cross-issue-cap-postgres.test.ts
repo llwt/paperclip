@@ -79,11 +79,14 @@ describeEmbeddedPostgres("cross-issue interaction resolution cap (routes + postg
     await tempDb?.cleanup();
   });
 
-  function app(actor: Record<string, unknown>) {
+  function app(actor: Record<string, unknown>, serverErrors: unknown[] = []) {
     const testApp = express();
     testApp.use(express.json());
-    testApp.use((req, _res, next) => {
+    testApp.use((req, res, next) => {
       (req as any).actor = actor;
+      res.on("finish", () => {
+        if ((res as any).__errorContext) serverErrors.push((res as any).__errorContext);
+      });
       next();
     });
     testApp.use("/api", issueRoutes(db, {} as any, {}));
@@ -251,6 +254,40 @@ describeEmbeddedPostgres("cross-issue interaction resolution cap (routes + postg
       ));
     return rows.length;
   }
+
+  it.each([
+    "accept", "reject", "respond", "verdicts", "withdraw", "skip", "cancel", "resolve-from-comment",
+  ])("returns 404 for malformed and missing interaction IDs on %s", async (route) => {
+    const { companyId, agentId, userId } = await seedCompanyAndAgent("BADID");
+    const issueId = await seedIssue(companyId, "BADID", agentId);
+    const runId = await seedRun(companyId, agentId, issueId);
+    const serverErrors: unknown[] = [];
+    const client = app(route === "resolve-from-comment"
+      ? agentActor(companyId, agentId, runId)
+      : boardActor(companyId, userId), serverErrors);
+    const body = route === "respond" ? { answers: [] }
+      : route === "verdicts" ? { verdicts: [{ id: "item", verdict: "approve" }] }
+      : route === "resolve-from-comment" ? { commentId: randomUUID(), decision: "accept" }
+      : {};
+
+    // The nil UUID is valid input too, even though it is not a generated v4 ID.
+    for (const interactionId of ["null", "not-a-uuid", randomUUID(), "00000000-0000-0000-0000-000000000000"]) {
+      const res = await request(client)
+        .post(`/api/issues/${issueId}/interactions/${interactionId}/${route}`)
+        .send(body);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(404);
+      expect(res.body).toMatchObject({ error: "Interaction not found" });
+      if (interactionId !== "null" && interactionId !== "not-a-uuid") {
+        expect(res.body).toEqual({
+          error: "Interaction not found",
+          code: "interaction_not_found",
+          details: { code: "interaction_not_found" },
+        });
+      }
+    }
+    expect(serverErrors).toEqual([]);
+  });
 
   it.each(["accept", "reject", "respond", "verdicts"] as const)(
     "fails a capped run closed on cross-issue %s with no interaction, task, activity, or wake",
