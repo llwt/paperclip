@@ -471,6 +471,65 @@ export interface AcpTargetDescriptor {
   };
 }
 
+/** One ordered piece of a run's persisted output, kept separate per stream. */
+export interface AdapterOutputRecoveryRecord {
+  stream: "stdout" | "stderr";
+  chunk: string;
+  seq: number;
+}
+
+export interface AdapterOutputRecoveryInput {
+  output: AsyncIterable<AdapterOutputRecoveryRecord>;
+  context: AdapterOutputRecoveryContext;
+}
+
+/**
+ * Allowlisted snapshot of the latest CLI invocation of a run, taken before it
+ * started. Deliberately not an AdapterExecutionContext: no env, credentials,
+ * prompt, tools or paths, so a recovery hook is a parser and nothing more.
+ */
+export interface AdapterOutputRecoveryContext {
+  version: 1;
+  /** Adapter type the run was started with, not today's agent setting. */
+  adapterType: string;
+  /** Engine that actually ran the child, for example "cli". */
+  engine: string;
+  /** Where the latest invocation begins in the run's output. */
+  invocation: {
+    /** First output seq that belongs to the latest invocation, when known. */
+    firstSeq: number | null;
+    sessionIdBefore: string | null;
+    /** Safe local session fields only. */
+    sessionParams: Record<string, unknown> | null;
+  };
+  accounting: {
+    provider: string | null;
+    biller: string | null;
+    model: string | null;
+    billingType: AdapterBillingType | null;
+  };
+  runStart: {
+    sessionIdBefore: string | null;
+    sessionDisplayId: string | null;
+    sessionParams: Record<string, unknown> | null;
+  };
+}
+
+export type AdapterOutputRecoveryResult =
+  | {
+      kind: "complete";
+      outcome: "succeeded" | "failed";
+      /** Always exitCode null, signal null, timedOut false. */
+      result: AdapterExecutionResult;
+      /** The provider event that ended the run, for provenance. */
+      terminalEvent: string;
+    }
+  | {
+      kind: "inconclusive";
+      reason: string;
+      observedSessionId?: string;
+    };
+
 export interface ServerAdapterModule {
   type: string;
   execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult>;
@@ -480,6 +539,12 @@ export interface ServerAdapterModule {
   syncSkills?: (ctx: AdapterSkillContext, desiredSkills: string[]) => Promise<AdapterSkillSnapshot>;
   sessionCodec?: AdapterSessionCodec;
   sessionManagement?: import("./session-compaction.js").AdapterSessionManagement;
+  /**
+   * Optional: read the final provider result from the persisted output of a
+   * local child whose parent process was lost. A parser only; the server
+   * establishes that the output is complete and owned before calling it.
+   */
+  recoverResultFromOutput?: (input: AdapterOutputRecoveryInput) => Promise<AdapterOutputRecoveryResult>;
   /** Selected harness can resume its conversation with this run's tool bindings. */
   supportsToolRefreshOnResume?: boolean | ((config: Record<string, unknown>) => boolean);
   supportsLocalAgentJwt?: boolean;
