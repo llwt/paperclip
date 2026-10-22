@@ -33,6 +33,8 @@ import type {
   ScopeKey,
   ToolResult,
   ToolRunContext,
+  PluginIssueExecutionDecision,
+  PluginIssueExecutionPrincipalLabel,
   PluginWorkspace,
   PluginExecutionWorkspaceMetadata,
   AgentSession,
@@ -112,6 +114,8 @@ export interface TestHarness {
     issues?: Issue[];
     issueComments?: IssueComment[];
     issueInteractions?: IssueThreadInteraction[];
+    issueExecutionDecisions?: PluginIssueExecutionDecision[];
+    issueExecutionPrincipalLabels?: Array<PluginIssueExecutionPrincipalLabel & { companyId: string }>;
     issueAttachments?: Array<IssueAttachment & { contentBase64?: string }>;
     approvals?: Approval[];
     agents?: Agent[];
@@ -502,6 +506,8 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
   const blockedByIssueIds = new Map<string, string[]>();
   const issueComments = new Map<string, IssueComment[]>();
   const issueInteractions = new Map<string, IssueThreadInteraction[]>();
+  const issueExecutionDecisions = new Map<string, PluginIssueExecutionDecision>();
+  const executionPrincipalLabels = new Map<string, PluginIssueExecutionPrincipalLabel>();
   const issueAttachments = new Map<string, IssueAttachment[]>();
   const attachmentContentById = new Map<string, string>();
   const approvals = new Map<string, Approval>();
@@ -1794,6 +1800,55 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       async requestCheckboxConfirmation(issueId, interaction, companyId, options) {
         return this.createInteraction(issueId, { ...interaction, kind: "request_checkbox_confirmation" }, companyId, options) as Promise<any>;
       },
+      async listExecutionDecisions(issueId, companyId, options = {}) {
+        requireCapability(manifest, capabilitySet, "issue.execution.read");
+        const limit = options.limit === undefined ? 50 : options.limit;
+        if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("Invalid execution decision history options");
+        let after: { companyId: string; issueId: string; createdAt: string; id: string } | undefined;
+        if (options.cursor !== undefined) {
+          try {
+            const bytes = Buffer.from(options.cursor, "base64url");
+            if (bytes.toString("base64url") !== options.cursor) throw new Error();
+            after = JSON.parse(bytes.toString("utf8"));
+            if (!after || after.companyId !== companyId || typeof after.issueId !== "string"
+              || !Number.isFinite(Date.parse(after.createdAt)) || typeof after.id !== "string") throw new Error();
+          } catch { throw new Error("Invalid execution decision history cursor"); }
+        }
+        const issue = issues.get(issueId) ?? [...issues.values()].find(row => row.identifier === issueId.toUpperCase());
+        if (!isInCompany(issue, companyId) || !issue) return { items: [], nextCursor: null, principalLabels: {} };
+        if (after && after.issueId !== issue.id) throw new Error("Invalid execution decision history cursor");
+        const rows = [...issueExecutionDecisions.values()]
+          .filter(row => row.companyId === companyId && row.issueId === issue.id)
+          .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+          .filter(row => !after || Date.parse(row.createdAt) > Date.parse(after.createdAt)
+            || (Date.parse(row.createdAt) === Date.parse(after.createdAt) && row.id > after.id))
+          .slice(0, limit + 1);
+        const items = rows.slice(0, limit).map(row => ({ ...row }));
+        const last = items.at(-1);
+        const principalLabels: Record<string, PluginIssueExecutionPrincipalLabel> = {};
+        const add = (type: "agent" | "user", id?: string | null) => {
+          if (!id) return;
+          const agent = type === "agent" ? agents.get(id) : undefined;
+          const seeded = executionPrincipalLabels.get(`${companyId}:${type}:${id}`);
+          principalLabels[`${type}:${id}`] = { type, id, label: seeded?.label ?? (agent?.companyId === companyId ? agent.name : null) };
+        };
+        const principals = [
+          ...(issue.executionPolicy?.stages.flatMap(stage => stage.participants) ?? []),
+          issue.executionState?.currentParticipant,
+          issue.executionState?.returnAssignee,
+        ];
+        for (const principal of principals) {
+          if (principal?.type === "agent") add("agent", principal.agentId);
+          if (principal?.type === "user") add("user", principal.userId);
+        }
+        for (const row of items) { add("agent", row.actorAgentId); add("user", row.actorUserId); }
+        return {
+          items, principalLabels,
+          nextCursor: rows.length > limit && last ? Buffer.from(JSON.stringify({
+            companyId, issueId: issue.id, createdAt: last.createdAt, id: last.id,
+          })).toString("base64url") : null,
+        };
+      },
       async listInteractions(issueId, companyId) {
         requireCapability(manifest, capabilitySet, "issue.interactions.read");
         if (!isInCompany(issues.get(issueId), companyId)) return [];
@@ -2551,6 +2606,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         const list = issueComments.get(row.issueId) ?? [];
         list.push(row);
         issueComments.set(row.issueId, list);
+      }
+      for (const row of input.issueExecutionDecisions ?? []) issueExecutionDecisions.set(row.id, row);
+      for (const { companyId, type, id, label } of input.issueExecutionPrincipalLabels ?? []) {
+        executionPrincipalLabels.set(`${companyId}:${type}:${id}`, { type, id, label });
       }
       for (const row of input.issueInteractions ?? []) {
         const list = issueInteractions.get(row.issueId) ?? [];

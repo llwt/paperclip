@@ -708,6 +708,36 @@ Relation and read helpers:
 - `ctx.issues.getSubtree(issueId, companyId, options)`
 - `ctx.issues.summaries.getOrchestration({ issueId, companyId, includeSubtree, billingCode })`
 
+Retained execution history (fork-local extension):
+
+- `ctx.issues.listExecutionDecisions(issueId, companyId, options?)` requires the
+  separate `issue.execution.read` capability before service access. `issues.get`
+  and its current policy/state projection remain unchanged.
+- Options are `{ cursor?: string, limit?: number }`. Limit defaults to 50 and
+  must be an integer from 1 through 100. Malformed options and cursors are
+  validation errors (`PLUGIN_RPC_ERROR_CODES.VALIDATION_ERROR`, -32007, on
+  worker-to-host RPC). Cursors are opaque and bound to the company and resolved
+  issue UUID. UUIDs and issue identifiers resolve within the requested company.
+- The response is `{ items, nextCursor, principalLabels }`. Query predicates
+  include both company and resolved issue UUID. Unknown and mismatched issues
+  return the same empty page. Order is ascending `(createdAt, id)`; the query
+  reads `limit + 1` records to decide continuation.
+- Items carry exactly the existing `IssueExecutionDecision` fields. Timestamps
+  are ISO strings. No inferred stage snapshot, card ID or SHA is added.
+- `principalLabels` is a map keyed by `agent:<id>` or `user:<id>`, with values
+  `{ type: "agent" | "user", id: string, label: string | null }`. Only principals
+  referenced by current policy/state and the returned page are included. Resolve
+  current company agent names and active human company member names only.
+  Unresolved principals keep their stable type/ID and a null label. No email,
+  grants, credentials or arbitrary user lookup is exposed.
+- The capability is an instance plugin grant under the existing plugin model.
+  The UI bridge's authorized company and invocation scope checks still apply.
+  It is not a per-company installation permission.
+- Retention and policy edits can leave gaps. Do not invent missing decisions or
+  assume a completed stage is an approval. An old host can reject this method;
+  a plugin must show unavailable history explicitly. This adds no HTTP issue
+  route, write method, schema or migration.
+
 Governance helpers:
 
 - `ctx.issues.assertCheckoutOwner({ issueId, companyId, actorAgentId, actorRunId })` lets plugin actions preserve agent-run checkout ownership.
