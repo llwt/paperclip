@@ -644,14 +644,16 @@ describeEmbeddedPostgres("issue reassignment execution safety", () => {
   // transaction before the first transaction that opens after `ready()`.
   // That puts a concurrent writer between the stop and the ownership commit,
   // where the real claimant would have to wait for the stop's issue lock.
-  function dbInjectingAfter(ready: () => Promise<boolean>, inject: () => Promise<void>): typeof db {
+  // `ready` gets the stack frame that opened the transaction.
+  function dbInjectingAfter(ready: (caller: string) => Promise<boolean>, inject: () => Promise<void>): typeof db {
     let injected = false;
     return new Proxy(db, {
       get(target, prop) {
         const value = Reflect.get(target, prop, target);
         if (prop !== "transaction") return typeof value === "function" ? value.bind(target) : value;
         return async (...args: Parameters<typeof db.transaction>) => {
-          if (!injected && await ready()) {
+          const caller = new Error().stack?.split("\n")[2] ?? "";
+          if (!injected && await ready(caller)) {
             injected = true;
             await inject();
           }
@@ -1101,6 +1103,96 @@ describeEmbeddedPostgres("issue reassignment execution safety", () => {
       }
       await expect.poll(async () => (await wakesFor(successorAgentId)).length).toBe(1);
       expect(await wakesFor(ownerAgentId)).toEqual([]);
+    });
+  });
+
+  // Two requests race on the pending stops. Request A stops and verifies R1
+  // and reads the pending stops. Before A's ownership transaction, R2 of the
+  // old owner is admitted and request B stops it and is refused, leaving R2
+  // pending and unverified. A's commit must not release R2: it refuses too.
+  describe.each(["run_stop_unacknowledged", "run_stop_uncertain"] as const)("when another request leaves an unverified stop pending before the commit (%s)", (code) => {
+    async function raceSecondRequest() {
+      const seeded = await seed({ liveRun: "tracked" });
+      const { companyId, ownerAgentId, successorAgentId, otherAgentId, issueId, runId } = seeded;
+      let secondRunId: string | null = null;
+      let lease: typeof environmentLeases.$inferSelect | null = null;
+      let second: request.Response | null = null;
+      // Only A's ownership commit opens its transaction from the issue route
+      // or service; R1's cancel opens its own from the heartbeat service. So
+      // R2 and request B land after A verified and read the pending stops.
+      const routeDb = dbInjectingAfter(
+        async (caller) => /[/\\](routes|services)[/\\]issues\.ts:/.test(caller) && (await readRun(runId)).status === "cancelled",
+        async () => {
+          secondRunId = await startNewerRun({ companyId, ownerAgentId, issueId, tracked: code === "run_stop_uncertain" });
+          if (code === "run_stop_uncertain") lease = await addRemoteLease(companyId, issueId, secondRunId);
+          second = await request(createApp(companyId)).patch(`/api/issues/${issueId}`).send({ assigneeAgentId: otherAgentId });
+        },
+      );
+      const first = await request(createApp(companyId, undefined, routeDb))
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: successorAgentId });
+      expect(secondRunId).not.toBeNull();
+      expect(second).not.toBeNull();
+      return { ...seeded, first, second: second!, secondRunId: secondRunId!, lease: lease as typeof environmentLeases.$inferSelect | null };
+    }
+
+    it("refuses the first request's commit and keeps the owner, the version and the pending stop", async () => {
+      const { first, second, ownerAgentId, successorAgentId, otherAgentId, issueId, runId, secondRunId } = await raceSecondRequest();
+
+      expect(second.status).toBe(409);
+      expect(second.body.details).toMatchObject({ code, runId: secondRunId });
+      expect(first.status).toBe(409);
+      expect(first.body.details).toMatchObject({ code, runId: secondRunId });
+      expect(await readIssue(issueId)).toMatchObject({ assigneeAgentId: ownerAgentId, status: "in_progress", statusVersion: 0 });
+      const r2 = await readRun(secondRunId);
+      expect(r2).toMatchObject({ status: "cancelled", resultJson: expect.objectContaining({ reassignmentPendingIssueId: issueId }) });
+      expect(await verifyOwnershipStop(db, r2, { verificationTimeoutMs: 0 }))
+        .toBe(code === "run_stop_uncertain" ? "uncertain" : "unacknowledged");
+      // R1 was verified, but nothing committed, so it stays pending too.
+      expect((await readRun(runId)).resultJson).toMatchObject({ reassignmentPendingIssueId: issueId });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(await wakesFor(successorAgentId)).toEqual([]);
+      expect(await wakesFor(otherAgentId)).toEqual([]);
+    });
+
+    it("commits a retry once the second stop is verified and releases both pending stops", async () => {
+      const { first, companyId, ownerAgentId, successorAgentId, issueId, runId, secondRunId, lease } = await raceSecondRequest();
+      expect(first.status).toBe(409);
+
+      if (lease) await recordRemoteTerminationReceipt(lease);
+      else await acknowledgeStop(secondRunId);
+      const retry = await request(createApp(companyId)).patch(`/api/issues/${issueId}`).send({ assigneeAgentId: successorAgentId });
+
+      expect(retry.status).toBe(200);
+      expect((await readIssue(issueId)).assigneeAgentId).toBe(successorAgentId);
+      for (const id of [runId, secondRunId]) {
+        expect(parseResult((await readRun(id)).resultJson).reassignmentPendingIssueId ?? null).toBeNull();
+      }
+      await expect.poll(async () => (await wakesFor(successorAgentId)).length).toBe(1);
+      expect(await wakesFor(ownerAgentId)).toEqual([]);
+    });
+
+    it("commits a board override of the second stop and records it in the reassignment activity", async () => {
+      const { first, companyId, successorAgentId, issueId, runId, secondRunId } = await raceSecondRequest();
+      expect(first.status).toBe(409);
+
+      const retry = await request(createApp(companyId))
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: successorAgentId, acceptUnverifiedStop: true });
+
+      expect(retry.status).toBe(200);
+      expect((await readIssue(issueId)).assigneeAgentId).toBe(successorAgentId);
+      const [activity] = await db
+        .select({ details: activityLog.details })
+        .from(activityLog)
+        .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.updated")));
+      expect(parseResult(activity?.details).unverifiedStopOverrides).toEqual([
+        { runId: secondRunId, reason: code, acceptedByActorType: "user", acceptedByActorId: "board-user" },
+      ]);
+      for (const id of [runId, secondRunId]) {
+        expect(parseResult((await readRun(id)).resultJson).reassignmentPendingIssueId ?? null).toBeNull();
+      }
+      await expect.poll(async () => (await wakesFor(successorAgentId)).length).toBe(1);
     });
   });
 });

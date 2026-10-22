@@ -13512,6 +13512,7 @@ export function issueRoutes(
       // own run (for example handing work to a signoff reviewer).
       const issueMutationStopId = randomUUID();
       let unverifiedStopOverrides: Array<Record<string, unknown>> | null = null;
+      let coveredStopRunIds: string[] = [];
       const assignmentExpectation: AssignmentExpectation = {
         issueId: existing.id,
         companyId: existing.companyId,
@@ -13537,6 +13538,7 @@ export function issueRoutes(
           },
         );
         if (stopReceipt.kind === "stopped") interruptedRunId = stopReceipt.interruptedRunId;
+        coveredStopRunIds = stopReceipt.coveredStopRunIds ?? [];
         if (stopReceipt.unverifiedStopOverrides?.length) {
           unverifiedStopOverrides = stopReceipt.unverifiedStopOverrides.map((override) => ({
             ...override,
@@ -13631,6 +13633,7 @@ export function issueRoutes(
               expectedAssigneeAgentId: existing.assigneeAgentId,
               expectedStatusVersion: existing.statusVersion,
               ownershipStopRunId: interruptedRunId,
+              ownershipCoveredStopRunIds: coveredStopRunIds,
             }
           : {}),
       };

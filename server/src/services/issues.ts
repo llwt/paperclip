@@ -108,7 +108,7 @@ import {
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
-import { assertNoLiveRunForPreviousOwner, releasePendingReassignmentStops } from "./issue-assignment.js";
+import { assertNoLiveRunForPreviousOwner, assertPendingStopsCoveredAndRelease } from "./issue-assignment.js";
 import { isForeignKeyViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
@@ -10918,6 +10918,12 @@ export function issueService(db: Db) {
         expectedStatusVersion?: number;
         /** The old owner's run this ownership change stopped; any other live one fails it. */
         ownershipStopRunId?: string | null;
+        /**
+         * Pending stops the caller verified or a board user overrode before the
+         * commit. Only the shared assignment step sets it; any other pending
+         * stop on the issue then refuses the commit.
+         */
+        ownershipCoveredStopRunIds?: string[];
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10968,6 +10974,7 @@ export function issueService(db: Db) {
         expectedAssigneeAgentId,
         expectedStatusVersion,
         ownershipStopRunId,
+        ownershipCoveredStopRunIds,
         ...issueData
       } = data;
       // An explicit edit claims the title, even if it keeps the same text.
@@ -11309,7 +11316,15 @@ export function issueService(db: Db) {
         if ((issueData.assigneeAgentId !== undefined && issueData.assigneeAgentId !== receiptExisting.assigneeAgentId)
           || (issueData.assigneeUserId !== undefined && issueData.assigneeUserId !== receiptExisting.assigneeUserId)) {
           patch.statusVersion = sql`${issues.statusVersion} + 1` as unknown as number;
-          await releasePendingReassignmentStops(tx, { companyId: receiptExisting.companyId, issueId: receiptExisting.id });
+          // Only the shared assignment step verifies stops. Other writers
+          // release none, so an unverified stop stays sticky for the next PATCH.
+          if (ownershipCoveredStopRunIds !== undefined) {
+            await assertPendingStopsCoveredAndRelease(tx, {
+              companyId: receiptExisting.companyId,
+              issueId: receiptExisting.id,
+              coveredStopRunIds: ownershipCoveredStopRunIds,
+            });
+          }
           // Invalidate human direction at the common assignment boundary, including
           // plugin/service writes that do not go through HTTP run cancellation.
           // Keep the requester attribution for audit; cancellation revokes its use.

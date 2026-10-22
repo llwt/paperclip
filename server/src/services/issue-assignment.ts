@@ -46,7 +46,14 @@ export type UnverifiedStopOverride = {
 export type StopReceipt = (
   | { kind: "none" }
   | { kind: "stopped"; interruptedRunId: string; issueMutationStopId: string }
-) & { unverifiedStopOverrides?: UnverifiedStopOverride[] };
+) & {
+  unverifiedStopOverrides?: UnverifiedStopOverride[];
+  /**
+   * Every stopped run this request verified or a board user overrode. The
+   * commit releases exactly these pending stops and refuses on any other.
+   */
+  coveredStopRunIds?: string[];
+};
 
 export type OwnershipStopVerdict = "stopped" | "unacknowledged" | "uncertain";
 
@@ -196,13 +203,50 @@ async function markPendingReassignmentStop(
 }
 
 /**
- * Runs inside the ownership commit, under the issue lock. A committed
- * reassignment ends the stickiness of every earlier refused stop on the issue.
+ * Runs inside the ownership commit, under the issue lock (issue before run).
+ * The stops were verified before the transaction, without any lock. Another
+ * request can stop a run and leave it pending after that check; its stop was
+ * never verified here. Refuse then, without waiting: the retry verifies it
+ * outside the lock. Then release only the stops this request covered.
  */
-export async function releasePendingReassignmentStops(
+export async function assertPendingStopsCoveredAndRelease(
   tx: Db,
-  input: { companyId: string; issueId: string },
+  input: { companyId: string; issueId: string; coveredStopRunIds: readonly string[] },
 ): Promise<void> {
+  const covered = new Set(input.coveredStopRunIds);
+  const pending: HeartbeatRunRow[] = await tx
+    .select()
+    .from(heartbeatRuns)
+    .where(and(
+      eq(heartbeatRuns.companyId, input.companyId),
+      // The same rows a retry finds and verifies (findPendingReassignmentStops).
+      eq(heartbeatRuns.status, "cancelled"),
+      sql`${heartbeatRuns.resultJson}->>'reassignmentPendingIssueId' = ${input.issueId}`,
+    ))
+    .for("update");
+  const uncovered = (pending ?? [])
+    .filter((run) => run.status === "cancelled" && !covered.has(run.id) &&
+      parseObject(run.resultJson).reassignmentPendingIssueId === input.issueId)
+    .sort((a, b) => a.id.localeCompare(b.id))[0];
+  if (uncovered) {
+    // Reads only; no provider wait while the issue is locked.
+    const verdict = await verifyOwnershipStop(tx, uncovered, { verificationTimeoutMs: 0 });
+    if (verdict === "stopped") {
+      throw conflict("Another request stopped an agent run on this issue while this reassignment was in progress. The assignee was not changed.", {
+        code: "issue_state_changed",
+        runId: uncovered.id,
+      });
+    }
+    const reason = verdict === "unacknowledged" ? "run_stop_unacknowledged" : "run_stop_uncertain";
+    const problem = verdict === "unacknowledged"
+      ? "its executor did not acknowledge the stop"
+      : "its execution could not be verified as stopped";
+    throw conflict(`Another request cancelled an agent run on this issue, but ${problem}. The assignee was not changed.`, {
+      code: reason,
+      runId: uncovered.id,
+    });
+  }
+  if (covered.size === 0) return;
   await tx
     .update(heartbeatRuns)
     .set({
@@ -211,6 +255,7 @@ export async function releasePendingReassignmentStops(
     })
     .where(and(
       eq(heartbeatRuns.companyId, input.companyId),
+      inArray(heartbeatRuns.id, [...covered]),
       sql`${heartbeatRuns.resultJson}->>'reassignmentPendingIssueId' = ${input.issueId}`,
     ));
 }
@@ -270,8 +315,9 @@ export async function stopIssueExecutionForOwnershipChange(
         acceptUnverifiedStop,
         earlierAttempt: true,
       }));
+      verifiedHere.add(pending.id);
     }
-    return withOverrides(receipt, overrides);
+    return { ...withOverrides(receipt, overrides), coveredStopRunIds: [...verifiedHere] };
   };
   // The run an interrupt stopped in this request is verified on its own: a
   // second active run of the old owner must not take its place in the
