@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   buildLocalProcessSandboxSpawnTarget,
   miseToolInstallMounts,
+  sharedToolCacheMounts,
   parseLocalProcessFilesystemScope,
   parseLocalProcessNetworkAllowlist,
   parseLocalProcessNetworkScope,
@@ -156,6 +157,42 @@ describe("local process sandbox", () => {
     expect(flagFor(hostInstalls)).toBe("--ro-bind");
     expect(target.args.filter((arg) => arg === dataDir)).toHaveLength(2);
     expect(target.args).not.toContain(path.join(root, "mise", "missing-cache"));
+  });
+
+  it("selects the pnpm store and Rust paths read-only without mounting relative paths", () => {
+    expect(sharedToolCacheMounts({
+      npm_config_store_dir: "/agent/pnpm/store/",
+      RUSTUP_HOME: "/agent/rustup",
+      CARGO_HOME: "/agent/cargo",
+    })).toEqual([
+      { path: "/agent/pnpm/store", access: "ro" },
+      { path: "/agent/rustup", access: "ro" },
+      { path: "/agent/cargo", access: "ro" },
+    ]);
+    expect(sharedToolCacheMounts({ npm_config_store_dir: "relative", RUSTUP_HOME: "", CARGO_HOME: "/agent/rust" })).toEqual([
+      { path: "/agent/rust", access: "ro" },
+    ]);
+    expect(sharedToolCacheMounts({ RUSTUP_HOME: "/agent/rust", CARGO_HOME: "/agent/rust/" })).toHaveLength(1);
+    expect(sharedToolCacheMounts({})).toEqual([]);
+  });
+
+  it.runIf(process.platform === "linux")("binds the pnpm store and Rust directories read-only into a workspace sandbox", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-tool-caches-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const dirs = ["pnpm/store", "rustup", "cargo"].map(dir => path.join(root, "runtime", dir));
+    await Promise.all([workspace, ...dirs].map(dir => fs.mkdir(dir, { recursive: true })));
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath, args: ["-e", "process.exit(0)"], cwd: workspace,
+      options: {
+        workspaceDir: workspace, filesystemScope: "workspace",
+        managedPaths: sharedToolCacheMounts({ npm_config_store_dir: dirs[0], RUSTUP_HOME: dirs[1], CARGO_HOME: dirs[2] }),
+      },
+    });
+    for (const dir of dirs) {
+      expect(target.args[target.args.indexOf(dir) - 1]).toBe("--ro-bind");
+      expect(target.args.filter(arg => arg === dir)).toHaveLength(2);
+    }
   });
 
   it.runIf(process.platform === "linux")("binds a confined absolute alias to the synchronized workspace", async () => {
@@ -387,6 +424,36 @@ describe("local process sandbox", () => {
 
       expect(result.exitCode, result.stderr).toBe(0);
       await expect(fs.readFile(path.join(workspace, "workspace-ok.txt"), "utf8")).resolves.toBe("ok");
+    },
+  );
+
+  it.runIf(Boolean(process.env.PAPERCLIP_TEST_BWRAP))(
+    "reads shared tool caches in the sandbox and rejects writes to each directory",
+    async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-tool-caches-integration-"));
+      cleanup.push(root);
+      const workspace = path.join(root, "workspace");
+      const dirs = ["pnpm/store", "rustup", "cargo"].map(dir => path.join(root, "runtime", dir));
+      await Promise.all([workspace, ...dirs].map(dir => fs.mkdir(dir, { recursive: true })));
+      for (const dir of dirs) await fs.writeFile(path.join(dir, "canary"), "shared-tool-data");
+      const result = await runChildProcess("filesystem-sandbox-tool-caches-test", process.execPath, ["-e", [
+        "const fs = require('node:fs');",
+        `for (const dir of ${JSON.stringify(dirs)}) {`,
+        "  if (fs.readFileSync(dir + '/canary', 'utf8') !== 'shared-tool-data') process.exit(8);",
+        "  try { fs.writeFileSync(dir + '/written', 'bad'); process.exit(9); } catch (error) {",
+        "    if (!['EROFS', 'EACCES'].includes(error.code)) throw error;",
+        "  }",
+        "}",
+      ].join("\n")], {
+        cwd: workspace, env: {}, timeoutSec: 10, graceSec: 1, onLog: async () => {},
+        localProcessSandbox: {
+          workspaceDir: workspace, filesystemScope: "workspace",
+          managedPaths: sharedToolCacheMounts({ npm_config_store_dir: dirs[0], RUSTUP_HOME: dirs[1], CARGO_HOME: dirs[2] }),
+          command: process.env.PAPERCLIP_TEST_BWRAP,
+        },
+      });
+      expect(result.exitCode, result.stderr).toBe(0);
+      for (const dir of dirs) await expect(fs.access(path.join(dir, "written"))).rejects.toThrow();
     },
   );
 

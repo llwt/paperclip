@@ -181,13 +181,14 @@ function managedAiHomeEnvironment(home: string): Record<string, string> {
 }
 
 /**
- * mise tool installs shared by all managed AI runs. A run's HOME and XDG dirs
+ * Tool installs and caches shared by all managed AI runs. A run's HOME and XDG dirs
  * point at its temp home, so without these mise looks for tools in the empty
  * `data/mise` there and reinstalls each one on every run (SX-1444). New
  * installs and the download cache go to a Paperclip-owned dir that outlives
  * the run; the host user's own installs are only read, through
  * MISE_SHARED_INSTALL_DIRS. mise state (config trust, incomplete installs)
- * stays in the run's home.
+ * stays in the run's home. pnpm, rustup and Cargo use separate shared dirs,
+ * without writing to the host user's stores or toolchains.
  */
 export function managedAiToolEnvironment(
   sourceEnv: NodeJS.ProcessEnv = process.env,
@@ -206,6 +207,9 @@ export function managedAiToolEnvironment(
     .map((entry) => entry.trim())
     .filter((entry) => path.isAbsolute(entry) && path.resolve(entry) !== path.join(dataDir, "installs"));
   return {
+    npm_config_store_dir: path.join(instanceRoot, "runtime", "pnpm", "store"),
+    RUSTUP_HOME: path.join(instanceRoot, "runtime", "rustup"),
+    CARGO_HOME: path.join(instanceRoot, "runtime", "cargo"),
     MISE_DATA_DIR: dataDir,
     MISE_CACHE_DIR: path.join(shared, "cache"),
     MISE_SHARED_INSTALL_DIRS: Array.from(new Set(installDirs.map((entry) => path.resolve(entry)))).join(path.delimiter),
@@ -456,8 +460,11 @@ export async function prepareManagedAiRuntime(
     const toolEnv = managedAiToolEnvironment();
     await mkdir(toolEnv.MISE_DATA_DIR, { recursive: true, mode: 0o700 });
     await mkdir(toolEnv.MISE_CACHE_DIR, { recursive: true, mode: 0o700 });
+    for (const key of ["npm_config_store_dir", "RUSTUP_HOME", "CARGO_HOME"]) {
+      await mkdir(toolEnv[key], { recursive: true, mode: 0o700 });
+    }
     const env: Record<string, unknown> = {
-      // An agent's own mise settings win over the shared defaults.
+      // An agent's own tool settings win over the shared defaults.
       ...toolEnv,
       ...stripAiAuthBindings(input.config.env),
       ...Object.fromEntries(AI_AUTH_ENV_KEYS.map((key) => [key, ""])),
