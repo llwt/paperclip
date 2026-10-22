@@ -95,6 +95,16 @@ describe("execution stage fixtures", () => {
     ]);
   });
 
+  it("does not warn when an old host omits optional stage index and type", () => {
+    const source = issue();
+    Reflect.deleteProperty(source.executionState!, "currentStageIndex");
+    Reflect.deleteProperty(source.executionState!, "currentStageType");
+    const view = model(source);
+    expect(view.execution.warnings).toEqual([]);
+    expect(view.execution.currentStageId).toBe("review");
+    expect(view.execution.currentHolder).toMatchObject({ id: "reviewer" });
+  });
+
   it("uses stable IDs for missing names and does not invent missing actors", () => {
     const records = page([decision("no-actor", { actorAgentId: null }), decision("unknown", { actorAgentId: "missing" })]);
     records.principalLabels = {};
@@ -169,6 +179,20 @@ describe("conservative head SHA evidence", () => {
   it("accepts one explicitly labeled full hash with its exact source excerpt", () => {
     const body = `Review complete. Head SHA: ${sha.toUpperCase()}\nChecked`;
     expect(model(issue(), page([decision("sha", { body })])).history.decisions[0].headSha).toEqual({ status: "reported", label: "Reported head SHA", sha, excerpts: [`Head SHA: ${sha.toUpperCase()}`] });
+  });
+  it("accepts a full labeled hash in backticks with its exact source excerpt", () => {
+    const body = `Review complete. Head SHA: \`${sha}\``;
+    expect(model(issue(), page([decision("sha", { body })])).history.decisions[0].headSha).toEqual({
+      status: "reported", label: "Reported head SHA", sha, excerpts: [`Head SHA: \`${sha}\``],
+    });
+  });
+  it("marks a hash in backticks and a different bare hash as ambiguous", () => {
+    expect(headShaEvidence([`Head SHA: \`${sha}\`\nHead SHA: ${otherSha}`])).toEqual({
+      status: "ambiguous", label: "Ambiguous", excerpts: [`Head SHA: \`${sha}\``, `Head SHA: ${otherSha}`],
+    });
+  });
+  it("does not accept a short labeled hash in backticks", () => {
+    expect(headShaEvidence([`Head SHA: \`${sha.slice(0, 7)}\``])).toEqual({ status: "not_recorded", label: "Not recorded" });
   });
   it("marks conflicting labeled hashes as ambiguous", () => {
     expect(headShaEvidence([`Head SHA: ${sha}\nHead SHA: ${otherSha}`])).toMatchObject({ status: "ambiguous", label: "Ambiguous" });

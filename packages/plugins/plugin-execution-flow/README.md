@@ -64,8 +64,9 @@ has no continuation, not that every historical decision still exists.
 
 The default is **Not recorded**. Only a full 40-hex value explicitly labeled
 `Head SHA:` in a decision's own body or a card's own prompt/details becomes
-**Reported head SHA**. The exact matched excerpt is retained with the normalized
-hash. Conflicting labeled full hashes are **Ambiguous**. Repeated case variants
+**Reported head SHA**. A hash can have one optional backtick on each side. The exact
+matched excerpt is retained with the normalized hash. Conflicting labeled full hashes
+are **Ambiguous**. Repeated case variants
 of the same hash are not conflicting. Bare hashes, partial hashes, target
 revision IDs, card results, and work products are not SHA evidence. A reported
 hash is not verified against GitHub.

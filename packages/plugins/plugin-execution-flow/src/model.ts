@@ -27,7 +27,7 @@ export type HeadShaEvidence =
 
 /** Only explicitly labeled, full hashes from this record's own text count. */
 export function headShaEvidence(texts: Array<string | null | undefined>): HeadShaEvidence {
-  const matches = texts.flatMap((text) => [...(text ?? "").matchAll(/\bHead SHA:[ \t]*([a-fA-F0-9]{40})(?![\w-])/g)]);
+  const matches = texts.flatMap((text) => [...(text ?? "").matchAll(/\bHead SHA:[ \t]*`?([a-fA-F0-9]{40})(?![\w-])`?/g)]);
   const hashes = new Set(matches.map((match) => match[1].toLowerCase()));
   const excerpts = matches.map((match) => match[0]);
   if (hashes.size === 0) return { status: "not_recorded", label: "Not recorded" };
@@ -195,8 +195,8 @@ export function buildExecutionFlow(input: {
   for (const id of state?.completedStageIds ?? []) {
     if (!stageIds.has(id)) warnings.push(`Completed stage is not in the current policy: ${id}`);
   }
-  if (state?.currentStageId && state.currentStageIndex !== null && policyStages[state.currentStageIndex]?.id !== state.currentStageId) warnings.push("Current stage ID and index disagree");
-  if (state?.currentStageId && state.currentStageType !== null && policyStages.find((stage) => stage.id === state.currentStageId)?.type !== state.currentStageType) warnings.push("Current stage ID and type disagree");
+  if (state?.currentStageId && state.currentStageIndex != null && policyStages[state.currentStageIndex]?.id !== state.currentStageId) warnings.push("Current stage ID and index disagree");
+  if (state?.currentStageId && state.currentStageType != null && policyStages.find((stage) => stage.id === state.currentStageId)?.type !== state.currentStageType) warnings.push("Current stage ID and type disagree");
   if (state?.status === "pending" && (!state.currentStageId || !currentParticipant)) warnings.push("Pending execution has no current stage or participant");
   if (workReturned && !returnAssignee) warnings.push("Changes requested has no return assignee");
   if (state?.currentStageId && state.completedStageIds.includes(state.currentStageId)) warnings.push("Current stage is also marked completed");
