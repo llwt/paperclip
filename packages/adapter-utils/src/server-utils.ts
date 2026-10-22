@@ -12,6 +12,7 @@ import {
 } from "./local-process-sandbox.js";
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
+import { spawnRunOutputRelay } from "./run-output-relay.js";
 import { paperclipChatFilePreparationDelivery } from "./chat-file-delivery.js";
 import {
   PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES,
@@ -90,6 +91,8 @@ interface RunningProcess {
   child: ChildProcess;
   graceSec: number;
   processGroupId: number | null;
+  /** Hot restart: give the child's output pipes to a detached relay. */
+  handOffOutput?: (dir: string) => Promise<{ relayPid: number }>;
 }
 
 interface SpawnTarget {
@@ -145,6 +148,19 @@ export function signalRunningProcess(
 }
 
 export const runningProcesses = new Map<string, RunningProcess>();
+
+/**
+ * Hand the output pipes of a tracked child to a detached relay that writes
+ * them under `dir`, so the output survives this server's exit. Afterwards this
+ * server no longer reads, records, times out or settles the child; the server
+ * that adopts the run tails the relay files instead. Returns null when the run
+ * has no child that supports the handoff.
+ */
+export async function handOffRunningProcessOutput(runId: string, dir: string) {
+  const running = runningProcesses.get(runId);
+  if (!running?.handOffOutput) return null;
+  return running.handOffOutput(dir);
+}
 export const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
 export const MAX_EXCERPT_BYTES = 32 * 1024;
 const TERMINAL_RESULT_SCAN_OVERLAP_CHARS = 64 * 1024;
@@ -4741,10 +4757,12 @@ export async function runChildProcess(
                 })
             : Promise.resolve();
 
+        let outputHandedOff = false;
         runningProcesses.set(runId, {
           child,
           graceSec: opts.graceSec,
           processGroupId,
+          handOffOutput: (dir) => handOffOutput(dir),
         });
 
         let timedOut = false;
@@ -4876,6 +4894,49 @@ export async function runChildProcess(
             });
         });
 
+        const handOffOutput = async (dir: string) => {
+          if (outputHandedOff) throw new Error("child output was already handed off");
+          const readables = [child.stdout, child.stderr];
+          for (const readable of readables) readable?.pause();
+          let relay: { relayPid: number };
+          try {
+            relay = await spawnRunOutputRelay({
+              dir,
+              stdout: child.stdout,
+              stderr: child.stderr,
+            });
+          } catch (err) {
+            for (const readable of readables) resumeReadable(readable);
+            throw err;
+          }
+          outputHandedOff = true;
+          if (timeout) clearTimeout(timeout);
+          clearTerminalCleanupTimers();
+          runningProcesses.delete(runId);
+          // The relay holds its own copy of each read end now. Emit whatever
+          // this stream had buffered before the pause (the data listener
+          // queues it on logChain), then close this server's copy so the relay
+          // is the only reader.
+          for (const readable of readables) {
+            if (!readable) continue;
+            while (readable.readableLength > 0 && readable.read() !== null) {
+              // drained through the data listener
+            }
+            readable.destroy();
+          }
+          let drainTimer: NodeJS.Timeout | null = null;
+          await Promise.race([
+            logChain,
+            new Promise<void>((resolveDrain) => {
+              drainTimer = setTimeout(resolveDrain, 5_000);
+              drainTimer.unref?.();
+            }),
+          ]).finally(() => {
+            if (drainTimer) clearTimeout(drainTimer);
+          });
+          return relay;
+        };
+
         const stdin = child.stdin;
         if (opts.stdin != null && stdin) {
           void spawnPersistPromise.finally(() => {
@@ -4900,6 +4961,7 @@ export async function runChildProcess(
         });
 
         child.on("exit", () => {
+          if (outputHandedOff) return;
           maybeArmTerminalResultCleanup();
         });
 
@@ -4908,6 +4970,10 @@ export async function runChildProcess(
           (code: number | null, signal: NodeJS.Signals | null) => {
             if (timeout) clearTimeout(timeout);
             clearTerminalCleanupTimers();
+            // After a handoff this server holds only part of the output. The
+            // adopting server records the end of the run; settling it here
+            // from a partial stdout would race that.
+            if (outputHandedOff) return;
             runningProcesses.delete(runId);
             void logChain.finally(() => {
               void Promise.resolve()

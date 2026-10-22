@@ -133,6 +133,7 @@ export function useLiveRunTranscripts({
   const [retryGeneration, setRetryGeneration] = useState(0);
   const retry = useCallback(() => {
     missingTerminalLogRunIdsRef.current.clear();
+    settledTerminalLogBytesByRunRef.current.clear();
     setRetryGeneration((value) => value + 1);
   }, []);
   const seenChunkKeysRef = useRef(new Set<string>());
@@ -143,6 +144,10 @@ export function useLiveRunTranscripts({
   const pendingLogRowsByRunRef = useRef(new Map<string, string>());
   const logOffsetByRunRef = useRef(new Map<string, number>());
   const missingTerminalLogRunIdsRef = useRef(new Set<string>());
+  // SX-1597: a finished run whose log was read to the end, mapped to the log size
+  // known at that point. The read effect re-runs on every run-metadata change,
+  // so without this each live update re-read every finished run on the page.
+  const settledTerminalLogBytesByRunRef = useRef(new Map<string, number | null>());
   // PAP-462 B3: buffered runs that dropped out of the `runs` list, mapped to the
   // wall-clock deadline (ms) after which their buffer may be pruned. A run still
   // inside its grace window is retained across the empty poll; `pruneTick` fires
@@ -280,6 +285,11 @@ export function useLiveRunTranscripts({
         missingTerminalLogRunIdsRef.current.delete(runId);
       }
     }
+    for (const runId of settledTerminalLogBytesByRunRef.current.keys()) {
+      if (!retainedRunIds.has(runId)) {
+        settledTerminalLogBytesByRunRef.current.delete(runId);
+      }
+    }
     for (const runId of transcriptCacheRef.current.keys()) {
       if (!retainedRunIds.has(runId)) {
         transcriptCacheRef.current.delete(runId);
@@ -310,6 +320,12 @@ export function useLiveRunTranscripts({
       if (missingTerminalLogRunIdsRef.current.has(run.id) || inFlightRunIds.has(run.id)) {
         return;
       }
+      const settledBytes = settledTerminalLogBytesByRunRef.current;
+      if (isTerminalStatus(run.status) && settledBytes.has(run.id)) {
+        // A late write changes the known size; read the rest once more.
+        if (settledBytes.get(run.id) === runKnownLogBytes(run)) return;
+        settledBytes.delete(run.id);
+      }
       inFlightRunIds.add(run.id);
       const offset = logOffsetByRunRef.current.get(run.id) ?? resolveInitialLogOffset(run, logReadLimitBytes);
       try {
@@ -334,6 +350,7 @@ export function useLiveRunTranscripts({
         if (result.content.length > 0) {
           logOffsetByRunRef.current.set(run.id, offset + result.content.length);
         }
+        if (isTerminalStatus(run.status)) settledBytes.set(run.id, runKnownLogBytes(run));
       } catch (error) {
         if (cancelled) return;
         if (error instanceof ApiError && error.status === 404) {
