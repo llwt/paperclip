@@ -271,91 +271,112 @@ export function hydrateEmbeddedPostgresSymlinks(payloadPath: string): number {
   return created;
 }
 
-export async function installGitPayload(repo: string, sha: string, runCommand: CommandRunner, paths = resolveInstallStorePaths()): Promise<{ payloadPath: string; reused: boolean; version: string }> {
-  const identifier = sha.slice(0, 12);
-  const payloadPath = payloadPathFor(paths, "git", identifier);
-  if (fs.existsSync(payloadPath)) {
-    const metadata = JSON.parse(fs.readFileSync(path.join(payloadPath, "node_modules", "paperclipai", "package.json"), "utf8")) as { version: string };
-    await smokePayload(payloadPath, metadata.version, runCommand);
-    return { payloadPath, reused: true, version: metadata.version };
-  }
-  const sourceRoot = path.dirname(payloadPath);
-  fs.mkdirSync(sourceRoot, { recursive: true, mode: 0o700 });
-  const sourceStat = fs.lstatSync(sourceRoot);
-  if (!sourceStat.isDirectory() || sourceStat.isSymbolicLink()) {
-    throw new Error(`Refusing to install into unsafe payload root ${sourceRoot}.`);
-  }
-  fs.chmodSync(paths.cliRoot, 0o700);
-  fs.chmodSync(paths.installsRoot, 0o700);
-  fs.chmodSync(sourceRoot, 0o700);
-  const stagingRoot = path.join(sourceRoot, `.${identifier}.tmp-${process.pid}-${Date.now()}`);
-  const checkoutPath = path.join(stagingRoot, "source");
-  const archivePath = path.join(stagingRoot, "source.tar.gz");
-  const stagedPayload = path.join(stagingRoot, "payload");
-  fs.rmSync(stagingRoot, { recursive: true, force: true });
-  fs.mkdirSync(checkoutPath, { recursive: true, mode: 0o700 });
-  // Workspace build scripts invoke bare `pnpm`; on a machine where pnpm exists only
-  // through corepack, nothing puts it on PATH, so provision a shim into the staging dir.
-  const pnpmShimDir = path.join(stagingRoot, "pnpm-bin");
-  fs.mkdirSync(pnpmShimDir, { recursive: true, mode: 0o700 });
-  // pnpm leaves the workspace root node_modules/.bin off the script PATH when
-  // ignore-scripts=true is configured, so packages that rely on the root
-  // TypeScript (tsc) fail to build. Put it on PATH here; this runs no dependency
-  // lifecycle scripts and leaves the setting itself alone.
-  const workspaceBinDir = path.join(checkoutPath, "node_modules", ".bin");
-  const buildEnv = (extra: NodeJS.ProcessEnv = {}) =>
-    gitBuildEnv({ PATH: [pnpmShimDir, workspaceBinDir, process.env.PATH].filter(Boolean).join(path.delimiter), ...extra });
+async function timed<T>(label: string, fn: () => Promise<T> | T): Promise<T> {
+  const start = performance.now();
   try {
-    await runGitHubCurl(["--fail", "--silent", "--show-error", "--location", "--output", archivePath, `https://codeload.github.com/${repo}/tar.gz/${sha}`], runCommand, { maxBuffer: 4 * 1024 * 1024 });
-    await runCommand("tar", ["-xzf", archivePath, "--strip-components=1", "-C", checkoutPath], { maxBuffer: 4 * 1024 * 1024 });
-    await runCommand("corepack", ["enable", "pnpm", "--install-directory", pnpmShimDir], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 4 * 1024 * 1024 });
-    await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-    await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-    await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-    // The server package ships ui-dist, but only its prepack script builds it, and
-    // prepare-bundled-package.mjs stages the server without running prepack.
-    await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-    // Same for the skills directory those packages ship: scripts/release.sh copies
-    // it in by hand, so do the same here for the same three packages.
-    const skillsPath = path.join(checkoutPath, "skills");
-    if (fs.existsSync(skillsPath)) {
-      for (const packageDir of ["server", "packages/adapters/claude-local", "packages/adapters/codex-local"]) {
-        const packageSkillsPath = path.join(checkoutPath, packageDir, "skills");
-        if (!fs.existsSync(path.dirname(packageSkillsPath))) continue;
-        fs.rmSync(packageSkillsPath, { recursive: true, force: true });
-        fs.cpSync(skillsPath, packageSkillsPath, { recursive: true });
+    const result = await fn();
+    console.log(`[install] ${label}: ${((performance.now() - start) / 1000).toFixed(1)} s`);
+    return result;
+  } catch (error) {
+    console.log(`[install] ${label}: failed after ${((performance.now() - start) / 1000).toFixed(1)} s`);
+    throw error;
+  }
+}
+
+export async function installGitPayload(repo: string, sha: string, runCommand: CommandRunner, paths = resolveInstallStorePaths()): Promise<{ payloadPath: string; reused: boolean; version: string }> {
+  const start = performance.now();
+  try {
+    const identifier = sha.slice(0, 12);
+    const payloadPath = payloadPathFor(paths, "git", identifier);
+    if (fs.existsSync(payloadPath)) {
+      const metadata = JSON.parse(fs.readFileSync(path.join(payloadPath, "node_modules", "paperclipai", "package.json"), "utf8")) as { version: string };
+      await timed("smoke payload", () => smokePayload(payloadPath, metadata.version, runCommand));
+      return { payloadPath, reused: true, version: metadata.version };
+    }
+    const sourceRoot = path.dirname(payloadPath);
+    fs.mkdirSync(sourceRoot, { recursive: true, mode: 0o700 });
+    const sourceStat = fs.lstatSync(sourceRoot);
+    if (!sourceStat.isDirectory() || sourceStat.isSymbolicLink()) {
+      throw new Error(`Refusing to install into unsafe payload root ${sourceRoot}.`);
+    }
+    fs.chmodSync(paths.cliRoot, 0o700);
+    fs.chmodSync(paths.installsRoot, 0o700);
+    fs.chmodSync(sourceRoot, 0o700);
+    const stagingRoot = path.join(sourceRoot, `.${identifier}.tmp-${process.pid}-${Date.now()}`);
+    const checkoutPath = path.join(stagingRoot, "source");
+    const archivePath = path.join(stagingRoot, "source.tar.gz");
+    const stagedPayload = path.join(stagingRoot, "payload");
+    fs.rmSync(stagingRoot, { recursive: true, force: true });
+    fs.mkdirSync(checkoutPath, { recursive: true, mode: 0o700 });
+    // Workspace build scripts invoke bare `pnpm`; on a machine where pnpm exists only
+    // through corepack, nothing puts it on PATH, so provision a shim into the staging dir.
+    const pnpmShimDir = path.join(stagingRoot, "pnpm-bin");
+    fs.mkdirSync(pnpmShimDir, { recursive: true, mode: 0o700 });
+    // pnpm leaves the workspace root node_modules/.bin off the script PATH when
+    // ignore-scripts=true is configured, so packages that rely on the root
+    // TypeScript (tsc) fail to build. Put it on PATH here; this runs no dependency
+    // lifecycle scripts and leaves the setting itself alone.
+    const workspaceBinDir = path.join(checkoutPath, "node_modules", ".bin");
+    const buildEnv = (extra: NodeJS.ProcessEnv = {}) =>
+      gitBuildEnv({ PATH: [pnpmShimDir, workspaceBinDir, process.env.PATH].filter(Boolean).join(path.delimiter), ...extra });
+    try {
+      await timed("download source", () => runGitHubCurl(["--fail", "--silent", "--show-error", "--location", "--output", archivePath, `https://codeload.github.com/${repo}/tar.gz/${sha}`], runCommand, { maxBuffer: 4 * 1024 * 1024 }));
+      await timed("extract source", () => runCommand("tar", ["-xzf", archivePath, "--strip-components=1", "-C", checkoutPath], { maxBuffer: 4 * 1024 * 1024 }));
+      await timed("enable pnpm", () => runCommand("corepack", ["enable", "pnpm", "--install-directory", pnpmShimDir], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 4 * 1024 * 1024 }));
+      await timed("pnpm install", () => runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 }));
+      await timed("build packages", () => runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 }));
+      await timed("build server", () => runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 }));
+      // The server package ships ui-dist, but only its prepack script builds it, and
+      // prepare-bundled-package.mjs stages the server without running prepack.
+      await timed("server ui-dist", () => runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 }));
+      // Same for the skills directory those packages ship: scripts/release.sh copies
+      // it in by hand, so do the same here for the same three packages.
+      await timed("copy skills", () => {
+        const skillsPath = path.join(checkoutPath, "skills");
+        if (fs.existsSync(skillsPath)) {
+          for (const packageDir of ["server", "packages/adapters/claude-local", "packages/adapters/codex-local"]) {
+            const packageSkillsPath = path.join(checkoutPath, packageDir, "skills");
+            if (!fs.existsSync(path.dirname(packageSkillsPath))) continue;
+            fs.rmSync(packageSkillsPath, { recursive: true, force: true });
+            fs.cpSync(skillsPath, packageSkillsPath, { recursive: true });
+          }
+        }
+      });
+      const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
+      const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
+      await timed("pack workspace packages", async () => {
+        for (const [index, workspacePackage] of workspacePackages.entries()) {
+          const packageDir = path.join(checkoutPath, workspacePackage.dir);
+          const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[] };
+          const bundledDependencies = packageJson.bundleDependencies ?? packageJson.bundledDependencies ?? [];
+          if (bundledDependencies.length > 0) {
+            const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
+            await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+            // The staged copy keeps the package's prepack script, which only works inside the
+            // workspace. The checkout is already built, so pack without scripts like scripts/release-lib.sh.
+            await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot, "--ignore-scripts"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
+          } else {
+            await runCommand("corepack", ["pnpm", "--dir", workspacePackage.dir, "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
+          }
+        }
+      });
+      await timed("pack cli", () => runCommand("npm", ["pack", "--pack-destination", stagingRoot], { cwd: path.join(checkoutPath, "cli"), env: buildEnv(), maxBuffer: 16 * 1024 * 1024 }));
+      const tarballs = fs.readdirSync(stagingRoot).filter((entry) => entry.endsWith(".tgz"));
+      const cliTarball = tarballs.find((entry) => entry === `paperclipai-${metadata.version}.tgz`);
+      const workspaceTarballs = tarballs.filter((entry) => entry !== cliTarball);
+      if (!cliTarball || workspaceTarballs.length !== workspacePackages.length) {
+        throw new Error(`Git install packaging produced ${workspaceTarballs.length} workspace tarballs; expected ${workspacePackages.length}.`);
       }
-    }
-    const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
-    const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
-    for (const [index, workspacePackage] of workspacePackages.entries()) {
-      const packageDir = path.join(checkoutPath, workspacePackage.dir);
-      const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[] };
-      const bundledDependencies = packageJson.bundleDependencies ?? packageJson.bundledDependencies ?? [];
-      if (bundledDependencies.length > 0) {
-        const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
-        await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-        // The staged copy keeps the package's prepack script, which only works inside the
-        // workspace. The checkout is already built, so pack without scripts like scripts/release-lib.sh.
-        await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot, "--ignore-scripts"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
-      } else {
-        await runCommand("corepack", ["pnpm", "--dir", workspacePackage.dir, "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
-      }
-    }
-    await runCommand("npm", ["pack", "--pack-destination", stagingRoot], { cwd: path.join(checkoutPath, "cli"), env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
-    const tarballs = fs.readdirSync(stagingRoot).filter((entry) => entry.endsWith(".tgz"));
-    const cliTarball = tarballs.find((entry) => entry === `paperclipai-${metadata.version}.tgz`);
-    const workspaceTarballs = tarballs.filter((entry) => entry !== cliTarball);
-    if (!cliTarball || workspaceTarballs.length !== workspacePackages.length) {
-      throw new Error(`Git install packaging produced ${workspaceTarballs.length} workspace tarballs; expected ${workspacePackages.length}.`);
-    }
-    await runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 });
-    const hydratedLinks = hydrateEmbeddedPostgresSymlinks(stagedPayload);
-    if (hydratedLinks > 0) console.log(pc.yellow(`Dependency install scripts did not run (npm ignore-scripts); linked ${hydratedLinks} embedded PostgreSQL libraries directly.`));
-    await smokePayload(stagedPayload, metadata.version, runCommand);
-    fs.renameSync(stagedPayload, payloadPath);
-    return { payloadPath, reused: false, version: metadata.version };
-  } finally { fs.rmSync(stagingRoot, { recursive: true, force: true }); }
+      await timed("npm install payload", () => runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 }));
+      const hydratedLinks = await timed("link embedded postgres", () => hydrateEmbeddedPostgresSymlinks(stagedPayload));
+      if (hydratedLinks > 0) console.log(pc.yellow(`Dependency install scripts did not run (npm ignore-scripts); linked ${hydratedLinks} embedded PostgreSQL libraries directly.`));
+      await timed("smoke payload", () => smokePayload(stagedPayload, metadata.version, runCommand));
+      fs.renameSync(stagedPayload, payloadPath);
+      return { payloadPath, reused: false, version: metadata.version };
+    } finally { fs.rmSync(stagingRoot, { recursive: true, force: true }); }
+  } finally {
+    console.log(`[install] total: ${((performance.now() - start) / 1000).toFixed(1)} s`);
+  }
 }
 
 function pathContains(directory: string): boolean {
