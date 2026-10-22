@@ -15,6 +15,7 @@
     "dev:mobile": "pnpm --filter @paperclipai/ui build && pnpm --filter @paperclipai/ui preview",
     "dev:both": "node scripts/dev-both.mjs",
     "storybook": "pnpm --filter @paperclipai/ui storybook",
+    "storybook:with": "node scripts/with-storybook.mjs",
     "build-storybook": "pnpm --filter @paperclipai/ui build-storybook",
     "build": "pnpm run preflight:workspace-links && pnpm -r build",
     "build:feature-catalog": "node cli/node_modules/tsx/dist/cli.mjs scripts/generate-feature-catalog.ts",
