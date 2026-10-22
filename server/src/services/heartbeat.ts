@@ -854,6 +854,8 @@ const ADOPTED_OUTPUT_TAIL_CHUNK_BYTES = 16 * 1024;
 const ADOPTED_OUTPUT_TAIL_MAX_FAILURES = 60;
 export const HOT_RESTART_OUTPUT_NOT_CAPTURED_MESSAGE =
   "Output not captured after hot restart: the previous server did not hand this child's output to a relay, so output written after the restart is lost";
+export const HOT_RESTART_OUTPUT_TAIL_FAILED_MESSAGE =
+  "Output not captured after hot restart: recording this child's output from its relay kept failing; the unread output stays in the relay files";
 export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
   30_000, 30_000,
 ] as const;
@@ -9650,6 +9652,8 @@ export interface HeartbeatServiceOptions {
     runId: string;
     issueId: string;
   }) => Promise<void>;
+  /** Test seam: failed ticks in a row before an adopted output tail gives up. */
+  adoptedOutputTailMaxFailures?: number;
 }
 
 export async function cancelHeartbeatNativeRun(input: {
@@ -15236,7 +15240,11 @@ export function heartbeatService(
     return { maxSeq, bytes };
   }
 
-  async function startAdoptedRunOutputTail(
+  // Records an adopted child's relay output into the run log. The tail is
+  // registered before anything can fail, so the reaper keeps the run open
+  // while setup is retried on the next tick; after too many failed ticks in
+  // a row the run is marked "not captured" and a warning is shown in the run.
+  function startAdoptedRunOutputTail(
     run: typeof heartbeatRuns.$inferSelect,
     relayDir: string,
   ) {
@@ -15244,15 +15252,17 @@ export function heartbeatService(
     const issueId = readNonEmptyString(
       parseObject(run.contextSnapshot).issueId,
     );
-    const redactionOptions = await getCurrentUserRedactionOptions();
-    const handle = await runLogStore.begin({
-      companyId: run.companyId,
-      agentId: run.agentId,
-      runId: run.id,
-    });
-    const logState = await readRunLogSeqAndBytes(handle);
-    let outputSeq = Math.max(Number(run.lastOutputSeq ?? 0), logState.maxSeq);
-    let persistedLogBytes = Math.max(Number(run.logBytes ?? 0), logState.bytes);
+    const maxFailures =
+      options.adoptedOutputTailMaxFailures ?? ADOPTED_OUTPUT_TAIL_MAX_FAILURES;
+    let tail: {
+      redactionOptions: Awaited<
+        ReturnType<typeof getCurrentUserRedactionOptions>
+      >;
+      handle: RunLogHandle;
+      offsets: RunOutputRelayOffsets;
+    } | null = null;
+    let outputSeq = 0;
+    let persistedLogBytes = 0;
     let lastOutputFlushAt = 0;
     let lastRuntimeStatusTouchMs = 0;
     let pendingProgress: {
@@ -15260,24 +15270,36 @@ export function heartbeatService(
       seq: number;
       stream: "stdout" | "stderr";
     } | null = null;
-    const offsets: RunOutputRelayOffsets =
-      await readRunOutputRelayOffsets(relayDir);
     let stopped = false;
     let consecutiveFailures = 0;
     let timer: NodeJS.Timeout | null = null;
     let tick: Promise<void> | null = null;
 
+    const initialize = async () => {
+      const redactionOptions = await getCurrentUserRedactionOptions();
+      const handle = await runLogStore.begin({
+        companyId: run.companyId,
+        agentId: run.agentId,
+        runId: run.id,
+      });
+      const logState = await readRunLogSeqAndBytes(handle);
+      const offsets = await readRunOutputRelayOffsets(relayDir);
+      outputSeq = Math.max(Number(run.lastOutputSeq ?? 0), logState.maxSeq);
+      persistedLogBytes = Math.max(Number(run.logBytes ?? 0), logState.bytes);
+      return { redactionOptions, handle, offsets };
+    };
+
+    // Pending progress is cleared only after the write succeeded, so a
+    // failed write is retried on a later tick or the final flush.
     const flushProgress = async (force: boolean) => {
-      if (!pendingProgress) return;
+      const progress = pendingProgress;
+      if (!progress) return;
       if (
         !force &&
-        pendingProgress.at.getTime() - lastOutputFlushAt <
+        progress.at.getTime() - lastOutputFlushAt <
           ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS
       )
         return;
-      const progress = pendingProgress;
-      pendingProgress = null;
-      lastOutputFlushAt = progress.at.getTime();
       await db
         .update(heartbeatRuns)
         .set({
@@ -15288,28 +15310,41 @@ export function heartbeatService(
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id));
+      lastOutputFlushAt = progress.at.getTime();
+      if (pendingProgress === progress) pendingProgress = null;
     };
 
     // Appends one relay chunk to the run log. The stream offset moves past
     // the chunk only once the append succeeded, so a failed append is read
     // again on the next tick instead of being skipped.
-    const record = async (stream: "stdout" | "stderr", bytes: Buffer) => {
+    const record = async (
+      state: NonNullable<typeof tail>,
+      stream: "stdout" | "stderr",
+      bytes: Buffer,
+    ) => {
       if (bytes.length === 0) return;
       const sanitizedChunk = compactRunLogChunk(
-        redactCurrentUserText(bytes.toString("utf8"), redactionOptions),
+        redactCurrentUserText(bytes.toString("utf8"), state.redactionOptions),
       );
       const ts = new Date().toISOString();
       const chunkSeq = outputSeq + 1;
-      persistedLogBytes += await runLogStore.append(handle, {
+      persistedLogBytes += await runLogStore.append(state.handle, {
         stream,
         chunk: sanitizedChunk,
         ts,
         seq: chunkSeq,
       });
       outputSeq = chunkSeq;
-      offsets[stream] += bytes.length;
+      state.offsets[stream] += bytes.length;
       pendingProgress = { at: new Date(ts), seq: chunkSeq, stream };
-      await flushProgress(false);
+      // The chunk is in the log; a failed progress write stays pending and
+      // is retried by the tick, so it must not stop the drain here.
+      await flushProgress(false).catch((err) => {
+        logger.warn(
+          { err, runId: run.id },
+          "failed to save adopted child output progress; retrying on the next tick",
+        );
+      });
       const at = new Date(ts);
       if (
         at.getTime() - lastRuntimeStatusTouchMs >=
@@ -15351,15 +15386,15 @@ export function heartbeatService(
     // into chunks well under the persisted chunk limit, so a burst of output
     // is not truncated, and never inside a UTF-8 character, so the saved
     // offsets are safe to resume from in a later server.
-    const drainOnce = async (final = false) => {
-      const before = { ...offsets };
+    const drainOnce = async (state: NonNullable<typeof tail>, final = false) => {
+      const before = { ...state.offsets };
       let advanced = false;
       try {
         for (const stream of RUN_OUTPUT_RELAY_STREAMS) {
           const bytes = await readRunOutputRelayBytes(
             relayDir,
             stream,
-            offsets[stream],
+            state.offsets[stream],
             ADOPTED_OUTPUT_TAIL_READ_BYTES,
           );
           const chunks = splitRunOutputRelayBytes(
@@ -15368,22 +15403,23 @@ export function heartbeatService(
             final,
           );
           for (const chunk of chunks) {
-            await record(stream, chunk);
+            await record(state, stream, chunk);
             advanced = true;
           }
         }
       } finally {
-        if (RUN_OUTPUT_RELAY_STREAMS.some((stream) => offsets[stream] !== before[stream])) {
-          await writeRunOutputRelayOffsets(relayDir, offsets);
+        if (
+          RUN_OUTPUT_RELAY_STREAMS.some(
+            (stream) => state.offsets[stream] !== before[stream],
+          )
+        ) {
+          await writeRunOutputRelayOffsets(relayDir, state.offsets);
         }
       }
       return advanced;
     };
 
-    const finish = async (
-      relay: RunOutputRelayState | null,
-      gaveUp = false,
-    ) => {
+    const finish = async (relay: RunOutputRelayState | null) => {
       await flushProgress(true);
       const current = await getRun(run.id);
       if (current) {
@@ -15391,24 +15427,67 @@ export function heartbeatService(
         await appendRunEvent(current, {
           eventType: "lifecycle",
           stream: "system",
-          level: ended && !gaveUp ? "info" : "warn",
-          message: gaveUp
-            ? "Could not record the child's output from its relay; the rest of the output stays in the relay files"
-            : ended
-              ? "Child output relay reached the end of the child's output"
-              : "Child output relay stopped before the end of the child's output; later output is not captured",
-          payload: { relayPid: relay?.relayPid ?? null, offsets, relayDir: gaveUp ? relayDir : null },
+          level: ended ? "info" : "warn",
+          message: ended
+            ? "Child output relay reached the end of the child's output"
+            : "Child output relay stopped before the end of the child's output; later output is not captured",
+          payload: {
+            relayPid: relay?.relayPid ?? null,
+            offsets: tail?.offsets ?? null,
+          },
         });
       }
-      // On give-up the unread bytes stay on disk for a manual look.
-      if (!gaveUp) await fs.rm(relayDir, { recursive: true, force: true });
+      await fs.rm(relayDir, { recursive: true, force: true });
       // Last, so the reaper settles the run only after its output is in.
       adoptedOutputTails.delete(run.id);
     };
 
+    // Recording kept failing: mark the run's output as not captured, so the
+    // run view shows it, and keep the relay files for a manual look.
+    const giveUp = async (err: unknown) => {
+      await flushProgress(true).catch(() => undefined);
+      const current = await getRun(run.id);
+      if (current) {
+        const result = parseObject(current.resultJson);
+        const hotRestart = parseObject(result.hotRestart);
+        const outputCapture = {
+          ...parseObject(hotRestart.outputCapture),
+          mode: "not_captured" as const,
+          reason: "output_tail_failed",
+          message: HOT_RESTART_OUTPUT_TAIL_FAILED_MESSAGE,
+          relayDir,
+        };
+        await db
+          .update(heartbeatRuns)
+          .set({
+            resultJson: {
+              ...result,
+              hotRestart: { ...hotRestart, outputCapture },
+            },
+            updatedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, run.id));
+        await appendRunEvent(current, {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message: HOT_RESTART_OUTPUT_TAIL_FAILED_MESSAGE,
+          payload: {
+            reason: "output_tail_failed",
+            error: err instanceof Error ? err.message : String(err),
+            consecutiveFailures,
+            offsets: tail?.offsets ?? null,
+            relayDir,
+          },
+        });
+      }
+    };
+
     const runTick = async () => {
       try {
-        while (!stopped && (await drainOnce())) {
+        tail ??= await initialize();
+        const state = tail;
+        while (!stopped && (await drainOnce(state))) {
           // keep draining while the files have unread bytes
         }
         if (stopped) return;
@@ -15418,11 +15497,11 @@ export function heartbeatService(
         if (relay?.status === "ended" || relayGone) {
           // The relay writes its end marker after its last append, so one
           // more read after seeing it gets every byte.
-          while (await drainOnce()) {
+          while (await drainOnce(state)) {
             // final drain
           }
           // An unfinished character at the very end is written as is.
-          await drainOnce(true);
+          await drainOnce(state, true);
           await finish(relay);
           return;
         }
@@ -15432,15 +15511,17 @@ export function heartbeatService(
         consecutiveFailures += 1;
         logger.warn(
           { err, runId: run.id, consecutiveFailures },
-          "failed to record adopted child output from its relay",
+          tail
+            ? "failed to record adopted child output from its relay"
+            : "failed to start recording adopted child output from its relay",
         );
-        if (consecutiveFailures >= ADOPTED_OUTPUT_TAIL_MAX_FAILURES) {
+        if (consecutiveFailures >= maxFailures) {
           // Do not hold the run open forever: the reaper settles it once
           // this tail is gone.
-          await finish(null, true).catch((finishErr) => {
+          await giveUp(err).catch((giveUpErr) => {
             logger.warn(
-              { err: finishErr, runId: run.id },
-              "failed to close adopted child output tail",
+              { err: giveUpErr, runId: run.id },
+              "failed to mark adopted child output as not captured",
             );
           });
           adoptedOutputTails.delete(run.id);
@@ -15467,9 +15548,11 @@ export function heartbeatService(
         timer = null;
         await tick;
         await flushProgress(true).catch(() => undefined);
-        await writeRunOutputRelayOffsets(relayDir, offsets).catch(
-          () => undefined,
-        );
+        if (tail) {
+          await writeRunOutputRelayOffsets(relayDir, tail.offsets).catch(
+            () => undefined,
+          );
+        }
         adoptedOutputTails.delete(run.id);
       },
     });
@@ -15766,12 +15849,7 @@ export function heartbeatService(
         },
       });
       if (relay) {
-        await startAdoptedRunOutputTail(updated, relayDir).catch((err) => {
-          logger.warn(
-            { err, runId: updated.id },
-            "failed to start recording adopted child output from its relay",
-          );
-        });
+        startAdoptedRunOutputTail(updated, relayDir);
       } else {
         await appendRunEvent(updated, {
           eventType: "lifecycle",

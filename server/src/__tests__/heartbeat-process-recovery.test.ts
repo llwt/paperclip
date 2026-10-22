@@ -218,6 +218,7 @@ import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import { getRunLogStore } from "../services/run-log-store.js";
 import {
   HOT_RESTART_OUTPUT_NOT_CAPTURED_MESSAGE,
+  HOT_RESTART_OUTPUT_TAIL_FAILED_MESSAGE,
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   heartbeatService,
@@ -4216,6 +4217,205 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .map((record) => record.chunk);
       expect(stdout).toEqual(["first line\n", "\u20ac rest\n"]);
       expect(stdout.join("")).not.toContain("\ufffd");
+    });
+  });
+
+  it("retries a failed output progress write without waiting for more output", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
+    });
+
+    await withTempPaperclipHome(async () => {
+      // One line, then the relay stays open with no further output.
+      const relayDir = await writeFakeRelay(
+        runId,
+        Buffer.from("only line\n"),
+        "running",
+      );
+      const originalUpdate = db.update.bind(db);
+      let failedProgressWrites = 0;
+      const update = vi
+        .spyOn(db, "update")
+        .mockImplementation(((table: Parameters<typeof db.update>[0]) => {
+          const builder = originalUpdate(table);
+          const originalSet = builder.set.bind(builder);
+          builder.set = ((values: Record<string, unknown>) => {
+            if ("lastOutputSeq" in values && failedProgressWrites === 0) {
+              failedProgressWrites += 1;
+              throw new Error("synthetic progress write failure");
+            }
+            return originalSet(values as never);
+          }) as typeof builder.set;
+          return builder;
+        }) as typeof db.update);
+      const heartbeat = heartbeatService(db);
+      try {
+        const adoption = await adoptAfterHotRestart(
+          heartbeat,
+          "2026-03-19T00:05:00.000Z",
+        );
+        expect(adoption).toMatchObject({ adoptedRunIds: [runId] });
+        const deadline = Date.now() + 5_000;
+        let progress: typeof heartbeatRuns.$inferSelect | null = null;
+        while (Date.now() < deadline) {
+          progress = await db
+            .select()
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, runId))
+            .then((rows) => rows[0] ?? null);
+          if (progress?.lastOutputSeq) break;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        expect(failedProgressWrites).toBe(1);
+        const records = await readRunLogRecords(companyId, agentId, runId);
+        const stdout = records.filter((record) => record.stream === "stdout");
+        expect(stdout.map((record) => record.chunk)).toEqual(["only line\n"]);
+        // The failed write was retried with no new chunk from the relay.
+        expect(progress).toMatchObject({
+          lastOutputSeq: stdout[0]?.seq,
+          lastOutputStream: "stdout",
+        });
+        expect(progress?.lastOutputAt).toBeInstanceOf(Date);
+        expect(Number(progress?.lastOutputBytes ?? 0)).toBeGreaterThan(0);
+      } finally {
+        update.mockRestore();
+        await fs.writeFile(
+          path.join(relayDir, "state.json"),
+          JSON.stringify({
+            version: 1,
+            status: "ended",
+            relayPid: process.pid,
+            startedAt: "2026-03-19T00:06:00.000Z",
+          }),
+        );
+        expect(await heartbeat.waitForAdoptedRunOutputTails()).toBe(true);
+      }
+    });
+  });
+
+  it("retries a failed output tail start and keeps the run open meanwhile", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
+    });
+
+    await withTempPaperclipHome(async () => {
+      await writeFakeRelay(runId, Buffer.from("after restart\n"), "ended");
+      const begin = vi
+        .spyOn(getRunLogStore(), "begin")
+        .mockRejectedValueOnce(new Error("synthetic run log begin failure"));
+      try {
+        const heartbeat = heartbeatService(db);
+        const adoption = await adoptAfterHotRestart(
+          heartbeat,
+          "2026-03-19T00:05:00.000Z",
+        );
+        expect(adoption).toMatchObject({ adoptedRunIds: [runId] });
+        // The tail is registered although its start failed, so the reaper
+        // does not settle the run before its output is in.
+        child.kill("SIGKILL");
+        expect(await waitForPidExit(child.pid!)).toBe(true);
+        expect(await heartbeat.reapOrphanedRuns()).toEqual({
+          reaped: 0,
+          runIds: [],
+        });
+        expect(await heartbeat.waitForAdoptedRunOutputTails()).toBe(true);
+        expect(begin.mock.calls.length).toBeGreaterThanOrEqual(2);
+      } finally {
+        begin.mockRestore();
+      }
+      const stdout = (await readRunLogRecords(companyId, agentId, runId))
+        .filter((record) => record.stream === "stdout")
+        .map((record) => record.chunk);
+      expect(stdout).toEqual(["after restart\n"]);
+    });
+  });
+
+  it("marks output as not captured when the output tail keeps failing to start", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
+    });
+
+    await withTempPaperclipHome(async () => {
+      const relayDir = await writeFakeRelay(
+        runId,
+        Buffer.from("never recorded\n"),
+        "running",
+      );
+      const begin = vi
+        .spyOn(getRunLogStore(), "begin")
+        .mockRejectedValue(new Error("synthetic run log begin failure"));
+      try {
+        const heartbeat = heartbeatService(db, {
+          adoptedOutputTailMaxFailures: 2,
+        });
+        const adoption = await adoptAfterHotRestart(
+          heartbeat,
+          "2026-03-19T00:05:00.000Z",
+        );
+        expect(adoption).toMatchObject({ adoptedRunIds: [runId] });
+        expect(await heartbeat.waitForAdoptedRunOutputTails()).toBe(true);
+        expect(begin).toHaveBeenCalledTimes(2);
+      } finally {
+        begin.mockRestore();
+      }
+
+      const run = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      expect(run?.status).toBe("running");
+      expect(run?.resultJson).toMatchObject({
+        hotRestart: {
+          adopted: true,
+          outputCapture: {
+            mode: "not_captured",
+            reason: "output_tail_failed",
+            message: HOT_RESTART_OUTPUT_TAIL_FAILED_MESSAGE,
+            relayDir,
+          },
+        },
+      });
+      const events = await db
+        .select()
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, runId));
+      expect(events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            level: "warn",
+            message: HOT_RESTART_OUTPUT_TAIL_FAILED_MESSAGE,
+          }),
+        ]),
+      );
+      // The unread output stays on disk for a manual look.
+      expect(
+        await fs.readFile(path.join(relayDir, "stdout.log"), "utf8"),
+      ).toBe("never recorded\n");
     });
   });
 
