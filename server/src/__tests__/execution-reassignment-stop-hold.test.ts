@@ -165,6 +165,7 @@ describeEmbeddedPostgres("wakes after the author's run is stopped for a stage ha
       status: "in_progress",
       priority: "high",
       assigneeAgentId: authorId,
+      responsibleUserId: "responsible-user",
       checkoutRunId: runId,
     });
     // The exact call the issue PATCH route makes (routes/issues.ts).
@@ -174,6 +175,7 @@ describeEmbeddedPostgres("wakes after the author's run is stopped for a stage ha
       resultJson: { reassignmentStopConfirmed: true, issueMutationStopId },
       eventMessage: "run cancelled before issue reassignment",
       eventPayload: { issueId },
+      suppressImmediateRecovery: true,
     });
     expect(cancelled?.status).toBe("cancelled");
 
@@ -223,7 +225,7 @@ describeEmbeddedPostgres("wakes after the author's run is stopped for a stage ha
     const ids = await stopAuthorRunThenHandOff();
     expect(await getExecutionBlocker(db, ids.companyId, ids.issueId)).toBeNull();
     expect(await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions)
-      .where(eq(issueRecoveryActions.issueId, ids.issueId))).toEqual([]);
+      .where(eq(issueRecoveryActions.sourceIssueId, ids.issueId))).toEqual([]);
   });
 
   it("starts a run for the stage participant after the move to in_review", async () => {
