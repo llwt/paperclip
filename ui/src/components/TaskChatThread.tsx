@@ -105,7 +105,6 @@ import { TaskChatQueuedMessages } from "@/components/task-chat/TaskChatQueuedMes
 import { TaskChatWindowScroll } from "@/components/task-chat/useWindowAutoFollow";
 import { useSidebar } from "@/context/SidebarContext";
 import { useStreamlinedUiEnabled } from "@/hooks/useStreamlinedUiEnabled";
-import { useDismissedTaskQuestions } from "@/hooks/useDismissedTaskQuestions";
 import { cn } from "@/lib/utils";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
@@ -2479,71 +2478,52 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     }
     return result;
   }, [interactions, pendingRuntimeRequest]);
-  // Questions already have an answerable history card, including
-  // when the user dismisses a fresh form without sending another message.
-  const pendingReminderInputs = useMemo(() => pendingComposerInputs.filter(input =>
-    !(input.kind === "durable" && input.interaction.kind === "ask_user_questions")),
-  [pendingComposerInputs]);
-  const { dismissedQuestionIds, dismissQuestion } = useDismissedTaskQuestions(issueId, currentUserId);
-  const latestUserComment = useMemo(() => comments
-    .filter(comment => !comment.deletedAt && comment.authorUserId && !comment.authorAgentId && !comment.createdByRunId)
-    .reduce<(typeof comments)[number] | null>((latest, comment) =>
-      !latest || toMs(comment.createdAt) >= toMs(latest.createdAt) ? comment : latest, null), [comments]);
-  const latestUserCommentId = latestUserComment?.id ?? null;
-  // A later message leaves a question answerable in history, without reopening
-  // its form on every render or reload. Explicit selection can still reopen it.
-  const currentPendingInputs = useMemo(() => pendingComposerInputs.filter(input =>
-    !(input.kind === "durable" && input.interaction.kind === "ask_user_questions"
-      && (dismissedQuestionIds.has(input.interaction.id) || (latestUserComment
-        && toMs(input.interaction.createdAt) < toMs(latestUserComment.createdAt))))),
-  [pendingComposerInputs, dismissedQuestionIds, latestUserComment]);
-  const currentPendingKeys = useMemo(() => new Set(currentPendingInputs.map(input => input.key)), [currentPendingInputs]);
+  // Fork (SX-1603): a pending question stays in the dock and the badge until it
+  // is answered, expired or withdrawn, like a confirmation. A later message
+  // does not hide it, and closing the dock only moves it to the badge.
   const [takeoverMode, setTakeoverMode] = useState<"open" | "normal">("open");
   const [selectedPendingKey, setSelectedPendingKey] = useState<string | null>(
     null,
   );
   const knownPendingKeysRef = useRef<Set<string>>(new Set());
-  const lastInputUserCommentRef = useRef(latestUserCommentId);
   useEffect(() => {
     const currentKeys = new Set(
       pendingComposerInputs.map((input) => input.key),
     );
     const hasNewInput = pendingComposerInputs.some(
-      (input) => currentPendingKeys.has(input.key) && !knownPendingKeysRef.current.has(input.key),
+      (input) => !knownPendingKeysRef.current.has(input.key),
     );
-    const movedOn = lastInputUserCommentRef.current !== latestUserCommentId;
-    lastInputUserCommentRef.current = latestUserCommentId;
     knownPendingKeysRef.current = currentKeys;
     setSelectedPendingKey((current) =>
-      current && currentKeys.has(current) && !(movedOn && !currentPendingKeys.has(current))
+      current && currentKeys.has(current)
         ? current
-        : (currentPendingInputs[0]?.key ?? null),
+        : (pendingComposerInputs[0]?.key ?? null),
     );
     if (hasNewInput) setTakeoverMode("open");
-  }, [pendingComposerInputs, latestUserCommentId, currentPendingInputs, currentPendingKeys]);
+  }, [pendingComposerInputs]);
   const selectedPendingInput =
     pendingComposerInputs.find((input) => input.key === selectedPendingKey) ??
-    currentPendingInputs[0] ??
+    pendingComposerInputs[0] ??
     null;
   const interactionDraftKey = selectedPendingInput
     ? `paperclip:task-input:${issueId ?? "unknown"}:${selectedPendingInput.key}`
     : undefined;
   const openPendingTakeover = useCallback(() => {
-    if (!pendingReminderInputs.some(input => input.key === selectedPendingInput?.key)) {
-      setSelectedPendingKey(pendingReminderInputs[0]?.key ?? null);
+    if (!pendingComposerInputs.some(input => input.key === selectedPendingInput?.key)) {
+      setSelectedPendingKey(pendingComposerInputs[0]?.key ?? null);
     }
     setTakeoverMode("open");
-  }, [pendingReminderInputs, selectedPendingInput]);
+  }, [pendingComposerInputs, selectedPendingInput]);
   const showNextPendingInput = useCallback(() => {
-    if (pendingReminderInputs.length < 2) return;
-    const currentIndex = pendingReminderInputs.findIndex(
+    if (pendingComposerInputs.length < 2) return;
+    const currentIndex = pendingComposerInputs.findIndex(
       (input) => input.key === selectedPendingInput?.key,
     );
     setSelectedPendingKey(
-      pendingReminderInputs[(currentIndex + 1) % pendingReminderInputs.length]
+      pendingComposerInputs[(currentIndex + 1) % pendingComposerInputs.length]
         ?.key ?? null,
     );
-  }, [pendingReminderInputs, selectedPendingInput?.key]);
+  }, [pendingComposerInputs, selectedPendingInput?.key]);
   const skipPendingInput = useCallback(
     async (input: PendingComposerInput) => {
       if (input.kind === "runtime") {
@@ -2579,17 +2559,12 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       if (assigneeUsesPaperclipRunner) setRunnerSubmissionPending(true);
       try {
         await onAdd(...args);
-        if (selectedPendingInput?.kind === "durable" && selectedPendingInput.interaction.kind === "ask_user_questions") {
-          dismissQuestion(selectedPendingInput.interaction.id);
-          setSelectedPendingKey(null);
-          setTakeoverMode("normal");
-        }
       } catch (error) {
         setRunnerSubmissionPending(false);
         throw error;
       }
     },
-    [assigneeUsesPaperclipRunner, onAdd, selectedPendingInput, dismissQuestion],
+    [assigneeUsesPaperclipRunner, onAdd],
   );
   const optimisticRunnerStartup =
     assigneeUsesPaperclipRunner &&
@@ -2777,11 +2752,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             selectedPendingInput.kind === "durable" &&
             selectedPendingInput.interaction.kind === "request_confirmation" &&
             Boolean(selectedPendingInput.interaction.payload.toolAction),
-          pendingCount: Math.max(1, pendingReminderInputs.length),
+          pendingCount: Math.max(1, pendingComposerInputs.length),
           content: takeoverContent,
           onDismiss: () => {
             if (selectedPendingInput.kind === "durable" && selectedPendingInput.interaction.kind === "ask_user_questions") {
-              dismissQuestion(selectedPendingInput.interaction.id);
               setSelectedPendingKey(null);
             }
             setTakeoverMode("normal");
@@ -3221,10 +3195,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                       onRunnerGoalCommand={runnerGoal.executeComposerCommand}
                       onRunnerGoalReassign={reassignForRunnerGoal}
                       pendingTakeover={
-                        pendingReminderInputs.length > 0
+                        pendingComposerInputs.length > 0
                           ? {
-                              count: pendingReminderInputs.length,
-                              label: `${pendingReminderInputs.length} pending input${pendingReminderInputs.length === 1 ? "" : "s"}`,
+                              count: pendingComposerInputs.length,
+                              label: `${pendingComposerInputs.length} pending input${pendingComposerInputs.length === 1 ? "" : "s"}`,
                               onOpen: openPendingTakeover,
                             }
                           : null
