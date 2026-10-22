@@ -378,6 +378,7 @@ describe("managed AI connections", () => {
   it("reads the host user's mise installs without making them the write target", () => {
     expect(managedAiToolEnvironment({ HOME: "/home/host" }, "/srv/pc")).toEqual({
       npm_config_store_dir: "/srv/pc/runtime/pnpm/store",
+      pnpm_config_store_dir: "/srv/pc/runtime/pnpm/store",
       RUSTUP_HOME: "/srv/pc/runtime/rustup",
       CARGO_HOME: "/srv/pc/runtime/cargo",
       MISE_DATA_DIR: "/srv/pc/runtime/mise/data",
@@ -392,14 +393,15 @@ describe("managed AI connections", () => {
     }, "/srv/pc").MISE_SHARED_INSTALL_DIRS).toBe(["/team/installs", "/opt/mise/installs"].join(path.delimiter));
   });
   it("shares pnpm and Rust directories across homes and retains agent overrides", async () => {
-    const keys = ["npm_config_store_dir", "RUSTUP_HOME", "CARGO_HOME"];
+    const keys = ["npm_config_store_dir", "pnpm_config_store_dir", "RUSTUP_HOME", "CARGO_HOME"];
     const shared = path.join(home, "instances", "ai-connection-fixture", "runtime");
     const defaults = {
       npm_config_store_dir: path.join(shared, "pnpm", "store"),
+      pnpm_config_store_dir: path.join(shared, "pnpm", "store"),
       RUSTUP_HOME: path.join(shared, "rustup"),
       CARGO_HOME: path.join(shared, "cargo"),
     };
-    const overrides = { npm_config_store_dir: "/agent/pnpm", RUSTUP_HOME: "/agent/rustup", CARGO_HOME: "/agent/cargo" };
+    const overrides = { npm_config_store_dir: "/agent/pnpm", pnpm_config_store_dir: "/agent/pnpm11", RUSTUP_HOME: "/agent/rustup", CARGO_HOME: "/agent/cargo" };
     const runs = await Promise.all([{}, {}, overrides].map(env => prepareManagedAiRuntime(db, {
       ...input, responsibleUserId: "alice", config: { env },
     })));

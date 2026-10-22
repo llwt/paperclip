@@ -162,14 +162,16 @@ describe("local process sandbox", () => {
   it("selects the pnpm store and Rust paths read-only without mounting relative paths", () => {
     expect(sharedToolCacheMounts({
       npm_config_store_dir: "/agent/pnpm/store/",
+      pnpm_config_store_dir: "/agent/pnpm11/store",
       RUSTUP_HOME: "/agent/rustup",
       CARGO_HOME: "/agent/cargo",
     })).toEqual([
       { path: "/agent/pnpm/store", access: "ro" },
+      { path: "/agent/pnpm11/store", access: "ro" },
       { path: "/agent/rustup", access: "ro" },
       { path: "/agent/cargo", access: "ro" },
     ]);
-    expect(sharedToolCacheMounts({ npm_config_store_dir: "relative", RUSTUP_HOME: "", CARGO_HOME: "/agent/rust" })).toEqual([
+    expect(sharedToolCacheMounts({ npm_config_store_dir: "relative", pnpm_config_store_dir: "also/relative", RUSTUP_HOME: "", CARGO_HOME: "/agent/rust" })).toEqual([
       { path: "/agent/rust", access: "ro" },
     ]);
     expect(sharedToolCacheMounts({ RUSTUP_HOME: "/agent/rust", CARGO_HOME: "/agent/rust/" })).toHaveLength(1);

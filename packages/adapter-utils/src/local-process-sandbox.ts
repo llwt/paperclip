@@ -84,7 +84,7 @@ export async function miseToolInstallMounts(env: Record<string, string | undefin
 
 /** Read-only mounts for the pnpm store and Rust tool directories selected by the run. */
 export function sharedToolCacheMounts(env: Record<string, string | undefined>): LocalProcessSandboxPath[] {
-  const paths = [env.npm_config_store_dir, env.RUSTUP_HOME, env.CARGO_HOME]
+  const paths = [env.npm_config_store_dir, env.pnpm_config_store_dir, env.RUSTUP_HOME, env.CARGO_HOME]
     .filter((entry): entry is string => typeof entry === "string" && path.isAbsolute(entry));
   return Array.from(new Set(paths.map((entry) => path.resolve(entry)))).map((entry) => ({ path: entry, access: "ro" }));
 }

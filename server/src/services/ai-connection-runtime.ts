@@ -208,6 +208,7 @@ export function managedAiToolEnvironment(
     .filter((entry) => path.isAbsolute(entry) && path.resolve(entry) !== path.join(dataDir, "installs"));
   return {
     npm_config_store_dir: path.join(instanceRoot, "runtime", "pnpm", "store"),
+    pnpm_config_store_dir: path.join(instanceRoot, "runtime", "pnpm", "store"),
     RUSTUP_HOME: path.join(instanceRoot, "runtime", "rustup"),
     CARGO_HOME: path.join(instanceRoot, "runtime", "cargo"),
     MISE_DATA_DIR: dataDir,
@@ -460,7 +461,7 @@ export async function prepareManagedAiRuntime(
     const toolEnv = managedAiToolEnvironment();
     await mkdir(toolEnv.MISE_DATA_DIR, { recursive: true, mode: 0o700 });
     await mkdir(toolEnv.MISE_CACHE_DIR, { recursive: true, mode: 0o700 });
-    for (const key of ["npm_config_store_dir", "RUSTUP_HOME", "CARGO_HOME"]) {
+    for (const key of ["npm_config_store_dir", "pnpm_config_store_dir", "RUSTUP_HOME", "CARGO_HOME"]) {
       await mkdir(toolEnv[key], { recursive: true, mode: 0o700 });
     }
     const env: Record<string, unknown> = {
