@@ -1344,6 +1344,22 @@ const nativeSessionResumeDispatchTimers = new Map<
   string,
   ReturnType<typeof setTimeout>
 >();
+// Differs from upstream (fork, SX-1537): a saved stage hand-off behind a
+// stopped run whose process is still exiting. A process exit has no event, so
+// the server rechecks it on a short timer, keyed by `companyId:issueId`, until
+// the timeout. After that the scheduler sweep in `resumeQueuedRuns` retries it.
+const ownerExitRecheckTimers = new Map<string, ReturnType<typeof setTimeout>>();
+// A fired timer has no handle left to clear, so drainActiveRunExecutions awaits
+// the running recheck here. While a drain runs no recheck timer is armed; the
+// saved wake stays durable and the scheduler sweep retries it.
+const activeOwnerExitRechecks = new Set<Promise<unknown>>();
+let ownerExitRecheckDrains = 0;
+/** Fork (SX-1537), for tests: owner-exit recheck timers and running rechecks. */
+export function getOwnerExitRecheckStatus() {
+  return { scheduled: ownerExitRecheckTimers.size, running: activeOwnerExitRechecks.size };
+}
+export const OWNER_EXIT_RECHECK_INTERVAL_MS = 5_000;
+export const OWNER_EXIT_RECHECK_TIMEOUT_MS = 5 * 60_000;
 // Task drain: an operator-controlled hold on new run admission, so a caller
 // can wait for active work to finish before it stops the process. The state
 // lives in process memory only — a process restart clears it — and it sits at
@@ -5636,31 +5652,119 @@ export async function getLatestSessionUsageJson(
   }
 }
 
+function readRawCostUsd(usageJson: unknown): number | null {
+  const parsed = parseObject(usageJson);
+  // Rows written before rawCostUsd existed stored the reported cost directly.
+  const value = parsed.rawCostUsd ?? parsed.costUsd;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : null;
+}
+
+function addUsageTotals(a: UsageTotals, b: UsageTotals): UsageTotals {
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    cachedInputTokens: a.cachedInputTokens + b.cachedInputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+  };
+}
+
 export async function resolveNormalizedUsageForSession(input: {
   sessionId: string | null;
   rawUsage: UsageTotals | null;
   usageBasis?: "per_run" | "session_cumulative" | null;
+  costBasis?: "per_run" | "session_cumulative" | null;
+  rawCostUsd?: number | null;
+  invocationUsage?: UsageTotals | null;
   getPreviousUsageJson: (sessionId: string) => Promise<unknown>;
 }) {
   const { sessionId, rawUsage, usageBasis } = input;
+  const rawCostUsd = input.rawCostUsd ?? null;
+  const costCumulative =
+    (input.costBasis ?? usageBasis) === "session_cumulative";
   // Adapters that declare per-run usage (e.g. the ACPX lane reports each
   // turn's tokens, not session totals) must not be session-delta'd, or
   // consecutive runs would be undercounted.
-  if (!sessionId || !rawUsage || usageBasis === "per_run") {
+  if (
+    !sessionId ||
+    !rawUsage ||
+    (usageBasis === "per_run" && !costCumulative)
+  ) {
     return {
       normalizedUsage: rawUsage,
+      normalizedCostUsd: rawCostUsd,
+      sessionRawUsage: rawUsage,
       previousRawUsage: null as UsageTotals | null,
+      previousRawCostUsd: null as number | null,
       derivedFromSessionTotals: false,
+      usageFromInvocation: false,
+      sessionRawUsageIncomplete: false,
     };
   }
 
-  const previousRawUsage = readRawUsageTotals(
-    await input.getPreviousUsageJson(sessionId),
-  );
+  const previousUsageJson = await input.getPreviousUsageJson(sessionId);
+  const previousRawUsage = readRawUsageTotals(previousUsageJson);
+  // Only adapters that declare session totals report a cumulative cost (the
+  // Claude CLI's total_cost_usd on --resume). Without a declared basis the
+  // legacy heuristic deltas tokens only, as before.
+  const previousRawCostUsd =
+    costCumulative && previousRawUsage !== null
+      ? readRawCostUsd(previousUsageJson)
+      : null;
+  const normalizedCostUsd =
+    rawCostUsd === null || previousRawCostUsd === null
+      ? rawCostUsd
+      : rawCostUsd >= previousRawCostUsd
+        ? rawCostUsd - previousRawCostUsd
+        : rawCostUsd;
+  if (usageBasis === "per_run") {
+    // Per-run tokens with a session-total cost (Claude CLI without
+    // modelUsage): keep the tokens, delta only the cost. Store the session's
+    // running token total as the raw counters, so this row stays a baseline
+    // for the next run. These tokens miss subagents (main loop only), so the
+    // counters are only a lower bound; mark them, or the next delta would
+    // book this run's subagent tokens to that run.
+    return {
+      normalizedUsage: rawUsage,
+      normalizedCostUsd,
+      sessionRawUsage: previousRawUsage
+        ? addUsageTotals(previousRawUsage, rawUsage)
+        : rawUsage,
+      previousRawUsage,
+      previousRawCostUsd,
+      derivedFromSessionTotals: false,
+      usageFromInvocation: false,
+      sessionRawUsageIncomplete: true,
+    };
+  }
+  if (
+    previousRawUsage !== null &&
+    parseObject(previousUsageJson).rawUsageIncomplete === true &&
+    input.invocationUsage
+  ) {
+    // The baseline is a lower bound, so a delta would include tokens of the
+    // earlier run. Store this invocation's own tokens instead; the session
+    // totals reported now are complete again and become the next baseline.
+    return {
+      normalizedUsage: { ...input.invocationUsage },
+      normalizedCostUsd,
+      sessionRawUsage: rawUsage,
+      previousRawUsage,
+      previousRawCostUsd,
+      derivedFromSessionTotals: false,
+      usageFromInvocation: true,
+      sessionRawUsageIncomplete: false,
+    };
+  }
   return {
     normalizedUsage: deriveNormalizedUsageDelta(rawUsage, previousRawUsage),
+    normalizedCostUsd,
+    sessionRawUsage: rawUsage,
     previousRawUsage,
+    previousRawCostUsd,
     derivedFromSessionTotals: previousRawUsage !== null,
+    usageFromInvocation: false,
+    sessionRawUsageIncomplete: false,
   };
 }
 
@@ -10578,7 +10682,13 @@ export function heartbeatService(
   // a retry after a commit finds nothing left to start. Callers: the end of
   // every lease release, the enqueue that saved the wake (the lease may have
   // been released during its transaction), and `resumeQueuedRuns`.
-  async function resumeDeferredExecutionStageWakes(companyId: string, issueId: string) {
+  // Returns "blocked" when a saved hand-off still waits behind a blocker (fork,
+  // SX-1537: the owner-exit recheck keeps going only then).
+  async function resumeDeferredExecutionStageWakes(
+    companyId: string,
+    issueId: string,
+  ): Promise<"none" | "blocked" | "attempted"> {
+    let state: "none" | "blocked" | "attempted" = "none";
     try {
       const waits = await db.select().from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, companyId),
@@ -10591,7 +10701,8 @@ export function heartbeatService(
         const context = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
         if (!isExecutionStageHandoffWakeContext(context)) continue;
         // Admission checks again under the issue lock; this only saves work.
-        if (await getExecutionBlocker(db, companyId, issueId)) return;
+        if (await getExecutionBlocker(db, companyId, issueId)) return "blocked";
+        state = "attempted";
         const wakePayload = { ...payload };
         delete wakePayload[DEFERRED_WAKE_CONTEXT_KEY];
         delete wakePayload.executionWait;
@@ -10611,6 +10722,69 @@ export function heartbeatService(
     } catch (err) {
       logger.warn({ err, issueId }, "failed to resume deferred execution stage wakes");
     }
+    return state;
+  }
+
+  // Differs from upstream (fork, SX-1537). One recheck of saved stage hand-offs
+  // behind a stopped run that has not exited yet. Before the timeout it asks
+  // for another recheck. At the timeout it marks the saved wakes, so the wait
+  // is visible on the wake rows and in the log; the rows stay saved and the
+  // scheduler sweep keeps retrying them. Admission still checks ownership
+  // under the issue lock, so no second provider process starts meanwhile.
+  async function recheckOwnerExitWait(
+    companyId: string,
+    issueId: string,
+    waitingSince: Date,
+    now = new Date(),
+  ): Promise<"done" | "waiting" | "timed_out"> {
+    if ((await getSchedulingSuppression()).suppressed) return "timed_out";
+    const state = await resumeDeferredExecutionStageWakes(companyId, issueId);
+    if (state !== "blocked") return "done";
+    if (now.getTime() - waitingSince.getTime() < OWNER_EXIT_RECHECK_TIMEOUT_MS) return "waiting";
+    const blocker = await getExecutionBlocker(db, companyId, issueId);
+    const marked = await db.update(agentWakeupRequests).set({
+      payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}',
+        coalesce(${agentWakeupRequests.payload}->'executionWait', '{}'::jsonb) || ${JSON.stringify({
+          ownerExitTimedOutAt: now.toISOString(),
+          blockingRunId: blocker?.runId ?? null,
+          message: "The stopped run has not exited. The hand-off is saved and starts when it exits.",
+        })}::jsonb)`,
+      updatedAt: now,
+    }).where(and(
+      eq(agentWakeupRequests.companyId, companyId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+      sql`${agentWakeupRequests.payload}->${DEFERRED_WAKE_CONTEXT_KEY}->>'source' = 'issue.execution_stage'`,
+      sql`${agentWakeupRequests.payload}->'executionWait'->>'ownerExitTimedOutAt' is null`,
+    )).returning({ id: agentWakeupRequests.id });
+    if (marked.length > 0) {
+      logger.warn({ companyId, issueId, blockingRunId: blocker?.runId ?? null, cause: blocker?.cause ?? null,
+        wakeIds: marked.map((row) => row.id) },
+      "saved stage hand-off still waits for a stopped run to exit; the scheduler sweep keeps retrying it");
+    }
+    return "timed_out";
+  }
+
+  function scheduleOwnerExitRecheck(companyId: string, issueId: string, waitingSince = new Date()) {
+    const key = `${companyId}:${issueId}`;
+    if (ownerExitRecheckDrains > 0 || ownerExitRecheckTimers.has(key)) return;
+    const timer = setTimeout(() => {
+      if (ownerExitRecheckTimers.get(key) !== timer) return;
+      ownerExitRecheckTimers.delete(key);
+      const recheck: Promise<void> = recheckOwnerExitWait(companyId, issueId, waitingSince)
+        .then((state) => {
+          if (state === "waiting") scheduleOwnerExitRecheck(companyId, issueId, waitingSince);
+        })
+        .catch((err) => {
+          logger.warn({ err, issueId }, "owner-exit recheck of saved stage hand-off failed");
+        })
+        .finally(() => {
+          activeOwnerExitRechecks.delete(recheck);
+        });
+      activeOwnerExitRechecks.add(recheck);
+    }, OWNER_EXIT_RECHECK_INTERVAL_MS);
+    timer.unref?.();
+    ownerExitRecheckTimers.set(key, timer);
   }
 
   // A run ended by a recovery path (stale-lock sweep, cancel without a process
@@ -19964,17 +20138,30 @@ export function heartbeatService(
     // Differs from upstream (fork, SX-1386): a saved stage hand-off normally
     // starts when the blocking run releases its lease. Retry it here after a
     // restart, or when a different blocker cleared without a lease release.
+    // Fork (SX-1537): the least recently tried tasks go first and each try is
+    // stamped, so hand-offs behind a process that never exits cannot starve
+    // the rest of the batch.
+    const stageHandoffIssueId = sql<string>`${agentWakeupRequests.payload}->>'issueId'`;
     const stageHandoffIssues = await db
-      .selectDistinct({ companyId: agentWakeupRequests.companyId, issueId: sql<string>`${agentWakeupRequests.payload}->>'issueId'` })
+      .select({ companyId: agentWakeupRequests.companyId, issueId: stageHandoffIssueId })
       .from(agentWakeupRequests).innerJoin(companies, eq(companies.id, agentWakeupRequests.companyId))
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
         eq(companies.status, "active"),
         sql`${agentWakeupRequests.payload}->${DEFERRED_WAKE_CONTEXT_KEY}->>'source' = 'issue.execution_stage'`,
         lte(agentWakeupRequests.requestedAt, new Date(Date.now() - 30_000)),
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
+      .groupBy(agentWakeupRequests.companyId, stageHandoffIssueId)
+      .orderBy(sql`min(${agentWakeupRequests.updatedAt})`)
       .limit(50);
     for (const { companyId, issueId } of stageHandoffIssues) {
-      if (issueId) await resumeDeferredExecutionStageWakes(companyId, issueId);
+      if (!issueId) continue;
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+        sql`${agentWakeupRequests.payload}->${DEFERRED_WAKE_CONTEXT_KEY}->>'source' = 'issue.execution_stage'`,
+      ));
+      await resumeDeferredExecutionStageWakes(companyId, issueId);
     }
     // A server restart or a message/cleanup race can leave a deferred wake
     // after its owner has released the issue lock. Revisit it through the same
@@ -20580,12 +20767,23 @@ export function heartbeatService(
       clearTimeout(timer);
     }
     nativeSessionResumeDispatchTimers.clear();
-    while (
-      activeWakeupPromises.size > 0 ||
-      activeRunExecutionPromises.size > 0
-    ) {
-      await Promise.allSettled([...activeWakeupPromises]);
-      await Promise.all([...activeRunExecutionPromises]);
+    // Fork (SX-1537): no owner-exit recheck timer may be armed during the
+    // drain, by a running recheck or by a wake; await rechecks already running.
+    ownerExitRecheckDrains += 1;
+    try {
+      for (const timer of ownerExitRecheckTimers.values()) clearTimeout(timer);
+      ownerExitRecheckTimers.clear();
+      while (
+        activeWakeupPromises.size > 0 ||
+        activeOwnerExitRechecks.size > 0 ||
+        activeRunExecutionPromises.size > 0
+      ) {
+        await Promise.allSettled([...activeWakeupPromises]);
+        await Promise.allSettled([...activeOwnerExitRechecks]);
+        await Promise.all([...activeRunExecutionPromises]);
+      }
+    } finally {
+      ownerExitRecheckDrains -= 1;
     }
   }
 
@@ -25862,12 +26060,31 @@ export function heartbeatService(
           previousDisplayId: runtimeForAdapter.sessionDisplayId,
           previousLegacySessionId: runtimeForAdapter.sessionId,
         });
+        // Usage belongs to the session this run reported, even when the
+        // adapter clears it for the next run (e.g. Claude max turns).
+        const usageSessionState = adapterResult.clearSession
+          ? resolveNextSessionState({
+              adapterType: agent.adapterType,
+              codec: sessionCodec,
+              adapterResult: { ...adapterResult, clearSession: false },
+              outcome,
+              previousParams: previousSessionParams,
+              previousDisplayId: runtimeForAdapter.sessionDisplayId,
+              previousLegacySessionId: runtimeForAdapter.sessionId,
+            })
+          : nextSessionState;
         const rawUsage = normalizeUsageTotals(adapterResult.usage);
+        const rawCostUsd = adapterResult.costUsd ?? null;
+        const costBasis =
+          adapterResult.costBasis ?? adapterResult.usageBasis ?? null;
         const sessionUsageResolution = await resolveNormalizedUsageForSession({
           sessionId:
-            nextSessionState.displayId ?? nextSessionState.legacySessionId,
+            usageSessionState.displayId ?? usageSessionState.legacySessionId,
           rawUsage,
           usageBasis: adapterResult.usageBasis ?? null,
+          costBasis,
+          rawCostUsd,
+          invocationUsage: normalizeUsageTotals(adapterResult.invocationUsage),
           getPreviousUsageJson: (sessionId) =>
             getLatestSessionUsageJson(db, {
               companyId: agent.companyId,
@@ -25877,6 +26094,14 @@ export function heartbeatService(
             }),
         });
         const normalizedUsage = sessionUsageResolution.normalizedUsage;
+        if (sessionUsageResolution.normalizedCostUsd !== rawCostUsd) {
+          // A session-total cost must not be billed again on every resumed
+          // run; usage_json and the cost ledger below both read this field.
+          adapterResult = {
+            ...adapterResult,
+            costUsd: sessionUsageResolution.normalizedCostUsd,
+          };
+        }
         const runErrorMessage =
           outcome === "cancelled"
             ? redactCurrentUserText(latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled", currentUserRedactionOptions)
@@ -25942,18 +26167,48 @@ export function heartbeatService(
           cacheAdjustedCostUsd != null
             ? ({
                 ...(normalizedUsage ?? {}),
-                ...(rawUsage
+                ...(sessionUsageResolution.sessionRawUsage
                   ? {
-                      rawInputTokens: rawUsage.inputTokens,
-                      rawCachedInputTokens: rawUsage.cachedInputTokens,
-                      rawOutputTokens: rawUsage.outputTokens,
+                      rawInputTokens:
+                        sessionUsageResolution.sessionRawUsage.inputTokens,
+                      rawCachedInputTokens:
+                        sessionUsageResolution.sessionRawUsage
+                          .cachedInputTokens,
+                      rawOutputTokens:
+                        sessionUsageResolution.sessionRawUsage.outputTokens,
                     }
+                  : {}),
+                // Raw token counters miss subagent tokens (lower bound).
+                ...(sessionUsageResolution.sessionRawUsageIncomplete
+                  ? { rawUsageIncomplete: true }
+                  : {}),
+                // The next resumed run subtracts this cumulative cost.
+                ...(costBasis === "session_cumulative" && rawCostUsd != null
+                  ? { rawCostUsd }
                   : {}),
                 ...(sessionUsageResolution.derivedFromSessionTotals
                   ? { usageSource: "session_delta" }
+                  : sessionUsageResolution.usageFromInvocation
+                    ? { usageSource: "invocation" }
                   : adapterResult.usageBasis === "per_run"
                     ? { usageSource: "per_run" }
-                    : {}),
+                    : adapterResult.usageBasis === "session_cumulative"
+                      ? // No earlier usage in this session to subtract:
+                        // stored as reported (a fresh session's own usage).
+                        { usageSource: "session_total" }
+                      : {}),
+                // Per-run tokens with a session-total cost: say how the cost
+                // was stored, since usageSource covers only the tokens.
+                ...(adapterResult.usageBasis === "per_run" &&
+                costBasis === "session_cumulative" &&
+                rawCostUsd != null
+                  ? {
+                      costSource:
+                        sessionUsageResolution.previousRawCostUsd !== null
+                          ? "session_delta"
+                          : "session_total",
+                    }
+                  : {}),
                 ...((nextSessionState.displayId ??
                 nextSessionState.legacySessionId)
                   ? {
@@ -29364,7 +29619,10 @@ export function heartbeatService(
       if (outcome.kind === "deferred" && stageHandoffDeferred) {
         // The run that held execution may have released it while this
         // transaction held the issue lock; its own release found nothing then.
-        await resumeDeferredExecutionStageWakes(agent.companyId, issueId);
+        if (await resumeDeferredExecutionStageWakes(agent.companyId, issueId) === "blocked") {
+          // Fork (SX-1537): a process exit has no release hook; recheck it.
+          scheduleOwnerExitRecheck(agent.companyId, issueId);
+        }
       }
       if (outcome.kind === "deferred" || outcome.kind === "skipped") {
         return null;
@@ -30865,6 +31123,8 @@ export function heartbeatService(
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    // Fork (SX-1537): one owner-exit recheck, the step the short timer repeats.
+    recheckOwnerExitWait,
 
     scheduleBoundedRetry: async (
       runId: string,

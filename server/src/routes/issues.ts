@@ -7748,6 +7748,16 @@ export function issueRoutes(
     };
   }
 
+  // All interaction routes share this guard before any interaction lookup.
+  const interactionIdSchema = z.string().guid();
+  router.param("interactionId", (_req, _res, next, rawId) => {
+    if (!interactionIdSchema.safeParse(rawId).success) {
+      next(notFound("Interaction not found"));
+      return;
+    }
+    next();
+  });
+
   // Resolve issue identifiers (e.g. "PAP-39") to UUIDs for all /issues/:id routes
   router.param("id", async (req, res, next, rawId) => {
     try {

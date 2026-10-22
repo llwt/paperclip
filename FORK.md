@@ -25,12 +25,17 @@ the ones on `somnex-main` before the merge; what is left of each is the diff of
 
 | Commit | What | Upstream status | Drops out when |
 | --- | --- | --- | --- |
+| Install smoke script (this PR) | Fork-only `scripts/somnex-smoke.mjs` checks health, installed SHA, UI assets and confirmation acceptance, then cancels its throwaway task; local fake-server coverage in `scripts/somnex-smoke.test.mjs` | Local only | An upstream release provides an equivalent install smoke check, or the fork drops this script |
+| SX-1378 (this PR) | Usage: a resumed Claude CLI run stores and bills only its own tokens and cost. On `--resume` the CLI's `modelUsage` and `total_cost_usd` are session totals (only `result.usage` covers the invocation), but the adapter labelled them `per_run`, so every resumed run stored the session total and a failed run repeated the previous run's figures. The adapter now labels `modelUsage` figures `session_cumulative` (`packages/adapters/claude-local/src/server/parse.ts`, `execute.ts`), and `resolveNormalizedUsageForSession` in `server/src/services/heartbeat.ts` subtracts the newest earlier run of the same session from the cost as well as the tokens, for `session_cumulative` only. Without `modelUsage` the tokens are per invocation but the cost is still the session total: the adapter sets `costBasis: "session_cumulative"` (`packages/adapter-utils/src/types.ts`), the server deltas only the cost (`costSource`), and stores the previous raw tokens plus this invocation's as the raw counters. Those invocation tokens count cache writes as input, as `modelUsage` does (`claudeResultUsageTotals`), so the rebuilt baseline uses the same definitions. `result.usage` misses subagent tokens, so those raw counters are marked `rawUsageIncomplete`; the next run that reports `modelUsage` then stores its own `result.usage` tokens (`usageSource: "invocation"`, adapter field `invocationUsage`) instead of a delta, and its complete totals become the baseline again. Subagent tokens of such runs go uncounted, never onto another run. A run that clears its session for the next run (max turns) is still deltaed against the session it resumed. `usage_json` keeps the cumulative cost as `rawCostUsd` for the next run; `usageSource` is `session_delta`, or `session_total` when there is no earlier usage to subtract. The baseline comes from stored rows, so it holds after a restart and for sessions started before the install (their rows hold the totals). Old rows are not rewritten. At install, set `CLAUDE_SESSION_TOTALS_UNTIL` in `maintenance/usage-audit.mjs` (SX-1376 interim script) to the install time, so the audit stops subtracting for runs after it. | Local only. Upstream `master` (`53732c811`, 2026-10-21) still labels Claude CLI `modelUsage` `per_run` | An upstream release stores per-run usage for resumed Claude CLI runs |
+| SX-1495 (this PR) | CI: `somnex-ci.yml` job `install_git` runs `paperclipai install --ref` for the commit under test on node 24 with npm ignore-scripts on, and the `somnex-ci` gate needs it (see "CI gate") | Local only. Fork-only workflow, nothing to submit | The fork stops installing from git refs |
 | SX-1457 (this PR) | Backups: both engines write to `.partial` files and publish the complete gzip by rename; server startup removes incomplete files; Install and Rollback check for a running backup before restart | Local only (SX-1456) | An upstream release writes backups to a temporary name |
 | Claude quota classification (this PR) | Claude login detection ignores stream-json objects in raw stdout and gives terminal quota or transient errors priority, so a tool's `unauthorized` output cannot turn a session limit into account reauthorization | Local only | An upstream release carries an equivalent fix |
 | NX-1092 (this PR) | Setup-token cleanup: exclude local subscription rows from scoped reads and writes, clear records with no lease without a provider release, and log only the error class and SQLSTATE on a failed release | Local only (NX-1092). Upstream `master` `f3af9887c` has the same fault | An upstream release carries an equivalent fix |
 | NX-834 (this PR) | Tools: opt-in `compact-v1` connection tool names for Claude runs. Pure helper `server/src/services/compact-connection-tool-names.ts`; narrow hooks in the named MCP route (`?toolNames=compact-v1`, unknown values rejected), `listToolsForNamedGateway` (alias projection), `findToolForSession` (alias resolution on the descriptors it already loads, after authentication) and `buildPaperclipRuntimeMcpServers` (label `p` and the versioned URL for `claude_local` agents with `runtimeConfig.connectionToolNames: "compact-v1"`), plus a Claude resume check (`packages/adapters/claude-local/src/server/tool-name-format.ts`) that starts a fresh session when the tool name format changes, because upstream now resumes across other MCP server changes. Stored names, policies, signatures and rate buckets keep the internal name. Kill switch `PAPERCLIP_COMPACT_CONNECTION_TOOL_NAMES_DISABLED=true`. Rollback: unset the agent opt-in (or set the kill switch), let compact sessions restart, then revert the binary | Local only (NX-658). Fork-specific implementation of the approved Nx plan. Related upstream: paperclipai/paperclip#15668 (open). | An upstream release provides equivalent presentation aliases without changing stored gateway identities, policy evaluation or signed approvals |
 | SX-1369 (this PR) | Runs: run temp folders (`paperclip-ai-*`, `paperclip-run-*`) are removed on every end path, and resume data survives. The managed AI home gets an owner marker (company, agent, run); at run end the heartbeat writes back the credential and removes the home only when the run is terminal and neither its process id nor its process group is alive (`server/src/services/run-temp-dirs.ts`). A home with a pending credential write-back (`.paperclip-ai-writeback.json`) is removed only after that write-back runs. A sweep at startup and every 10 minutes removes marked folders whose run the lookup shows as ended for the same company and agent, skips runs whose teardown is still in progress in this server, and runs a write-back left pending by a crash before removal; unmarked folders are left alone. For local runs `provider/projects`, `provider/sessions` and `provider/archived_sessions` link to `<instance>/companies/<company>/agents/<agent>/ai-session-state/`, so Claude `--resume`, agent memory and Codex sessions outlive the temp home; a run whose links cannot be verified fails before the provider starts. Credentials stay in `/tmp`. The sandbox mounts the link targets read-write | Local only. Not checked against upstream `master` and not raised upstream | An upstream release keeps managed session state outside the temp home and sweeps folders of runs cut off by a restart |
+| SX-1444 (this PR) | Runs: a managed AI run gets `MISE_DATA_DIR` and `MISE_CACHE_DIR` in `<instance>/runtime/mise/{data,cache}` and the host user's `<mise data dir>/installs` in `MISE_SHARED_INSTALL_DIRS` (`managedAiToolEnvironment` in `server/src/services/ai-connection-runtime.ts`). Before, `HOME` and `XDG_DATA_HOME` in the run's temp home made mise reinstall every tool into `/tmp/paperclip-ai-*/data/mise` on each run. mise reads the host installs and never writes them; new installs land once in the shared dir, and two runs that install the same version wait on mise's lock in the shared cache. mise state (config trust) and credentials stay in the temp home. An agent's own `MISE_*` env wins. The values are left out of the session fingerprint. A workspace sandbox mounts these dirs, the shims next to them and the `mise` binary on `PATH` read-only (`miseToolInstallMounts`), so a confined run can call `mise` or a shim and reuse tools but cannot install or change them. The fresh-root sandbox also no longer binds the host's `/bin`, `/sbin`, `/lib`, `/lib64` when they are symlinks into `/usr` (merged-/usr hosts); that bind failed before with `Can't bind mount /oldroot/usr/bin on /newroot/bin` | Local only. Upstream has the same per-run `HOME` | An upstream release keeps tool installs out of the managed AI home |
 | SX-1386 (this PR) | Heartbeat: a stage hand-off wake (`execution_review_requested`, `execution_approval_requested`, `execution_changes_requested`) that meets an execution blocker is saved as `deferred_issue_execution` instead of a skipped execution wait. It starts through normal admission when the blocking run releases its environment lease (`resumeDeferredExecutionStageWakes`, called from `releaseEnvironmentLeasesForRun` and `resumeQueuedRuns`), only if the task still waits on that participant. The saved row is settled in the same transaction that stores the successor run, so a failed or interrupted start leaves it saved for a retry and a retry never starts a second run. Before, the decision stopped the deciding run, its lease was still held, and the next participant got no run | Local only (NX-1092) | An upstream release saves or resumes stage hand-off wakes the same way |
+| SX-1537 (this PR) | Heartbeat: a stage hand-off saved behind a stopped run whose provider process or process group is still exiting (`execution_owner_active` with no lease left) is rechecked in the server every 5 s (`scheduleOwnerExitRecheck`, `recheckOwnerExitWait`), because a process exit has no release hook. After 5 minutes the saved wakes get `executionWait.ownerExitTimedOutAt` and a warning is logged; they stay `deferred_issue_execution` and the `resumeQueuedRuns` sweep keeps retrying them. That sweep now takes the least recently tried tasks first and stamps each try, so wakes that stay blocked cannot starve the rest of its batch of 50. While a hand-off is saved, the execution blocker notice says so. `drainActiveRunExecutions` awaits a recheck already running and arms no recheck timer while it drains. Admission still checks ownership under the issue lock, so no second provider process starts on the conversation. Builds on SX-1386; the installed build before SX-1386 wrote these wakes as `skipped` | Local only. Upstream `master` `043f2514e` still drops this case; upstream `06484b3c4` (#15463) uses the same approach (keep the saved row, recheck later) for a scheduled retry of the same run, not ported | An upstream release saves and retries a wake blocked by an exiting process |
 | SX-1120 (this PR) | Database: index for the `paperclipIssue` branch of `valuesForIssue`, so comment lists do not scan all `heartbeat_runs` | On upstream `master` since `e9b6c4d44` (paperclipai/paperclip#16278), also open PR paperclipai/paperclip#12499; not in a stable tag yet. Nothing to submit: upstream already has the fix | The first upstream release merge that contains #16278. On that merge drop the fork's 0306 migration, its journal entry and snapshot, and take upstream's |
 | SX-1361 (this PR) | Runs: `runsForIssue` reads the task run list through `heartbeat_runs.id IN (... UNION ...)` (context issue id plus activity log run ids) instead of an `OR` that scans every run of the company. The company run list reads the run context once per row, takes 200 rows by default and at most 1,000 (route, service, UI client); both agent detail pages fetch an older linked run by id. The fork matches the issue through `context_snapshot ->> 'issueId'` (no `heartbeat_runs.issue_id`) | `runsForIssue`: open upstream PR paperclipai/paperclip#16713 (head `df285a125`). Company run list: on upstream `master` since `ebeac833a` (paperclipai/paperclip#16286), not in a stable tag yet. Nothing to submit | The first upstream release merge that contains both #16713 and #16286. Take upstream's code on a conflict (upstream matches `heartbeat_runs.issue_id`) |
 | `2593ef230` | CLI: pruning preserves and reports older install payloads with a live executable or working directory on Linux. Processes the installing user may not inspect (`EACCES`, `EPERM`) are skipped and not protected. Unsupported platforms and failed process checks retain payloads without failing the install | Local only (NX-658) | An upstream release guards payload pruning against live processes and failed inspection |
@@ -205,7 +210,7 @@ git merge --no-ff <tag>
 
 ## CI gate
 
-`.github/workflows/somnex-ci.yml` runs on every pull request into `somnex-main`, on
+`.github/workflows/somnex-ci.yml` runs on every pull request into `somnex-main` and on every push to `somnex-main` (each merge), so the exact SHA to install has its own run, on
 GitHub-hosted runners: `pnpm install --frozen-lockfile`, `pnpm typecheck`,
 `pnpm build`, and the suites of `pnpm test:run` split into parallel lanes with
 upstream's own shard flags. Upstream's server shards pick files by path rules
@@ -213,7 +218,12 @@ and miss a few that the unsharded run includes, so one extra lane ("server
 other") runs every server project test file that no shard selects. The list is
 computed by `scripts/somnex-ci-server-other.mjs` (fork-only) from vitest's own
 collection minus the shards' dry-run selection; `--list` prints it. The
-`somnex-ci` check is green only when every lane passed.
+"Git install (node 24)" job (`install_git`) runs the CLI from the commit under
+test and runs its `install --repo llwt/paperclip --ref <sha> -y` with the node
+major of `.nvmrc`, `npm_config_ignore_scripts=true` and a scratch `HOME` and
+`PAPERCLIP_HOME`, then checks that the installed `paperclipai --version` runs and
+reports the CLI version (SX-1495). The `somnex-ci` check is green only when
+every lane passed.
 
 Until 2026-10-21 the mainline was named `nrwl-main` and the required check `nrwl-ci` (renamed on SX-1119 Step 3). Older PRs, tasks and install notes use those names.
 
@@ -294,8 +304,45 @@ change to get one merge through.
 
 ## Install
 
-An install is a deployment. It is its own task, assigned by the Coordinator
-after Steven approves the SHA.
+An install is a deployment. It is its own task for the Sr. Engineer, with
+Steven's card on the exact SHA (Steven's decisions on SX-1481, 21 October 2026).
+
+**When an install starts.**
+
+- A high-priority fork fix is installed as soon as it is merged: the
+  Engineering Lead creates the install task right after the merge.
+- Every other merged fix waits for the fixed install at 09:00 and 15:00 UTC on
+  weekdays. A routine creates a task for the Engineering Lead at those times.
+  When `somnex-main` has merged commits that are not installed, the
+  Engineering Lead creates the install task for the head SHA; otherwise the
+  routine task is closed with no install.
+
+**One card per install.** Steven's card on the install SHA is the only card.
+The smoke checklist has no card for Steven (item 5 is an agent check).
+
+**Only the restart waits.** When Steven accepts the card, steps 0 to 5 start at
+once. Only the restart (step 7) waits, for:
+
+- the backup check (step 6);
+- the restart window agreed with Nx (NX-1306, 22 October 2026): any time, also
+  during working hours, but not at minute :00 to :02 or :30 to :32 of the hour
+  (UTC). No check for an Nx merge or install in flight is needed;
+- only for an install with a database migration: the Nx notice. Before the
+  card is posted, the Engineering Lead creates a notice task for Hog Boss with
+  the SHA and the planned time, and the install task is blocked on it until
+  Nx Boss has answered. An install with no migration has no notice.
+
+**After the install.** The install task reports the installed SHA, the restart
+time (UTC) and any Nx run lost in the restart (run id and task) if it can be
+seen. The Sr. Engineer then creates one task with no parent for Hog Boss with
+these facts and what changed for Nx; Hog Boss sends it to Nx as an FYI.
+
+0. Test the combined SHA when it has no green `somnex-ci` run of its own (a
+   pull request's run tests its own head, not `somnex-main` after a later
+   merge). Extract the SHA into the task scratch dir with `git archive`, not a
+   new worktree, and run `pnpm install --frozen-lockfile`, `pnpm typecheck`
+   and the test files that the new pull requests add or change. Stop on any
+   failure.
 
 1. The target is a full SHA on `somnex-main` with a green `somnex-ci` run. Never
    install a branch name. GitHub lets a commit reach `somnex-main` only through
@@ -308,7 +355,18 @@ after Steven approves the SHA.
 4. Copy anything hand-made out of `~/.paperclip/cli/installs` first. `install`
    keeps the new payload and the two before it and deletes every other
    directory under `installs/npm` and `installs/git`, hand-made ones included.
-5. `GH_TOKEN="$(gh auth token)" paperclipai install --repo llwt/paperclip --ref <sha> -y`
+5. Run the install with node 24, not through the `paperclipai` shim:
+
+   ```sh
+   N24=/home/steven-bot/.local/share/mise/installs/node/24/bin
+   PATH="$N24:$PATH" GH_TOKEN="$(gh auth token)" "$N24/node" \
+     /home/steven-bot/.paperclip/cli/current/node_modules/paperclipai/dist/index.js \
+     install --repo llwt/paperclip --ref <sha> -y
+   ```
+
+   Then check that the new shim names node 24:
+   `grep -c 'installs/node/24' /home/steven-bot/.local/bin/paperclipai` prints a
+   number above 0. If it prints 0, stop and report before the restart.
 6. Check that no database backup is running. A restart during a backup cuts the
    dump off (SX-1455). Run:
 
@@ -327,6 +385,17 @@ after Steven approves the SHA.
 
 Facts about `install --ref` on this host (found on NX-449 and NX-509):
 
+- **Run the install CLI with node 24 (SX-1447, 21 October 2026).** The shim
+  `~/.local/bin/paperclipai` hard-codes the node that ran the last install and
+  puts its bin dir first on `PATH`. Node 25 and newer ship no `corepack`, and
+  `install` runs `corepack enable pnpm`, so an install through a shim pinned to
+  node 26 fails ("corepack is not a valid shim"). A `PATH` prefix alone does not
+  help: the shim still runs node 26 and writes node 26 into the new shim. Step 5
+  runs the CLI with node 24 (the line in `.nvmrc` and the fork CI), which has
+  `corepack` and re-pins the shim to node 24. The restart in step 7 then moves
+  the server to node 24 too; the install card says so. Use absolute paths:
+  agent runs have their own `HOME`, so `~` and `$HOME` do not point at
+  `/home/steven-bot` there.
 - **Run the fixed CLI from a checkout while the installed CLI is older than
   fork PR #7.** The installed CLI cannot build a git ref (see the next
   point). In a checkout of the target SHA, after `pnpm install`, replace
@@ -396,8 +465,14 @@ The health endpoint reports `commit: null`, so the SHA check reads
 2. `sha` in `~/.paperclip/cli/install.json` equals the approved SHA.
 3. One agent heartbeat run completes on a throwaway task.
 4. One MCP gateway tool call succeeds (the tool timeout path).
-5. One pending card renders and accepts input in the UI (the card remount
-   path).
+5. The UI and cards work, checked by an agent (no card for Steven, SX-1481):
+   `GET /` returns 200 HTML and the `/assets/*.js` file it references returns
+   200; on a throwaway task, a `request_confirmation` interaction with
+   `resolverPolicy: "anyone"` is posted and accepted through
+   `POST /api/issues/{id}/interactions/{interactionId}/accept`, and reads
+   `accepted` afterwards. Cancel the throwaway task.
+
+`node scripts/somnex-smoke.mjs --sha <sha>` runs items 1, 2 and 5 in one go (fork-only script).
 
 ## Record of the `98fa44c` install
 

@@ -207,6 +207,130 @@ describeEmbeddedPostgres("GitHub connection event delivery", () => {
     expect(connector.acknowledgeEvents).toHaveBeenCalledTimes(2);
   });
 
+  it("replaces an earlier Not found verdict with the webhook state and shows a draft PR as Draft", async () => {
+    const companyId = randomUUID();
+    const applicationId = randomUUID();
+    const connectionId = randomUUID();
+    const grantId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Paperclip", issuePrefix: "GHD" });
+    await db.insert(toolApplications).values({
+      id: applicationId,
+      companyId,
+      applicationKey: `github-${randomUUID()}`,
+      name: "GitHub",
+      type: "mcp_server",
+      status: "active",
+    });
+    await db.insert(toolConnections).values({
+      id: connectionId,
+      companyId,
+      applicationId,
+      name: "GitHub",
+      uid: `github-${randomUUID()}`,
+      transport: "mcp_remote",
+      authKind: "oauth",
+      credentialPolicy: "per_user",
+      status: "active",
+      enabled: true,
+      config: { sourceTemplateKey: "github", oauth: { connectorProfile: "github.code" } },
+      transportConfig: {},
+    });
+    await db.insert(connectionGrants).values({
+      id: grantId,
+      companyId,
+      connectionId,
+      kind: "user",
+      subjectUserId: `github-owner-${randomUUID()}`,
+      status: "active",
+      isDefault: false,
+      providerTenant: {
+        oauth: { strategy: "paperclip_cloud_connector", accessTokenExpiresAt: null },
+        github: {
+          userId: "42",
+          login: "octocat",
+          installationCount: 1,
+          repositoryCount: 1,
+          repositorySelection: "selected",
+          installationIds: ["101"],
+          installationOwnerLogins: ["paperclipai"],
+          repositories: [{ id: "99", fullName: "paperclipai/private", installationId: "101" }],
+          webhookHealth: "pending",
+        },
+      },
+    });
+    const externalObjectId = randomUUID();
+    await db.insert(externalObjects).values({
+      id: externalObjectId,
+      companyId,
+      providerKey: "github",
+      objectType: "pull_request",
+      externalId: "paperclipai/private#pull/7",
+      statusKey: "not_found",
+      statusLabel: "Not found",
+      statusCategory: "unknown",
+      statusTone: "danger",
+      isTerminal: true,
+      liveness: "auth_required",
+      lastErrorAt: new Date("2026-09-04T11:00:00.000Z"),
+      lastErrorCode: "github_repo_not_accessible",
+      lastErrorMessage: "GitHub returned not-found for paperclipai/private.",
+      data: { provider: "github", notFound: true, probeVerified: true, marker: "preserved" },
+    });
+    const leasedEvent = {
+      id: "delivery_draft_7",
+      provider: "github" as const,
+      event: "pull_request",
+      action: "opened",
+      installationId: "101",
+      repositoryId: "99",
+      createdAt: "2026-09-04T12:00:00.000Z",
+      bindingIds: [`${grantId}_101`],
+      payload: {
+        repository: "paperclipai/private",
+        number: 7,
+        state: "open",
+        draft: true,
+        merged: false,
+        updatedAt: "2026-09-04T11:59:01.000Z",
+        url: "https://github.com/paperclipai/private/pull/7",
+      },
+    };
+    const connector = {
+      getCapabilities: vi.fn(async () => ["github.code" as const]),
+      startAuthorization: vi.fn(),
+      claim: vi.fn(),
+      refresh: vi.fn(),
+      revoke: vi.fn(),
+      setWebhookBinding: vi.fn(async () => undefined),
+      leaseEvents: vi.fn(async () => ({ leaseId: "lease-draft", events: [leasedEvent] })),
+      acknowledgeEvents: vi.fn(async () => 1),
+    } as unknown as PaperclipCloudConnector;
+    const service = githubConnectionEventService(db, { connector, now: () => new Date("2026-09-04T12:00:05.000Z") });
+
+    await expect(service.pollOnce()).resolves.toMatchObject({ leased: 1, processed: 1, failed: 0 });
+    const [snapshot] = await db.select().from(externalObjects).where(eq(externalObjects.id, externalObjectId));
+    expect(snapshot).toMatchObject({
+      statusKey: "draft",
+      statusLabel: "Draft",
+      statusCategory: "waiting",
+      statusTone: "warning",
+      statusIconKey: "clock",
+      isTerminal: false,
+      liveness: "fresh",
+      lastErrorAt: null,
+      lastErrorCode: null,
+      lastErrorMessage: null,
+      data: expect.objectContaining({ marker: "preserved", state: "open", draft: true, merged: false }),
+    });
+    expect(snapshot?.data).not.toHaveProperty("notFound");
+    expect(snapshot?.data).not.toHaveProperty("probeVerified");
+    const [receipt] = await db.select().from(connectionEventDeliveries).where(eq(
+      connectionEventDeliveries.providerDeliveryId,
+      leasedEvent.id,
+    ));
+    expect(receipt?.normalizedPayload).toMatchObject({ state: "open", draft: true });
+  });
+
   it.each([false, true])("applies installation events once without discarding newer verified access (refreshed: %s)", async (refreshed) => {
     const companyId = randomUUID();
     const applicationId = randomUUID();
