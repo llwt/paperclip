@@ -4993,7 +4993,9 @@ export async function runChildProcess(
             void logChain.finally(() => {
               void Promise.resolve()
                 .then(() => target.cleanup?.())
-                .catch(() => {})
+                .catch((err) =>
+                  onLogError(err, runId, "failed to clean up spawn target"),
+                )
                 .then(() => runLeftoverSweep())
                 .then((leftoverProcessSweep) => {
                   resolve({
