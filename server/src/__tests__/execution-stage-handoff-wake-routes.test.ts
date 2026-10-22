@@ -159,9 +159,12 @@ describeEmbeddedPostgres("execution stage hand-off wake through the issue routes
    * about to decide. With `leaseHeld` that run has a live process in this
    * server and owns an active environment lease. Stopping it ends the process;
    * the lease stays held until its executor finishes cleanup, which here is
-   * the fork's sweep for a terminal run whose process is gone.
+   * the fork's sweep for a terminal run whose process is gone. With
+   * `processTracked` the run has a live process but no lease: a PATCH
+   * reassignment refuses to stop a run whose executor cannot acknowledge
+   * the stop (`run_stop_unacknowledged`).
    */
-  async function seedStage(input: { transition: Transition; leaseHeld: boolean }) {
+  async function seedStage(input: { transition: Transition; leaseHeld: boolean; processTracked?: boolean }) {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
@@ -182,7 +185,7 @@ describeEmbeddedPostgres("execution stage hand-off wake through the issue routes
     const issueId = randomUUID();
     const decidingRunId = randomUUID();
     let processId = DEAD_ID;
-    if (input.leaseHeld) {
+    if (input.leaseHeld || input.processTracked) {
       const child = spawn("sleep", ["120"], { detached: true, stdio: "ignore" });
       if (!child.pid) throw new Error("could not start the deciding run's process");
       children.set(decidingRunId, child);
@@ -350,7 +353,7 @@ describeEmbeddedPostgres("execution stage hand-off wake through the issue routes
   it.each(cases)(
     "%s %s, normal path without a held lease: exactly one run, no duplicate",
     async (_label, route, transition, wakeReason) => {
-      const ids = await seedStage({ transition, leaseHeld: false });
+      const ids = await seedStage({ transition, leaseHeld: false, processTracked: route === "patch" });
       if (route === "comment") {
         // The deciding run already ended without holding a lease.
         await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
