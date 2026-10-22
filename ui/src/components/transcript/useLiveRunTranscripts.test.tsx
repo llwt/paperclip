@@ -305,6 +305,54 @@ describe("useLiveRunTranscripts", () => {
     container.remove();
   });
 
+  it("reads a finished run's log once while live updates of other runs re-run the read effect (SX-1597)", async () => {
+    logMock.mockImplementation(async () => ({ runId: "run", store: "memory", logRef: "log", content: "" }));
+    const readsOf = (runId: string) => logMock.mock.calls.filter((call) => (call as unknown[])[0] === runId).length;
+
+    function Harness({ liveBytes, doneBytes }: { liveBytes: number; doneBytes: number }) {
+      useLiveRunTranscripts({
+        companyId: "company-1",
+        enableRealtimeUpdates: false,
+        logPollIntervalMs: 0,
+        runs: [
+          { id: "run-done", status: "succeeded", adapterType: "codex_local", logBytes: doneBytes },
+          { id: "run-live", status: "running", adapterType: "codex_local", logBytes: liveBytes },
+        ],
+      });
+      return null;
+    }
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    for (const liveBytes of [10, 20, 30]) {
+      await act(async () => {
+        root.render(<Harness liveBytes={liveBytes} doneBytes={100} />);
+        await Promise.resolve();
+      });
+    }
+
+    expect(readsOf("run-live")).toBe(3);
+    expect(readsOf("run-done")).toBe(1);
+
+    // A late write to the finished run changes its known size: read the rest once.
+    for (const liveBytes of [40, 50]) {
+      await act(async () => {
+        root.render(<Harness liveBytes={liveBytes} doneBytes={120} />);
+        await Promise.resolve();
+      });
+    }
+
+    expect(readsOf("run-live")).toBe(5);
+    expect(readsOf("run-done")).toBe(2);
+
+    act(() => {
+      root.unmount();
+    });
+    container.remove();
+  });
+
   it("does not request persisted logs until a queued run starts", async () => {
     function Harness({ status }: { status: "queued" | "running" }) {
       useLiveRunTranscripts({
