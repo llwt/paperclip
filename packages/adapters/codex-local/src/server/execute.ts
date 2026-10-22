@@ -51,6 +51,7 @@ import {
   isPaperclipRecoveryWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
+  leftoverProcessSweepResultJson,
   joinPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
@@ -1417,6 +1418,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               elapsedMsSinceLastEvent: attempt.monitor.elapsedMsSinceLastEvent,
               terminationSignal: attempt.monitor.terminationSignal,
             },
+            ...leftoverProcessSweepResultJson(attempt.proc),
           },
           summary: attempt.parsed.summary,
           clearSession: clearSessionOnMissingSession,
@@ -1428,6 +1430,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           signal: attempt.proc.signal,
           timedOut: true,
           errorMessage: `Timed out after ${timeoutSec}s`,
+          ...(attempt.proc.leftoverProcessSweep?.stopped
+            ? { resultJson: leftoverProcessSweepResultJson(attempt.proc) }
+            : {}),
           clearSession: clearSessionOnMissingSession,
         };
       }
@@ -1544,6 +1549,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
           ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
           ...(providerQuota && transientRetryNotBefore ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
+          ...leftoverProcessSweepResultJson(attempt.proc),
         },
         summary: attempt.parsed.summary,
         clearSession: Boolean((clearSessionOnMissingSession || forceFreshSession) && !resolvedSessionId),
