@@ -848,6 +848,13 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         return { patch };
       }
 
+      // Parking the task on a blocker is not a decision: keep the participant
+      // as assignee and current participant, and record no decision (a counted
+      // decision at the round cap would escalate the task to a human).
+      if (requestedStatus === "blocked") {
+        return { patch };
+      }
+
       if (requestedStatus && requestedStatus !== "in_review") {
         if (!input.commentBody?.trim()) {
           throw unprocessable(`Requesting changes requires a comment. ${STAGE_DECISION_COMMENT_HINT}`);

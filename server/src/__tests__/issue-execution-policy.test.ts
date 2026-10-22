@@ -1899,6 +1899,21 @@ describe("review round circuit breaker", () => {
     });
   });
 
+  it("does not treat a blocked update from the current participant as a decision, even at the round cap", () => {
+    const result = applyIssueExecutionPolicyTransition({
+      issue: reviewPendingIssue({}, { changesRequestedCount: 2 }),
+      policy,
+      requestedStatus: "blocked",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Waiting for a fresh review",
+    });
+
+    expect(result.patch).toEqual({});
+    expect(result.decision).toBeUndefined();
+    expect(result.workflowControlledAssignment).toBeUndefined();
+  });
+
   it("keeps the escalated hold sticky across unrelated transitions", () => {
     const result = applyIssueExecutionPolicyTransition({
       issue: reviewPendingIssue(

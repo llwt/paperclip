@@ -1263,6 +1263,7 @@ describe("issue execution policy routes", () => {
       mockDbSelectWhere.mockImplementation((...args: []) => ({
         ...(original(...args) as object),
         limit: async () => rows,
+        orderBy: async () => [],
       }));
       mockDbSelectFrom.mockImplementation(() => {
         const query: Record<string, unknown> = { where: mockDbSelectWhere };
