@@ -20,6 +20,7 @@ const serverRoot = path.join(repoRoot, "server");
 const serverSrcDir = path.join(repoRoot, "server", "src");
 const serverTestsDir = path.join(repoRoot, "server", "src", "__tests__");
 const nonServerProjects = [
+  "agent-test-limits",
   "@paperclipai/shared",
   "@paperclipai/skills-catalog",
   "@paperclipai/db",

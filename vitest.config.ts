@@ -1,8 +1,16 @@
 import { defineConfig } from "vitest/config";
+import { agentMaxWorkers } from "./scripts/agent-test-limits.mjs";
 
 export default defineConfig({
   test: {
+    maxWorkers: agentMaxWorkers(process.env),
     projects: [
+      {
+        test: {
+          name: "agent-test-limits",
+          include: ["scripts/agent-test-limits.test.mjs"],
+        },
+      },
       "packages/shared",
       "packages/skills-catalog",
       "packages/db",

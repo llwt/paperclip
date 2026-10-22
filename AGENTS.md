@@ -158,6 +158,8 @@ scope, not proof that a live journey passed.
 
 Default local/agent test path:
 
+In agent runs, tests and typecheck use at most 2 workers (set `PAPERCLIP_TEST_MAX_WORKERS` to change). Run the tests of the package you changed (`pnpm vitest run <path>`), not the whole suite, until the final check.
+
 ```sh
 pnpm test
 ```
