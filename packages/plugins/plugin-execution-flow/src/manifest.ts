@@ -14,7 +14,6 @@ const manifest: PaperclipPluginManifestV1 = {
     "issue.interactions.read",
     "ui.detailTab.register",
   ],
-  // The UI entrypoint is reserved for Step C; this package must not be installed yet.
   entrypoints: { worker: "./dist/worker.js", ui: "./dist/ui" },
   ui: {
     slots: [{

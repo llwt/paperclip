@@ -53,6 +53,7 @@ describe("read-only worker", () => {
     expect(worker.listInteractions).toHaveBeenCalledExactlyOnceWith("issue", "company");
     expect(view.execution.stages).toHaveLength(2);
     expect(view.history.decisions).toHaveLength(1);
+    expect(view.subject).toEqual({ companyId: "company", issueId: "issue" });
     expect(JSON.stringify(view)).not.toContain("Unrelated private data");
     expect(JSON.stringify(view)).not.toContain("Do not return this");
     expect(JSON.stringify(view)).not.toContain("createdByRunId");
