@@ -1411,6 +1411,24 @@ describe("issue execution policy routes", () => {
       },
     );
 
+    it("rejects blocked combined with a reassign to another agent from the approver and changes nothing", async () => {
+      seed(approvalStageIssue(2));
+
+      const res = await request(await createApp(approverActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          status: "blocked",
+          assigneeAgentId: otherAgentId,
+          blockedByIssueIds: [blockerId],
+          comment: "Blocked, handing this over.",
+        });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toContain("Only the active reviewer or approver can advance");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
+
     it("rejects an explicit reassign to another agent from the approver and changes nothing", async () => {
       seed(approvalStageIssue(2));
 

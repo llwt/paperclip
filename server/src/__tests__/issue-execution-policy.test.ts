@@ -1914,6 +1914,33 @@ describe("review round circuit breaker", () => {
     expect(result.workflowControlledAssignment).toBeUndefined();
   });
 
+  it("rejects a blocked update that also reassigns to someone other than the current participant", () => {
+    expect(() =>
+      applyIssueExecutionPolicyTransition({
+        issue: reviewPendingIssue({}, { changesRequestedCount: 2 }),
+        policy,
+        requestedStatus: "blocked",
+        requestedAssigneePatch: { assigneeAgentId: ctoAgentId },
+        actor: { agentId: qaAgentId },
+        commentBody: "Waiting, handing over",
+      }),
+    ).toThrow("Only the active reviewer or approver can advance");
+  });
+
+  it("accepts a blocked update that names the current participant as assignee", () => {
+    const result = applyIssueExecutionPolicyTransition({
+      issue: reviewPendingIssue({}, { changesRequestedCount: 2 }),
+      policy,
+      requestedStatus: "blocked",
+      requestedAssigneePatch: { assigneeAgentId: qaAgentId },
+      actor: { agentId: qaAgentId },
+      commentBody: "Waiting for a fresh review",
+    });
+
+    expect(result.patch).toEqual({});
+    expect(result.decision).toBeUndefined();
+  });
+
   it("keeps the escalated hold sticky across unrelated transitions", () => {
     const result = applyIssueExecutionPolicyTransition({
       issue: reviewPendingIssue(

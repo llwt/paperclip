@@ -852,6 +852,9 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       // as assignee and current participant, and record no decision (a counted
       // decision at the round cap would escalate the task to a human).
       if (requestedStatus === "blocked") {
+        if (requestedAssigneePatchProvided && !principalsEqual(explicitAssignee, currentParticipant)) {
+          throw unprocessable("Only the active reviewer or approver can advance the current execution stage");
+        }
         return { patch };
       }
 
