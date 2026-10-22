@@ -48,7 +48,19 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     )).limit(1) : [];
 
   const ownership = await getConversationOwnershipBlocker(db, companyId, issueId);
-  if (ownership) return { ...ownership, recoveryActionId: null };
+  if (ownership) {
+    // Differs from upstream (fork, SX-1537): say when a stage hand-off is saved
+    // behind this run, so the task does not look stuck with nothing pending.
+    const [savedHandoff] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+      sql`${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'source' = 'issue.execution_stage'`,
+    )).limit(1);
+    const nextAction = savedHandoff
+      ? `${ownership.nextAction} The hand-off to the next participant is saved and starts when it has stopped.`
+      : ownership.nextAction;
+    return { ...ownership, nextAction, recoveryActionId: null };
+  }
   const [action] = restoreHold ? [restoreHold] : await db.select().from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, companyId),
     eq(issueRecoveryActions.sourceIssueId, issueId),
