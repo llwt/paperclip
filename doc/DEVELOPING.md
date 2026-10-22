@@ -94,6 +94,18 @@ The preview server binds `0.0.0.0` and accepts any Host, so a tailnet or LAN add
 
 ## Storybook
 
+For screenshots, run a command with a temporary Storybook server:
+
+```sh
+pnpm storybook:with 6199 -- curl -sf http://127.0.0.1:6199/index.json
+```
+
+The wrapper rejects an occupied port, waits up to 180 seconds for Storybook,
+and sets `STORYBOOK_URL` for the command. It stops the server process group
+when the command exits or the wrapper receives SIGINT, SIGTERM, or SIGHUP. Processes
+that do not stop within five seconds receive SIGKILL. Run the command in the
+foreground. Process-group cleanup requires a POSIX system.
+
 The board UI Storybook keeps stories and Storybook config under `ui/storybook/` so component review files stay out of the app source routes.
 
 ```sh
