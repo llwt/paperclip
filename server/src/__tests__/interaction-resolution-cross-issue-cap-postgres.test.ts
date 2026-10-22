@@ -277,7 +277,14 @@ describeEmbeddedPostgres("cross-issue interaction resolution cap (routes + postg
         .send(body);
 
       expect(res.status, JSON.stringify(res.body)).toBe(404);
-      expect(res.body).toEqual({ error: "Interaction not found" });
+      expect(res.body).toMatchObject({ error: "Interaction not found" });
+      if (interactionId !== "null" && interactionId !== "not-a-uuid") {
+        expect(res.body).toEqual({
+          error: "Interaction not found",
+          code: "interaction_not_found",
+          details: { code: "interaction_not_found" },
+        });
+      }
     }
     expect(serverErrors).toEqual([]);
   });
