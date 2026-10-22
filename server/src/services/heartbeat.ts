@@ -1349,6 +1349,15 @@ const nativeSessionResumeDispatchTimers = new Map<
 // the server rechecks it on a short timer, keyed by `companyId:issueId`, until
 // the timeout. After that the scheduler sweep in `resumeQueuedRuns` retries it.
 const ownerExitRecheckTimers = new Map<string, ReturnType<typeof setTimeout>>();
+// A fired timer has no handle left to clear, so drainActiveRunExecutions awaits
+// the running recheck here. While a drain runs no recheck timer is armed; the
+// saved wake stays durable and the scheduler sweep retries it.
+const activeOwnerExitRechecks = new Set<Promise<unknown>>();
+let ownerExitRecheckDrains = 0;
+/** Fork (SX-1537), for tests: owner-exit recheck timers and running rechecks. */
+export function getOwnerExitRecheckStatus() {
+  return { scheduled: ownerExitRecheckTimers.size, running: activeOwnerExitRechecks.size };
+}
 export const OWNER_EXIT_RECHECK_INTERVAL_MS = 5_000;
 export const OWNER_EXIT_RECHECK_TIMEOUT_MS = 5 * 60_000;
 // Task drain: an operator-controlled hold on new run admission, so a caller
@@ -10670,17 +10679,21 @@ export function heartbeatService(
 
   function scheduleOwnerExitRecheck(companyId: string, issueId: string, waitingSince = new Date()) {
     const key = `${companyId}:${issueId}`;
-    if (ownerExitRecheckTimers.has(key)) return;
+    if (ownerExitRecheckDrains > 0 || ownerExitRecheckTimers.has(key)) return;
     const timer = setTimeout(() => {
       if (ownerExitRecheckTimers.get(key) !== timer) return;
       ownerExitRecheckTimers.delete(key);
-      void recheckOwnerExitWait(companyId, issueId, waitingSince)
+      const recheck: Promise<void> = recheckOwnerExitWait(companyId, issueId, waitingSince)
         .then((state) => {
           if (state === "waiting") scheduleOwnerExitRecheck(companyId, issueId, waitingSince);
         })
         .catch((err) => {
           logger.warn({ err, issueId }, "owner-exit recheck of saved stage hand-off failed");
+        })
+        .finally(() => {
+          activeOwnerExitRechecks.delete(recheck);
         });
+      activeOwnerExitRechecks.add(recheck);
     }, OWNER_EXIT_RECHECK_INTERVAL_MS);
     timer.unref?.();
     ownerExitRecheckTimers.set(key, timer);
@@ -20666,14 +20679,23 @@ export function heartbeatService(
       clearTimeout(timer);
     }
     nativeSessionResumeDispatchTimers.clear();
-    for (const timer of ownerExitRecheckTimers.values()) clearTimeout(timer);
-    ownerExitRecheckTimers.clear();
-    while (
-      activeWakeupPromises.size > 0 ||
-      activeRunExecutionPromises.size > 0
-    ) {
-      await Promise.allSettled([...activeWakeupPromises]);
-      await Promise.all([...activeRunExecutionPromises]);
+    // Fork (SX-1537): no owner-exit recheck timer may be armed during the
+    // drain, by a running recheck or by a wake; await rechecks already running.
+    ownerExitRecheckDrains += 1;
+    try {
+      for (const timer of ownerExitRecheckTimers.values()) clearTimeout(timer);
+      ownerExitRecheckTimers.clear();
+      while (
+        activeWakeupPromises.size > 0 ||
+        activeOwnerExitRechecks.size > 0 ||
+        activeRunExecutionPromises.size > 0
+      ) {
+        await Promise.allSettled([...activeWakeupPromises]);
+        await Promise.allSettled([...activeOwnerExitRechecks]);
+        await Promise.all([...activeRunExecutionPromises]);
+      }
+    } finally {
+      ownerExitRecheckDrains -= 1;
     }
   }
 

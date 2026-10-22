@@ -62,7 +62,40 @@ vi.mock("../adapters/index.ts", async () => {
   };
 });
 
+// Holds the next ownership check on a controlled promise, so a test can keep a
+// recheck or a wake in its database I/O while a drain runs.
+const blockerHold = vi.hoisted(() => ({
+  next: null as null | { entered: () => void; release: Promise<void> },
+}));
+
+vi.mock("../services/execution-blocker.ts", async () => {
+  const actual = await vi.importActual<typeof import("../services/execution-blocker.ts")>(
+    "../services/execution-blocker.ts",
+  );
+  return {
+    ...actual,
+    getExecutionBlocker: vi.fn(async (...args: Parameters<typeof actual.getExecutionBlocker>) => {
+      const hold = blockerHold.next;
+      if (hold) {
+        blockerHold.next = null;
+        hold.entered();
+        await hold.release;
+      }
+      return actual.getExecutionBlocker(...args);
+    }),
+  };
+});
+
+function holdNextBlockerCheck() {
+  let release!: () => void;
+  let entered!: () => void;
+  const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+  blockerHold.next = { entered, release: new Promise<void>((resolve) => { release = resolve; }) };
+  return { entered: enteredPromise, release };
+}
+
 import {
+  getOwnerExitRecheckStatus,
   heartbeatService,
   OWNER_EXIT_RECHECK_INTERVAL_MS,
   OWNER_EXIT_RECHECK_TIMEOUT_MS,
@@ -128,6 +161,7 @@ describeEmbeddedPostgres("stage hand-off wake behind a stopped run whose process
   }, 20_000);
 
   afterEach(async () => {
+    blockerHold.next = null;
     for (const child of [...children]) await stopOwnerProcess(child);
     mockAdapterExecute.mockClear();
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
@@ -416,6 +450,73 @@ describeEmbeddedPostgres("stage hand-off wake behind a stopped run whose process
     const [stamped] = await db.select({ updatedAt: agentWakeupRequests.updatedAt })
       .from(agentWakeupRequests).where(eq(agentWakeupRequests.id, row!.id));
     expect(stamped!.updatedAt.getTime()).toBeGreaterThan(old.getTime());
+  }, 30_000);
+
+  it("drain waits for a fired owner-exit recheck held in I/O, and it arms no timer after", async () => {
+    const child = startOwnerProcess();
+    const ids = await seedHandoffToReview({ kind: "pid", child });
+    expect(await heartbeat.wakeup(ids.reviewerId, ids.stageWakeup.wakeup)).toBeNull();
+    expect(getOwnerExitRecheckStatus()).toEqual({ scheduled: 1, running: 0 });
+
+    // The timer fires and its recheck stops in the ownership check.
+    const hold = holdNextBlockerCheck();
+    await hold.entered;
+    expect(getOwnerExitRecheckStatus()).toEqual({ scheduled: 0, running: 1 });
+
+    let drained = false;
+    const drain = heartbeat.drainActiveRunExecutions().then(() => { drained = true; });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(drained).toBe(false);
+
+    // The process is still alive, so the recheck ends "waiting". It must not
+    // arm a new timer while the drain runs, nor after the drain returns.
+    hold.release();
+    await drain;
+    expect(getOwnerExitRecheckStatus()).toEqual({ scheduled: 0, running: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(getOwnerExitRecheckStatus()).toEqual({ scheduled: 0, running: 0 });
+    expect(await otherRunsOnIssue(ids.issueId, ids.authorRunId)).toHaveLength(0);
+
+    // The wake stays saved; the scheduler sweep starts it once the process exits.
+    expect(await reviewWakes(ids.reviewerId, ids.issueId)).toEqual([
+      expect.objectContaining({ status: "deferred_issue_execution", runId: null }),
+    ]);
+    await stopOwnerProcess(child);
+    await db.update(agentWakeupRequests).set({ requestedAt: new Date(Date.now() - 60_000) })
+      .where(eq(agentWakeupRequests.agentId, ids.reviewerId));
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    expect(await reviewRuns(ids.reviewerId)).toHaveLength(1);
+  }, 30_000);
+
+  it("a public wake that saves its hand-off during a drain arms no recheck timer", async () => {
+    const child = startOwnerProcess();
+    const ids = await seedHandoffToReview({ kind: "pid", child });
+
+    // The wake stops in its ownership check; then a drain starts.
+    const hold = holdNextBlockerCheck();
+    const wake = heartbeat.wakeup(ids.reviewerId, ids.stageWakeup.wakeup);
+    await hold.entered;
+    let drained = false;
+    const drain = heartbeat.drainActiveRunExecutions().then(() => { drained = true; });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(drained).toBe(false);
+
+    hold.release();
+    expect(await wake).toBeNull();
+    await drain;
+    expect(getOwnerExitRecheckStatus()).toEqual({ scheduled: 0, running: 0 });
+    expect(await otherRunsOnIssue(ids.issueId, ids.authorRunId)).toHaveLength(0);
+    expect(await reviewWakes(ids.reviewerId, ids.issueId)).toEqual([
+      expect.objectContaining({ status: "deferred_issue_execution", runId: null }),
+    ]);
+
+    await stopOwnerProcess(child);
+    await db.update(agentWakeupRequests).set({ requestedAt: new Date(Date.now() - 60_000) })
+      .where(eq(agentWakeupRequests.agentId, ids.reviewerId));
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    expect(await reviewRuns(ids.reviewerId)).toHaveLength(1);
   }, 30_000);
 
   it("normal path: with no live old process the hand-off gives exactly one wake and one run", async () => {
