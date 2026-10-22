@@ -25,6 +25,7 @@ the ones on `somnex-main` before the merge; what is left of each is the diff of
 
 | Commit | What | Upstream status | Drops out when |
 | --- | --- | --- | --- |
+| SX-1495 (this PR) | CI: `somnex-ci.yml` job `install_git` runs `paperclipai install --ref` for the commit under test on node 24 with npm ignore-scripts on, and the `somnex-ci` gate needs it (see "CI gate") | Local only. Fork-only workflow, nothing to submit | The fork stops installing from git refs |
 | SX-1457 (this PR) | Backups: both engines write to `.partial` files and publish the complete gzip by rename; server startup removes incomplete files; Install and Rollback check for a running backup before restart | Local only (SX-1456) | An upstream release writes backups to a temporary name |
 | Claude quota classification (this PR) | Claude login detection ignores stream-json objects in raw stdout and gives terminal quota or transient errors priority, so a tool's `unauthorized` output cannot turn a session limit into account reauthorization | Local only | An upstream release carries an equivalent fix |
 | NX-1092 (this PR) | Setup-token cleanup: exclude local subscription rows from scoped reads and writes, clear records with no lease without a provider release, and log only the error class and SQLSTATE on a failed release | Local only (NX-1092). Upstream `master` `f3af9887c` has the same fault | An upstream release carries an equivalent fix |
@@ -213,7 +214,12 @@ and miss a few that the unsharded run includes, so one extra lane ("server
 other") runs every server project test file that no shard selects. The list is
 computed by `scripts/somnex-ci-server-other.mjs` (fork-only) from vitest's own
 collection minus the shards' dry-run selection; `--list` prints it. The
-`somnex-ci` check is green only when every lane passed.
+"Git install (node 24)" job (`install_git`) runs the CLI from the commit under
+test and runs its `install --repo llwt/paperclip --ref <sha> -y` with the node
+major of `.nvmrc`, `npm_config_ignore_scripts=true` and a scratch `HOME` and
+`PAPERCLIP_HOME`, then checks that the installed `paperclipai --version` runs and
+reports the CLI version (SX-1495). The `somnex-ci` check is green only when
+every lane passed.
 
 Until 2026-10-21 the mainline was named `nrwl-main` and the required check `nrwl-ci` (renamed on SX-1119 Step 3). Older PRs, tasks and install notes use those names.
 
