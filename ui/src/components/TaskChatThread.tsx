@@ -2479,11 +2479,12 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     }
     return result;
   }, [interactions, pendingRuntimeRequest]);
-  // Questions already have an answerable history card, including
-  // when the user dismisses a fresh form without sending another message.
-  const pendingReminderInputs = useMemo(() => pendingComposerInputs.filter(input =>
-    !(input.kind === "durable" && input.interaction.kind === "ask_user_questions")),
-  [pendingComposerInputs]);
+  // Differs from upstream v2026.1012.0 (#15229, `59015846a`), which leaves
+  // durable questions out of this list. Here every pending input, including a
+  // dismissed or moved-on question, counts in the composer and stays reachable
+  // from it (SX-1581): a muted history row far up the thread was missed.
+  // `currentPendingInputs` below still decides what opens by itself.
+  const pendingReminderInputs = pendingComposerInputs;
   const { dismissedQuestionIds, dismissQuestion } = useDismissedTaskQuestions(issueId, currentUserId);
   const latestUserComment = useMemo(() => comments
     .filter(comment => !comment.deletedAt && comment.authorUserId && !comment.authorAgentId && !comment.createdByRunId)
