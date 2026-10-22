@@ -1,6 +1,12 @@
-import type { Db } from "@paperclipai/db";
+import { createHash } from "node:crypto";
+import { agents, type Db } from "@paperclipai/db";
 import type { ExternalObjectCanonicalUrl } from "@paperclipai/shared";
-import { DEFAULT_GITHUB_TOKEN_SECRET_NAMES } from "./git-credentials.js";
+import { inArray } from "drizzle-orm";
+import { logger } from "../middleware/logger.js";
+import {
+  DEFAULT_GITHUB_TOKEN_SECRET_NAMES,
+  resolveManagedGitHubCredential,
+} from "./git-credentials.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { secretService } from "./secrets.js";
 import type {
@@ -188,8 +194,52 @@ function notFoundSnapshot(identity: GitHubObjectIdentity, etag: string | null): 
       repo: identity.repo,
       number: identity.number,
       notFound: true,
+      // The repository was probed with the configured credentials and found
+      // to be visible, so this not-found verdict is definitive, not a stale
+      // guess from a time when credentials could not see the repo. The due
+      // sweep uses this flag to avoid re-polling a confirmed-deleted object
+      // forever and exhausting the company's GitHub API budget.
+      probeVerified: true,
     },
   };
+}
+
+/**
+ * Probe `/repos/{owner}/{repo}` to classify a 404 on a pull request or issue.
+ *
+ * GitHub returns 404 both when the object does not exist and when the repository
+ * exists but the credentials cannot see it (private repos are deliberately hidden
+ * behind 404). This probes the repo metadata with the same credentials to tell the
+ * two apart:
+ *
+* - "visible": the repo returns 2xx — the referenced object really is gone.
+ * - "hidden": the repo returns 404/403 — the credentials lack access to the repo,
+ *   so the object status cannot be determined and should not be frozen as "Not found".
+ * - "uncertain": the probe itself failed (network/rate limit) — retry later.
+ */
+async function probeRepoVisibility(
+  identity: GitHubObjectIdentity,
+  opts: { fetch: FetchLike; headers?: Record<string, string> | undefined },
+): Promise<"visible" | "hidden" | "uncertain"> {
+  try {
+    const probe = await opts.fetch(
+      `${gitHubApiBase(identity.host)}/repos/${encodeURIComponent(identity.owner)}/${encodeURIComponent(identity.repo)}`,
+      { headers: opts.headers },
+    );
+    if (probe.ok) return "visible";
+    if (probe.status === 404) return "hidden";
+    if (probe.status === 403) {
+      // GitHub can return 403 for both "credentials lack access" and "rate limit
+      // reached". A rate-limited probe cannot tell the two apart, so treat it as
+      // uncertain (retry later) instead of implying missing access.
+      const rateLimitRemaining = probe.headers.get("x-ratelimit-remaining");
+      if (rateLimitRemaining === "0") return "uncertain";
+      return "hidden";
+    }
+    return "uncertain";
+  } catch {
+    return "uncertain";
+  }
 }
 
 function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string, unknown>, etag: string | null): ExternalObjectResolverSnapshot {
@@ -317,16 +367,90 @@ async function safeJson(response: Response) {
   }
 }
 
-async function defaultTokenProvider(db: Db, companyId: string, secretNames: readonly string[]) {
-  const secrets = secretService(db);
-  for (const secretName of secretNames) {
-    const secret = await secrets.getByName(companyId, secretName);
-    if (!secret) continue;
-    const token = await secrets.resolveSecretValue(companyId, secret.id, "latest");
-    const trimmed = token.trim();
-    if (trimmed) return trimmed;
-  }
-  return null;
+/** Comma-separated agent ids whose dedicated GitHub grant the status poller may use, at most one per company. */
+export const EXTERNAL_OBJECTS_GITHUB_AGENT_IDS_ENV_KEY = "PAPERCLIP_EXTERNAL_OBJECTS_GITHUB_AGENT_IDS";
+
+type GitCredentialSecretsDeps = Parameters<typeof resolveManagedGitHubCredential>[1];
+
+export interface GitHubPollerTokenProviderDeps {
+  secrets?: GitCredentialSecretsDeps;
+  env?: NodeJS.ProcessEnv;
+  secretNames?: readonly string[];
+  findPollerAgentId?: (companyId: string, agentIds: string[]) => Promise<string | null>;
+  resolveManaged?: typeof resolveManagedGitHubCredential;
+}
+
+async function findPollerAgentIdInDb(db: Db, companyId: string, agentIds: string[]) {
+  const rows = await db
+    .select({ id: agents.id, companyId: agents.companyId, status: agents.status })
+    .from(agents)
+    .where(inArray(agents.id, agentIds));
+  return rows.find((row) => row.companyId === companyId && row.status !== "terminated")?.id ?? null;
+}
+
+/**
+ * Token source for the server-side status poller, which only knows the company. Order: the
+ * dedicated managed GitHub grant of the company's poller agent (named in
+ * PAPERCLIP_EXTERNAL_OBJECTS_GITHUB_AGENT_IDS), then a company secret by well-known name, then
+ * the server environment. Unlike git checkouts this falls through when the managed step has
+ * no token: read-only status polling must keep working for public PRs and the secret path.
+ */
+export function createGitHubPollerTokenProvider(db: Db, deps: GitHubPollerTokenProviderDeps = {}) {
+  const secrets: GitCredentialSecretsDeps = deps.secrets ?? secretService(db);
+  const env = deps.env ?? process.env;
+  const secretNames = deps.secretNames ?? DEFAULT_GITHUB_TOKEN_SECRET_NAMES;
+  const findPollerAgentId = deps.findPollerAgentId
+    ?? ((companyId: string, agentIds: string[]) => findPollerAgentIdInDb(db, companyId, agentIds));
+  const resolveManaged = deps.resolveManaged ?? resolveManagedGitHubCredential;
+  // The poller resolves every object on each refresh; log a fall-through only when its reason changes.
+  const lastReasonByCompany = new Map<string, string>();
+  const noteFallThrough = (companyId: string, reason: string | null) => {
+    if (reason === null) {
+      lastReasonByCompany.delete(companyId);
+      return;
+    }
+    if (lastReasonByCompany.get(companyId) === reason) return;
+    lastReasonByCompany.set(companyId, reason);
+    logger.info({ companyId, reason }, "GitHub status poller: managed connection gave no token, using fallback credentials");
+  };
+
+  const managedToken = async (companyId: string): Promise<string | null> => {
+    const agentIds = (env[EXTERNAL_OBJECTS_GITHUB_AGENT_IDS_ENV_KEY] ?? "")
+      .split(",")
+      .map((id) => id.trim())
+      .filter(Boolean);
+    if (agentIds.length === 0) return null;
+    try {
+      const agentId = await findPollerAgentId(companyId, agentIds);
+      if (!agentId) {
+        noteFallThrough(companyId, "no_poller_agent_for_company");
+        return null;
+      }
+      const managed = await resolveManaged(db, secrets, companyId, { agentId, allowStandingDelegation: false });
+      const token = managed.credential?.token.trim() ?? "";
+      if (token) {
+        noteFallThrough(companyId, null);
+        return token;
+      }
+      noteFallThrough(companyId, managed.configured ? "managed_identity_unavailable" : "managed_connection_not_configured");
+    } catch {
+      noteFallThrough(companyId, "managed_lookup_failed");
+    }
+    return null;
+  };
+
+  return async (companyId: string): Promise<string | null> => {
+    const managed = await managedToken(companyId);
+    if (managed) return managed;
+    for (const secretName of secretNames) {
+      const secret = await secrets.getByName(companyId, secretName);
+      if (!secret) continue;
+      const token = await secrets.resolveSecretValue(companyId, secret.id, "latest");
+      const trimmed = token.trim();
+      if (trimmed) return trimmed;
+    }
+    return env.GITHUB_TOKEN?.trim() || env.GH_TOKEN?.trim() || null;
+  };
 }
 
 export function createGitHubExternalObjectProvider(
@@ -337,7 +461,31 @@ export function createGitHubExternalObjectProvider(
   const secretNames = opts.secretNames ?? DEFAULT_GITHUB_TOKEN_SECRET_NAMES;
   const tokenProvider = Object.prototype.hasOwnProperty.call(opts, "tokenProvider") && opts.tokenProvider !== undefined
     ? opts.tokenProvider
-    : ((companyId: string) => defaultTokenProvider(db, companyId, secretNames));
+    : createGitHubPollerTokenProvider(db, { secretNames });
+// Cache repository-visibility probe results so many objects in the same repo
+  // share a single probe instead of each issuing its own request every refresh
+  // cycle. Only determined outcomes ("visible"/"hidden") are cached; uncertain
+  // probes are retried on the next cycle. The cache is keyed per company+repo+
+  // credential fingerprint so a verdict obtained under one token is never
+  // reused after the company rotates its credentials — that would freeze a
+  // reference as "probe-verified not-found" using an out-of-date result.
+
+  const probeCache = new Map<string, { result: "visible" | "hidden"; expiresAt: number }>();
+  async function cachedProbeRepoVisibility(
+    companyId: string,
+    identity: GitHubObjectIdentity,
+    headers: Record<string, string>,
+  ): Promise<"visible" | "hidden" | "uncertain"> {
+    const credentialFingerprint = createHash("sha256").update(headers.authorization ?? "anonymous").digest("hex");
+    const key = `${companyId}\u0000${credentialFingerprint}\u0000${identity.owner.toLowerCase()}\u0000${identity.repo.toLowerCase()}`;
+    const cached = probeCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) return cached.result;
+    const result = await probeRepoVisibility(identity, { fetch: fetchImpl, headers });
+    if (result !== "uncertain") {
+      probeCache.set(key, { result, expiresAt: Date.now() + GITHUB_OBJECT_TTL_SECONDS * 1000 });
+    }
+    return result;
+  }
 
   const detector: ExternalObjectDetector = {
     key: "github",
@@ -414,7 +562,32 @@ export function createGitHubExternalObjectProvider(
 
         const etag = response.headers.get("etag");
         if (response.status === 404) {
-          return { ok: true, snapshot: notFoundSnapshot(identity, etag) };
+          // GitHub deliberately returns 404 for repositories the credentials cannot
+          // see, to avoid leaking that a private repo exists. A 404 therefore means
+          // either "object deleted/never existed" or "repo private / no access".
+          // Probe the repository metadata to classify: if the repo itself is visible
+          // the object truly is gone; if it is not, surface credentials-needed
+          // instead of permanently freezing a reference as "Not found".
+          const repoVisibility = await cachedProbeRepoVisibility(companyId, identity, headers);
+          if (repoVisibility === "visible") {
+            return { ok: true, snapshot: notFoundSnapshot(identity, etag) };
+          }
+          if (repoVisibility === "hidden") {
+            return {
+              ok: false,
+              liveness: "auth_required",
+              errorCode: "github_repo_not_accessible",
+              errorMessage: `GitHub returned not-found for ${identity.owner}/${identity.repo}. The repository may be private, deleted, or the configured GitHub credentials may lack access to it.`,
+              retryAfterSeconds: GITHUB_OBJECT_TTL_SECONDS,
+            };
+          }
+          return {
+            ok: false,
+            liveness: "unreachable",
+            errorCode: "github_repo_probe_failed",
+            errorMessage: "GitHub could not verify this repository while checking this object.",
+            retryAfterSeconds: GITHUB_OBJECT_TTL_SECONDS,
+          };
         }
 
         const failure = failureFromGitHubResponse(response);
