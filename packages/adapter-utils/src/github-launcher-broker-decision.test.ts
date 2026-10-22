@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -170,5 +170,47 @@ process.stdout.write(JSON.stringify(Object.fromEntries(keys.map(key => [key, pro
     await exec("git", ["-C", repo, "config", "remote.origin.promisor", "true"]);
     await git("status");
     expect(calls()).toBe(1);
+  });
+
+  it("keeps the broker when a full parent recurses into a partial-clone submodule", async () => {
+    const { root, bin, env, calls } = await fixture();
+    const origin = path.join(root, "sub-origin"), parent = path.join(root, "parent"), sub = path.join(parent, "sub");
+    const setup = (...args: string[]) => exec("git", ["-c", "user.name=Setup", "-c", "user.email=setup@example.test", "-c", "protocol.file.allow=always", ...args]);
+    await setup("init", "-q", origin);
+    await setup("-C", origin, "config", "uploadpack.allowFilter", "true");
+    await writeFile(path.join(origin, "data.txt"), "old content\n");
+    await setup("-C", origin, "add", "data.txt");
+    await setup("-C", origin, "commit", "-q", "-m", "old");
+    const oldCommit = (await setup("-C", origin, "rev-parse", "HEAD")).stdout.trim();
+    await writeFile(path.join(origin, "data.txt"), "new content\n");
+    await setup("-C", origin, "commit", "-q", "-am", "new");
+    // The parent is a full repository; only the submodule is a partial clone,
+    // so the old blob is missing there and checkout must fetch it.
+    await setup("init", "-q", parent);
+    await setup("clone", "-q", "--filter=blob:none", `file://${origin}`, sub);
+    await setup("-C", parent, "submodule", "add", "-q", `file://${origin}`, "sub");
+    await setup("-C", parent, "update-index", "--cacheinfo", `160000,${oldCommit},sub`);
+    await setup("-C", parent, "commit", "-q", "-m", "submodule at old");
+    await setup("-C", parent, "update-index", "--cacheinfo", `160000,${(await setup("-C", sub, "rev-parse", "HEAD")).stdout.trim()},sub`);
+    await setup("-C", parent, "commit", "-q", "-m", "submodule at new");
+    await expect(exec("git", ["-C", parent, "config", "--get-regexp", "^(extensions\\.partialclone|remote\\..*\\.promisor)$"])).rejects.toThrow();
+    const git = (...args: string[]) => exec(path.join(bin, "git"), args, { cwd: parent, env: env() });
+    await git("checkout", "-q", "--recurse-submodules", "HEAD~1");
+    expect(calls()).toBe(1);
+    expect(await readFile(path.join(sub, "data.txt"), "utf8")).toBe("old content\n");
+  }, 20_000);
+
+  it("keeps the broker when configuration enables submodule recursion", async () => {
+    const { root, bin, env, calls } = await fixture();
+    const repo = path.join(root, "repo");
+    await exec("git", ["init", "-q", repo]);
+    const git = (...args: string[]) => exec(path.join(bin, "git"), args, { cwd: repo, env: env() });
+    await git("status");
+    expect(calls()).toBe(0);
+    await git("-c", "submodule.recurse=true", "status");
+    expect(calls()).toBe(1);
+    await exec("git", ["-C", repo, "config", "submodule.recurse", "true"]);
+    await git("status");
+    expect(calls()).toBe(2);
   });
 });

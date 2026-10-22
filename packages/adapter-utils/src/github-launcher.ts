@@ -122,11 +122,14 @@ async function main() {
     // gh always uses the broker. A local git command keeps the sanitised
     // environment above and never receives a credential. In a partial clone a
     // local command can fetch missing objects, so it keeps the broker too.
+    // Recursion can fetch inside a submodule, where child Git runs without the
+    // launcher, so any submodule configuration (an initialised submodule's url,
+    // submodule.recurse, submodule.active) keeps the broker as well.
     let needsBroker = true;
     if (program === 'git') {
       const decision = classifyGitInvocation(process.argv.slice(2));
       if (!decision.needsBroker) {
-        const promisor = spawnSync(executable, [...decision.globalArgs, 'config', '--get-regexp', '^(extensions\\.partialclone|remote\\..*\\.promisor)$'],
+        const promisor = spawnSync(executable, [...decision.globalArgs, 'config', '--get-regexp', '^(extensions\\.partialclone|remote\\..*\\.promisor|submodule\\..*)$'],
           { env: { ...env, PATH: originalPath.join(path.delimiter) }, stdio: 'ignore', timeout: 10000 });
         needsBroker = promisor.status !== 1;
       }
