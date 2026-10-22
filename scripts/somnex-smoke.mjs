@@ -64,6 +64,7 @@ export async function checkUi(request) {
     const path = src?.[1] ?? src?.[2] ?? src?.[3];
     if (path && /^\/assets\/[^?#]+\.js(?:[?#].*)?$/.test(path)) assets.add(path);
   }
+  if (assets.size === 0) throw new Error("no JavaScript asset referenced");
   for (const path of assets) {
     const asset = await request(path);
     if (asset.status !== 200) throw new Error(`${path}: HTTP ${asset.status}`);

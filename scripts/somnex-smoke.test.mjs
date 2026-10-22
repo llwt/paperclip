@@ -13,7 +13,7 @@ const API_KEY = "synthetic-smoke-key";
 const runFile = promisify(execFile);
 const scriptPath = new URL("./somnex-smoke.mjs", import.meta.url);
 
-async function fixture(t, { failPath, hangPath, pending = false, failCleanup = false, health = "ok" } = {}) {
+async function fixture(t, { failPath, hangPath, pending = false, failCleanup = false, health = "ok", noAssets = false } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "somnex-smoke-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const installJson = join(dir, "install.json");
@@ -37,7 +37,7 @@ async function fixture(t, { failPath, hangPath, pending = false, failCleanup = f
       json({ status: health });
     } else if (req.url === "/") {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-      res.end('<!doctype html><html><script type="module" src="/assets/main.js"></script><script src=\'/assets/other.js?v=1\'></script><script src=/assets/unquoted.js></script></html>');
+      res.end(noAssets ? '<!doctype html><html><body>No bundle</body></html>' : '<!doctype html><html><script type="module" src="/assets/main.js"></script><script src=\'/assets/other.js?v=1\'></script><script src=/assets/unquoted.js></script></html>');
     } else if (req.url.startsWith("/assets/")) {
       res.writeHead(200, { "content-type": "text/javascript" });
       res.end("export default true;");
@@ -112,6 +112,15 @@ test("HTTP 500 on a JavaScript asset fails ui and still runs card", async (t) =>
   assert.equal(results.ui.pass, false);
   assert.match(results.ui.detail, /HTTP 500/);
   assert.equal(results.card.pass, true);
+});
+
+test("HTML without a JavaScript asset fails ui and still runs card", async (t) => {
+  const options = await fixture(t, { noAssets: true });
+  const results = await runSmokeChecks(options);
+  assert.equal(results.ui.pass, false);
+  assert.equal(results.ui.detail, "no JavaScript asset referenced");
+  assert.ok(results.health.pass && results.sha.pass && results.card.pass);
+  assertCancelled(options.calls);
 });
 
 test("a failed accept call fails card and still cancels the throwaway task", async (t) => {
