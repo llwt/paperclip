@@ -28,7 +28,7 @@ export const DismissAndAnswerLater: Story = {
     await userEvent.click(canvas.getByRole("button", { name: /^Dismiss / }));
     await expect(canvas.getByTestId("task-chat-unanswered-question")).toBeVisible();
     await expect(canvas.queryByTestId("task-chat-composer-takeover")).not.toBeInTheDocument();
-    await expect(canvas.queryByTestId("task-chat-pending-input-indicator")).not.toBeInTheDocument();
+    await expect(canvas.getByTestId("task-chat-pending-input-indicator")).toHaveTextContent("1 pending input");
     await userEvent.click(canvas.getByTestId("task-chat-unanswered-question"));
     await expect(canvas.getByRole("radio", { name: "Green" })).toBeChecked();
     await userEvent.click(canvas.getByRole("button", { name: /^(Send|Submit) answers$/ }));
