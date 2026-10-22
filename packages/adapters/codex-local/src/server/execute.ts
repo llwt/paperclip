@@ -59,6 +59,7 @@ import {
   parseLocalProcessNetworkAllowlist,
   parseLocalProcessNetworkScope,
   managedAiSessionStateMounts,
+  miseToolInstallMounts,
   type LocalProcessSandboxOptions,
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import {
@@ -1005,6 +1006,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             managedPaths: [
               { path: effectiveCodexHome, access: "rw" },
               ...(config.managedAiConnection ? await managedAiSessionStateMounts(effectiveCodexHome) : []),
+              ...(await miseToolInstallMounts(effectiveEnv)),
             ],
             extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
             pathAliases: targetWorkspaceRealization?.mode === "copy"

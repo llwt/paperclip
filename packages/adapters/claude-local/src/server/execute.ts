@@ -60,6 +60,7 @@ import {
   parseLocalProcessNetworkAllowlist,
   parseLocalProcessNetworkScope,
   managedAiSessionStateMounts,
+  miseToolInstallMounts,
   type LocalProcessSandboxOptions,
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import {
@@ -579,6 +580,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             { path: promptBundle.addDir, access: "ro" },
             { path: localMcpConfigDir, access: "ro" },
             ...(config.managedAiConnection ? await managedAiSessionStateMounts(sharedClaudeConfigDir) : []),
+            ...(await miseToolInstallMounts(effectiveEnv)),
           ],
           extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
           homeDir: filesystemScope ? path.dirname(sharedClaudeConfigDir) : null,
