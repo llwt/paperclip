@@ -90,6 +90,11 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
   let db: ReturnType<typeof createDb>;
 
   beforeAll(async () => {
+    // Exercise scheduling against the scratch DB, regardless of flags inherited
+    // from an agent run or loaded from the worktree's .paperclip/.env.
+    vi.stubEnv("PAPERCLIP_IN_WORKTREE", "false");
+    vi.stubEnv("PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS", "false");
+    vi.stubEnv("PAPERCLIP_RESTORE_IN_PROGRESS", "false");
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-issue-liveness-");
     db = createDb(tempDb.connectionString);
   }, 30_000);
@@ -130,7 +135,11 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
   });
 
   afterAll(async () => {
-    await tempDb?.cleanup();
+    try {
+      await tempDb?.cleanup();
+    } finally {
+      vi.unstubAllEnvs();
+    }
   }, 30_000);
 
   async function seedBlockedChain(opts: {
