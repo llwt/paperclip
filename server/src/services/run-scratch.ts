@@ -27,7 +27,7 @@ export interface HeartbeatRunScratchEnvResult {
 
 export type HeartbeatRunScratchCleanupResult =
   | { removed: true; dir: string }
-  | { removed: false; dir: string; reason: "missing" | "unmarked" | "owner_mismatch" | "process_group_alive" };
+  | { removed: false; dir: string; reason: "missing" | "unmarked" | "owner_mismatch" | "process_pid_alive" | "process_group_alive" };
 
 const TEMP_ENV_KEYS = ["TMPDIR", "TEMP", "TMP"] as const;
 const ISSUE_SEGMENT_MAX_CHARS = 32;
@@ -124,6 +124,8 @@ export function buildHeartbeatRunScratchEnv(
 
 export async function cleanupHeartbeatRunScratch(input: {
   scratch: HeartbeatRunScratch;
+  processPid?: number | null;
+  isPidAlive?: (pid: number) => boolean;
   processGroupId?: number | null;
   isProcessGroupAlive?: (processGroupId: number | null | undefined) => boolean;
 }): Promise<HeartbeatRunScratchCleanupResult> {
@@ -147,6 +149,10 @@ export async function cleanupHeartbeatRunScratch(input: {
     marker.runId !== input.scratch.metadata.runId
   ) {
     return { removed: false, dir, reason: "owner_mismatch" };
+  }
+  // Some adapters (ACP) record a pid with no process group, so check both.
+  if (typeof input.processPid === "number" && input.isPidAlive?.(input.processPid) === true) {
+    return { removed: false, dir, reason: "process_pid_alive" };
   }
   if (input.isProcessGroupAlive?.(input.processGroupId) === true) {
     return { removed: false, dir, reason: "process_group_alive" };

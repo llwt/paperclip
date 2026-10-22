@@ -14,6 +14,61 @@ import {
 } from "./parse.js";
 
 describe("detectClaudeLoginRequired", () => {
+  const toolResult = JSON.stringify({
+    type: "user",
+    message: { content: [{ type: "tool_result", content: "HTTP 401 unauthorized" }] },
+  });
+
+  it("keeps a session-limit result on the quota lane despite unauthorized tool output", () => {
+    const parsed = {
+      type: "result",
+      is_error: true,
+      result: "You've hit your session limit · resets 5:40pm (Europe/Amsterdam)",
+    };
+    const input = { parsed, stdout: [toolResult, JSON.stringify(parsed)].join("\n"), stderr: "" };
+    expect(detectClaudeLoginRequired(input).requiresLogin).toBe(false);
+    expect(isClaudeProviderQuotaError(input)).toBe(true);
+  });
+
+  it.each([false, true])("ignores unauthorized stream events when is_error is %s", (is_error) => {
+    const parsed = { type: "result", is_error, result: is_error ? "Request failed" : "Done" };
+    expect(detectClaudeLoginRequired({
+      parsed,
+      stdout: [toolResult, JSON.stringify(parsed)].join("\n"),
+      stderr: "",
+    }).requiresLogin).toBe(false);
+  });
+
+  it.each(["result", "errors", "stderr"])("gives terminal quota and transient %s text priority over login prompts", (source) => {
+    for (const message of ["You've hit your session limit", "API Error: 503 service unavailable"]) {
+      const parsed = {
+        is_error: true,
+        result: source === "result" ? message : "",
+        errors: source === "errors" ? [{ message }] : [],
+      };
+      const loginUrl = "https://claude.ai/login";
+      const input = {
+        parsed,
+        stdout: `Not logged in · Please run /login ${loginUrl}`,
+        stderr: source === "stderr" ? message : "",
+      };
+      expect(detectClaudeLoginRequired(input)).toEqual({ requiresLogin: false, loginUrl });
+    }
+  });
+
+  it.each(["stdout", "stderr", "result", "errors"])("keeps real login prompts in %s", (source) => {
+    const message = "Not logged in · Please run /login";
+    expect(detectClaudeLoginRequired({
+      parsed: {
+        is_error: true,
+        result: source === "result" ? message : "",
+        errors: source === "errors" ? [message] : [],
+      },
+      stdout: source === "stdout" ? `${toolResult}\n${message}` : "",
+      stderr: source === "stderr" ? message : "",
+    }).requiresLogin).toBe(true);
+  });
+
   it("classifies Claude's invalid API key login prompt as auth required", () => {
     expect(
       detectClaudeLoginRequired({

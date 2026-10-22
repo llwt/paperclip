@@ -17,6 +17,9 @@ import {
   aiConnectionLoginIntentSchema,
   localAiConnectionSchema,
   localAiLoginStartSchema,
+  reconnectAiConnectionWithSetupTokenSchema,
+  revalidateAiConnectionSchema,
+  aiConnectionMetadataSchema,
   isAiConnectionCompatible,
   type AiConnectionLoginIntent,
   type AiProvider,
@@ -30,6 +33,7 @@ import { accessService } from "../services/access.js";
 import { logActivity } from "../services/activity-log.js";
 import { aiConnectionRouterService } from "../services/ai-connection-router.js";
 import { aiConnectionService } from "../services/ai-connections.js";
+import { checkAiCredential, checkSetupTokenShape } from "../services/ai-credential-check.js";
 import { validate } from "../middleware/validate.js";
 
 /** Agent API calls inherit authenticated run identity, never the agent's own ID. */
@@ -357,6 +361,78 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
       const attemptStartedAt = new Date();
       const credential = await readVerifiedLocalAiCredential(input.provider);
       res.status(201).json(await service.save(companyId, userId, input, credential, undefined, attemptStartedAt));
+    },
+  );
+  // Reconnect a Claude subscription with a pasted `claude setup-token` value.
+  // The token is checked, then saved on the existing grant; it is never logged
+  // (the `token` body field is redacted) and never returned.
+  router.post(
+    "/companies/:companyId/ai-connections/:connectionId/setup-token",
+    validate(reconnectAiConnectionWithSetupTokenSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertBoard(req);
+      assertCompanyAccess(req, companyId);
+      const connectionId = z.string().uuid().safeParse(req.params.connectionId);
+      if (!connectionId.success) throw unprocessable("Invalid connection ID");
+      const { token } = reconnectAiConnectionWithSetupTokenSchema.parse(req.body);
+      const [row] = await db
+        .select({ connection: toolConnections, grant: connectionGrants })
+        .from(toolConnections)
+        .innerJoin(connectionGrants, and(eq(connectionGrants.companyId, toolConnections.companyId), eq(connectionGrants.connectionId, toolConnections.id)))
+        .where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.id, connectionId.data), eq(toolConnections.connectionPurpose, "ai")))
+        .limit(1);
+      if (!row) throw notFound("AI connection not found");
+      const metadata = aiConnectionMetadataSchema.safeParse(row.connection.config.ai);
+      if (!metadata.success || metadata.data.provider !== "anthropic" || metadata.data.method !== "subscription")
+        throw unprocessable("A setup-token can only reconnect a Claude subscription");
+      const intent: AiConnectionLoginIntent = {
+        provider: "anthropic", method: "subscription", name: row.connection.name,
+        ownership: row.grant.kind === "user" ? "personal" : "shared",
+        agentIds: [], allAgents: false, connectionId: connectionId.data,
+      };
+      const userId = await assertAiConnectionCreateAccess(db, req, companyId, intent);
+      const attemptStartedAt = new Date();
+      const check = checkSetupTokenShape(token) ?? await checkAiCredential(metadata.data, token);
+      if (!check.valid) throw unprocessable(check.message, { code: check.code });
+      res.setHeader("Cache-Control", "no-store");
+      res.json(await service.save(companyId, userId, intent, token, undefined, attemptStartedAt));
+    },
+  );
+  // "Check again": test the saved credential without a run. Board only: the
+  // owner of a personal grant, or for a shared grant its creator or a
+  // connection manager.
+  router.post(
+    "/companies/:companyId/ai-connections/:connectionId/revalidate",
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertBoard(req);
+      assertCompanyAccess(req, companyId);
+      const connectionId = z.string().uuid().safeParse(req.params.connectionId);
+      if (!connectionId.success) throw unprocessable("Invalid connection ID");
+      const { grantId } = revalidateAiConnectionSchema.parse(req.body ?? {});
+      if (req.actor.memberships?.some((m) => m.companyId === companyId && m.status === "active" && m.membershipRole === "viewer"))
+        throw forbidden("Viewers cannot check AI connections");
+      const userId = getActorInfo(req).actorId;
+      const grants = await db
+        .select({ id: connectionGrants.id, kind: connectionGrants.kind, subjectUserId: connectionGrants.subjectUserId, createdByUserId: connectionGrants.createdByUserId })
+        .from(connectionGrants)
+        .innerJoin(toolConnections, eq(toolConnections.id, connectionGrants.connectionId))
+        .where(and(
+          eq(toolConnections.companyId, companyId),
+          eq(toolConnections.id, connectionId.data),
+          eq(toolConnections.connectionPurpose, "ai"),
+          ...(grantId ? [eq(connectionGrants.id, grantId)] : []),
+        ));
+      if (!grants.length) throw notFound("AI connection not found");
+      for (const grant of grants) {
+        const allowed = grant.kind === "user"
+          ? grant.subjectUserId === userId
+          : grant.createdByUserId === userId || await canManageAiConnections(db, req, companyId);
+        if (!allowed) throw forbidden("Only the account owner or a connection manager can check this account");
+      }
+      res.setHeader("Cache-Control", "no-store");
+      res.json(await service.revalidate({ companyId, connectionId: connectionId.data, grantId, userId, trigger: "check_again" }));
     },
   );
   router.put(

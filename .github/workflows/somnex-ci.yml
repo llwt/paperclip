@@ -1,20 +1,22 @@
-name: Nrwl fork CI
+name: Somnex fork CI
 
 # Fork-only workflow (llwt/paperclip). pr.yml calls upstream's reusable
 # workflow and is left untouched so it never conflicts with an upstream merge.
-# This file is the gate for nrwl-main: see FORK.md.
+# This file is the gate for somnex-main: see FORK.md.
 on:
   pull_request:
     branches:
-      - nrwl-main
+      - somnex-main
+  push:
+    branches:
       - somnex-main
 
 permissions:
   contents: read
 
 concurrency:
-  group: nrwl-ci-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: somnex-ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   typecheck_build:
@@ -55,7 +57,7 @@ jobs:
   # route/authz names under server/src/__tests__ only), which leaves out some
   # files the unsharded run includes. The "server other" lane runs exactly the
   # server project test files that no shard selects, computed by
-  # scripts/nrwl-ci-server-other.mjs. The server vitest config pins maxWorkers
+  # scripts/somnex-ci-server-other.mjs. The server vitest config pins maxWorkers
   # to 1, so one unsplit job would take the sum of all lanes.
   #
   # Do not name this job "test": the runner exports the job id as GITHUB_JOB,
@@ -90,7 +92,7 @@ jobs:
             command: >-
               pnpm run preflight:workspace-links &&
               pnpm --filter @paperclipai/plugin-sdk ensure-build-deps &&
-              node scripts/nrwl-ci-server-other.mjs
+              node scripts/somnex-ci-server-other.mjs
           - label: workspaces-a 1/2
             script: test:run:general
             args: --group general-workspaces-a --shard-index 0 --shard-count 2
@@ -139,30 +141,71 @@ jobs:
       - name: Run tests
         run: ${{ matrix.command || format('pnpm {0} -- {1}', matrix.script, matrix.args) }}
 
-  # Single check to require on nrwl-main. There is no red test baseline: any
+  # Runs the real git install path (`paperclipai install --repo --ref`) for the
+  # commit under test, the way an install on chungus does: same node major
+  # (.nvmrc), npm ignore-scripts on, and a scratch HOME and PAPERCLIP_HOME so the
+  # runner starts with no install store. The installer downloads the commit from
+  # GitHub, so it builds what is pushed. The checkout is the same commit (not the
+  # PR merge ref), so the CLI and the expected version come from it too.
+  install_git:
+    name: Git install (node 24)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.4
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The esbuild bundle in cli/dist resolves its npm dependencies from an
+      # installed package, not from the workspace, so run the CLI from source as
+      # FORK.md "Install" does for a checkout.
+      - name: Install the commit with the CLI from this checkout
+        env:
+          REF: ${{ github.event.pull_request.head.sha || github.sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+          npm_config_ignore_scripts: "true"
+        run: |
+          scratch="$RUNNER_TEMP/paperclip-install"
+          mkdir -p "$scratch"
+          echo "SCRATCH_HOME=$scratch" >> "$GITHUB_ENV"
+          # rustup keeps its toolchains under the real HOME; keep cargo working
+          # for packages/paperclip-runner after HOME moves.
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export HOME="$scratch" PAPERCLIP_HOME="$scratch/.paperclip"
+          node --version
+          cargo --version
+          node cli/node_modules/tsx/dist/cli.mjs cli/src/index.ts install --repo llwt/paperclip --ref "$REF" -y
+
+      - name: Check the installed paperclipai runs
+        run: |
+          expected="$(node -p 'require("./cli/package.json").version')"
+          actual="$(HOME="$SCRATCH_HOME" "$SCRATCH_HOME/.local/bin/paperclipai" --version)"
+          echo "paperclipai --version: $actual"
+          test "$(echo "$actual" | awk '{print $1}')" = "$expected"
+
+  # Single check to require on somnex-main. There is no red test baseline: any
   # failing lane fails the gate.
   gate:
-    name: nrwl-ci
-    if: ${{ always() }}
-    needs: [typecheck_build, suites]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-
-    steps:
-      - name: Fail if any lane failed
-        env:
-          TYPECHECK_BUILD_RESULT: ${{ needs.typecheck_build.result }}
-          TEST_RESULT: ${{ needs.suites.result }}
-        run: |
-          test "$TYPECHECK_BUILD_RESULT" = "success"
-          test "$TEST_RESULT" = "success"
-
-  # Temporary second gate for the rename on SX-1119 Step 3.
-  # PR 2 removes gate (nrwl-ci) after GitHub requires somnex-ci.
-  gate_somnex:
     name: somnex-ci
     if: ${{ always() }}
-    needs: [typecheck_build, suites]
+    needs: [typecheck_build, suites, install_git]
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -171,6 +214,8 @@ jobs:
         env:
           TYPECHECK_BUILD_RESULT: ${{ needs.typecheck_build.result }}
           TEST_RESULT: ${{ needs.suites.result }}
+          INSTALL_GIT_RESULT: ${{ needs.install_git.result }}
         run: |
           test "$TYPECHECK_BUILD_RESULT" = "success"
           test "$TEST_RESULT" = "success"
+          test "$INSTALL_GIT_RESULT" = "success"

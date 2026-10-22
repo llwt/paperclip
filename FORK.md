@@ -5,12 +5,12 @@ submitted upstream (`paperclipai/paperclip`), per Steven's decision on NX-658
 (2026-10-17). An inventory row drops out only when an upstream release ships
 an equivalent fix on its own, or when Steven drops the patch.
 
-- Mainline: `nrwl-main`. Installs pin a full commit SHA on it. The branch is
+- Mainline: `somnex-main`. Installs pin a full commit SHA on it. The branch is
   protected: GitHub accepts a change only through a pull request with a green
-  `nrwl-ci` and rejects every direct push (see "CI gate").
+  `somnex-ci` and rejects every direct push (see "CI gate").
 - `master` is a pure mirror of upstream `master`. Never commit to it.
-- Fork-only files: this file, `.github/workflows/nrwl-ci.yml`,
-  `scripts/nrwl-ci-server-other.mjs` and the files named under "Localhost
+- Fork-only files: this file, `.github/workflows/somnex-ci.yml`,
+  `scripts/somnex-ci-server-other.mjs` and the files named under "Localhost
   sign-in". Everything else is upstream code plus the patches listed below.
 
 ## Inventory of fork-only commits
@@ -20,13 +20,21 @@ contains `v2026.1005.0`). The tag is upstream `master` at `22a3ea341` plus two
 release commits that are not on `master`. Last refreshed 2026-10-13 against
 upstream `master` `4b958ecbd`, which is 240 commits past that tag.
 `v2026.1012.0` was the latest stable tag on that day. The commits below are
-the ones on `nrwl-main` before the merge; what is left of each is the diff of
-`nrwl-main` against the tag.
+the ones on `somnex-main` before the merge; what is left of each is the diff of
+`somnex-main` against the tag.
 
 | Commit | What | Upstream status | Drops out when |
 | --- | --- | --- | --- |
+| SX-1495 (this PR) | CI: `somnex-ci.yml` job `install_git` runs `paperclipai install --ref` for the commit under test on node 24 with npm ignore-scripts on, and the `somnex-ci` gate needs it (see "CI gate") | Local only. Fork-only workflow, nothing to submit | The fork stops installing from git refs |
+| SX-1457 (this PR) | Backups: both engines write to `.partial` files and publish the complete gzip by rename; server startup removes incomplete files; Install and Rollback check for a running backup before restart | Local only (SX-1456) | An upstream release writes backups to a temporary name |
+| Claude quota classification (this PR) | Claude login detection ignores stream-json objects in raw stdout and gives terminal quota or transient errors priority, so a tool's `unauthorized` output cannot turn a session limit into account reauthorization | Local only | An upstream release carries an equivalent fix |
+| NX-1092 (this PR) | Setup-token cleanup: exclude local subscription rows from scoped reads and writes, clear records with no lease without a provider release, and log only the error class and SQLSTATE on a failed release | Local only (NX-1092). Upstream `master` `f3af9887c` has the same fault | An upstream release carries an equivalent fix |
 | NX-834 (this PR) | Tools: opt-in `compact-v1` connection tool names for Claude runs. Pure helper `server/src/services/compact-connection-tool-names.ts`; narrow hooks in the named MCP route (`?toolNames=compact-v1`, unknown values rejected), `listToolsForNamedGateway` (alias projection), `findToolForSession` (alias resolution on the descriptors it already loads, after authentication) and `buildPaperclipRuntimeMcpServers` (label `p` and the versioned URL for `claude_local` agents with `runtimeConfig.connectionToolNames: "compact-v1"`), plus a Claude resume check (`packages/adapters/claude-local/src/server/tool-name-format.ts`) that starts a fresh session when the tool name format changes, because upstream now resumes across other MCP server changes. Stored names, policies, signatures and rate buckets keep the internal name. Kill switch `PAPERCLIP_COMPACT_CONNECTION_TOOL_NAMES_DISABLED=true`. Rollback: unset the agent opt-in (or set the kill switch), let compact sessions restart, then revert the binary | Local only (NX-658). Fork-specific implementation of the approved Nx plan. Related upstream: paperclipai/paperclip#15668 (open). | An upstream release provides equivalent presentation aliases without changing stored gateway identities, policy evaluation or signed approvals |
+| SX-1369 (this PR) | Runs: run temp folders (`paperclip-ai-*`, `paperclip-run-*`) are removed on every end path, and resume data survives. The managed AI home gets an owner marker (company, agent, run); at run end the heartbeat writes back the credential and removes the home only when the run is terminal and neither its process id nor its process group is alive (`server/src/services/run-temp-dirs.ts`). A home with a pending credential write-back (`.paperclip-ai-writeback.json`) is removed only after that write-back runs. A sweep at startup and every 10 minutes removes marked folders whose run the lookup shows as ended for the same company and agent, skips runs whose teardown is still in progress in this server, and runs a write-back left pending by a crash before removal; unmarked folders are left alone. For local runs `provider/projects`, `provider/sessions` and `provider/archived_sessions` link to `<instance>/companies/<company>/agents/<agent>/ai-session-state/`, so Claude `--resume`, agent memory and Codex sessions outlive the temp home; a run whose links cannot be verified fails before the provider starts. Credentials stay in `/tmp`. The sandbox mounts the link targets read-write | Local only. Not checked against upstream `master` and not raised upstream | An upstream release keeps managed session state outside the temp home and sweeps folders of runs cut off by a restart |
+| SX-1386 (this PR) | Heartbeat: a stage hand-off wake (`execution_review_requested`, `execution_approval_requested`, `execution_changes_requested`) that meets an execution blocker is saved as `deferred_issue_execution` instead of a skipped execution wait. It starts through normal admission when the blocking run releases its environment lease (`resumeDeferredExecutionStageWakes`, called from `releaseEnvironmentLeasesForRun` and `resumeQueuedRuns`), only if the task still waits on that participant. The saved row is settled in the same transaction that stores the successor run, so a failed or interrupted start leaves it saved for a retry and a retry never starts a second run. Before, the decision stopped the deciding run, its lease was still held, and the next participant got no run | Local only (NX-1092) | An upstream release saves or resumes stage hand-off wakes the same way |
+| SX-1537 (this PR) | Heartbeat: a stage hand-off saved behind a stopped run whose provider process or process group is still exiting (`execution_owner_active` with no lease left) is rechecked in the server every 5 s (`scheduleOwnerExitRecheck`, `recheckOwnerExitWait`), because a process exit has no release hook. After 5 minutes the saved wakes get `executionWait.ownerExitTimedOutAt` and a warning is logged; they stay `deferred_issue_execution` and the `resumeQueuedRuns` sweep keeps retrying them. That sweep now takes the least recently tried tasks first and stamps each try, so wakes that stay blocked cannot starve the rest of its batch of 50. While a hand-off is saved, the execution blocker notice says so. `drainActiveRunExecutions` awaits a recheck already running and arms no recheck timer while it drains. Admission still checks ownership under the issue lock, so no second provider process starts on the conversation. Builds on SX-1386; the installed build before SX-1386 wrote these wakes as `skipped` | Local only. Upstream `master` `043f2514e` still drops this case; upstream `06484b3c4` (#15463) uses the same approach (keep the saved row, recheck later) for a scheduled retry of the same run, not ported | An upstream release saves and retries a wake blocked by an exiting process |
 | SX-1120 (this PR) | Database: index for the `paperclipIssue` branch of `valuesForIssue`, so comment lists do not scan all `heartbeat_runs` | On upstream `master` since `e9b6c4d44` (paperclipai/paperclip#16278), also open PR paperclipai/paperclip#12499; not in a stable tag yet. Nothing to submit: upstream already has the fix | The first upstream release merge that contains #16278. On that merge drop the fork's 0306 migration, its journal entry and snapshot, and take upstream's |
+| SX-1361 (this PR) | Runs: `runsForIssue` reads the task run list through `heartbeat_runs.id IN (... UNION ...)` (context issue id plus activity log run ids) instead of an `OR` that scans every run of the company. The company run list reads the run context once per row, takes 200 rows by default and at most 1,000 (route, service, UI client); both agent detail pages fetch an older linked run by id. The fork matches the issue through `context_snapshot ->> 'issueId'` (no `heartbeat_runs.issue_id`) | `runsForIssue`: open upstream PR paperclipai/paperclip#16713 (head `df285a125`). Company run list: on upstream `master` since `ebeac833a` (paperclipai/paperclip#16286), not in a stable tag yet. Nothing to submit | The first upstream release merge that contains both #16713 and #16286. Take upstream's code on a conflict (upstream matches `heartbeat_runs.issue_id`) |
 | `2593ef230` | CLI: pruning preserves and reports older install payloads with a live executable or working directory on Linux. Processes the installing user may not inspect (`EACCES`, `EPERM`) are skipped and not protected. Unsupported platforms and failed process checks retain payloads without failing the install | Local only (NX-658) | An upstream release guards payload pruning against live processes and failed inspection |
 | `d6ca4706f` | A future scheduled check covers an agent-owned `in_progress` or `in_review` blocker with no user assignee and marks its dependency path live. Checks that cannot fire, overdue, cleared, timed out, exhausted checks and checks owned by uninvokable agents keep the previous attention result | Local only (NX-658) | An upstream release carries the same scheduled-check blocker coverage |
 | `25fcf9633` | Gateway: configurable tool timeout, connection stays listed after a tool timeout | Local only (NX-658). Port branch `gateway-tool-timeout-upstream` (`014ad6cb0`) is kept as a record, not to be submitted | An upstream release carries an equivalent fix |
@@ -48,16 +56,20 @@ the ones on `nrwl-main` before the merge; what is left of each is the diff of
 | NX-668 (this PR) | CLI tests: a setup guard blocks `systemctl`, `loginctl`, `journalctl` and `launchctl` in every CLI test and fails the test that reached them; the two `uninstallCommand` tests and the `doctor` test no longer look up the host service manager. Test-only, no runtime change | Local only (NX-658). Upstream `master` (`9f4acc8f1`) has the same unguarded tests. Port branch `fix/cli-tests-never-reach-service-manager` is kept as a record, not to be submitted | An upstream release carries an equivalent fix |
 | fork PR #29 | UI: show all nine Google Workspace catalog entries and saved accounts on the Connectors page for this instance's customer-owned OAuth app | Local only (NX-658). Upstream plans to remove the filter itself after Google approval | The upstream release without the filter is merged |
 | NX-716 (this PR) | Interactions: a confirmation card whose source run ended without a `workspace_finalize` row can be accepted (`runWorkspaceIsFinalized` in `server/src/services/issues.ts`). Before, a card posted by a run that was then lost (`process_lost`) could never be accepted. A live run still blocks, and so does an ended native-runtime run whose finalization coordinator row has not reached `terminal_failure` (native recovery can still resume it) | Local only (NX-658). Upstream `master` has the same gap | An upstream release carries an equivalent fix |
+| SX-1370 (this PR) | Dependencies: the workspace-finalize barrier on a `done` blocker holds only while the run that last touched the blocker's workspace can still record a `workspace_finalize` (a live run, or an ended native-runtime run native recovery can still resume, as in `runWorkspaceIsFinalized`). A finalize that ended `failed` or `skipped`, a stale `running` finalize of an ended run, a run that ended without one and an operation with no run no longer block the dependent; the run-end hook and the periodic dependency backstop then wake it. A `PATCH` that changes `blockedByIssueIds` and the status together checks the blockers against the new links (`getDependencyReadinessForBlockerIssueIds`). `cancelled` blockers still block, as upstream intends | Local only (NX-1092). Upstream `master` has the same barrier and route ordering | An upstream release carries an equivalent fix |
 | NX-892 (this PR) | `pnpm-lock.yaml`: the `server` entries for `@modelcontextprotocol/sdk` and `light-my-request`, 27 added lines. The tag's `server/package.json` names both, its lockfile does not, and `pnpm install --frozen-lockfile` (fork CI and `paperclipai install`) fails without them | Upstream `master` has them since its lockfile refresh `03cf6a6ec` (2026-10-06), which is after the commit the tag was cut from | The next upstream merge. Take upstream's lockfile on a conflict |
-| fork PR #3, fork files | `FORK.md`, `.github/workflows/nrwl-ci.yml` and `scripts/nrwl-ci-server-other.mjs` | Fork-only by design, will not go upstream | The fork is retired |
+| SX-1397 (this PR) | AI connections: repair a false "needs reconnect" mark. Reconnect a Claude subscription with a pasted setup-token (`POST .../ai-connections/:connectionId/setup-token`), "Check again" (`POST .../ai-connections/:connectionId/revalidate`), and a re-check after a board secret-value change. Each clears both the grant mark and the connection health mark in one transaction after a read-only provider check (`server/src/services/ai-credential-check.ts`); see "Repairing a needs reconnect mark" in `doc/connections/AI-CONNECTIONS.md` | Local only (NX-1092) | An upstream release offers an equivalent repair path for a marked AI account |
+| SX-1134 (this PR) | Workspaces: a reused shared `project_primary` execution workspace whose cwd differs from the cwd the project's primary workspace now resolves to is rebound to that cwd on the same record, with its project workspace and repo (`resolveSharedProjectPrimaryWorkspaceRebindCwd` in `server/src/services/heartbeat.ts`). Before, a task whose shared workspace was saved in the managed `_default` folder failed `missing_git_metadata` after a repo was added to the project. Isolated, worktree, adapter-managed and sandbox workspaces, the agent fallback cwd and native recovery are unchanged | Local only (NX-658). Upstream `master` (`cde944ed7`, 2026-10-20) still restores the persisted cwd as is in `heartbeat/workspace-preparation.ts` | An upstream release rebinds a stale shared project workspace on reuse |
+| SX-1431 (this PR) | Plugins: read-only `ctx.issues.listExecutionDecisions` with `issue.execution.read`, company/issue-bound cursor pagination over retained execution decisions, and a bounded projection of current principal names. SDK protocol, worker, host factory and test harness use the same public contract. No schema, route or write-path change | Fork-only extension approved for the execution flow plugin. No upstream PR or npm publication | An upstream release supplies the same scoped read contract, capability and safe principal-label projection |
+| fork PR #3, fork files | `FORK.md`, `.github/workflows/somnex-ci.yml` and `scripts/somnex-ci-server-other.mjs` | Fork-only by design, will not go upstream | The fork is retired |
 
 To refresh this table:
 
 ```sh
 git fetch upstream --tags && git fetch fork
-git log --oneline <base tag>..fork/nrwl-main        # fork-only commits
-git cherry upstream/master fork/nrwl-main           # "-" means upstream has it
-git rev-list --left-right --count fork/nrwl-main...upstream/master
+git log --oneline <base tag>..fork/somnex-main        # fork-only commits
+git cherry upstream/master fork/somnex-main           # "-" means upstream has it
+git rev-list --left-right --count fork/somnex-main...upstream/master
 gh pr view <number> -R paperclipai/paperclip        # each upstream PR
 ```
 
@@ -137,9 +149,9 @@ lines),
 and `ui/src/features/connections/ConnectionSetupFlow.tsx`. On a release merge,
 keep those marked blocks and rerun `tool-oauth-loopback.test.ts`.
 
-## Rules for a change to `nrwl-main`
+## Rules for a change to `somnex-main`
 
-1. **Fork first, local only.** A fix the instance needs lands on `nrwl-main`
+1. **Fork first, local only.** A fix the instance needs lands on `somnex-main`
    through a fork PR. Do not create a port branch on upstream `master` or
    prepare an upstream PR. A fix that is not urgent is not sent upstream
    either: it waits for upstream or becomes a fork fix.
@@ -151,31 +163,31 @@ keep those marked blocks and rerun `tool-oauth-loopback.test.ts`.
    from upstream" comment in `server/src/services/mcp-http.ts`). A release
    merge updates the tag named in such a comment.
 4. **Upstream release merges land as a merge commit, never squashed.** Fix PRs
-   may be squash-merged. No rebase and no force push on `nrwl-main`.
+   may be squash-merged. No rebase and no force push on `somnex-main`.
 5. Posting to `paperclipai/paperclip` (PR, issue, comment or push to an open PR)
    is external and needs Steven's go-ahead each time.
-6. **Every change goes through a fork pull request with a green `nrwl-ci`.**
+6. **Every change goes through a fork pull request with a green `somnex-ci`.**
    That covers fixes, upstream release merges, reverts and edits to this file.
-   Never push to `nrwl-main` directly. GitHub enforces this: branch protection
-   requires a pull request and a green `nrwl-ci` on its head, for admins too,
+   Never push to `somnex-main` directly. GitHub enforces this: branch protection
+   requires a pull request and a green `somnex-ci` on its head, for admins too,
    and rejects a direct push (see "CI gate").
 
 ## Taking upstream releases
 
-`nrwl-main` takes each upstream **stable release tag** by merge commit, within
+`somnex-main` takes each upstream **stable release tag** by merge commit, within
 7 days of the release.
 
 ```sh
 git fetch upstream --tags
-git switch -c merge/upstream-<tag> fork/nrwl-main
+git switch -c merge/upstream-<tag> fork/somnex-main
 git merge --no-ff <tag>
 ```
 
 - Push `merge/upstream-<tag>` to the fork and open a fork PR from it into
-  `nrwl-main`. Merge that PR with a merge commit. Never squash or rebase it
+  `somnex-main`. Merge that PR with a merge commit. Never squash or rebase it
   (rule 4). The release merge has no shortcut: branch protection requires a
   pull request, so GitHub rejects a push of the merge commit straight to
-  `nrwl-main`, and the PR merges only once `nrwl-ci` is green on its head
+  `somnex-main`, and the PR merges only once `somnex-ci` is green on its head
   (rule 6).
 - Conflicts only appear in files the fork patched. Resolve each conflict so
   the fork patch stays, and keep the "Differs from upstream" comments.
@@ -187,31 +199,47 @@ git merge --no-ff <tag>
   (`pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile`) and
   give it an inventory row.
 - Sync the fork's `master` from upstream in the same task.
+- After the merge, disable each upstream workflow that the merge added (see
+  "Upstream workflows are disabled" under "CI gate").
 - Exception: merge a specific upstream `master` commit only when one upstream
   fix is needed early, and record the reason in the PR.
 
 ## CI gate
 
-`.github/workflows/nrwl-ci.yml` runs on every pull request into `nrwl-main`, on
+`.github/workflows/somnex-ci.yml` runs on every pull request into `somnex-main` and on every push to `somnex-main` (each merge), so the exact SHA to install has its own run, on
 GitHub-hosted runners: `pnpm install --frozen-lockfile`, `pnpm typecheck`,
 `pnpm build`, and the suites of `pnpm test:run` split into parallel lanes with
 upstream's own shard flags. Upstream's server shards pick files by path rules
 and miss a few that the unsharded run includes, so one extra lane ("server
 other") runs every server project test file that no shard selects. The list is
-computed by `scripts/nrwl-ci-server-other.mjs` (fork-only) from vitest's own
+computed by `scripts/somnex-ci-server-other.mjs` (fork-only) from vitest's own
 collection minus the shards' dry-run selection; `--list` prints it. The
-`nrwl-ci` check is green only when every lane passed.
+"Git install (node 24)" job (`install_git`) runs the CLI from the commit under
+test and runs its `install --repo llwt/paperclip --ref <sha> -y` with the node
+major of `.nvmrc`, `npm_config_ignore_scripts=true` and a scratch `HOME` and
+`PAPERCLIP_HOME`, then checks that the installed `paperclipai --version` runs and
+reports the CLI version (SX-1495). The `somnex-ci` check is green only when
+every lane passed.
 
-During the rename to `somnex-main` (SX-1119 Step 3) the workflow has two identical gate jobs, `nrwl-ci` and `somnex-ci`, and runs on pull requests into both branch names. GitHub requires `nrwl-ci` until the branch protection is switched to `somnex-ci`; a later PR removes the old names.
+Until 2026-10-21 the mainline was named `nrwl-main` and the required check `nrwl-ci` (renamed on SX-1119 Step 3). Older PRs, tasks and install notes use those names.
 
-`.github/workflows/pr.yml` is upstream's and calls upstream's reusable
-workflow at upstream `master` (`pr-trusted.yml@master`). It is left untouched
-so it never conflicts with an upstream merge. It does run on fork pull
-requests (it passed on fork PR #3), but its definition follows upstream
-`master`, not the code on `nrwl-main`, so it is extra signal and not the gate.
+### Upstream workflows are disabled
+
+Every upstream workflow in `.github/workflows/` is disabled in the fork's
+Actions settings (21 October 2026, SX-1363). They need upstream secrets,
+runners or registry access, or they call upstream `master` (`pr.yml` runs
+`pr-trusted.yml@master`), so on the fork they only failed and sent notices.
+Only `somnex-ci.yml` (and `nrwl-ci.yml`, for branches made before the rename)
+is active. The files stay untouched, so upstream merges stay clean.
+
+- See the state: `gh workflow list --all -R llwt/paperclip`.
+- Turn one back on: `gh workflow enable <name or id> -R llwt/paperclip`.
+- A workflow file that is new in an upstream merge starts as `active`. After
+  each upstream merge, run the list and disable each new upstream workflow
+  with `gh workflow disable <name or id> -R llwt/paperclip`.
 
 **Red test baseline: empty.** No test is allowed to fail. The two tests that
-were red on `nrwl-main` (`tool-access-service.test.ts`, "executes allowed test
+were red on `somnex-main` (`tool-access-service.test.ts`, "executes allowed test
 calls as a board user while attributing the selected agent" and "drives an
 ask-first test call through its live lifecycle") pass on clean `v2026.916.1`.
 They failed only with the fork's request ID selection (`0d78b3d67`), because
@@ -222,13 +250,13 @@ failures outside the baseline", and never skip or delete the test.
 
 ### Branch protection
 
-`nrwl-main` takes changes only through a pull request, and `nrwl-ci` is a
+`somnex-main` takes changes only through a pull request, and `somnex-ci` is a
 required status check on it. GitHub branch protection enforces both. Settings
 as of 2026-10-07:
 
 | Setting | Value |
 | --- | --- |
-| Required status checks | `nrwl-ci` only, pinned to GitHub Actions (app id 15368). It is the `gate` job of `nrwl-ci.yml` |
+| Required status checks | `somnex-ci` only, pinned to GitHub Actions (app id 15368). It is the `gate` job of `somnex-ci.yml` |
 | Branch up to date before merging (`strict`) | Off |
 | Enforced for admins (`enforce_admins`) | On |
 | Force pushes | Blocked |
@@ -241,28 +269,28 @@ as of 2026-10-07:
 
 What this means in practice:
 
-- A pull request into `nrwl-main` cannot be merged until `nrwl-ci` is green on
+- A pull request into `somnex-main` cannot be merged until `somnex-ci` is green on
   its head commit. That holds for everyone, including the admin account all
   agents use. There is no admin override.
-- A direct push to `nrwl-main` is rejected in every case, for admins too,
+- A direct push to `somnex-main` is rejected in every case, for admins too,
   because protection requires a pull request. That includes a push of a commit
-  that already has a green `nrwl-ci`, such as the head of an up to date pull
+  that already has a green `somnex-ci`, such as the head of an up to date pull
   request. The merged pull request is the only way in (rule 6).
-- `nrwl-main` cannot be force pushed or deleted. To take a commit back, open a
+- `somnex-main` cannot be force pushed or deleted. To take a commit back, open a
   revert pull request.
 - `strict` is off: a pull request does not have to contain the latest
-  `nrwl-main` to merge. Its `nrwl-ci` result is for the merge with the base as
+  `somnex-main` to merge. Its `somnex-ci` result is for the merge with the base as
   it was when the run started.
 - Zero approving reviews are required. All agents share one GitHub account and
   an account cannot approve its own pull request, so an approval requirement
   could not be met. The independent review and Steven's approval of the head
   SHA are process, not something GitHub enforces.
-- `master` has no part in this: the protection covers `nrwl-main` only.
+- `master` has no part in this: the protection covers `somnex-main` only.
 
 To inspect the live settings (read only):
 
 ```sh
-gh api repos/llwt/paperclip/branches/nrwl-main/protection
+gh api repos/llwt/paperclip/branches/somnex-main/protection
 ```
 
 If the output differs from the table, the table is stale: correct it in a pull
@@ -272,13 +300,50 @@ change to get one merge through.
 
 ## Install
 
-An install is a deployment. It is its own task, assigned by the Coordinator
-after Steven approves the SHA.
+An install is a deployment. It is its own task for the Sr. Engineer, with
+Steven's card on the exact SHA (Steven's decisions on SX-1481, 21 October 2026).
 
-1. The target is a full SHA on `nrwl-main` with a green `nrwl-ci` run. Never
-   install a branch name. GitHub lets a commit reach `nrwl-main` only through
+**When an install starts.**
+
+- A high-priority fork fix is installed as soon as it is merged: the
+  Engineering Lead creates the install task right after the merge.
+- Every other merged fix waits for the fixed install at 09:00 and 15:00 UTC on
+  weekdays. A routine creates a task for the Engineering Lead at those times.
+  When `somnex-main` has merged commits that are not installed, the
+  Engineering Lead creates the install task for the head SHA; otherwise the
+  routine task is closed with no install.
+
+**One card per install.** Steven's card on the install SHA is the only card.
+The smoke checklist has no card for Steven (item 5 is an agent check).
+
+**Only the restart waits.** When Steven accepts the card, steps 0 to 5 start at
+once. Only the restart (step 7) waits, for:
+
+- the backup check (step 6);
+- the restart window agreed with Nx (NX-1306, 22 October 2026): any time, also
+  during working hours, but not at minute :00 to :02 or :30 to :32 of the hour
+  (UTC). No check for an Nx merge or install in flight is needed;
+- only for an install with a database migration: the Nx notice. Before the
+  card is posted, the Engineering Lead creates a notice task for Hog Boss with
+  the SHA and the planned time, and the install task is blocked on it until
+  Nx Boss has answered. An install with no migration has no notice.
+
+**After the install.** The install task reports the installed SHA, the restart
+time (UTC) and any Nx run lost in the restart (run id and task) if it can be
+seen. The Sr. Engineer then creates one task with no parent for Hog Boss with
+these facts and what changed for Nx; Hog Boss sends it to Nx as an FYI.
+
+0. Test the combined SHA when it has no green `somnex-ci` run of its own (a
+   pull request's run tests its own head, not `somnex-main` after a later
+   merge). Extract the SHA into the task scratch dir with `git archive`, not a
+   new worktree, and run `pnpm install --frozen-lockfile`, `pnpm typecheck`
+   and the test files that the new pull requests add or change. Stop on any
+   failure.
+
+1. The target is a full SHA on `somnex-main` with a green `somnex-ci` run. Never
+   install a branch name. GitHub lets a commit reach `somnex-main` only through
    a merged pull request (rule 6), so an install never involves a push to
-   `nrwl-main`.
+   `somnex-main`.
 2. Record the current `sha` from `~/.paperclip/cli/install.json`. List the
    migrations the new commit adds: `git diff --stat <old> <new> -- packages/db/src/migrations`.
 3. Take a database backup: `paperclipai db:backup`. `install` takes none (only
@@ -286,12 +351,47 @@ after Steven approves the SHA.
 4. Copy anything hand-made out of `~/.paperclip/cli/installs` first. `install`
    keeps the new payload and the two before it and deletes every other
    directory under `installs/npm` and `installs/git`, hand-made ones included.
-5. `GH_TOKEN="$(gh auth token)" paperclipai install --repo llwt/paperclip --ref <sha> -y`
-6. `paperclipai service restart`
-7. Run the smoke checklist.
+5. Run the install with node 24, not through the `paperclipai` shim:
+
+   ```sh
+   N24=/home/steven-bot/.local/share/mise/installs/node/24/bin
+   PATH="$N24:$PATH" GH_TOKEN="$(gh auth token)" "$N24/node" \
+     /home/steven-bot/.paperclip/cli/current/node_modules/paperclipai/dist/index.js \
+     install --repo llwt/paperclip --ref <sha> -y
+   ```
+
+   Then check that the new shim names node 24:
+   `grep -c 'installs/node/24' /home/steven-bot/.local/bin/paperclipai` prints a
+   number above 0. If it prints 0, stop and report before the restart.
+6. Check that no database backup is running. A restart during a backup cuts the
+   dump off (SX-1455). Run:
+
+   ```sh
+   journalctl --user -u paperclipai --since "-2h" --no-pager \
+     | grep -E "database backup (starting|complete|failed)|database backups enabled" \
+     | tail -1
+   ```
+
+   If the last line says "database backup starting", a backup is running (it
+   takes about 5 minutes). Wait and run the check again until the last line says
+   "complete", "failed" or "backups enabled". Backups start each hour at about
+   the same minute; plan the restart away from that minute.
+7. `paperclipai service restart`
+8. Run the smoke checklist.
 
 Facts about `install --ref` on this host (found on NX-449 and NX-509):
 
+- **Run the install CLI with node 24 (SX-1447, 21 October 2026).** The shim
+  `~/.local/bin/paperclipai` hard-codes the node that ran the last install and
+  puts its bin dir first on `PATH`. Node 25 and newer ship no `corepack`, and
+  `install` runs `corepack enable pnpm`, so an install through a shim pinned to
+  node 26 fails ("corepack is not a valid shim"). A `PATH` prefix alone does not
+  help: the shim still runs node 26 and writes node 26 into the new shim. Step 5
+  runs the CLI with node 24 (the line in `.nvmrc` and the fork CI), which has
+  `corepack` and re-pins the shim to node 24. The restart in step 7 then moves
+  the server to node 24 too; the install card says so. Use absolute paths:
+  agent runs have their own `HOME`, so `~` and `$HOME` do not point at
+  `/home/steven-bot` there.
 - **Run the fixed CLI from a checkout while the installed CLI is older than
   fork PR #7.** The installed CLI cannot build a git ref (see the next
   point). In a checkout of the target SHA, after `pnpm install`, replace
@@ -333,15 +433,16 @@ Facts about `install --ref` on this host (found on NX-449 and NX-509):
 
 1. `paperclipai update --rollback`, or
    `paperclipai install --repo llwt/paperclip --ref <previous sha> -y`.
-2. `paperclipai service restart`, then the smoke checklist.
+2. `paperclipai service restart`, then the smoke checklist. Run the backup check
+   of the Install section first, unless the server is already down.
 3. If the new build ran migrations, the old code may not work on the new
    schema. Rollback then also means restoring the database backup from install
    step 3.
 
-A rollback changes the installed build only. It does not move `nrwl-main`,
+A rollback changes the installed build only. It does not move `somnex-main`,
 which cannot be reset, force pushed or pushed to directly. To take the bad
-commit off `nrwl-main`, open a revert pull request and wait for a green
-`nrwl-ci` like any other change.
+commit off `somnex-main`, open a revert pull request and wait for a green
+`somnex-ci` like any other change.
 
 `update --rollback` flips `current` to `previous[0]` in `install.json` for any
 managed install, npm or git, and restarts the active service. It does not
@@ -360,8 +461,12 @@ The health endpoint reports `commit: null`, so the SHA check reads
 2. `sha` in `~/.paperclip/cli/install.json` equals the approved SHA.
 3. One agent heartbeat run completes on a throwaway task.
 4. One MCP gateway tool call succeeds (the tool timeout path).
-5. One pending card renders and accepts input in the UI (the card remount
-   path).
+5. The UI and cards work, checked by an agent (no card for Steven, SX-1481):
+   `GET /` returns 200 HTML and the `/assets/*.js` file it references returns
+   200; on a throwaway task, a `request_confirmation` interaction with
+   `resolverPolicy: "anyone"` is posted and accepted through
+   `POST /api/issues/{id}/interactions/{interactionId}/accept`, and reads
+   `accepted` afterwards. Cancel the throwaway task.
 
 ## Record of the `98fa44c` install
 
@@ -388,7 +493,7 @@ line into a procedure step without testing it first.
   person to click a card in the UI; an agent can only show that the UI is
   served from the new payload.
 - **Process, not a test result.** Steven's approval binds to one full SHA. A
-  new commit on `nrwl-main` after the approval is not covered: it needs a new
+  new commit on `somnex-main` after the approval is not covered: it needs a new
   approval before it is installed, and smoke step 2 checks the installed `sha`
   against the approved one.
 

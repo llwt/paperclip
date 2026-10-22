@@ -9,6 +9,7 @@ import {
   prepareHeartbeatRunScratch,
   type HeartbeatRunScratch,
 } from "./run-scratch.js";
+import { isPidAlive, isProcessGroupAlive } from "./local-service-supervisor.js";
 
 const cleanupDirs = new Set<string>();
 
@@ -102,6 +103,47 @@ describe("heartbeat run scratch cleanup", () => {
 
     expect(result).toEqual({ removed: false, dir: scratch.dir, reason: "process_group_alive" });
     await expect(fs.stat(scratch.dir)).resolves.toMatchObject({ isDirectory: expect.any(Function) });
+  });
+
+  it.each(["failed", "cancelled"])(
+    "skips cleanup of a %s run whose provider pid is alive with no process group",
+    async (status) => {
+      const scratch = await trackScratch(await prepareHeartbeatRunScratch({
+        companyId: "company-1",
+        agentId: "agent-1",
+        runId: `run-${status}`,
+      }));
+
+      // Heartbeat only cleans a terminal run; this mirrors its call for an ACP run.
+      const result = await cleanupHeartbeatRunScratch({
+        scratch,
+        processPid: process.pid,
+        isPidAlive,
+        processGroupId: null,
+        isProcessGroupAlive,
+      });
+
+      expect(result).toEqual({ removed: false, dir: scratch.dir, reason: "process_pid_alive" });
+      await expect(fs.stat(scratch.dir)).resolves.toMatchObject({ isDirectory: expect.any(Function) });
+    },
+  );
+
+  it("removes scratch once the provider pid has exited", async () => {
+    const scratch = await trackScratch(await prepareHeartbeatRunScratch({
+      companyId: "company-1",
+      agentId: "agent-1",
+      runId: "run-1",
+    }));
+
+    const result = await cleanupHeartbeatRunScratch({
+      scratch,
+      processPid: 4243,
+      isPidAlive: () => false,
+      processGroupId: null,
+      isProcessGroupAlive,
+    });
+
+    expect(result).toEqual({ removed: true, dir: scratch.dir });
   });
 
   it("builds explicit scratch env without clobbering configured temp dirs", async () => {

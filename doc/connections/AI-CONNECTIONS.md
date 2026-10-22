@@ -218,6 +218,46 @@ units, absent percentages, and proto3 zero messages. The disposable database
 and encrypted vault were removed. These checks started no provider turn and
 exchanged no refresh tokens.
 
+## Repairing a "needs reconnect" mark
+
+A run that ends with an authentication failure sets two marks: the grant
+status `needs_reauthorization` and the connection health `error`. Selection
+refuses the account while either is set. Three paths clear both, in one
+transaction, and leave both when the check fails:
+
+- **Paste a setup-token.** `POST /api/companies/:companyId/ai-connections/:connectionId/setup-token`
+  with `{ token }`, for a Claude subscription only. The token must have the
+  setup-token shape the `claude setup-token` parser accepts, passes the check
+  below, and is saved through the normal reconnect (`save()` with
+  `connectionId`): the private secret slot is rotated in place and
+  `ai_connection.reconnected` is logged. Same owner rule as Reconnect. The
+  `token` body field is redacted in request logs and never returned.
+- **Check again.** `POST /api/companies/:companyId/ai-connections/:connectionId/revalidate`
+  checks the saved credential. Board only: the owner of a personal grant; for a
+  shared grant its creator or a connection manager. Logs
+  `ai_connection.revalidated` with `trigger: "check_again"` and the result.
+- **A secret change.** After `POST /api/secrets/:id/rotate`,
+  `POST /api/companies/:companyId/me/user-secrets/:secretId/rotate`, or a value
+  change through `PATCH /api/companies/:companyId/me/user-secrets/:secretId`
+  commits, every marked AI grant whose `ai.credential` is that secret is
+  checked again (`trigger: "secret_rotated"`). The hook sits in these routes
+  and not in `secretService.rotate()`, because `rotate()` also runs inside
+  other transactions (an AI reconnect among them) and the check is a provider
+  request that must not hold their locks. A failed check never fails the
+  secret change.
+
+The check (`server/src/services/ai-credential-check.ts`) is one read-only
+provider request: no run, no model tokens. A Claude subscription is checked
+with `GET https://api.anthropic.com/api/oauth/usage`. A setup-token carries
+only `user:inference`, so Anthropic authenticates it and answers 403
+`permission_error` about the missing scope; that answer, 200 and 429 (usage
+limit) count as signed in. 401 and any other 403 count as rejected. A network
+error or another status fails the check without calling the credential bad. A
+Claude API key is checked with `GET /v1/models` (200 and 429 pass). Other
+providers have no check; `revalidationSupported` is false for them and the UI
+does not offer "Check again". A failed check writes its reason to the
+connection health message, which the account controls show.
+
 ## Runtime isolation
 
 Provider authentication failures, including `acpx_auth_required`, adapter login

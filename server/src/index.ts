@@ -27,6 +27,7 @@ import { pathToFileURL } from "node:url";
 import type { Request as ExpressRequest, RequestHandler } from "express";
 import { warnIfUnsupportedNodeVersion } from "@paperclipai/shared/node-version";
 import { and, eq } from "drizzle-orm";
+import { removeIncompleteBackupFiles } from "@paperclipai/db/backup-lib";
 import {
   createDb,
   ensurePostgresDatabase,
@@ -100,6 +101,8 @@ import {
 } from "./services/device-login-reaper.js";
 import { createProductionSetupTokenReaper } from "./services/setup-token-reaper.js";
 import { localAiLoginService } from "./services/local-ai-login.js";
+import { heartbeatRunTempDirLookup, isRunProcessAlive, sweepRunTempDirs } from "./services/run-temp-dirs.js";
+import { writeBackManagedAiCredential } from "./services/ai-connection-runtime.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
 import {
   parseAdapterRegistryEnv,
@@ -1184,6 +1187,29 @@ async function startServerWithDatabaseTeardown(
   const executionControlInterval = setInterval(sweepExecutionControl, EXECUTION_RECONCILIATION_INTERVAL_MS);
   executionControlInterval.unref?.();
   sweepExecutionControl();
+  // Run temp folders (`paperclip-ai-*`, `paperclip-run-*`) of runs that ended
+  // without their own cleanup, such as a run cut off by a server restart.
+  const RUN_TEMP_DIR_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
+  let runTempDirSweepInFlight = false;
+  const sweepRunTempFolders = () => {
+    if (heartbeatSchedulerStopped || isWarmStandby() || runTempDirSweepInFlight) return;
+    runTempDirSweepInFlight = true;
+    trackHeartbeatSchedulerWork(sweepRunTempDirs({
+      lookupRuns: heartbeatRunTempDirLookup(db as any),
+      isRunProcessAlive,
+      writeBack: (dir) => writeBackManagedAiCredential(db as any, dir),
+    })
+      .then((result) => {
+        if (result.removed.length > 0) {
+          logger.info({ removed: result.removed.length, scanned: result.scanned }, "removed temp folders of ended runs");
+        }
+      })
+      .catch(err => logger.error({ err }, "run temp folder sweep failed"))
+      .finally(() => { runTempDirSweepInFlight = false; }));
+  };
+  const runTempDirSweepInterval = setInterval(sweepRunTempFolders, RUN_TEMP_DIR_SWEEP_INTERVAL_MS);
+  runTempDirSweepInterval.unref?.();
+  sweepRunTempFolders();
   const startHeartbeatSchedulerInterval = (callback: () => void) => {
     heartbeatSchedulerInterval = setInterval(() => {
       if (!isWarmStandby()) callback();
@@ -1862,6 +1888,16 @@ async function startServerWithDatabaseTeardown(
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
 
+    // Differs from upstream: discard dumps interrupted before publication.
+    try {
+      const files = removeIncompleteBackupFiles(config.databaseBackupDir, "paperclip");
+      if (files.length > 0) {
+        logger.info({ backupDir: config.databaseBackupDir, files }, "Removed incomplete database backup files");
+      }
+    } catch (err) {
+      logger.warn({ err, backupDir: config.databaseBackupDir }, "Failed to remove incomplete database backup files");
+    }
+
     logger.info(
       {
         intervalMinutes: config.databaseBackupIntervalMinutes,
@@ -1955,6 +1991,7 @@ async function startServerWithDatabaseTeardown(
     heartbeatSchedulerStopped = true;
     unsubscribeChatCompletions();
     clearInterval(executionControlInterval);
+    clearInterval(runTempDirSweepInterval);
     if (heartbeatSchedulerInterval) {
       clearInterval(heartbeatSchedulerInterval);
       heartbeatSchedulerInterval = null;
