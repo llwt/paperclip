@@ -49,6 +49,44 @@ through to another person, an organization credential, or a legacy token.
 Agent grants are company-scoped, have exactly one `subjectAgentId`, cannot be
 organization defaults, and are installed only for that agent.
 
+### Linked-object status poller (exception)
+
+The server-side status poller for linked GitHub issues and pull requests has
+no run, agent, or responsible user; it knows only the company. The same
+resolver also serves pull-request merge-detail reconciliation for work
+products and execution workspaces. It uses a different order:
+
+1. The dedicated GitHub grant of the company's poller agent, when one is
+   named in `PAPERCLIP_EXTERNAL_OBJECTS_GITHUB_AGENT_IDS`.
+2. A company secret named `GITHUB_TOKEN`, `GH_TOKEN`, or
+   `PAPERCLIP_GITHUB_TOKEN`.
+3. The server's `GITHUB_TOKEN` or `GH_TOKEN` environment variable.
+
+`PAPERCLIP_EXTERNAL_OBJECTS_GITHUB_AGENT_IDS` is a comma-separated list of
+agent ids in the server environment. List at most one agent per company. For
+each company, the poller uses only a listed agent that belongs to that company
+and is not terminated; an agent of another company is never used. The poller
+resolves that agent's dedicated (`kind = "agent"`) grant with standing
+delegation disabled. It never uses a personal grant, a delegated grant, or an
+organization credential.
+
+Unlike the order above, the poller falls through. When the variable is unset,
+no listed agent matches, the agent has no dedicated grant, or the managed
+lookup fails, the poller uses the company secret and then the server
+environment. It logs one line with the reason code only, and only when the
+reason changes. Read-only status polling must keep working for public
+repositories and for the secret path.
+
+To use the managed connection for the poller, an operator must:
+
+- set `PAPERCLIP_EXTERNAL_OBJECTS_GITHUB_AGENT_IDS` in the server environment
+  and restart the server;
+- give that agent an active dedicated GitHub grant that can read the linked
+  repositories.
+
+Without this setup, the poller behaves as before: company secret, then server
+environment.
+
 The connection installation is the credential owner's consent boundary. A
 personal setup may target every agent or a selected set, and runtime resolution
 considers only an enabled, active connection installed for the current agent.
