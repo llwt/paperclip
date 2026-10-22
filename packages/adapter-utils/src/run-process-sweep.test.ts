@@ -246,6 +246,10 @@ describe("sweepRunProcesses", () => {
       ["client", "--token=synthetic first second"],
       ["env", "API_KEY=synthetic first second", "client"],
       ["sh", "-c", "client --password 'synthetic first second' --verbose"],
+      ["sh", "-c", `client --password "synthetic first's second" --verbose`],
+      ["sh", "-c", `client --password 'synthetic first"s second' --verbose`],
+      ["sh", "-c", `client --password "synthetic first\\" second" --verbose`],
+      ["sh", "-c", `API_KEY="synthetic first's second" client`],
     ];
     cmdlines.forEach((cmdline, index) => {
       procs.set(6100 + index, { uid: UID, ppid: 400, startTime: `61${index}`, env: { PAPERCLIP_RUN_ID: RUN_ID }, cmdline, onTerm: "exit" });
@@ -258,7 +262,11 @@ describe("sweepRunProcesses", () => {
       "client --password ***REDACTED***",
       "client --token=***REDACTED***",
       "env API_KEY=***REDACTED*** client",
-      "sh -c client --password '***REDACTED***' --verbose",
+      "sh -c client --password ***REDACTED***",
+      "sh -c client --password ***REDACTED***",
+      "sh -c client --password ***REDACTED***",
+      "sh -c client --password ***REDACTED***",
+      "sh -c API_KEY=***REDACTED***",
     ]);
     for (const process of evidence?.processes ?? []) {
       expect(process.command).not.toMatch(/synthetic|first|second/);

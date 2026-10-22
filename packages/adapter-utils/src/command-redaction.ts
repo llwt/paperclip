@@ -144,15 +144,13 @@ const ARGV_SECRET_OPTION_RE = new RegExp(
   String.raw`^-{1,2}${SECRET_NAME_PATTERN}$`,
   "i",
 );
-const ARGV_SECRET_PREFIX_RE = new RegExp(
-  String.raw`^(-{1,2}${SECRET_NAME_PATTERN}=|${SECRET_NAME_PATTERN}\s*=)`,
+// A secret option or assignment inside one argument, such as the script of
+// `sh -c`: `--password 'a b'` or `TOKEN="a b"`. Shell quoting and escapes in
+// such a script cannot be parsed safely here, so everything after the marker
+// up to the end of the argument is redacted.
+const ARGV_EMBEDDED_SECRET_RE = new RegExp(
+  String.raw`(?:\B-{1,2}${SECRET_NAME_PATTERN}(?:\s+|=)|\b${SECRET_NAME_PATTERN}\s*=)`,
   "i",
-);
-// A quoted secret option inside one argument, such as the script of `sh -c`:
-// `--password 'a b'`. The command redaction stops a value at whitespace.
-const ARGV_QUOTED_SECRET_OPTION_RE = new RegExp(
-  String.raw`(\B-{1,2}${SECRET_NAME_PATTERN}(?:\s+|=))(["'])[^"'\r\n]*\2`,
-  "gi",
 );
 
 /**
@@ -160,8 +158,10 @@ const ARGV_QUOTED_SECRET_OPTION_RE = new RegExp(
  * on NUL. Joining argv first loses argument boundaries, so a secret value that
  * holds whitespace would be redacted only up to its first space. Here a whole
  * argument is redacted when it is the value of a secret option (`--password
- * <value>`, `--password=<value>`, `TOKEN=<value>`); other arguments go through
- * the command redaction.
+ * <value>`). When an argument holds a secret option or assignment
+ * (`--password=<value>`, `TOKEN=<value>`, a `sh -c` script), the rest of that
+ * argument after the marker is redacted. Other arguments go through the
+ * command redaction.
  */
 export function redactCommandArgv(
   argv: readonly string[],
@@ -171,11 +171,11 @@ export function redactCommandArgv(
     if (index > 0 && ARGV_SECRET_OPTION_RE.test(argv[index - 1]!)) {
       return redactedValue;
     }
-    const prefix = ARGV_SECRET_PREFIX_RE.exec(arg);
-    if (prefix) return `${prefix[1]}${redactedValue}`;
-    return redactCommandText(
-      arg.replace(ARGV_QUOTED_SECRET_OPTION_RE, `$1$2${redactedValue}$2`),
-      redactedValue,
-    );
+    const marker = ARGV_EMBEDDED_SECRET_RE.exec(arg);
+    if (marker) {
+      const head = arg.slice(0, marker.index + marker[0].length);
+      return `${redactCommandText(head, redactedValue)}${redactedValue}`;
+    }
+    return redactCommandText(arg, redactedValue);
   });
 }
