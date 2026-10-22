@@ -9,7 +9,7 @@ import { TRANSCRIPT_REQUEST_TIMEOUT_MS } from "./read-transcript-request";
 
 const { useQueryMock, logMock, buildTranscriptMock } = vi.hoisted(() => ({
   useQueryMock: vi.fn(() => ({ data: { censorUsernameInLogs: false } })),
-  logMock: vi.fn(async () => ({ runId: "run-1", store: "memory", logRef: "log-1", content: "", nextOffset: 0 })),
+  logMock: vi.fn(async (..._args: unknown[]): Promise<{ runId: string; store: string; logRef: string; content: string; nextOffset?: number }> => ({ runId: "run-1", store: "memory", logRef: "log-1", content: "", nextOffset: 0 })),
   buildTranscriptMock: vi.fn((chunks: unknown[]) => chunks),
 }));
 
