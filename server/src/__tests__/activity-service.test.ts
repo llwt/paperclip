@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -253,6 +253,74 @@ describeEmbeddedPostgres("activity service", () => {
     });
     expect(runs[0]).not.toHaveProperty("contextSnapshot");
   });
+
+  it("lists issue activity and source-issue project and skill events, newest first (SX-1597)", async () => {
+    const companyId = randomUUID();
+    const otherCompanyId = randomUUID();
+    const issueId = randomUUID();
+    const otherIssueId = randomUUID();
+    for (const id of [companyId, otherCompanyId]) {
+      await db.insert(companies).values({
+        id,
+        name: "Paperclip",
+        issuePrefix: `T${id.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+    }
+    await db.insert(issues).values([
+      { id: issueId, companyId, title: "Issue", status: "in_progress", priority: "medium" },
+      { id: otherIssueId, companyId, title: "Other", status: "in_progress", priority: "medium" },
+    ]);
+    const at = (minute: number) => new Date(`2026-04-10T00:0${minute}:00.000Z`);
+    const base = { actorType: "system", actorId: "system" } as const;
+    await db.insert(activityLog).values([
+      { ...base, companyId, action: "issue.created", entityType: "issue", entityId: issueId, createdAt: at(1) },
+      { ...base, companyId, action: "project.created", entityType: "project", entityId: randomUUID(), details: { sourceIssueId: issueId }, createdAt: at(2) },
+      { ...base, companyId, action: "company.skill_created", entityType: "company_skill", entityId: randomUUID(), details: { sourceIssueId: issueId }, createdAt: at(3) },
+      { ...base, companyId, action: "issue.updated", entityType: "issue", entityId: issueId, createdAt: at(4) },
+      // Not this issue's activity: another issue, another action, another company.
+      { ...base, companyId, action: "issue.updated", entityType: "issue", entityId: otherIssueId, createdAt: at(5) },
+      { ...base, companyId, action: "project.updated", entityType: "project", entityId: randomUUID(), details: { sourceIssueId: issueId }, createdAt: at(6) },
+      { ...base, companyId, action: "project.created", entityType: "project", entityId: randomUUID(), details: { sourceIssueId: otherIssueId }, createdAt: at(7) },
+      { ...base, companyId: otherCompanyId, action: "project.created", entityType: "project", entityId: randomUUID(), details: { sourceIssueId: issueId }, createdAt: at(8) },
+    ]);
+
+    const rows = await activityService(db).forIssue(issueId);
+
+    expect(rows.map((row) => row.action)).toEqual([
+      "issue.updated",
+      "company.skill_created",
+      "project.created",
+      "issue.created",
+    ]);
+    expect(rows.every((row) => row.companyId === companyId)).toBe(true);
+  });
+
+  it("reads issue activity through indexes, not a scan of activity_log (SX-1597)", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Issue", status: "in_progress", priority: "medium" });
+    await db.execute(sql`
+      insert into activity_log (company_id, actor_type, actor_id, action, entity_type, entity_id, details, created_at)
+      select ${companyId}, 'system', 'system', 'issue.updated', 'issue', gen_random_uuid()::text, '{}'::jsonb,
+        now() - (g || ' seconds')::interval
+      from generate_series(1, 60000) g
+    `);
+    await db.execute(sql`analyze activity_log`);
+
+    const plan = await db.execute(sql`explain ${activityService(db).forIssue(issueId)}`);
+    const planText = [...plan].map((row) => Object.values(row)[0]).join("\n");
+
+    expect(planText).not.toMatch(/Seq Scan on activity_log/);
+    expect(planText).toContain("activity_log_entity_type_id_idx");
+    expect(planText).toContain("activity_log_company_source_issue_idx");
+  }, 60_000);
 
   it("lists issue runs from the run binding and from activity links, once each", async () => {
     const companyId = randomUUID();
