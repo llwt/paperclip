@@ -977,17 +977,22 @@ function assertSelectableProviderConfig(config: {
 const recentSuccessfulResolutionAudits = new Map<string, number>();
 
 /** True when this success should be audited; claims the window for the key. */
-function claimSuccessfulResolutionAudit(key: string, windowMs: number) {
+function claimSuccessfulResolutionAudit(key: string, windowMs: number): number | null {
   const now = Date.now();
   const expiresAt = recentSuccessfulResolutionAudits.get(key);
-  if (expiresAt !== undefined && expiresAt > now) return false;
+  if (expiresAt !== undefined && expiresAt > now) return null;
   if (recentSuccessfulResolutionAudits.size >= 10_000) {
     for (const [entry, expiry] of recentSuccessfulResolutionAudits) {
       if (expiry <= now) recentSuccessfulResolutionAudits.delete(entry);
     }
   }
   recentSuccessfulResolutionAudits.set(key, now + windowMs);
-  return true;
+  return now + windowMs;
+}
+
+/** A failed audit write gives the window back so the next resolution retries it. */
+function releaseSuccessfulResolutionAudit(key: string, claim: number) {
+  if (recentSuccessfulResolutionAudits.get(key) === claim) recentSuccessfulResolutionAudits.delete(key);
 }
 
 export function secretService(db: Db | DbTransaction) {
@@ -1432,7 +1437,8 @@ export function secretService(db: Db | DbTransaction) {
           accessContext.issueId ?? null, accessContext.configPath ?? null,
         ])
         : null;
-      if (!auditKey || claimSuccessfulResolutionAudit(auditKey, dedupeWindowMs!)) await Promise.all([
+      const auditClaim = auditKey ? claimSuccessfulResolutionAudit(auditKey, dedupeWindowMs!) : null;
+      if (!auditKey || auditClaim !== null) await Promise.all([
         db
           .update(companySecrets)
           .set({ lastResolvedAt: new Date(), updatedAt: new Date() })
@@ -1450,7 +1456,9 @@ export function secretService(db: Db | DbTransaction) {
           credentialSubjectType: secret.scope === "user" ? "user" : null,
           credentialSubjectId: secret.ownerUserId ?? null,
           outcome: "success",
-        }).catch(() => undefined),
+        }).catch(() => {
+          if (auditKey && auditClaim !== null) releaseSuccessfulResolutionAudit(auditKey, auditClaim);
+        }),
       ]);
       return {
         value,

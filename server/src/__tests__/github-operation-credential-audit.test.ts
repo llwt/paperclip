@@ -136,6 +136,31 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await accessRows(fixture.secretId, input.runId)).toHaveLength(3);
   });
 
+  it("retries the access event on the next call when the first write fails", async () => {
+    const fixture = await seed();
+    const input = await fixture.run();
+    let failNextAccessEvent = true;
+    const flakyDb = new Proxy(db, {
+      get(target, property, receiver) {
+        if (property !== "insert") return Reflect.get(target, property, receiver);
+        return (table: unknown) => {
+          if (table === secretAccessEvents && failNextAccessEvent) {
+            failNextAccessEvent = false;
+            return { values: () => Promise.reject(new Error("transient insert failure")) };
+          }
+          return target.insert(table as never);
+        };
+      },
+    });
+    expect(await resolveGitHubOperationCredentials(flakyDb, input)).toMatchObject({ status: "available" });
+    expect(failNextAccessEvent).toBe(false);
+    expect(await accessRows(fixture.secretId, input.runId)).toHaveLength(0);
+
+    await resolveGitHubOperationCredentials(flakyDb, input);
+    await resolveGitHubOperationCredentials(flakyDb, input);
+    expect(await accessRows(fixture.secretId, input.runId)).toHaveLength(1);
+  });
+
   it("returns the same broker response body for every call in a run", async () => {
     const fixture = await seed();
     const input = await fixture.run();
