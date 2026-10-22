@@ -169,7 +169,6 @@ import {
   computeComposerHandoffPreview,
   extractAgentMentionIds,
   findPlainAgentNameCandidate,
-  knownComposerHandoffRefusal,
   type ComposerHandoffPreview,
   type HandoffAgentMention,
 } from "../lib/interrupt-handoff";
@@ -212,7 +211,7 @@ import {
   summarizeToolInput,
   summarizeToolResult,
 } from "../lib/transcriptPresentation";
-import { buildAgentMentionHref, parseLeadingAgentMention } from "@paperclipai/shared";
+import { buildAgentMentionHref } from "@paperclipai/shared";
 import { useComposerStop } from "@/hooks/useComposerStop";
 import { cn, formatDateTime, formatShortDate } from "../lib/utils";
 import { liveBlueBadge } from "../lib/status-colors";
@@ -536,8 +535,6 @@ interface IssueChatComposerProps {
   issueStatus?: string;
   issueWorkMode?: IssueWorkMode;
   onWorkModeChange?: (workMode: IssueWorkMode) => Promise<void> | void;
-  /** Whether a leading agent mention hands the task off. Off until the server path is switched on. */
-  commentHandoffAvailable?: boolean;
 }
 
 interface IssueChatThreadProps {
@@ -4685,7 +4682,6 @@ const IssueChatComposer = forwardRef<
     issueStatus,
     issueWorkMode,
     onWorkModeChange,
-    commentHandoffAvailable = false,
   },
   forwardedRef,
 ) {
@@ -5300,7 +5296,6 @@ const IssueChatComposer = forwardRef<
         : findPlainAgentNameCandidate(body, agentMentionOptions),
     [body, mentionedAgentIds, agentMentionOptions],
   );
-  const leadingMention = useMemo(() => parseLeadingAgentMention(body), [body]);
   const handoffPreview = useMemo(
     () =>
       computeComposerHandoffPreview({
@@ -5310,9 +5305,6 @@ const IssueChatComposer = forwardRef<
         bodyHasAgentMention: mentionedAgentIds.length > 0,
         mentionedAgentId: mentionedAgentIds[0] ?? null,
         plainNameCandidate,
-        leadingMention,
-        handoffAvailable: commentHandoffAvailable,
-        handoffCheck: knownComposerHandoffRefusal({ issueStatus }),
       }),
     [
       reassignTarget,
@@ -5320,9 +5312,6 @@ const IssueChatComposer = forwardRef<
       hasActiveRun,
       mentionedAgentIds,
       plainNameCandidate,
-      leadingMention,
-      commentHandoffAvailable,
-      issueStatus,
     ],
   );
   const coachVisible = Boolean(
