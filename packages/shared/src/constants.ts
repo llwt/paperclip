@@ -1332,6 +1332,7 @@ export const PLUGIN_CAPABILITIES = [
   "issue.comments.read",
   // Read pending issue-thread interactions (decision cards) on an issue.
   "issue.interactions.read",
+  "issue.execution.read",
   // Read issue attachment metadata and, via the capability-scoped host
   // bridge, attachment content bytes (bytes-only, company-scoped, audit-logged).
   "issue.attachments.read",
@@ -1495,6 +1496,8 @@ export const PLUGIN_UI_SLOT_TYPES = [
 export type PluginUiSlotType = (typeof PLUGIN_UI_SLOT_TYPES)[number];
 
 export const WORKSPACE_OVERVIEW_DEFAULT_LIMIT = 50;
+export const HEARTBEAT_RUN_LIST_DEFAULT_LIMIT = 200;
+export const HEARTBEAT_RUN_LIST_MAX_LIMIT = 1000;
 export const WORKSPACE_OVERVIEW_MAX_LIMIT = 100;
 export const WORKSPACE_OVERVIEW_LINKED_ISSUE_LIMIT = 4;
 

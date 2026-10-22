@@ -90,6 +90,11 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
   let db: ReturnType<typeof createDb>;
 
   beforeAll(async () => {
+    // Exercise scheduling against the scratch DB, regardless of flags inherited
+    // from an agent run or loaded from the worktree's .paperclip/.env.
+    vi.stubEnv("PAPERCLIP_IN_WORKTREE", "false");
+    vi.stubEnv("PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS", "false");
+    vi.stubEnv("PAPERCLIP_RESTORE_IN_PROGRESS", "false");
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-issue-liveness-");
     db = createDb(tempDb.connectionString);
   }, 30_000);
@@ -130,7 +135,11 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
   });
 
   afterAll(async () => {
-    await tempDb?.cleanup();
+    try {
+      await tempDb?.cleanup();
+    } finally {
+      vi.unstubAllEnvs();
+    }
   }, 30_000);
 
   async function seedBlockedChain(opts: {
@@ -319,11 +328,20 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       type: "blocks",
     });
 
+    const blockerRunId = randomUUID();
     if (workspaceState === "not_finalized") {
+      // The blocker's run is still live, so it can still record the finalize.
+      await db.insert(heartbeatRuns).values({
+        id: blockerRunId,
+        companyId,
+        agentId,
+        status: "running",
+      });
       await db.insert(workspaceOperations).values({
         companyId,
         executionWorkspaceId,
         issueId: blockerIssueId,
+        heartbeatRunId: blockerRunId,
         phase: "adapter_execute",
         status: "succeeded",
         startedAt: new Date(Date.now() - 60_000),
@@ -339,7 +357,14 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       });
     }
 
-    return { companyId, agentId, blockedIssueId, blockerIssueId, executionWorkspaceId };
+    return {
+      companyId,
+      agentId,
+      blockedIssueId,
+      blockerIssueId,
+      executionWorkspaceId,
+      blockerRunId,
+    };
   }
 
   it("runs exactly one bounded review-path recovery before surfacing a stalled decision", async () => {
@@ -361,7 +386,9 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       role: "engineer",
       status: "idle",
       adapterType: "codex_local",
-      adapterConfig: {},
+      // The pre-dispatch credential gate runs before the mocked adapter.
+      // Use a dummy per-agent key so recovery does not need host Codex auth.
+      adapterConfig: { env: { OPENAI_API_KEY: "test-only-openai-key" } },
       runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
       permissions: {},
     });
@@ -744,6 +771,32 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
         blockerIssueIds: [blockerIssueId],
       }),
     });
+  });
+
+  it("heals a resolved blocked dependent once the blocker's run ended without a workspace finalize", async () => {
+    const { agentId, blockedIssueId, blockerRunId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "not_finalized" });
+    const heartbeat = heartbeatService(db);
+
+    expect((await heartbeat.reconcileResolvedDependencyWakes()).healed).toBe(0);
+
+    // SX-1370: the run ends without a workspace_finalize (a legacy run on a
+    // git worktree records none). Nothing can record it later.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, blockerRunId));
+
+    const afterRunEnded = await heartbeat.reconcileResolvedDependencyWakes();
+
+    expect(afterRunEnded.healed).toBe(1);
+    expect(afterRunEnded.issueIds).toEqual([blockedIssueId]);
+    const wake = await db
+      .select({ reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wake).toMatchObject({ reason: "issue_blockers_resolved" });
   });
 
   it("does not duplicate an existing dependency wake keyed to any resolved blocker", async () => {

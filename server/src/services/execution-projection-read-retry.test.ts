@@ -44,6 +44,8 @@ function fixture(options: {
         innerJoin() { return query; },
         orderBy(...values: SQL[]) { order = values; return query; },
         limit() { return query; },
+        // runsForIssue selects its run ids through a UNION subquery (fork port of #16713).
+        union() { return query; },
         then(resolve: (value: unknown[]) => unknown, reject: (error: unknown) => unknown) {
           // Re-awaiting the same failed builder cannot recover the connection.
           result ??= Promise.resolve().then(() => {

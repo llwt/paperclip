@@ -4,7 +4,7 @@ import path from "node:path";
 import { gunzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import { BACKUP_TEMP_SUFFIX, createBufferedTextFileWriter, removeIncompleteBackupFiles, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -27,6 +27,29 @@ async function createTempDatabase(): Promise<string> {
   const db = await startEmbeddedPostgresTestDatabase("paperclip-db-backup-");
   cleanups.push(db.cleanup);
   return db.connectionString;
+}
+
+function useFakePgDump(exitCode: number): { readyFile: string; content: string } {
+  const dir = createTempDir("paperclip-fake-pg-dump-");
+  const script = path.join(dir, "pg_dump");
+  const readyFile = path.join(dir, "ready");
+  const first = "-- first part\n";
+  const last = "-- last part\n";
+  fs.writeFileSync(script, `#!${process.execPath}
+const fs = require("node:fs");
+process.stdout.write(${JSON.stringify(first)});
+fs.writeFileSync(${JSON.stringify(readyFile)}, "ready");
+setTimeout(() => {
+  process.stdout.write(${JSON.stringify(last)}, () => process.exit(${exitCode}));
+}, 1000);
+`, { mode: 0o755 });
+  const original = process.env.PAPERCLIP_PG_DUMP_PATH;
+  process.env.PAPERCLIP_PG_DUMP_PATH = script;
+  cleanups.push(() => {
+    if (original === undefined) delete process.env.PAPERCLIP_PG_DUMP_PATH;
+    else process.env.PAPERCLIP_PG_DUMP_PATH = original;
+  });
+  return { readyFile, content: first + last };
 }
 
 async function createSiblingDatabase(connectionString: string, databaseName: string): Promise<string> {
@@ -74,7 +97,66 @@ describe("createBufferedTextFileWriter", () => {
   });
 });
 
+describe("removeIncompleteBackupFiles", () => {
+  it("removes only regular partial files with the selected prefix", () => {
+    const dir = createTempDir("paperclip-incomplete-backups-");
+    const partials = ["paperclip-1.sql.gz.partial", "paperclip-2.sql.partial"];
+    const retained = ["paperclip-3.sql.gz", "paperclip-4.sql", "other-5.sql.gz.partial"];
+    for (const name of [...partials, ...retained]) fs.writeFileSync(path.join(dir, name), "dump");
+    fs.mkdirSync(path.join(dir, "paperclip-6.partial"));
+    fs.symlinkSync(path.join(dir, retained[0]!), path.join(dir, "paperclip-7.partial"));
+
+    expect(removeIncompleteBackupFiles(dir, "paperclip").sort()).toEqual(partials);
+    expect(fs.readdirSync(dir).sort()).toEqual([...retained, "paperclip-6.partial", "paperclip-7.partial"].sort());
+    expect(BACKUP_TEMP_SUFFIX).toBe(".partial");
+  });
+
+  it("returns no files for a missing directory", () => {
+    const dir = createTempDir("paperclip-missing-backups-");
+    expect(removeIncompleteBackupFiles(path.join(dir, "missing"), "paperclip")).toEqual([]);
+  });
+});
+
 describeEmbeddedPostgres("runDatabaseBackup", () => {
+  it("publishes a pg_dump backup only after the complete gzip write", async () => {
+    const connectionString = await createTempDatabase();
+    const backupDir = createTempDir("paperclip-pg-dump-publish-");
+    const fake = useFakePgDump(0);
+    const backup = runDatabaseBackup({
+      connectionString,
+      backupDir,
+      retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+      backupEngine: "pg_dump",
+    });
+    try {
+      await expect.poll(() => fs.existsSync(fake.readyFile)).toBe(true);
+      const files = fs.readdirSync(backupDir);
+      expect(files.filter((name) => name.endsWith(".sql.gz.partial"))).toHaveLength(1);
+      expect(files.some((name) => name.endsWith(".sql.gz") || name.endsWith(".sql"))).toBe(false);
+    } finally {
+      await backup;
+    }
+    const result = await backup;
+    expect(fs.readdirSync(backupDir)).toEqual([path.basename(result.backupFile)]);
+    expect(result.backupFile).toMatch(/paperclip-.*\.sql\.gz$/);
+    const compressed = fs.readFileSync(result.backupFile);
+    expect(result.sizeBytes).toBe(compressed.length);
+    expect(gunzipSync(compressed).toString("utf8")).toBe(fake.content);
+  }, 30_000);
+
+  it("leaves no partial or final file after pg_dump exits with an error", async () => {
+    const connectionString = await createTempDatabase();
+    const backupDir = createTempDir("paperclip-pg-dump-failed-");
+    useFakePgDump(1);
+    await expect(runDatabaseBackup({
+      connectionString,
+      backupDir,
+      retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+      backupEngine: "pg_dump",
+    })).rejects.toThrow("exit code 1");
+    expect(fs.readdirSync(backupDir)).toEqual([]);
+  }, 30_000);
+
   it(
     "keeps the newest backup for each retained calendar month",
     async () => {
@@ -188,6 +270,7 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         expect(result.backupFile).toMatch(/paperclip-test-.*\.sql\.gz$/);
         expect(result.sizeBytes).toBeGreaterThan(0);
         expect(fs.existsSync(result.backupFile)).toBe(true);
+        expect(fs.readdirSync(backupDir)).toEqual([path.basename(result.backupFile)]);
 
         await runDatabaseRestore({
           connectionString: restoreConnectionString,
@@ -490,7 +573,7 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
       const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
       const originalPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
       const originalPsqlPath = process.env.PAPERCLIP_PSQL_PATH;
-      process.env.PAPERCLIP_PG_DUMP_PATH = "/bin/false";
+      useFakePgDump(1);
       process.env.PAPERCLIP_PSQL_PATH = "/bin/false";
 
       try {
@@ -524,6 +607,8 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
 
         const backupSql = gunzipSync(await fs.promises.readFile(result.backupFile)).toString("utf8");
         expect(backupSql.indexOf("-- Data for: public.aaa_child_records")).toBeGreaterThan(-1);
+        expect(fs.readdirSync(backupDir)).toEqual([path.basename(result.backupFile)]);
+        expect(backupSql).not.toContain("-- first part");
         expect(backupSql.indexOf("-- Data for: public.aaa_child_records")).toBeLessThan(
           backupSql.indexOf("-- Data for: public.zzz_parent_records"),
         );

@@ -583,6 +583,8 @@ export {
   PLUGIN_API_ROUTE_AUTH_MODES,
   PLUGIN_API_ROUTE_CHECKOUT_POLICIES,
   WORKSPACE_OVERVIEW_DEFAULT_LIMIT,
+  HEARTBEAT_RUN_LIST_DEFAULT_LIMIT,
+  HEARTBEAT_RUN_LIST_MAX_LIMIT,
   WORKSPACE_OVERVIEW_MAX_LIMIT,
   WORKSPACE_OVERVIEW_LINKED_ISSUE_LIMIT,
   PIPELINE_AUTOMATION_DEFAULT_TITLE_TEMPLATE,
@@ -1168,6 +1170,7 @@ export type {
   IssueQueuedCommentSteeringDisposition,
   IssueCommentDerivedAuthorSource,
   IssueCommentMetadata,
+  IssueCommentHandoffReceipt,
   IssueCommentMetadataSection,
   IssueCommentMetadataRow,
   IssueCommentMetadataTextRow,
@@ -1985,6 +1988,8 @@ export {
   issueCommentMetadataRowSchema,
   issueCommentMetadataSectionSchema,
   issueCommentMetadataSchema,
+  issueCommentHandoffReceiptSchema,
+  issueCommentRequestMetadataSchema,
   addIssueCommentSchema,
   issueThreadInteractionStatusSchema,
   issueThreadInteractionKindSchema,
@@ -2552,6 +2557,17 @@ export {
   type ParsedSkillMention,
   type ParsedUserMention,
 } from "./project-mentions.js";
+export {
+  ISSUE_COMMENT_HANDOFF_OUTCOMES,
+  ISSUE_COMMENT_HANDOFF_REASON_CODES,
+  ISSUE_COMMENT_HANDOFF_STATUSES,
+  describeIssueCommentHandoffReason,
+  hasLeadingHandoffCandidate,
+  parseLeadingAgentMention,
+  type IssueCommentHandoffOutcome,
+  type IssueCommentHandoffReasonCode,
+  type LeadingAgentMention,
+} from "./agent-mention-handoff.js";
 
 export {
   BUILTIN_ROUTINE_VARIABLE_NAMES,

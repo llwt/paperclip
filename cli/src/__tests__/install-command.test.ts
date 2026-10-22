@@ -107,6 +107,7 @@ describe("managed install commands", () => {
   });
 
   it("reuses a SHA-keyed git payload without downloading or rebuilding", async () => {
+    vi.spyOn(performance, "now").mockReturnValue(1000);
     const sha = "b".repeat(40);
     const paths = resolveInstallStorePaths();
     const payloadPath = payloadPathFor(paths, "git", sha.slice(0, 12));
@@ -118,6 +119,10 @@ describe("managed install commands", () => {
     await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, paths)).resolves.toEqual({ payloadPath, reused: true, version: "0.3.1" });
     expect(runCommand).toHaveBeenCalledOnce();
     expect(runCommand.mock.calls[0]?.[0]).toBe(process.execPath);
+    expect(vi.mocked(console.log).mock.calls).toEqual([
+      ["[install] smoke payload: 0.0 s"],
+      ["[install] total: 0.0 s"],
+    ]);
   });
 
   const createGitCheckoutRunCommand = (sha: string) =>
@@ -165,6 +170,89 @@ describe("managed install commands", () => {
       if (file === process.execPath) return { stdout: "0.3.1\n", stderr: "" };
       throw new Error(`Unexpected command: ${file} ${args.join(" ")}`);
     });
+
+  it("logs all git install step durations in order and a total in seconds", async () => {
+    const sha = "a".repeat(40);
+    let now = 1000;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const baseRunCommand = createGitCheckoutRunCommand(sha);
+    const runCommand: CommandRunner = async (file, args, options) => {
+      const result = await baseRunCommand(file, args, options);
+      now += 1234;
+      return result;
+    };
+
+    await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths()))
+      .resolves.toMatchObject({ reused: false, version: "0.3.1" });
+
+    expect(vi.mocked(console.log).mock.calls).toEqual([
+      ["[install] download source: 1.2 s"],
+      ["[install] extract source: 1.2 s"],
+      ["[install] enable pnpm: 1.2 s"],
+      ["[install] pnpm install: 1.2 s"],
+      ["[install] build packages: 1.2 s"],
+      ["[install] build server: 1.2 s"],
+      ["[install] server ui-dist: 1.2 s"],
+      ["[install] copy skills: 0.0 s"],
+      ["[install] pack workspace packages: 4.9 s"],
+      ["[install] pack cli: 1.2 s"],
+      ["[install] npm install payload: 1.2 s"],
+      ["[install] link embedded postgres: 0.0 s"],
+      ["[install] smoke payload: 1.2 s"],
+      ["[install] total: 17.3 s"],
+    ]);
+  });
+
+  it("logs a failed git install step and rethrows the original error", async () => {
+    const sha = "a".repeat(40);
+    const failure = new Error("tar failed");
+    let now = 1000;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const baseRunCommand = createGitCheckoutRunCommand(sha);
+    const runCommand = vi.fn(async (file: string, args: string[], options?: Parameters<CommandRunner>[2]) => {
+      if (file === "tar") {
+        now += 12345;
+        throw failure;
+      }
+      const result = await baseRunCommand(file, args, options);
+      now += 1234;
+      return result;
+    });
+    const paths = resolveInstallStorePaths();
+
+    await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, paths)).rejects.toBe(failure);
+
+    expect(vi.mocked(console.log).mock.calls).toEqual([
+      ["[install] download source: 1.2 s"],
+      ["[install] extract source: failed after 12.3 s"],
+      ["[install] total: 13.6 s"],
+    ]);
+    expect(runCommand.mock.calls.map(([file]) => file)).toEqual(["curl", "tar"]);
+    expect(fs.readdirSync(path.join(paths.installsRoot, "git"))).toEqual([]);
+  });
+
+  it("logs a synchronous git install step failure and rethrows the original error", async () => {
+    const sha = "a".repeat(40);
+    const failure = new Error("skills copy failed");
+    vi.spyOn(performance, "now").mockReturnValue(1000);
+    vi.spyOn(fs, "cpSync").mockImplementation(() => { throw failure; });
+    const baseRunCommand = createGitCheckoutRunCommand(sha);
+    const runCommand: CommandRunner = async (file, args, options) => {
+      const result = await baseRunCommand(file, args, options);
+      if (file === "tar") {
+        fs.mkdirSync(path.join(args[args.indexOf("-C") + 1], "skills"));
+      }
+      return result;
+    };
+
+    await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths()))
+      .rejects.toBe(failure);
+
+    expect(vi.mocked(console.log).mock.calls.slice(-2)).toEqual([
+      ["[install] copy skills: failed after 0.0 s"],
+      ["[install] total: 0.0 s"],
+    ]);
+  });
 
   it("installs a GitHub branch through codeload and reuses the resolved SHA", async () => {
     const sha = "c".repeat(40);

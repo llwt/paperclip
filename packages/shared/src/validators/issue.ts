@@ -1,5 +1,9 @@
 import { z } from "zod";
 import {
+  ISSUE_COMMENT_HANDOFF_OUTCOMES,
+  ISSUE_COMMENT_HANDOFF_REASON_CODES,
+} from "../agent-mention-handoff.js";
+import {
   ISSUE_EXECUTION_DECISION_OUTCOMES,
   ISSUE_EXECUTION_MONITOR_CLEAR_REASONS,
   ISSUE_EXECUTION_MONITOR_KINDS,
@@ -1028,6 +1032,35 @@ export const issueCommentMetadataSectionSchema = z
   })
   .strict();
 
+export const issueCommentHandoffReceiptSchema = z
+  .object({
+    version: z.literal(1),
+    outcome: z.enum(ISSUE_COMMENT_HANDOFF_OUTCOMES),
+    reasonCode: z.enum(ISSUE_COMMENT_HANDOFF_REASON_CODES).optional(),
+    targetAgentId: z.string().guid().optional(),
+    statusVersion: z.number().int().nonnegative().optional(),
+    interruptedRunId: z.string().guid().optional(),
+  })
+  .strict()
+  .superRefine((receipt, ctx) => {
+    const fail = (path: string, message: string) =>
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message, path: [path] });
+    if (receipt.outcome === "assigned") {
+      if (receipt.reasonCode) fail("reasonCode", "An assigned handoff has no refusal reason");
+      if (!receipt.targetAgentId) fail("targetAgentId", "An assigned handoff requires targetAgentId");
+      if (receipt.statusVersion === undefined) fail("statusVersion", "An assigned handoff requires statusVersion");
+      return;
+    }
+    if (receipt.statusVersion !== undefined) fail("statusVersion", "Only an assigned handoff has statusVersion");
+    if (receipt.interruptedRunId !== undefined) fail("interruptedRunId", "Only an assigned handoff has interruptedRunId");
+    if (receipt.outcome === "context_only" && !receipt.reasonCode) {
+      fail("reasonCode", "A context-only handoff requires reasonCode");
+    }
+    if (receipt.outcome === "unchanged" && receipt.reasonCode) {
+      fail("reasonCode", "An unchanged handoff has no refusal reason");
+    }
+  });
+
 export const issueCommentMetadataSchema = z
   .object({
     version: z.literal(1),
@@ -1048,11 +1081,18 @@ export const issueCommentMetadataSchema = z
       reason: z.string().trim().min(1).max(160),
       assigneeAgentId: z.string().guid().nullable(),
     }).strict().optional(),
+    handoff: issueCommentHandoffReceiptSchema.optional(),
     sections: z.array(issueCommentMetadataSectionSchema).min(1).max(20),
   })
   .strict();
 
 export type IssueCommentMetadata = z.infer<typeof issueCommentMetadataSchema>;
+
+/**
+ * Comment metadata a caller may submit. The handoff receipt is server-authored,
+ * so a request that carries one is rejected rather than stored.
+ */
+export const issueCommentRequestMetadataSchema = issueCommentMetadataSchema.omit({ handoff: true });
 
 export const addIssueCommentSchema = z.object({
   clientRequestId: z.string().uuid().optional(),
@@ -1061,7 +1101,7 @@ export const addIssueCommentSchema = z.object({
   onBehalfOfUserId: z.string().trim().min(1).optional().nullable(),
   authorType: issueCommentAuthorTypeSchema.optional(),
   presentation: issueCommentPresentationSchema.nullable().optional(),
-  metadata: issueCommentMetadataSchema.nullable().optional(),
+  metadata: issueCommentRequestMetadataSchema.nullable().optional(),
   reopen: z.boolean().optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),

@@ -28,6 +28,8 @@ const mockIssueService = vi.hoisted(() => ({
   getRelationSummaries: vi.fn(),
   update: vi.fn(),
   getDependencyReadiness: vi.fn(),
+  getDependencyReadinessForBlockerIssueIds: vi.fn(),
+  addComment: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
   findMentionedAgents: vi.fn(async () => []),
@@ -680,5 +682,70 @@ describe("issue dependency wakeups in issue routes", () => {
     expect(res.status).toBe(200);
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  describe("resuming a blocked issue while replacing its blocker links (SX-1370)", () => {
+    const blockerIssueId = "33333333-3333-4333-8333-333333333333";
+    const unresolvedReadiness = {
+      issueId: "issue-1",
+      blockerIssueIds: [blockerIssueId],
+      unresolvedBlockerIssueIds: [blockerIssueId],
+      unresolvedBlockerCount: 1,
+      pendingFinalizeBlockerIssueIds: [blockerIssueId],
+      allBlockersDone: false,
+      isDependencyReady: false,
+    };
+
+    beforeEach(() => {
+      mockIssueService.getById.mockResolvedValue(issueRecord({ status: "blocked" }));
+      mockIssueService.update.mockResolvedValue(issueRecord({ status: "todo" }));
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-1",
+        issueId: "issue-1",
+        companyId: "company-1",
+        body: "Blocker removed",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      mockIssueService.getDependencyReadiness.mockResolvedValue(unresolvedReadiness);
+      mockIssueService.getDependencyReadinessForBlockerIssueIds.mockResolvedValue({
+        issueId: "issue-1",
+        blockerIssueIds: [],
+        unresolvedBlockerIssueIds: [],
+        unresolvedBlockerCount: 0,
+        pendingFinalizeBlockerIssueIds: [],
+        allBlockersDone: true,
+        isDependencyReady: true,
+      });
+    });
+
+    it("checks the blockers against the links sent in the same request", async () => {
+      const res = await request(await createApp())
+        .patch("/api/issues/issue-1")
+        .send({
+          status: "todo",
+          blockedByIssueIds: [],
+          resume: true,
+          comment: "Blocker removed",
+        });
+
+      expect(res.body.error).not.toBe("Issue follow-up blocked by unresolved blockers");
+      expect(res.status).toBe(200);
+      expect(mockIssueService.getDependencyReadinessForBlockerIssueIds).toHaveBeenCalledWith(
+        "company-1",
+        "issue-1",
+        [],
+      );
+    });
+
+    it("still rejects the resume when the stored links keep an unresolved blocker", async () => {
+      const res = await request(await createApp())
+        .patch("/api/issues/issue-1")
+        .send({ status: "todo", resume: true, comment: "Try again" });
+
+      expect(res.status).toBe(409);
+      expect(res.body.error).toBe("Issue follow-up blocked by unresolved blockers");
+      expect(mockIssueService.getDependencyReadinessForBlockerIssueIds).not.toHaveBeenCalled();
+    });
   });
 });
