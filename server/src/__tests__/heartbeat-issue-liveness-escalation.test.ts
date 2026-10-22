@@ -386,7 +386,9 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       role: "engineer",
       status: "idle",
       adapterType: "codex_local",
-      adapterConfig: {},
+      // The pre-dispatch credential gate runs before the mocked adapter.
+      // Use a dummy per-agent key so recovery does not need host Codex auth.
+      adapterConfig: { env: { OPENAI_API_KEY: "test-only-openai-key" } },
       runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
       permissions: {},
     });
