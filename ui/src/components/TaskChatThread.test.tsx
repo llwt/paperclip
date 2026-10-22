@@ -3287,6 +3287,24 @@ describe.each([true, false])("Pending question dock (conversationMode=%s)", conv
     expect(historyRows()).toHaveLength(2);
   });
 
+  it("shows a run's free-text question at its slot in history and in the dock after later messages (SX-1317)", async () => {
+    const tokenQuestion = {
+      ...questionInteraction("token", "Which secret holds the token?", "2026-08-15T12:00:30Z"),
+      title: null,
+      sourceRunId: "run-1",
+      sourceCommentId: null,
+      payload: { version: 1, supersedeOnUserComment: false, questions: [{ id: "secret", prompt: "Which secret holds the token?", selectionMode: "single", required: true, options: [{ id: "describe", label: "Secret link or ID", freeText: true }] }] },
+    } as IssueThreadInteraction;
+    render(<TaskChatThread {...props} comments={movedOn} interactions={[tokenQuestion]} />);
+    const anchors = Array.from(container.querySelectorAll("[data-thread-anchor]")).map(element => element.getAttribute("data-thread-anchor"));
+    expect(anchors.indexOf("interaction:token")).toBeGreaterThan(anchors.indexOf("comment-1"));
+    expect(anchors.indexOf("interaction:token")).toBeLessThan(anchors.indexOf("comment-2"));
+    expect(historyRows()[0]?.textContent).toContain("Which secret holds the token?");
+    expect(takeover()?.textContent).toContain("Which secret holds the token?");
+    await dismiss();
+    expect(pendingIndicator()?.textContent).toContain("1 pending input");
+  });
+
   it("leaves the dock once the question is no longer pending", async () => {
     render(<TaskChatThread {...props} comments={movedOn} interactions={[old]} />);
     expect(takeover()).not.toBeNull();
