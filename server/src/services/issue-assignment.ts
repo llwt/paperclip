@@ -37,7 +37,7 @@ export type AssignmentExpectation = {
   executionRunId: string | null;
 };
 
-/** A board user accepted a stop that could not be verified. Audited. */
+/** A board user accepted a stop that could not be verified. Each one is audited. */
 export type UnverifiedStopOverride = {
   runId: string;
   reason: "run_stop_unacknowledged" | "run_stop_uncertain";
@@ -46,7 +46,7 @@ export type UnverifiedStopOverride = {
 export type StopReceipt = (
   | { kind: "none" }
   | { kind: "stopped"; interruptedRunId: string; issueMutationStopId: string }
-) & { unverifiedStopOverride?: UnverifiedStopOverride };
+) & { unverifiedStopOverrides?: UnverifiedStopOverride[] };
 
 export type OwnershipStopVerdict = "stopped" | "unacknowledged" | "uncertain";
 
@@ -151,12 +151,13 @@ function assertStopVerified(
  * run even though it is no longer active and cannot slip past the unverified
  * stop. The run is either cancelled by the reassignment (`issue_reassigned`)
  * or by a board interrupt in the same request (`operator_interrupted`); the
- * marker, not the error code, makes it pending.
+ * marker, not the error code, makes it pending. Returns every pending stop:
+ * a newer stopped run must not hide an older one that is still unverified.
  */
-export async function findPendingReassignmentStop(
+export async function findPendingReassignmentStops(
   db: Db,
   expectation: Pick<AssignmentExpectation, "companyId" | "issueId">,
-): Promise<HeartbeatRunRow | null> {
+): Promise<HeartbeatRunRow[]> {
   const pending: HeartbeatRunRow[] = await db
     .select()
     .from(heartbeatRuns)
@@ -165,13 +166,14 @@ export async function findPendingReassignmentStop(
       eq(heartbeatRuns.status, "cancelled"),
       sql`${heartbeatRuns.resultJson}->>'reassignmentPendingIssueId' = ${expectation.issueId}`,
     ));
-  // Few rows: every commit releases them. Latest stop first.
+  // Few rows: every commit releases them. Oldest stop first, so a refusal
+  // names the same run on every retry.
   const stoppedAt = (run: HeartbeatRunRow) => new Date(run.finishedAt ?? run.createdAt).getTime();
   return (pending ?? [])
     .filter((run) =>
       run.companyId === expectation.companyId && run.status === "cancelled" &&
       parseObject(run.resultJson).reassignmentPendingIssueId === expectation.issueId)
-    .sort((a, b) => stoppedAt(b) - stoppedAt(a))[0] ?? null;
+    .sort((a, b) => stoppedAt(a) - stoppedAt(b) || a.id.localeCompare(b.id));
 }
 
 /** Marks a run an interrupt already cancelled as the pending stop of this reassignment. */
@@ -231,8 +233,11 @@ export async function stopIssueExecutionForOwnershipChange(
 ): Promise<StopReceipt> {
   const { expectation, issueMutationStopId } = input;
   const acceptUnverifiedStop = input.acceptUnverifiedStop === true;
-  const withOverride = (receipt: StopReceipt, override: UnverifiedStopOverride | null): StopReceipt =>
-    override && !receipt.unverifiedStopOverride ? { ...receipt, unverifiedStopOverride: override } : receipt;
+  const withOverrides = (receipt: StopReceipt, overrides: Array<UnverifiedStopOverride | null>): StopReceipt => {
+    const added = overrides.filter((override): override is UnverifiedStopOverride => override !== null);
+    if (added.length === 0) return receipt;
+    return { ...receipt, unverifiedStopOverrides: [...(receipt.unverifiedStopOverrides ?? []), ...added] };
+  };
   const verifyEarlierStop = async (runId: string): Promise<StopReceipt> => {
     const stopped = await deps.heartbeat.getRun(runId);
     if (!stopped) {
@@ -252,21 +257,25 @@ export async function stopIssueExecutionForOwnershipChange(
       await markPendingReassignmentStop(deps.db, stopped, expectation.issueId);
     }
     const override = assertStopVerified(await verifyOwnershipStop(deps.db, stopped), runId, { acceptUnverifiedStop });
-    return withOverride({ kind: "stopped", interruptedRunId: runId, issueMutationStopId }, override);
+    return withOverrides({ kind: "stopped", interruptedRunId: runId, issueMutationStopId }, [override]);
   };
-  // A retry of a refused reassignment finds no active run. It must still see
-  // the unverified stop of the earlier attempt.
-  const verifyPendingStop = async (receipt: StopReceipt): Promise<StopReceipt> => {
-    const pending = await findPendingReassignmentStop(deps.db, expectation);
-    if (!pending || (receipt.kind === "stopped" && pending.id === receipt.interruptedRunId)) return receipt;
-    const override = assertStopVerified(await verifyOwnershipStop(deps.db, pending), pending.id, {
-      acceptUnverifiedStop,
-      earlierAttempt: true,
-    });
-    return withOverride(receipt, override);
+  // A retry of a refused reassignment finds no active run, or a newer run it
+  // stops itself. It must still see every unverified stop of earlier attempts:
+  // the commit releases all of them.
+  const verifyPendingStops = async (receipt: StopReceipt): Promise<StopReceipt> => {
+    const verifiedHere = receipt.kind === "stopped" ? receipt.interruptedRunId : null;
+    const overrides: Array<UnverifiedStopOverride | null> = [];
+    for (const pending of await findPendingReassignmentStops(deps.db, expectation)) {
+      if (pending.id === verifiedHere) continue;
+      overrides.push(assertStopVerified(await verifyOwnershipStop(deps.db, pending), pending.id, {
+        acceptUnverifiedStop,
+        earlierAttempt: true,
+      }));
+    }
+    return withOverrides(receipt, overrides);
   };
   if (!expectation.assigneeAgentId) {
-    return verifyPendingStop(
+    return verifyPendingStops(
       input.interruptedRunId ? await verifyEarlierStop(input.interruptedRunId) : { kind: "none" },
     );
   }
@@ -277,13 +286,13 @@ export async function stopIssueExecutionForOwnershipChange(
   });
   const runToStop = await deps.resolveActiveRun(expectation);
   if (!runToStop) {
-    return verifyPendingStop(
+    return verifyPendingStops(
       input.interruptedRunId ? await verifyEarlierStop(input.interruptedRunId) : { kind: "none" },
     );
   }
   const cancelled = await deps.heartbeat.cancelRun(runToStop.id, "Cancelled before issue reassignment", {
     errorCode: "issue_reassigned",
-    // Pending until an ownership change commits; see findPendingReassignmentStop.
+    // Pending until an ownership change commits; see findPendingReassignmentStops.
     resultJson: { reassignmentStopConfirmed: true, issueMutationStopId, reassignmentPendingIssueId: expectation.issueId },
     eventMessage: "run cancelled before issue reassignment",
     eventPayload: { issueId: expectation.issueId },
@@ -298,8 +307,8 @@ export async function stopIssueExecutionForOwnershipChange(
     });
   }
   const override = assertStopVerified(await verifyOwnershipStop(deps.db, cancelled), cancelled.id, { acceptUnverifiedStop });
-  return verifyPendingStop(
-    withOverride({ kind: "stopped", interruptedRunId: cancelled.id, issueMutationStopId }, override),
+  return verifyPendingStops(
+    withOverrides({ kind: "stopped", interruptedRunId: cancelled.id, issueMutationStopId }, [override]),
   );
 }
 

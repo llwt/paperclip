@@ -774,12 +774,12 @@ describeEmbeddedPostgres("issue reassignment execution safety", () => {
       actorType: "user",
       actorId: "board-user",
       details: {
-        unverifiedStopOverride: {
+        unverifiedStopOverrides: [{
           runId,
           reason: "run_stop_unacknowledged",
           acceptedByActorType: "user",
           acceptedByActorId: "board-user",
-        },
+        }],
       },
     });
     await expect.poll(() => wakesFor(successorAgentId)).toEqual([{ reason: "issue_assigned" }]);
@@ -885,12 +885,12 @@ describeEmbeddedPostgres("issue reassignment execution safety", () => {
       .from(activityLog)
       .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.updated")));
     expect(activity?.details).toMatchObject({
-      unverifiedStopOverride: {
+      unverifiedStopOverrides: [{
         runId,
         reason: "run_stop_unacknowledged",
         acceptedByActorType: "user",
         acceptedByActorId: "board-user",
-      },
+      }],
     });
     expect((await readRun(runId)).resultJson).toMatchObject({ reassignmentPendingIssueId: null });
     await expect.poll(() => wakesFor(successorAgentId)).toEqual([{ reason: "issue_assigned" }]);
@@ -908,5 +908,127 @@ describeEmbeddedPostgres("issue reassignment execution safety", () => {
     const run = await readRun(runId);
     expect(run).toMatchObject({ status: "cancelled", errorCode: "operator_interrupted" });
     expect(parseResult(run.resultJson).reassignmentPendingIssueId).toBeUndefined();
+  });
+
+  // A newer run of the same owner starts on the issue after a refused
+  // reassignment (for example a recovery run). The retry stops and verifies
+  // that newer run; it must still refuse on the older, unverified stop,
+  // because the commit releases every pending stop.
+  async function startNewerRun(input: { companyId: string; ownerAgentId: string; issueId: string; tracked: boolean }) {
+    const newerRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: newerRunId,
+      companyId: input.companyId,
+      agentId: input.ownerAgentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      startedAt: new Date(),
+      runtimeModeResolvedAt: new Date(),
+      contextSnapshot: { issueId: input.issueId, taskId: input.issueId, wakeReason: "issue_assigned" },
+    });
+    await db.update(issues)
+      .set({ executionRunId: newerRunId, executionAgentNameKey: "owner", executionLockedAt: new Date() })
+      .where(eq(issues.id, input.issueId));
+    if (input.tracked) {
+      const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+      children.push(child);
+      runningProcesses.set(newerRunId, { child, graceSec: 1, processGroupId: null });
+      await db.update(heartbeatRuns).set({ processPid: child.pid ?? null }).where(eq(heartbeatRuns.id, newerRunId));
+    }
+    return newerRunId;
+  }
+
+  async function acknowledgeStop(runId: string) {
+    await db.update(heartbeatRuns).set({
+      resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || '{"executionCancellation": {"state": "acknowledged"}}'::jsonb`,
+    }).where(eq(heartbeatRuns.id, runId));
+  }
+
+  const handoffBody = (via: "plain" | "interrupt", successorAgentId: string, extra: Record<string, unknown> = {}) =>
+    via === "interrupt" ? interruptHandoff(successorAgentId, extra) : { assigneeAgentId: successorAgentId, ...extra };
+  // Stopping the newer run of a process adapter in a plain handoff opens a
+  // reconciliation hold after the route read the active recovery action, so
+  // the successor's wake waits behind that hold. An interrupt is an expected
+  // cancellation and opens none. Either way the successor, and only the
+  // successor, gets the one wake.
+  const successorWake = (via: "plain" | "interrupt") =>
+    [{ reason: via === "interrupt" ? "issue_assigned" : "execution_reconciliation_required" }];
+
+  describe.each(["plain", "interrupt"] as const)("with a newer stopped run of the old owner (%s handoff)", (via) => {
+    it.each(["run_stop_uncertain", "run_stop_unacknowledged"] as const)("refuses the retry on the older stop refused with %s", async (code) => {
+      const { companyId, ownerAgentId, successorAgentId, issueId, runId } = await seed({
+        liveRun: code === "run_stop_uncertain" ? "tracked" : "untracked",
+      });
+      if (code === "run_stop_uncertain") await addRemoteLease(companyId, issueId, runId);
+      const app = createApp(companyId);
+      const first = await request(app).patch(`/api/issues/${issueId}`).send(handoffBody(via, successorAgentId));
+      expect(first.status).toBe(409);
+      expect(first.body.details).toMatchObject({ code, runId });
+      const newerRunId = await startNewerRun({ companyId, ownerAgentId, issueId, tracked: true });
+
+      const retry = await request(app).patch(`/api/issues/${issueId}`).send(handoffBody(via, successorAgentId));
+
+      expect(retry.status).toBe(409);
+      expect(retry.body.details).toMatchObject({ code, runId });
+      expect(await readRun(newerRunId)).toMatchObject({ status: "cancelled" });
+      expect(await verifyOwnershipStop(db, await readRun(newerRunId))).toBe("stopped");
+      expect(await readIssue(issueId)).toMatchObject({ assigneeAgentId: ownerAgentId, status: "in_progress", statusVersion: 0 });
+      expect((await readRun(runId)).resultJson).toMatchObject({ reassignmentPendingIssueId: issueId });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(await wakesFor(successorAgentId)).toEqual([]);
+    });
+
+    it.each(["run_stop_uncertain", "run_stop_unacknowledged"] as const)("commits the retry once the older stop refused with %s is verified", async (code) => {
+      const { companyId, ownerAgentId, successorAgentId, issueId, runId } = await seed({
+        liveRun: code === "run_stop_uncertain" ? "tracked" : "untracked",
+      });
+      const lease = code === "run_stop_uncertain" ? await addRemoteLease(companyId, issueId, runId) : null;
+      const app = createApp(companyId);
+      expect((await request(app).patch(`/api/issues/${issueId}`).send(handoffBody(via, successorAgentId))).status).toBe(409);
+      const newerRunId = await startNewerRun({ companyId, ownerAgentId, issueId, tracked: true });
+
+      if (lease) await recordRemoteTerminationReceipt(lease);
+      else await acknowledgeStop(runId);
+      const retry = await request(app).patch(`/api/issues/${issueId}`).send(handoffBody(via, successorAgentId));
+
+      expect(retry.status).toBe(200);
+      expect((await readIssue(issueId)).assigneeAgentId).toBe(successorAgentId);
+      expect((await readRun(runId)).resultJson).toMatchObject({ reassignmentPendingIssueId: null });
+      expect(parseResult((await readRun(newerRunId)).resultJson).reassignmentPendingIssueId ?? null).toBeNull();
+      await expect.poll(() => wakesFor(successorAgentId)).toEqual(successorWake(via));
+      expect(await wakesFor(ownerAgentId)).toEqual([]);
+    });
+
+    it("commits a board override of two unverified stops and records both in the reassignment activity", async () => {
+      const { companyId, ownerAgentId, successorAgentId, issueId, runId } = await seed({ liveRun: "untracked" });
+      const app = createApp(companyId);
+      expect((await request(app).patch(`/api/issues/${issueId}`).send(handoffBody(via, successorAgentId))).status).toBe(409);
+      const newerRunId = await startNewerRun({ companyId, ownerAgentId, issueId, tracked: false });
+
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send(handoffBody(via, successorAgentId, { acceptUnverifiedStop: true }));
+
+      expect(res.status).toBe(200);
+      expect((await readIssue(issueId)).assigneeAgentId).toBe(successorAgentId);
+      const [activity] = await db
+        .select({ details: activityLog.details })
+        .from(activityLog)
+        .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.updated")));
+      const overrides = parseResult(activity?.details).unverifiedStopOverrides as Array<Record<string, unknown>>;
+      expect(overrides).toHaveLength(2);
+      expect(overrides).toEqual(expect.arrayContaining([runId, newerRunId].map((id) => ({
+        runId: id,
+        reason: "run_stop_unacknowledged",
+        acceptedByActorType: "user",
+        acceptedByActorId: "board-user",
+      }))));
+      for (const id of [runId, newerRunId]) {
+        expect(parseResult((await readRun(id)).resultJson).reassignmentPendingIssueId ?? null).toBeNull();
+      }
+      await expect.poll(() => wakesFor(successorAgentId)).toEqual(successorWake(via));
+      expect(await wakesFor(ownerAgentId)).toEqual([]);
+    });
   });
 });

@@ -13475,7 +13475,7 @@ export function issueRoutes(
       // Only this request may finish a mutation that intentionally stops its
       // own run (for example handing work to a signoff reviewer).
       const issueMutationStopId = randomUUID();
-      let unverifiedStopOverride: Record<string, unknown> | null = null;
+      let unverifiedStopOverrides: Array<Record<string, unknown>> | null = null;
       const assignmentExpectation: AssignmentExpectation = {
         issueId: existing.id,
         companyId: existing.companyId,
@@ -13501,12 +13501,12 @@ export function issueRoutes(
           },
         );
         if (stopReceipt.kind === "stopped") interruptedRunId = stopReceipt.interruptedRunId;
-        if (stopReceipt.unverifiedStopOverride) {
-          unverifiedStopOverride = {
-            ...stopReceipt.unverifiedStopOverride,
+        if (stopReceipt.unverifiedStopOverrides?.length) {
+          unverifiedStopOverrides = stopReceipt.unverifiedStopOverrides.map((override) => ({
+            ...override,
             acceptedByActorType: actor.actorType,
             acceptedByActorId: actor.actorId,
-          };
+          }));
         }
       }
 
@@ -13840,7 +13840,7 @@ export function issueRoutes(
             : {}),
           ...scheduledRetryActivityDetails(outcome),
           ...(interruptedRunId ? { interruptedRunId } : {}),
-          ...(unverifiedStopOverride ? { unverifiedStopOverride } : {}),
+          ...(unverifiedStopOverrides ? { unverifiedStopOverrides } : {}),
           ...(extras.cancelledStatusRunId
             ? { cancelledStatusRunId: extras.cancelledStatusRunId }
             : {}),
