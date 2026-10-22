@@ -39,6 +39,7 @@ import {
   selectPaperclipPromptSections,
   stringifyPaperclipWakePayload,
   isPaperclipRecoveryWakePayload,
+  leftoverProcessSweepResultJson,
 } from "@paperclipai/adapter-utils/server-utils";
 
 import {
@@ -608,6 +609,7 @@ export async function execute(
     session_id: parsed.sessionId || null,
     usage: parsed.usage || null,
     cost_usd: parsed.costUsd ?? null,
+    ...leftoverProcessSweepResultJson(result),
   };
 
   // Store session ID for next run

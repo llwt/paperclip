@@ -53,6 +53,7 @@ import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   leftoverProcessSweepResultJson,
+  withLeftoverProcessSweep,
   joinPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
@@ -1575,7 +1576,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           `[paperclip] Codex resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
         );
         const retry = await runAttempt(null);
-        const retryResult = toResult(retry, true, true);
+        const retryResult = withLeftoverProcessSweep(toResult(retry, true, true), [initial.proc, retry.proc]);
         if (retryResult.errorMessage) {
           executionError = new Error(retryResult.errorMessage);
         }

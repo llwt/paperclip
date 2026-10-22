@@ -93,6 +93,39 @@ export function leftoverProcessSweepResultJson(
   return sweep && sweep.stopped > 0 ? { leftoverProcessSweep: sweep } : {};
 }
 
+type LeftoverProcessSweepSource = Pick<RunProcessResult, "leftoverProcessSweep"> | null | undefined;
+
+// One evidence record for every attempt of a run (initial attempt plus a
+// retry), so a retry does not hide what the first attempt left behind.
+export function mergeLeftoverProcessSweeps(
+  procs: readonly LeftoverProcessSweepSource[],
+): RunProcessSweepEvidence | null {
+  const sweeps = procs
+    .map((proc) => proc?.leftoverProcessSweep)
+    .filter((sweep): sweep is RunProcessSweepEvidence => Boolean(sweep && sweep.stopped > 0));
+  if (sweeps.length === 0) return null;
+  if (sweeps.length === 1) return sweeps[0]!;
+  return {
+    kind: "leftover_process_sweep",
+    stopped: sweeps.reduce((sum, sweep) => sum + sweep.stopped, 0),
+    forceKilled: sweeps.reduce((sum, sweep) => sum + sweep.forceKilled, 0),
+    processes: sweeps.flatMap((sweep) => sweep.processes),
+  };
+}
+
+// Put the sweep evidence of the given attempts on an adapter result's
+// resultJson. Every adapter result path goes through this, so the server
+// records the stopped processes for every adapter that uses runChildProcess.
+export function withLeftoverProcessSweep<T extends object>(
+  result: T,
+  procs: readonly LeftoverProcessSweepSource[],
+): T {
+  const sweep = mergeLeftoverProcessSweeps(procs);
+  if (!sweep) return result;
+  const resultJson = (result as { resultJson?: Record<string, unknown> | null }).resultJson;
+  return { ...result, resultJson: { ...(resultJson ?? {}), leftoverProcessSweep: sweep } };
+}
+
 export interface TerminalResultCleanupOptions {
   hasTerminalResult: (output: { stdout: string; stderr: string }) => boolean;
   graceMs?: number;

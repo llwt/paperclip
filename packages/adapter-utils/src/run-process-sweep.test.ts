@@ -7,7 +7,7 @@ import {
   sweepRunProcesses,
   type RunProcessSweepProcReader,
 } from "./run-process-sweep.js";
-import { runChildProcess } from "./server-utils.js";
+import { mergeLeftoverProcessSweeps, runChildProcess, withLeftoverProcessSweep } from "./server-utils.js";
 
 const RUN_ID = "11111111-2222-3333-4444-555555555555";
 const UID = 1000;
@@ -384,5 +384,48 @@ describe.skipIf(process.platform !== "linux")("runChildProcess leftover sweep (L
     });
     expect(result.exitCode).toBe(0);
     expect(result.leftoverProcessSweep).toBeUndefined();
+  });
+});
+
+describe("withLeftoverProcessSweep", () => {
+  const sweep = (pid: number, forceKilled = 0) => ({
+    kind: "leftover_process_sweep" as const,
+    stopped: 1,
+    forceKilled,
+    processes: [{ pid, command: `sleep ${pid}`, forceKilled: forceKilled > 0 }],
+  });
+
+  it("adds the sweep to resultJson and keeps the other fields", () => {
+    const result = withLeftoverProcessSweep(
+      { exitCode: 0, resultJson: { stdout: "done\n" } },
+      [{ leftoverProcessSweep: sweep(101) }],
+    );
+    expect(result).toEqual({
+      exitCode: 0,
+      resultJson: { stdout: "done\n", leftoverProcessSweep: sweep(101) },
+    });
+  });
+
+  it("creates resultJson for a result without one", () => {
+    const bare: { exitCode: number | null; resultJson?: Record<string, unknown> | null } = { exitCode: null };
+    const result = withLeftoverProcessSweep(bare, [{ leftoverProcessSweep: sweep(101) }]);
+    expect(result.resultJson).toEqual({ leftoverProcessSweep: sweep(101) });
+  });
+
+  it("merges the initial attempt and the retry", () => {
+    expect(
+      mergeLeftoverProcessSweeps([{ leftoverProcessSweep: sweep(101) }, { leftoverProcessSweep: sweep(202, 1) }]),
+    ).toEqual({
+      kind: "leftover_process_sweep",
+      stopped: 2,
+      forceKilled: 1,
+      processes: [...sweep(101).processes, ...sweep(202, 1).processes],
+    });
+  });
+
+  it("returns the same result when nothing was stopped", () => {
+    const original = { exitCode: 0, resultJson: { stdout: "" } };
+    const empty = { kind: "leftover_process_sweep" as const, stopped: 0, forceKilled: 0, processes: [] };
+    expect(withLeftoverProcessSweep(original, [null, { leftoverProcessSweep: empty }, {}])).toBe(original);
   });
 });
