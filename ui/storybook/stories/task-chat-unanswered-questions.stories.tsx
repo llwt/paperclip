@@ -11,16 +11,12 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-// Keep the test-drive story's dismissal preference across actual page reloads.
 export const TestDrive: Story = {};
 export const MovedOn: Story = { args: { movedOn: true } };
 export const MultipleUnanswered: Story = { args: { multiple: true } };
 export const AnsweredHistory: Story = { args: { answered: true } };
 export const Mobile: Story = { args: { movedOn: true }, globals: { viewport: { value: "mobile", isRotated: false } } };
 export const DismissAndAnswerLater: Story = {
-  beforeEach: () => {
-    localStorage.removeItem("paperclip:task-question-dismissals:user-board:task-unanswered-questions-demo");
-  },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await waitFor(() => expect(canvas.getByRole("radio", { name: "Green" })).toBeVisible());
@@ -28,8 +24,8 @@ export const DismissAndAnswerLater: Story = {
     await userEvent.click(canvas.getByRole("button", { name: /^Dismiss / }));
     await expect(canvas.getByTestId("task-chat-unanswered-question")).toBeVisible();
     await expect(canvas.queryByTestId("task-chat-composer-takeover")).not.toBeInTheDocument();
-    await expect(canvas.queryByTestId("task-chat-pending-input-indicator")).not.toBeInTheDocument();
-    await userEvent.click(canvas.getByTestId("task-chat-unanswered-question"));
+    await expect(canvas.getByTestId("task-chat-pending-input-indicator")).toHaveTextContent("1 pending");
+    await userEvent.click(canvas.getByTestId("task-chat-pending-input-indicator"));
     await expect(canvas.getByRole("radio", { name: "Green" })).toBeChecked();
     await userEvent.click(canvas.getByRole("button", { name: /^(Send|Submit) answers$/ }));
     await waitFor(() => expect(canvas.getByTestId("task-chat-answered-questions-receipt")).toBeVisible());
