@@ -12,7 +12,7 @@ import { createDb, companies, agents, heartbeatRuns, companyMemberships, connect
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { aiConnectionService } from "../services/ai-connections.js";
 import * as executionTarget from "@paperclipai/adapter-utils/execution-target";
-import { prepareManagedAiRuntime, assertManagedAiProjectAuth } from "../services/ai-connection-runtime.js";
+import { prepareManagedAiRuntime, assertManagedAiProjectAuth, managedAiSessionFingerprintConfig, managedAiToolEnvironment } from "../services/ai-connection-runtime.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { secretService } from "../services/secrets.js";
 import { aiConnectionBindingSchema, connectionPurposeTransportSchema, isAiConnectionCompatible } from "@paperclipai/shared";
@@ -354,6 +354,39 @@ describe("managed AI connections", () => {
     expect(ae.HOME).not.toBe(be.HOME); expect(a.identity).not.toBe(b.identity);
     expect(a.config.model).toBe("unchanged-model"); expect(config.env.ANTHROPIC_API_KEY).toBe("project-never-use");
     await Promise.all([a.cleanup(), b.cleanup()]); await expect(access(ae.HOME)).rejects.toThrow();
+  });
+  it("points every run home at one shared mise install dir outside the home", async () => {
+    const [a, b] = await Promise.all(["alice", "bob"].map(responsibleUserId => prepareManagedAiRuntime(db, { ...input, responsibleUserId, config: {} })));
+    try {
+      const ae = a.config.env as Record<string, string>, be = b.config.env as Record<string, string>;
+      const shared = path.join(home, "instances", "ai-connection-fixture", "runtime", "mise");
+      expect(ae.MISE_DATA_DIR).toBe(path.join(shared, "data"));
+      expect(ae.MISE_CACHE_DIR).toBe(path.join(shared, "cache"));
+      expect(ae.MISE_SHARED_INSTALL_DIRS).toBe(managedAiToolEnvironment().MISE_SHARED_INSTALL_DIRS);
+      for (const key of ["MISE_DATA_DIR", "MISE_CACHE_DIR", "MISE_SHARED_INSTALL_DIRS"]) expect(be[key]).toBe(ae[key]);
+      expect(path.relative(a.home!, ae.MISE_DATA_DIR).startsWith("..")).toBe(true);
+      await access(ae.MISE_DATA_DIR); await access(ae.MISE_CACHE_DIR);
+      expect(ae.XDG_DATA_HOME).toBe(path.join(a.home!, "data"));
+      // The shared values stay out of the session fingerprint.
+      expect((managedAiSessionFingerprintConfig(a.config, a.home).env as Record<string, unknown>).MISE_DATA_DIR).toBeUndefined();
+      // An agent's own mise setting wins.
+      const own = await prepareManagedAiRuntime(db, { ...input, responsibleUserId: "alice", config: { env: { MISE_DATA_DIR: "/agent/mise" } } });
+      try { expect((own.config.env as Record<string, string>).MISE_DATA_DIR).toBe("/agent/mise"); } finally { await own.cleanup(); }
+    } finally { await Promise.all([a.cleanup(), b.cleanup()]); }
+    expect(await access(path.join(home, "instances", "ai-connection-fixture", "runtime", "mise", "data")).then(() => true)).toBe(true);
+  });
+  it("reads the host user's mise installs without making them the write target", () => {
+    expect(managedAiToolEnvironment({ HOME: "/home/host" }, "/srv/pc")).toEqual({
+      MISE_DATA_DIR: "/srv/pc/runtime/mise/data",
+      MISE_CACHE_DIR: "/srv/pc/runtime/mise/cache",
+      MISE_SHARED_INSTALL_DIRS: "/home/host/.local/share/mise/installs",
+    });
+    expect(managedAiToolEnvironment({ HOME: "/home/host", XDG_DATA_HOME: "/xdg" }, "/srv/pc").MISE_SHARED_INSTALL_DIRS).toBe("/xdg/mise/installs");
+    expect(managedAiToolEnvironment({
+      HOME: "/home/host",
+      MISE_DATA_DIR: "/opt/mise",
+      MISE_SHARED_INSTALL_DIRS: ["/team/installs", "rel", "/srv/pc/runtime/mise/data/installs", "/team/installs/"].join(path.delimiter),
+    }, "/srv/pc").MISE_SHARED_INSTALL_DIRS).toBe(["/team/installs", "/opt/mise/installs"].join(path.delimiter));
   });
   it("blocks missing identity, incompatible providers, and cross-company explicit selections", async () => {
     await expect(service.select({ ...input, userId: null })).rejects.toThrow("responsible user");
