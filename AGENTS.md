@@ -143,7 +143,7 @@ pnpm db:generate
 4. Validate compile:
 
 ```sh
-pnpm -r typecheck
+pnpm typecheck
 ```
 
 Notes:
@@ -178,7 +178,7 @@ For normal issue work, run the smallest relevant verification first. Do not defa
 Run this full check before claiming repo work done in a PR-ready hand-off, or when the change scope is broad enough that targeted checks are not sufficient:
 
 ```sh
-pnpm -r typecheck
+pnpm typecheck
 pnpm test:run
 pnpm build
 ```

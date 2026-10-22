@@ -53,17 +53,20 @@ describe("typecheck wrapper", () => {
     expect(typecheckArgs(env)).toEqual(expected);
   });
 
-  it.skipIf(process.platform === "win32")("passes arguments and the child's exit status through", () => {
+  it.skipIf(process.platform === "win32").each([undefined, "4"])("passes arguments, Cargo jobs (%s), and the child's exit status through", (jobs) => {
     const dir = mkdtempSync(path.join(tmpdir(), "agent-typecheck-"));
     try {
       const command = path.join(dir, "pnpm");
-      writeFileSync(command, '#!/bin/sh\nprintf "%s\\n" "$@"\nexit 7\n');
+      writeFileSync(command, '#!/bin/sh\nprintf "%s\\n" "$@"\nprintf "jobs=%s\\n" "$CARGO_BUILD_JOBS"\nexit 7\n');
       chmodSync(command, 0o755);
+      const env = { ...process.env, PATH: dir, PAPERCLIP_RUN_ID: "test", CI: "false", PAPERCLIP_TEST_MAX_WORKERS: "2" };
+      if (jobs === undefined) delete env.CARGO_BUILD_JOBS;
+      else env.CARGO_BUILD_JOBS = jobs;
       const result = spawnSync(process.execPath, [path.join(root, "scripts/run-typecheck.mjs"), "--filter=example"], {
         encoding: "utf8",
-        env: { ...process.env, PATH: dir, PAPERCLIP_RUN_ID: "test", CI: "false", PAPERCLIP_TEST_MAX_WORKERS: "2" },
+        env,
       });
-      expect(result.stdout.trim().split("\n")).toEqual(["-r", "--workspace-concurrency=2", "typecheck", "--filter=example"]);
+      expect(result.stdout.trim().split("\n")).toEqual(["-r", "--workspace-concurrency=2", "typecheck", "--filter=example", `jobs=${jobs ?? "2"}`]);
       expect(result.status).toBe(7);
     } finally {
       rmSync(dir, { recursive: true, force: true });
