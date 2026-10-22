@@ -261,12 +261,11 @@ export async function stopIssueExecutionForOwnershipChange(
   };
   // A retry of a refused reassignment finds no active run, or a newer run it
   // stops itself. It must still see every unverified stop of earlier attempts:
-  // the commit releases all of them.
-  const verifyPendingStops = async (receipt: StopReceipt): Promise<StopReceipt> => {
-    const verifiedHere = receipt.kind === "stopped" ? receipt.interruptedRunId : null;
+  // the commit releases all of them. Runs verified in this request are skipped.
+  const verifyPendingStops = async (receipt: StopReceipt, verifiedHere: Set<string>): Promise<StopReceipt> => {
     const overrides: Array<UnverifiedStopOverride | null> = [];
     for (const pending of await findPendingReassignmentStops(deps.db, expectation)) {
-      if (pending.id === verifiedHere) continue;
+      if (verifiedHere.has(pending.id)) continue;
       overrides.push(assertStopVerified(await verifyOwnershipStop(deps.db, pending), pending.id, {
         acceptUnverifiedStop,
         earlierAttempt: true,
@@ -274,10 +273,26 @@ export async function stopIssueExecutionForOwnershipChange(
     }
     return withOverrides(receipt, overrides);
   };
+  // The run an interrupt stopped in this request is verified on its own: a
+  // second active run of the old owner must not take its place in the
+  // receipt. Verified before any other run is looked up, so a refusal leaves
+  // it pending. If it still shows as live, the active-run stop below handles
+  // it; when that stop picks another run, it is verified after all.
+  const interruptedRun = input.interruptedRunId ? await deps.heartbeat.getRun(input.interruptedRunId) : null;
+  const interruptedStillLive = interruptedRun !== null &&
+    interruptedRun.status !== "cancelled" && !TERMINAL_RUN_STATUSES.has(interruptedRun.status);
+  let earlier: StopReceipt = input.interruptedRunId && !interruptedStillLive
+    ? await verifyEarlierStop(input.interruptedRunId)
+    : { kind: "none" };
+  const verifiedHere = new Set<string>(earlier.kind === "stopped" ? [earlier.interruptedRunId] : []);
+  const verifyLiveInterruptedRun = async (stoppedRunId: string | null) => {
+    if (!interruptedStillLive || input.interruptedRunId === stoppedRunId) return;
+    earlier = await verifyEarlierStop(input.interruptedRunId!);
+    verifiedHere.add(input.interruptedRunId!);
+  };
   if (!expectation.assigneeAgentId) {
-    return verifyPendingStops(
-      input.interruptedRunId ? await verifyEarlierStop(input.interruptedRunId) : { kind: "none" },
-    );
+    await verifyLiveInterruptedRun(null);
+    return verifyPendingStops(earlier, verifiedHere);
   }
   await deps.stopRunnerGoal({
     companyId: expectation.companyId,
@@ -285,10 +300,9 @@ export async function stopIssueExecutionForOwnershipChange(
     agentId: expectation.assigneeAgentId,
   });
   const runToStop = await deps.resolveActiveRun(expectation);
-  if (!runToStop) {
-    return verifyPendingStops(
-      input.interruptedRunId ? await verifyEarlierStop(input.interruptedRunId) : { kind: "none" },
-    );
+  if (!runToStop || verifiedHere.has(runToStop.id)) {
+    await verifyLiveInterruptedRun(null);
+    return verifyPendingStops(earlier, verifiedHere);
   }
   const cancelled = await deps.heartbeat.cancelRun(runToStop.id, "Cancelled before issue reassignment", {
     errorCode: "issue_reassigned",
@@ -307,8 +321,15 @@ export async function stopIssueExecutionForOwnershipChange(
     });
   }
   const override = assertStopVerified(await verifyOwnershipStop(deps.db, cancelled), cancelled.id, { acceptUnverifiedStop });
+  verifiedHere.add(cancelled.id);
+  await verifyLiveInterruptedRun(cancelled.id);
+  // The receipt names the newest stopped run; the earlier one keeps its overrides.
   return verifyPendingStops(
-    withOverrides({ kind: "stopped", interruptedRunId: cancelled.id, issueMutationStopId }, [override]),
+    withOverrides(
+      { kind: "stopped", interruptedRunId: cancelled.id, issueMutationStopId, unverifiedStopOverrides: earlier.unverifiedStopOverrides },
+      [override],
+    ),
+    verifiedHere,
   );
 }
 

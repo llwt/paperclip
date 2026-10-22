@@ -914,7 +914,7 @@ describeEmbeddedPostgres("issue reassignment execution safety", () => {
   // reassignment (for example a recovery run). The retry stops and verifies
   // that newer run; it must still refuse on the older, unverified stop,
   // because the commit releases every pending stop.
-  async function startNewerRun(input: { companyId: string; ownerAgentId: string; issueId: string; tracked: boolean }) {
+  async function startNewerRun(input: { companyId: string; ownerAgentId: string; issueId: string; tracked: boolean; takeLock?: boolean }) {
     const newerRunId = randomUUID();
     await db.insert(heartbeatRuns).values({
       id: newerRunId,
@@ -927,9 +927,11 @@ describeEmbeddedPostgres("issue reassignment execution safety", () => {
       runtimeModeResolvedAt: new Date(),
       contextSnapshot: { issueId: input.issueId, taskId: input.issueId, wakeReason: "issue_assigned" },
     });
-    await db.update(issues)
-      .set({ executionRunId: newerRunId, executionAgentNameKey: "owner", executionLockedAt: new Date() })
-      .where(eq(issues.id, input.issueId));
+    if (input.takeLock !== false) {
+      await db.update(issues)
+        .set({ executionRunId: newerRunId, executionAgentNameKey: "owner", executionLockedAt: new Date() })
+        .where(eq(issues.id, input.issueId));
+    }
     if (input.tracked) {
       const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
       children.push(child);
@@ -1028,6 +1030,76 @@ describeEmbeddedPostgres("issue reassignment execution safety", () => {
         expect(parseResult((await readRun(id)).resultJson).reassignmentPendingIssueId ?? null).toBeNull();
       }
       await expect.poll(() => wakesFor(successorAgentId)).toEqual(successorWake(via));
+      expect(await wakesFor(ownerAgentId)).toEqual([]);
+    });
+  });
+
+  // The interrupt of a combined handoff cancels run R1 before the shared step
+  // looks up the old owner's active run. When that lookup finds a second run
+  // R2 (already running, or admitted in this same request), R1 must still be
+  // verified on its own: stopping R2 does not prove R1 stopped.
+  describe.each(["already running", "admitted in this request"] as const)("with a second old-owner run %s during an interrupting handoff", (when) => {
+    async function patchWithSecondRun(input: { r1: "untracked" | "tracked"; remoteLease: boolean; r2Tracked: boolean }) {
+      const seeded = await seed({ liveRun: input.r1 });
+      const { companyId, ownerAgentId, successorAgentId, issueId, runId } = seeded;
+      if (input.remoteLease) await addRemoteLease(companyId, issueId, runId);
+      let secondRunId: string | null = null;
+      let routeDb: typeof db = db;
+      if (when === "already running") {
+        secondRunId = await startNewerRun({ companyId, ownerAgentId, issueId, tracked: input.r2Tracked, takeLock: false });
+      } else {
+        routeDb = dbInjectingAfter(
+          async () => (await readRun(runId)).status === "cancelled",
+          async () => {
+            secondRunId = await startNewerRun({ companyId, ownerAgentId, issueId, tracked: input.r2Tracked });
+          },
+        );
+      }
+      const res = await request(createApp(companyId, undefined, routeDb))
+        .patch(`/api/issues/${issueId}`)
+        .send(interruptHandoff(successorAgentId));
+      expect(secondRunId).not.toBeNull();
+      return { ...seeded, res, secondRunId: secondRunId! };
+    }
+
+    it.each(["run_stop_unacknowledged", "run_stop_uncertain"] as const)("refuses with %s for the interrupted run and changes nothing", async (code) => {
+      const { res, ownerAgentId, successorAgentId, issueId, runId } = await patchWithSecondRun({
+        r1: code === "run_stop_uncertain" ? "tracked" : "untracked",
+        remoteLease: code === "run_stop_uncertain",
+        r2Tracked: true,
+      });
+
+      expect(res.status).toBe(409);
+      expect(res.body.details).toMatchObject({ code, runId });
+      expect(await readIssue(issueId)).toMatchObject({ assigneeAgentId: ownerAgentId, status: "in_progress", statusVersion: 0 });
+      const first = await readRun(runId);
+      expect(first).toMatchObject({
+        status: "cancelled",
+        errorCode: "operator_interrupted",
+        resultJson: expect.objectContaining({ reassignmentPendingIssueId: issueId }),
+      });
+      expect(await verifyOwnershipStop(db, first, { verificationTimeoutMs: 0 }))
+        .toBe(code === "run_stop_uncertain" ? "uncertain" : "unacknowledged");
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(await wakesFor(successorAgentId)).toEqual([]);
+    });
+
+    it("commits when both the interrupted run and the second run acknowledged their stop", async () => {
+      const { res, ownerAgentId, successorAgentId, issueId, runId, secondRunId } = await patchWithSecondRun({
+        r1: "tracked",
+        remoteLease: false,
+        r2Tracked: true,
+      });
+
+      expect(res.status).toBe(200);
+      expect((await readIssue(issueId)).assigneeAgentId).toBe(successorAgentId);
+      for (const id of [runId, secondRunId]) {
+        const run = await readRun(id);
+        expect(run.status).toBe("cancelled");
+        expect(await verifyOwnershipStop(db, run, { verificationTimeoutMs: 0 })).toBe("stopped");
+        expect(parseResult(run.resultJson).reassignmentPendingIssueId ?? null).toBeNull();
+      }
+      await expect.poll(async () => (await wakesFor(successorAgentId)).length).toBe(1);
       expect(await wakesFor(ownerAgentId)).toEqual([]);
     });
   });
