@@ -12,7 +12,7 @@ import { createDb, companies, agents, heartbeatRuns, companyMemberships, connect
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { aiConnectionService } from "../services/ai-connections.js";
 import * as executionTarget from "@paperclipai/adapter-utils/execution-target";
-import { prepareManagedAiRuntime, assertManagedAiProjectAuth } from "../services/ai-connection-runtime.js";
+import { prepareManagedAiRuntime, assertManagedAiProjectAuth, managedAiSessionFingerprintConfig, managedAiToolEnvironment } from "../services/ai-connection-runtime.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { secretService } from "../services/secrets.js";
 import { aiConnectionBindingSchema, connectionPurposeTransportSchema, isAiConnectionCompatible } from "@paperclipai/shared";
@@ -354,6 +354,82 @@ describe("managed AI connections", () => {
     expect(ae.HOME).not.toBe(be.HOME); expect(a.identity).not.toBe(b.identity);
     expect(a.config.model).toBe("unchanged-model"); expect(config.env.ANTHROPIC_API_KEY).toBe("project-never-use");
     await Promise.all([a.cleanup(), b.cleanup()]); await expect(access(ae.HOME)).rejects.toThrow();
+  });
+  it("points every run home at one shared mise install dir outside the home", async () => {
+    const [a, b] = await Promise.all(["alice", "bob"].map(responsibleUserId => prepareManagedAiRuntime(db, { ...input, responsibleUserId, config: {} })));
+    try {
+      const ae = a.config.env as Record<string, string>, be = b.config.env as Record<string, string>;
+      const shared = path.join(home, "instances", "ai-connection-fixture", "runtime", "mise");
+      expect(ae.MISE_DATA_DIR).toBe(path.join(shared, "data"));
+      expect(ae.MISE_CACHE_DIR).toBe(path.join(shared, "cache"));
+      expect(ae.MISE_SHARED_INSTALL_DIRS).toBe(managedAiToolEnvironment().MISE_SHARED_INSTALL_DIRS);
+      for (const key of ["MISE_DATA_DIR", "MISE_CACHE_DIR", "MISE_SHARED_INSTALL_DIRS"]) expect(be[key]).toBe(ae[key]);
+      expect(path.relative(a.home!, ae.MISE_DATA_DIR).startsWith("..")).toBe(true);
+      await access(ae.MISE_DATA_DIR); await access(ae.MISE_CACHE_DIR);
+      expect(ae.XDG_DATA_HOME).toBe(path.join(a.home!, "data"));
+      // The shared values stay out of the session fingerprint.
+      expect((managedAiSessionFingerprintConfig(a.config, a.home).env as Record<string, unknown>).MISE_DATA_DIR).toBeUndefined();
+      // An agent's own mise setting wins.
+      const own = await prepareManagedAiRuntime(db, { ...input, responsibleUserId: "alice", config: { env: { MISE_DATA_DIR: "/agent/mise" } } });
+      try { expect((own.config.env as Record<string, string>).MISE_DATA_DIR).toBe("/agent/mise"); } finally { await own.cleanup(); }
+    } finally { await Promise.all([a.cleanup(), b.cleanup()]); }
+    expect(await access(path.join(home, "instances", "ai-connection-fixture", "runtime", "mise", "data")).then(() => true)).toBe(true);
+  });
+  it("reads the host user's mise installs without making them the write target", () => {
+    expect(managedAiToolEnvironment({ HOME: "/home/host" }, "/srv/pc")).toEqual({
+      npm_config_store_dir: "/srv/pc/runtime/pnpm/store",
+      pnpm_config_store_dir: "/srv/pc/runtime/pnpm/store",
+      RUSTUP_HOME: "/srv/pc/runtime/rustup",
+      CARGO_HOME: "/srv/pc/runtime/cargo",
+      MISE_DATA_DIR: "/srv/pc/runtime/mise/data",
+      MISE_CACHE_DIR: "/srv/pc/runtime/mise/cache",
+      MISE_SHARED_INSTALL_DIRS: "/home/host/.local/share/mise/installs",
+    });
+    expect(managedAiToolEnvironment({ HOME: "/home/host", XDG_DATA_HOME: "/xdg" }, "/srv/pc").MISE_SHARED_INSTALL_DIRS).toBe("/xdg/mise/installs");
+    expect(managedAiToolEnvironment({
+      HOME: "/home/host",
+      MISE_DATA_DIR: "/opt/mise",
+      MISE_SHARED_INSTALL_DIRS: ["/team/installs", "rel", "/srv/pc/runtime/mise/data/installs", "/team/installs/"].join(path.delimiter),
+    }, "/srv/pc").MISE_SHARED_INSTALL_DIRS).toBe(["/team/installs", "/opt/mise/installs"].join(path.delimiter));
+  });
+  it("shares pnpm and Rust directories across homes and retains agent overrides", async () => {
+    const keys = ["npm_config_store_dir", "pnpm_config_store_dir", "RUSTUP_HOME", "CARGO_HOME"];
+    const shared = path.join(home, "instances", "ai-connection-fixture", "runtime");
+    const defaults = {
+      npm_config_store_dir: path.join(shared, "pnpm", "store"),
+      pnpm_config_store_dir: path.join(shared, "pnpm", "store"),
+      RUSTUP_HOME: path.join(shared, "rustup"),
+      CARGO_HOME: path.join(shared, "cargo"),
+    };
+    const overrides = { npm_config_store_dir: "/agent/pnpm", pnpm_config_store_dir: "/agent/pnpm11", RUSTUP_HOME: "/agent/rustup", CARGO_HOME: "/agent/cargo" };
+    const runs = await Promise.all([{}, {}, overrides].map(env => prepareManagedAiRuntime(db, {
+      ...input, responsibleUserId: "alice", config: { env },
+    })));
+    try {
+      const [a, b, own] = runs;
+      const ae = a.config.env as Record<string, string>;
+      const be = b.config.env as Record<string, string>;
+      const ownEnv = own.config.env as Record<string, string>;
+      expect(a.home).not.toBe(b.home);
+      for (const [key, value] of Object.entries(defaults)) {
+        expect(ae[key]).toBe(value);
+        expect(be[key]).toBe(value);
+        expect(ownEnv[key]).toBe(overrides[key as keyof typeof overrides]);
+        await access(value);
+        expect(path.relative(a.home!, value).startsWith("..")).toBe(true);
+      }
+      // Adding the defaults leaves the normalized config of an existing session unchanged.
+      const beforeEnv = { ...ae };
+      for (const key of keys) delete beforeEnv[key];
+      expect(managedAiSessionFingerprintConfig(a.config, a.home)).toEqual(
+        managedAiSessionFingerprintConfig({ ...a.config, env: beforeEnv }, a.home),
+      );
+      expect(managedAiSessionFingerprintConfig(a.config, a.home)).toEqual(managedAiSessionFingerprintConfig(b.config, b.home));
+      expect(managedAiSessionFingerprintConfig(own.config, own.home).env).toMatchObject(overrides);
+      await expect(access(path.join(a.home!, "data", "pnpm"))).rejects.toThrow();
+      await expect(access(path.join(a.home!, ".rustup"))).rejects.toThrow();
+    } finally { await Promise.all(runs.map(run => run.cleanup())); }
+    for (const value of Object.values(defaults)) await access(value);
   });
   it("blocks missing identity, incompatible providers, and cross-company explicit selections", async () => {
     await expect(service.select({ ...input, userId: null })).rejects.toThrow("responsible user");

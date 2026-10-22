@@ -2136,6 +2136,13 @@
       "when": 1792487416034,
       "tag": "0306_heartbeat_context_paperclip_issue_index",
       "breakpoints": true
+    },
+    {
+      "idx": 307,
+      "version": "7",
+      "when": 1792678040544,
+      "tag": "0307_activity_log_source_issue_index",
+      "breakpoints": true
     }
   ]
 }

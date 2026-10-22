@@ -42,7 +42,10 @@ const DIRECT_ADAPTER_TYPES = [
   "http",
   "custom_plugin",
 ] as const;
-const editorCallbacks = vi.hoisted(() => ({ change: (_value: string) => {} }));
+const editorCallbacks = vi.hoisted(() => ({
+  change: (_value: string) => {},
+  byNode: new WeakMap<Element, (value: string) => void>(),
+}));
 const streamlinedState = vi.hoisted(() => ({ enabled: true }));
 
 vi.mock("@/components/transcript/useLiveRunTranscripts", () => ({
@@ -101,7 +104,11 @@ vi.mock("@/components/MarkdownEditor", () => ({
       focus: () => {},
     }));
     editorCallbacks.change = onChange;
-    return <div data-testid="mock-editor">{value}</div>;
+    return (
+      <div data-testid="mock-editor" ref={node => { if (node) editorCallbacks.byNode.set(node, onChange); }}>
+        {value}
+      </div>
+    );
   }),
 }));
 
@@ -3176,10 +3183,13 @@ describe.each([true, false])("Unanswered question history (conversationMode=%s)"
     await act(async () => button!.click());
   };
 
+  // Fork (SX-1581): a pending question stays counted and reachable from the
+  // composer after a dismissal or a later message. It still does not reopen
+  // the takeover by itself.
   it("leaves a compact, reopenable question on reload after moving on", async () => {
     render(<TaskChatThread {...props} comments={movedOn} interactions={[old]} />);
     expect(takeover()).toBeNull();
-    expect(pendingIndicator()).toBeNull();
+    expect(pendingIndicator()?.textContent).toContain("1 pending input");
     const row = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-unanswered-question"]');
     expect(row?.textContent).toContain("Which color?");
     await act(async () => row!.click());
@@ -3194,49 +3204,59 @@ describe.each([true, false])("Unanswered question history (conversationMode=%s)"
     expect(takeover()).not.toBeNull();
     await act(async () => render(<TaskChatThread {...props} comments={movedOn} interactions={[old]} />));
     expect(takeover()).toBeNull();
-    expect(pendingIndicator()).toBeNull();
+    expect(pendingIndicator()?.textContent).toContain("1 pending input");
     expect(container.querySelector('[data-testid="task-chat-unanswered-question"]')).not.toBeNull();
+    await act(async () => pendingIndicator()!.click());
+    expect(takeover()?.textContent).toContain("Which color?");
   });
 
-  it.each(["Cancel", "dismiss"])("leaves only the history card after %s on a fresh question", async action => {
+  it.each(["Cancel", "dismiss"])("keeps a fresh question reachable from the composer and history after %s", async action => {
     render(<TaskChatThread {...props} comments={[]} interactions={[old]} />);
     await click("Yes");
     if (action === "Cancel") await click("Cancel");
     else await dismiss();
     expect(takeover()).toBeNull();
-    expect(pendingIndicator()).toBeNull();
+    expect(pendingIndicator()?.textContent).toContain("1 pending input");
+    await act(async () => pendingIndicator()!.click());
+    expect(takeover()?.querySelector('[role="radio"][aria-checked="true"]')?.textContent).toContain("Yes");
+    await dismiss();
     await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Answer question: Which color?"]')!.click());
     expect(takeover()?.querySelector('[role="radio"][aria-checked="true"]')?.textContent).toContain("Yes");
   });
 
-  it("keeps multiple historical questions out of the composer after reopening and dismissing one", async () => {
+  it("keeps multiple historical questions counted in the composer after reopening and dismissing one", async () => {
     const anotherOld = questionInteraction("another-old", "Which format?", "2026-08-15T12:00:02Z");
     render(<TaskChatThread {...props} comments={movedOn} interactions={[old, anotherOld]} />);
     expect(container.querySelectorAll('[data-testid="task-chat-unanswered-question"]')).toHaveLength(2);
-    expect(pendingIndicator()).toBeNull();
+    expect(takeover()).toBeNull();
+    expect(pendingIndicator()?.textContent).toContain("2 pending inputs");
     await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Answer question: Which color?"]')!.click());
     expect(takeover()?.textContent).toContain("Which color?");
-    expect(takeover()?.textContent).not.toContain("2 pending");
+    await click("2 pending");
+    expect(takeover()?.textContent).toContain("Which format?");
     await dismiss();
     expect(takeover()).toBeNull();
-    expect(pendingIndicator()).toBeNull();
+    expect(pendingIndicator()?.textContent).toContain("2 pending inputs");
   });
 
-  it("counts and cycles approvals without including fresh or historical question cards", async () => {
+  it("counts and cycles approvals together with fresh and historical question cards", async () => {
     const approval = { ...planReviewInteraction(), id: "approval", title: "Approve the outline?", payload: { version: 1, prompt: "Approve the outline?" } } as IssueThreadInteraction;
     const nextApproval = { ...approval, id: "next-approval", title: "Approve the note?", createdAt: new Date("2026-08-23T10:02:00Z"), payload: { version: 1, prompt: "Approve the note?" } } as IssueThreadInteraction;
     render(<TaskChatThread {...props} comments={movedOn} interactions={[old, newer, approval, nextApproval]} />);
     expect(takeover()?.textContent).toContain("Approve the note?");
-    await click("2 pending");
+    await click("4 pending");
     expect(takeover()?.textContent).toContain("Approve the outline?");
-    await click("2 pending");
+    await click("4 pending");
+    expect(takeover()?.textContent).toContain("Which tone?");
+    await click("4 pending");
+    expect(takeover()?.textContent).toContain("Which color?");
+    await click("4 pending");
     expect(takeover()?.textContent).toContain("Approve the note?");
     await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Answer question: Which color?"]')!.click());
     expect(takeover()?.textContent).toContain("Which color?");
-    expect(takeover()?.textContent).toContain("2 pending");
-    expect(takeover()?.textContent).not.toContain("3 pending");
+    expect(takeover()?.textContent).toContain("4 pending");
     await dismiss();
-    expect(pendingIndicator()?.textContent).toContain("2 pending inputs");
+    expect(pendingIndicator()?.textContent).toContain("4 pending inputs");
     await act(async () => pendingIndicator()!.click());
     expect(takeover()?.textContent).toContain("Approve the note?");
   });
@@ -3248,11 +3268,16 @@ describe.each([true, false])("Unanswered question history (conversationMode=%s)"
     const oldRow = container.querySelector<HTMLButtonElement>('[aria-label="Answer question: Which color?"]');
     await act(async () => oldRow!.click());
     expect(takeover()?.textContent).toContain("Which color?");
-    expect(takeover()?.textContent).not.toContain("2 pending");
+    expect(takeover()?.textContent).toContain("2 pending");
     render(<TaskChatThread {...props} comments={[...movedOn]} interactions={[nativeOld, newer]} />);
     expect(takeover()?.textContent).toContain("Which color?");
     await dismiss();
-    expect(pendingIndicator()).toBeNull();
+    expect(pendingIndicator()?.textContent).toContain("2 pending inputs");
+    await act(async () => pendingIndicator()!.click());
+    expect(takeover()?.textContent).toContain("Which tone?");
+    await click("2 pending");
+    expect(takeover()?.textContent).toContain("Which color?");
+    await dismiss();
     await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Answer question: Which tone?"]')!.click());
     expect(takeover()?.textContent).toContain("Which tone?");
   });
@@ -3268,7 +3293,7 @@ describe.each([true, false])("Unanswered question history (conversationMode=%s)"
     expect(onAdd).toHaveBeenCalledTimes(1);
     if (success) {
       expect(takeover()).toBeNull();
-      expect(pendingIndicator()).toBeNull();
+      expect(pendingIndicator()?.textContent).toContain("1 pending input");
       await act(async () => container.querySelector<HTMLButtonElement>('[data-testid="task-chat-unanswered-question"]')!.click());
     }
     expect(takeover()).not.toBeNull();
@@ -3286,7 +3311,7 @@ describe.each([true, false])("Unanswered question history (conversationMode=%s)"
     root = createRoot(container);
     show();
     expect(takeover()).toBeNull();
-    expect(pendingIndicator()).toBeNull();
+    expect(pendingIndicator()?.textContent).toContain("1 pending input");
     await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Answer question: Which color?"]')!.click());
     expect(takeover()?.querySelector('[role="radio"][aria-checked="true"]')?.textContent).toContain("Yes");
   });
@@ -3297,6 +3322,7 @@ describe.each([true, false])("Unanswered question history (conversationMode=%s)"
     await act(async () => render(<TaskChatThread {...props} comments={[]} interactions={[old, newer]} />));
     expect(takeover()?.textContent).toContain("Which tone?");
     expect(takeover()?.textContent).not.toContain("Which color?");
+    expect(takeover()?.textContent).toContain("2 pending");
     expect(container.querySelectorAll('[data-testid="task-chat-unanswered-question"]')).toHaveLength(2);
   });
 
@@ -3309,8 +3335,93 @@ describe.each([true, false])("Unanswered question history (conversationMode=%s)"
     root = createRoot(container);
     render(<TaskChatThread {...props} comments={[]} interactions={[old, newer]} />);
     expect(takeover()).toBeNull();
-    expect(pendingIndicator()).toBeNull();
+    expect(pendingIndicator()?.textContent).toContain("2 pending inputs");
     expect(container.querySelectorAll('[data-testid="task-chat-unanswered-question"]')).toHaveLength(2);
+  });
+
+  it("does not reopen a dismissed question by itself on later renders", async () => {
+    render(<TaskChatThread {...props} comments={[]} interactions={[old]} />);
+    await dismiss();
+    await act(async () => render(<TaskChatThread {...props} comments={[]} interactions={[{ ...old }]} />));
+    await act(async () => render(<TaskChatThread {...props} comments={movedOn} interactions={[{ ...old }]} />));
+    expect(takeover()).toBeNull();
+    expect(pendingIndicator()?.textContent).toContain("1 pending input");
+  });
+
+  it("does not count answered, cancelled, expired or degenerate questions", async () => {
+    const resolved = (["answered", "cancelled", "expired"] as const).map(status =>
+      ({ ...questionInteraction(`q-${status}`, `Question ${status}?`, "2026-08-15T12:10:00Z"), status }) as IssueThreadInteraction);
+    const degenerate = { ...questionInteraction("q-degenerate", "Blank?", "2026-08-15T12:11:00Z"), payload: { version: 1, questions: [] } } as IssueThreadInteraction;
+    render(<TaskChatThread {...props} comments={[]} interactions={[...resolved, degenerate, old]} />);
+    expect(takeover()?.textContent).toContain("Which color?");
+    expect(takeover()?.textContent).not.toContain("pending");
+    await dismiss();
+    expect(pendingIndicator()?.textContent).toContain("1 pending input");
+  });
+
+  it("reaches and answers a confirmation and a question posted by the same run (SX-1460 shape)", async () => {
+    const confirmation = {
+      ...planReviewInteraction("pending", "revision-2", "run-same"),
+      id: "confirm-same",
+      title: "Approve the route?",
+      createdAt: new Date("2026-08-15T12:10:00.000Z"),
+      payload: { version: 1, prompt: "Approve the route?", acceptLabel: "Approve", rejectLabel: "Request changes" },
+    } as IssueThreadInteraction;
+    const question = {
+      ...questionInteraction("question-same", "Which route?", "2026-08-15T12:10:00.100Z"),
+      sourceRunId: "run-same",
+      title: "Copy of the set",
+      payload: {
+        version: 1,
+        supersedeOnUserComment: false,
+        questions: [
+          {
+            id: "route",
+            prompt: "Which route?",
+            selectionMode: "single",
+            required: true,
+            allowOther: true,
+            options: [{ id: "a", label: "Route A" }, { id: "b", label: "Route B" }],
+          },
+          {
+            id: "directory",
+            prompt: "Which folder?",
+            selectionMode: "single",
+            required: true,
+            options: [{ id: "path", label: "I'll type the path", freeText: true }],
+          },
+        ],
+      },
+    } as IssueThreadInteraction;
+    const onAcceptInteraction = vi.fn(async () => {});
+    const onSubmitInteractionAnswers = vi.fn(async () => {});
+    const shown = { ...props, onAcceptInteraction, onRejectInteraction: async () => {}, onSubmitInteractionAnswers };
+    render(<TaskChatThread {...shown} comments={[]} interactions={[confirmation, question]} />);
+    expect(takeover()?.textContent).toContain("Which route?");
+    expect(takeover()?.textContent).toContain("2 pending");
+    await dismiss();
+    expect(pendingIndicator()?.textContent).toContain("2 pending inputs");
+    await act(async () => pendingIndicator()!.click());
+    expect(takeover()?.textContent).toContain("Approve the route?");
+    await click("Approve");
+    expect(onAcceptInteraction).toHaveBeenCalledWith(confirmation);
+    await act(async () => render(<TaskChatThread {...shown} comments={[]} interactions={[{ ...confirmation, status: "accepted" }, question]} />));
+    expect(takeover()).toBeNull();
+    expect(pendingIndicator()?.textContent).toContain("1 pending input");
+    await act(async () => pendingIndicator()!.click());
+    expect(takeover()?.textContent).toContain("Which route?");
+    await click("Route B");
+    await click("Next");
+    expect(takeover()?.textContent).toContain("Which folder?");
+    await click("I'll type the path");
+    const pathEditor = takeover()!.querySelector('[data-testid="question-other-answer-composer"] [data-testid="mock-editor"]');
+    expect(pathEditor).toBeTruthy();
+    await act(async () => editorCallbacks.byNode.get(pathEditor!)!("My Drive/Taxes/2025"));
+    await click("Submit answers");
+    expect(onSubmitInteractionAnswers).toHaveBeenCalledWith(question, [
+      { questionId: "route", optionIds: ["b"] },
+      { questionId: "directory", optionIds: [], otherText: "My Drive/Taxes/2025" },
+    ]);
   });
 
   it("scopes dismissal to the person and task", async () => {

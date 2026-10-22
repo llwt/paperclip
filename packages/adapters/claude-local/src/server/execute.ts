@@ -62,10 +62,13 @@ import {
   parseLocalProcessNetworkAllowlist,
   parseLocalProcessNetworkScope,
   managedAiSessionStateMounts,
+  miseToolInstallMounts,
+  sharedToolCacheMounts,
   type LocalProcessSandboxOptions,
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import {
   claudeModelUsageTotals,
+  claudeResultUsageTotals,
   parseClaudeStreamJson,
   describeClaudeFailure,
   detectClaudeLoginRequired,
@@ -580,6 +583,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             { path: promptBundle.addDir, access: "ro" },
             { path: localMcpConfigDir, access: "ro" },
             ...(config.managedAiConnection ? await managedAiSessionStateMounts(sharedClaudeConfigDir) : []),
+            ...(await miseToolInstallMounts(effectiveEnv)),
+            ...sharedToolCacheMounts(effectiveEnv),
           ],
           extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
           homeDir: filesystemScope ? path.dirname(sharedClaudeConfigDir) : null,
@@ -1147,18 +1152,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const usage =
       parsedStream.usage ??
       fallbackModelUsageTotals ??
-      (() => {
-        const usageObj = parseObject(parsed.usage);
-        return {
-          inputTokens: asNumber(usageObj.input_tokens, 0),
-          cachedInputTokens: asNumber(usageObj.cache_read_input_tokens, 0),
-          outputTokens: asNumber(usageObj.output_tokens, 0),
-        };
-      })();
+      claudeResultUsageTotals(parsed.usage);
     const usageBasis = parsedStream.usage
       ? parsedStream.usageBasis
       : fallbackModelUsageTotals
-      ? ("per_run" as const)
+      ? ("session_cumulative" as const)
+      : null;
+    const invocationUsage = parsedStream.usage
+      ? parsedStream.invocationUsage
+      : fallbackModelUsageTotals
+      ? claudeResultUsageTotals(parsed.usage)
       : null;
 
     const rawResolvedSessionId =
@@ -1289,6 +1292,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       errorMeta,
       usage,
       ...(usageBasis ? { usageBasis } : {}),
+      ...(parsedStream.costBasis ? { costBasis: parsedStream.costBasis } : {}),
+      ...(invocationUsage ? { invocationUsage } : {}),
       sessionId: resolvedSessionId,
       sessionParams: resolvedSessionParams,
       sessionDisplayId: resolvedSessionId,
