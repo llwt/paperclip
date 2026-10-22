@@ -54,6 +54,21 @@ export function claudeModelUsageTotals(modelUsage: unknown): UsageSummary | null
   return { inputTokens, outputTokens, cachedInputTokens };
 }
 
+/**
+ * Usage from a result event's top-level `usage` block (this invocation's main
+ * loop only). Counted like claudeModelUsageTotals, cache writes as input, so
+ * the server can add it to a modelUsage baseline without mixing definitions.
+ */
+export function claudeResultUsageTotals(usage: unknown): UsageSummary {
+  const usageObj = parseObject(usage);
+  return {
+    inputTokens:
+      asNumber(usageObj.input_tokens, 0) + asNumber(usageObj.cache_creation_input_tokens, 0),
+    cachedInputTokens: asNumber(usageObj.cache_read_input_tokens, 0),
+    outputTokens: asNumber(usageObj.output_tokens, 0),
+  };
+}
+
 export function parseClaudeStreamJson(stdout: string) {
   let sessionId: string | null = null;
   let model = "";
@@ -100,19 +115,17 @@ export function parseClaudeStreamJson(stdout: string) {
       model,
       costUsd: null as number | null,
       usage: null as UsageSummary | null,
-      usageBasis: null as "per_run" | null,
+      usageBasis: null as "per_run" | "session_cumulative" | null,
+      costBasis: null as "session_cumulative" | null,
+      invocationUsage: null as UsageSummary | null,
       summary: assistantTexts.join("\n\n").trim(),
       resultJson: null as Record<string, unknown> | null,
     };
   }
 
   const modelUsageTotals = claudeModelUsageTotals(finalResult.modelUsage);
-  const usageObj = parseObject(finalResult.usage);
-  const usage: UsageSummary = modelUsageTotals ?? {
-    inputTokens: asNumber(usageObj.input_tokens, 0),
-    cachedInputTokens: asNumber(usageObj.cache_read_input_tokens, 0),
-    outputTokens: asNumber(usageObj.output_tokens, 0),
-  };
+  const invocationUsage = claudeResultUsageTotals(finalResult.usage);
+  const usage: UsageSummary = modelUsageTotals ?? invocationUsage;
   const costRaw = finalResult.total_cost_usd;
   const costUsd = typeof costRaw === "number" && Number.isFinite(costRaw) ? costRaw : null;
   const summary = asString(finalResult.result, assistantTexts.join("\n\n")).trim();
@@ -122,9 +135,13 @@ export function parseClaudeStreamJson(stdout: string) {
     model,
     costUsd,
     usage,
-    // modelUsage covers exactly this CLI invocation, so mark it per-run to
-    // keep the server from applying its session-cumulative delta heuristic.
-    usageBasis: "per_run" as const,
+    // On --resume, modelUsage and total_cost_usd are session totals; only
+    // result.usage covers this invocation. Let the server subtract the
+    // previous run's raw counters and cost. Without modelUsage the tokens are
+    // the per-invocation result.usage, but the cost is still the session total.
+    usageBasis: modelUsageTotals ? ("session_cumulative" as const) : ("per_run" as const),
+    costBasis: "session_cumulative" as const,
+    invocationUsage,
     summary,
     resultJson: finalResult,
   };
