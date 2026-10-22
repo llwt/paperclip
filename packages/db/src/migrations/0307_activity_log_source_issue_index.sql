@@ -1,3 +1,3 @@
 -- Fork-only (SX-1597): partial index for the source-issue branch of activity forIssue, which scanned all of activity_log.
--- No CONCURRENTLY: the fork's migration runner applies each file in a transaction. The index holds only two rare actions.
+-- paperclip:migration-safety-ignore large-create-index-not-concurrently: The migration runner wraps each migration in a transaction, so CONCURRENTLY is unavailable. The partial index holds only project.created and company.skill_created rows. The build reads activity_log once (146k rows on the fork's instance, under a second) and blocks writes to it meanwhile.
 CREATE INDEX IF NOT EXISTS "activity_log_company_source_issue_idx" ON "activity_log" USING btree ("company_id",("details" ->> 'sourceIssueId')) WHERE "activity_log"."action" IN ('project.created', 'company.skill_created');
