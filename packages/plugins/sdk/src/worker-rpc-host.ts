@@ -1002,6 +1002,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           }) as Promise<RequestCheckboxConfirmationInteraction>;
         },
 
+        async listExecutionDecisions(issueId, companyId, options) {
+          return callHost("issues.listExecutionDecisions", { ...options, issueId, companyId });
+        },
         async listInteractions(issueId: string, companyId: string) {
           return callHost("issues.listInteractions", { issueId, companyId });
         },

@@ -449,6 +449,14 @@ const TOKEN_FRAGMENT_RE = /^[A-Za-z0-9_-]+$/;
 const FULL_TOKEN_RE = /^sk-ant-oat01-[A-Za-z0-9_-]{20,}$/;
 
 /**
+ * True when `value` has the full setup-token shape the success-screen parser
+ * accepts. A pasted token passes the same shape check as a parsed one.
+ */
+export function isSetupTokenShape(value: string): boolean {
+  return FULL_TOKEN_RE.test(value);
+}
+
+/**
  * Returns the index of the one line that equals `anchor` after a trim. Returns
  * null when no line matches. Returns null when more than one line matches, so a
  * duplicate success block fails closed.

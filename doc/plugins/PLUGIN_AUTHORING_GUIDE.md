@@ -170,6 +170,41 @@ handler. The worker receives sanitized headers, route params, query, parsed JSON
 body, actor context, and company id. Do not use plugin routes to claim core
 paths; they always remain under `/api/plugins/:pluginId/api/*`.
 
+### Read retained execution decisions (fork extension)
+
+Declare `issue.execution.read` to call
+`ctx.issues.listExecutionDecisions(issueId, companyId, { cursor?, limit? })`.
+This separate read does not change `ctx.issues.get`, which still returns the
+current `executionPolicy` and `executionState` under `issues.read`.
+
+```ts
+const page = await ctx.issues.listExecutionDecisions(issueId, companyId, {
+  limit: 50,
+});
+// Pass page.nextCursor on the next request, until it is null.
+```
+
+The default limit is 50, and valid limits are integers from 1 through 100.
+Treat cursors as opaque, bound to the company and resolved issue UUID. Invalid
+limits or cursors fail with the worker RPC `VALIDATION_ERROR` code (-32007). Unknown and mismatched issues return
+`{ items: [], nextCursor: null, principalLabels: {} }`.
+
+Items contain the existing execution decision fields with ISO timestamp strings,
+in ascending `(createdAt, id)` order. These are retained decisions only. No
+stage snapshot, confirmation card ID or head SHA is inferred. A removed stage
+can still have decisions, and a completed stage need not have a decision.
+
+`principalLabels` uses `agent:<id>` and `user:<id>` keys. Each value is
+`{ type, id, label }`. It contains only principals referenced by the current
+policy/state and the returned page. Labels are current company agent names or
+active human company member names, with `null` for unresolved principals.
+It does not expose email, grants, credentials or a general user directory.
+
+This is a fork-local host/SDK extension. Handle an unsupported method or denied
+read as unavailable history, not as an empty history. Reset pagination when the
+issue/company changes or the user refreshes. No plugin installation is needed
+to ship this host contract.
+
 ## Managed Paperclip resources
 
 Plugins that provide durable Paperclip business objects should declare them in

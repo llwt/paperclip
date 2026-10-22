@@ -23,7 +23,9 @@ import {
   aiSubscriptionNeedsIsolatedLogin,
   isAiConnectionCompatible,
   supportsAiConnectionUsage,
+  supportsAiConnectionRevalidation,
   type AiConnectionBinding,
+  type AiConnectionRevalidation,
   type AiConnectionAttribution,
   type AiConnectionMetadata,
   type AiManagedConnectionSummary,
@@ -31,10 +33,12 @@ import {
   type CreateAiConnection,
   type AiConnectionLoginIntent,
 } from "@paperclipai/shared";
-import { forbidden, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 import { secretService } from "./secrets.js";
 import { probeAiConnectionUsage } from "./ai-connection-usage.js";
+import { checkAiCredential } from "./ai-credential-check.js";
+import { logger } from "../middleware/logger.js";
 
 /** Same human audience displayed by the existing Connections identity controls. */
 function canUseCredential(
@@ -136,6 +140,8 @@ export function aiConnectionService(db: Db) {
           companyId,
           ...metadata.data,
           usageProbeSupported: supportsAiConnectionUsage(metadata.data.provider, metadata.data.method),
+          revalidationSupported: supportsAiConnectionRevalidation(metadata.data.provider, metadata.data.method),
+          ...(connection.healthStatus === "error" && connection.healthMessage ? { healthMessage: connection.healthMessage } : {}),
           name: connection.name,
           accountLabel: grant.providerTenant?.name,
           ...(needsReconnect ? { unavailableReason: "Reconnect with a separate sign-in to protect your existing terminal login." } : {}),
@@ -804,6 +810,122 @@ export function aiConnectionService(db: Db) {
       return { connectionId: id, grantId };
     });
   }
+  /**
+   * Checks the saved credential of one grant without a run. A pass clears both
+   * marks a false auth failure sets (grant `needs_reauthorization`, connection
+   * health `error`) in one transaction. A failed check leaves both marks and
+   * records its reason on the connection health message.
+   */
+  async function revalidate(input: {
+    companyId: string;
+    connectionId: string;
+    grantId?: string;
+    userId: string;
+    trigger: "check_again" | "secret_rotated";
+    request?: typeof fetch;
+  }): Promise<AiConnectionRevalidation> {
+    const candidates = (await rows(input.companyId)).filter((row) =>
+      row.connection.id === input.connectionId && (!input.grantId || row.grant.id === input.grantId));
+    if (!candidates.length) throw notFound("AI connection not found");
+    if (candidates.length > 1) throw unprocessable("Choose a credential grant to check");
+    const row = candidates[0]!;
+    const metadata = aiConnectionMetadataSchema.safeParse(row.connection.config.ai);
+    if (!metadata.success) throw notFound("AI connection not found");
+    if (!supportsAiConnectionRevalidation(metadata.data.provider, metadata.data.method))
+      throw unprocessable("Check again is not available for this provider. Reconnect the account instead.", { code: "ai_connection_check_unsupported" });
+    if (row.grant.status !== "active" && row.grant.status !== "needs_reauthorization")
+      throw unprocessable("This account was revoked or has expired. Reconnect it instead.", { code: "ai_connection_unavailable" });
+    const value = await credential(row);
+    const generation = createHash("sha256").update(value).digest("hex");
+    const check = await checkAiCredential(metadata.data, value, input.request);
+    return db.transaction(async (tx) => {
+      const [grant] = await tx.select().from(connectionGrants).where(and(
+        eq(connectionGrants.companyId, input.companyId),
+        eq(connectionGrants.id, row.grant.id),
+      )).for("update");
+      if (!grant || (grant.status !== "active" && grant.status !== "needs_reauthorization"))
+        throw conflict("The account changed while it was checked. Check again.");
+      const ref = grant.credentialSecretRefs.find((candidate) => candidate.configPath === "ai.credential");
+      if (!ref) throw conflict("The credential changed while it was checked. Check again.");
+      // Lock the secret before reading it, as markAuthenticationFailed does: a
+      // rotation that commits after this read then waits for the clear, and a
+      // rotation that is already writing is seen here and fails the compare.
+      await tx.select({ id: companySecrets.id }).from(companySecrets).where(and(
+        eq(companySecrets.companyId, input.companyId), eq(companySecrets.id, ref.secretId),
+      )).for("update");
+      const current = await aiConnectionService(tx as unknown as Db).credential({ connection: row.connection, grant });
+      if (createHash("sha256").update(current).digest("hex") !== generation)
+        throw conflict("The credential changed while it was checked. Check again.");
+      const now = new Date();
+      if (check.valid) {
+        // Bumping updatedAt also makes markAuthenticationFailed ignore failures
+        // of runs that started before this check.
+        await tx.update(connectionGrants).set({ status: "active", updatedAt: now })
+          .where(eq(connectionGrants.id, grant.id));
+        await tx.update(toolConnections).set({ healthStatus: "ok", healthMessage: null, updatedAt: now })
+          .where(eq(toolConnections.id, row.connection.id));
+      } else if (row.connection.healthStatus === "error") {
+        await tx.update(toolConnections).set({ healthMessage: check.message, updatedAt: now })
+          .where(eq(toolConnections.id, row.connection.id));
+      }
+      await logActivity(tx as unknown as Db, {
+        companyId: input.companyId,
+        actorType: "user",
+        actorId: input.userId,
+        action: "ai_connection.revalidated",
+        entityType: "tool_connection",
+        entityId: row.connection.id,
+        details: {
+          provider: metadata.data.provider, method: metadata.data.method, grantId: grant.id,
+          trigger: input.trigger, result: check.valid ? "passed" : "failed",
+          limited: check.valid && check.limited, ...(check.valid ? {} : { code: check.code }),
+        },
+      });
+      return {
+        connectionId: row.connection.id,
+        grantId: grant.id,
+        result: check.valid ? "passed" as const : "failed" as const,
+        limited: check.valid && check.limited,
+        ...(check.valid ? {
+          message: check.limited
+            ? "Signed in. The account is at its usage limit for now; runs resume when the limit resets."
+            : "Signed in. Runs can use this account again.",
+        } : { code: check.code, message: check.message }),
+      };
+    });
+  }
+  /**
+   * Called by the board secret routes after a secret value change has
+   * committed. Re-checks every marked AI grant whose `ai.credential` is that
+   * secret. A failure never fails the secret change itself.
+   */
+  async function revalidateAfterSecretChange(input: {
+    companyId: string;
+    secretId: string;
+    userId: string;
+    request?: typeof fetch;
+  }): Promise<AiConnectionRevalidation[]> {
+    const marked = (await rows(input.companyId)).filter(({ connection, grant }) => {
+      const metadata = aiConnectionMetadataSchema.safeParse(connection.config.ai);
+      return metadata.success &&
+        supportsAiConnectionRevalidation(metadata.data.provider, metadata.data.method) &&
+        grant.credentialSecretRefs.some((ref) => ref.configPath === "ai.credential" && ref.secretId === input.secretId) &&
+        (grant.status === "needs_reauthorization" || (grant.status === "active" && connection.healthStatus === "error"));
+    });
+    const results: AiConnectionRevalidation[] = [];
+    for (const { connection, grant } of marked) {
+      try {
+        results.push(await revalidate({
+          companyId: input.companyId, connectionId: connection.id, grantId: grant.id,
+          userId: input.userId, trigger: "secret_rotated", request: input.request,
+        }));
+      } catch (error) {
+        logger.warn({ connectionId: connection.id, grantId: grant.id, errorName: error instanceof Error ? error.name : typeof error },
+          "AI connection re-check after a secret change failed");
+      }
+    }
+    return results;
+  }
   /** A late failure must never invalidate credentials that were refreshed or reconnected meanwhile. */
   async function markAuthenticationFailed(input: {
     companyId: string;
@@ -848,5 +970,5 @@ export function aiConnectionService(db: Db) {
       });
     });
   }
-  return { list, select, credential, probeUsage, save, setDefault, membership, markAuthenticationFailed };
+  return { list, select, credential, probeUsage, save, setDefault, membership, markAuthenticationFailed, revalidate, revalidateAfterSecretChange };
 }

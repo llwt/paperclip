@@ -418,3 +418,29 @@ describe("createHostClientHandlers capability gating for LOOA-641 methods", () =
     expect(list).not.toHaveBeenCalled();
   });
 });
+
+describe("execution decision history host contract", () => {
+  it("checks the separate capability before service access and forwards the paginated read", async () => {
+    const page = { items: [], nextCursor: null, principalLabels: {} };
+    const listExecutionDecisions = vi.fn(async () => page);
+    const services = { issues: { listExecutionDecisions } } as unknown as HostServices;
+    const params = { issueId: "issue-a", companyId: "company-a", cursor: "opaque", limit: 25 };
+    const context = { invocationScope: { companyId: "company-a" } };
+    const denied = createHostClientHandlers({ pluginId: "fixture", capabilities: ["issues.read"], services });
+    await expect(denied["issues.listExecutionDecisions"](params, context)).rejects.toBeInstanceOf(CapabilityDeniedError);
+    expect(listExecutionDecisions).not.toHaveBeenCalled();
+    const allowed = createHostClientHandlers({ pluginId: "fixture", capabilities: ["issue.execution.read"], services });
+    await expect(allowed["issues.listExecutionDecisions"](params, context)).resolves.toEqual(page);
+    expect(listExecutionDecisions).toHaveBeenCalledExactlyOnceWith(params);
+  });
+
+  it("rejects a forged invocation company before the history service", async () => {
+    const listExecutionDecisions = vi.fn();
+    const services = { issues: { listExecutionDecisions } } as unknown as HostServices;
+    const handlers = createHostClientHandlers({ pluginId: "fixture", capabilities: ["issue.execution.read"], services });
+    await expect(handlers["issues.listExecutionDecisions"](
+      { issueId: "issue-a", companyId: "company-b" }, { invocationScope: { companyId: "company-a" } },
+    )).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(listExecutionDecisions).not.toHaveBeenCalled();
+  });
+});
