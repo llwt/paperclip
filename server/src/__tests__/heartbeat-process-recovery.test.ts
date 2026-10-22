@@ -4419,6 +4419,116 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("retries the not-captured marker and warning until they are saved", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
+    });
+
+    await withTempPaperclipHome(async () => {
+      const relayDir = await writeFakeRelay(
+        runId,
+        Buffer.from("never recorded\n"),
+        "running",
+      );
+      const begin = vi
+        .spyOn(getRunLogStore(), "begin")
+        .mockRejectedValue(new Error("synthetic run log begin failure"));
+      // The first marker write fails; then the first warning write fails.
+      const originalUpdate = db.update.bind(db);
+      let markerAttempts = 0;
+      const update = vi
+        .spyOn(db, "update")
+        .mockImplementation(((table: Parameters<typeof db.update>[0]) => {
+          const builder = originalUpdate(table);
+          const originalSet = builder.set.bind(builder);
+          builder.set = ((values: Record<string, unknown>) => {
+            const outputCapture = (
+              (values.resultJson as Record<string, any> | undefined)
+                ?.hotRestart as Record<string, any> | undefined
+            )?.outputCapture;
+            if (outputCapture?.reason === "output_tail_failed") {
+              markerAttempts += 1;
+              if (markerAttempts === 1) {
+                throw new Error("synthetic marker write failure");
+              }
+            }
+            return originalSet(values as never);
+          }) as typeof builder.set;
+          return builder;
+        }) as typeof db.update);
+      const originalTransaction = db.transaction.bind(db);
+      let failedEventWrites = 0;
+      const transaction = vi
+        .spyOn(db, "transaction")
+        .mockImplementation(((...args: Parameters<typeof db.transaction>) => {
+          if (markerAttempts >= 2 && failedEventWrites === 0) {
+            failedEventWrites += 1;
+            return Promise.reject(new Error("synthetic warning write failure"));
+          }
+          return originalTransaction(...args);
+        }) as typeof db.transaction);
+      try {
+        const heartbeat = heartbeatService(db, {
+          adoptedOutputTailMaxFailures: 2,
+        });
+        const adoption = await adoptAfterHotRestart(
+          heartbeat,
+          "2026-03-19T00:05:00.000Z",
+        );
+        expect(adoption).toMatchObject({ adoptedRunIds: [runId] });
+        expect(await heartbeat.waitForAdoptedRunOutputTails()).toBe(true);
+        expect(begin).toHaveBeenCalledTimes(2);
+        expect(markerAttempts).toBe(3);
+        expect(failedEventWrites).toBe(1);
+      } finally {
+        transaction.mockRestore();
+        update.mockRestore();
+        begin.mockRestore();
+      }
+
+      const run = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      expect(run?.status).toBe("running");
+      expect(run?.resultJson).toMatchObject({
+        hotRestart: {
+          adopted: true,
+          outputCapture: {
+            mode: "not_captured",
+            reason: "output_tail_failed",
+            message: HOT_RESTART_OUTPUT_TAIL_FAILED_MESSAGE,
+            relayDir,
+          },
+        },
+      });
+      const events = await db
+        .select()
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, runId));
+      expect(
+        events.filter(
+          (event) =>
+            event.level === "warn" &&
+            event.message === HOT_RESTART_OUTPUT_TAIL_FAILED_MESSAGE,
+        ),
+      ).toHaveLength(1);
+      // The unread output stays on disk for a manual look.
+      expect(
+        await fs.readFile(path.join(relayDir, "stdout.log"), "utf8"),
+      ).toBe("never recorded\n");
+    });
+  });
+
   it("adopts a child without an output relay and marks its output as not captured", async () => {
     // A child started by a server without the relay (or a failed handoff):
     // no runningProcesses entry, so nothing hands its output off.

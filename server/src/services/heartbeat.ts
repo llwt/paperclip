@@ -15272,6 +15272,7 @@ export function heartbeatService(
     } | null = null;
     let stopped = false;
     let consecutiveFailures = 0;
+    let givingUp: { err: unknown } | null = null;
     let timer: NodeJS.Timeout | null = null;
     let tick: Promise<void> | null = null;
 
@@ -15484,6 +15485,22 @@ export function heartbeatService(
     };
 
     const runTick = async () => {
+      if (givingUp) {
+        // Keep trying until the marker and the warning are saved; only then
+        // drop the tail, so the run never stays silent as "relay".
+        try {
+          await giveUp(givingUp.err);
+          adoptedOutputTails.delete(run.id);
+          return;
+        } catch (err) {
+          logger.warn(
+            { err, runId: run.id },
+            "failed to mark adopted child output as not captured; retrying on the next tick",
+          );
+        }
+        if (!stopped && adoptedOutputTails.has(run.id)) schedule();
+        return;
+      }
       try {
         tail ??= await initialize();
         const state = tail;
@@ -15516,16 +15533,13 @@ export function heartbeatService(
             : "failed to start recording adopted child output from its relay",
         );
         if (consecutiveFailures >= maxFailures) {
-          // Do not hold the run open forever: the reaper settles it once
-          // this tail is gone.
-          await giveUp(err).catch((giveUpErr) => {
-            logger.warn(
-              { err: giveUpErr, runId: run.id },
-              "failed to mark adopted child output as not captured",
-            );
-          });
-          adoptedOutputTails.delete(run.id);
-          return;
+          // Do not hold the run open forever: stop recording and mark the
+          // run; the reaper settles it once this tail is gone.
+          givingUp = { err };
+          if (!stopped) {
+            await runTick();
+            return;
+          }
         }
       }
       if (!stopped && adoptedOutputTails.has(run.id)) schedule();
