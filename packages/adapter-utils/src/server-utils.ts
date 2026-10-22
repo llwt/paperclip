@@ -13,7 +13,6 @@ import {
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
 import {
-  RUN_PROCESS_SWEEP_DEFAULT_GRACE_MS,
   RUN_PROCESS_SWEEP_INVOCATION_ENV,
   RUN_PROCESS_SWEEP_RUN_ID_ENV,
   formatRunProcessSweepLogLine,
@@ -4761,10 +4760,7 @@ export async function runChildProcess(
         }
         let leftoverSweep: Promise<RunProcessSweepEvidence | null> | null =
           null;
-        let leftoverSweepTimer: NodeJS.Timeout | null = null;
         const runLeftoverSweep = () => {
-          if (leftoverSweepTimer) clearTimeout(leftoverSweepTimer);
-          leftoverSweepTimer = null;
           if (!sweepInvocationId) return Promise.resolve(null);
           leftoverSweep ??= sweepRunProcesses(runId, {
             ...opts.leftoverProcessSweep,
@@ -4969,19 +4965,12 @@ export async function runChildProcess(
 
         child.on("exit", () => {
           maybeArmTerminalResultCleanup();
-          // A leftover that inherited stdout/stderr keeps the pipes open, so
-          // "close" would wait for it. Sweep after the grace time if "close"
-          // has not come by then.
-          if (sweepInvocationId && !leftoverSweep && !leftoverSweepTimer) {
-            leftoverSweepTimer = setTimeout(
-              () => void runLeftoverSweep(),
-              Math.max(
-                0,
-                opts.leftoverProcessSweep?.graceMs ??
-                  RUN_PROCESS_SWEEP_DEFAULT_GRACE_MS,
-              ),
-            );
-          }
+          // The adapter process has ended, so whatever still carries this
+          // spawn's ids is a leftover. Sweep now rather than on "close": a
+          // leftover that inherited stdout/stderr keeps the pipes open, and
+          // "close" waits for it. Starting here keeps the whole wait within one
+          // grace time from adapter exit; "close" reuses this sweep.
+          void runLeftoverSweep();
         });
 
         child.on(

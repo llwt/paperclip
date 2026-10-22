@@ -139,3 +139,43 @@ export function redactDiagnosticText(
     .replace(JSON_ESCAPED_SECRET_FIELD_RE, `$1${redactedValue}$2`)
     .replace(JSON_SECRET_FIELD_RE, `$1${redactedValue}$2`);
 }
+
+const ARGV_SECRET_OPTION_RE = new RegExp(
+  String.raw`^-{1,2}${SECRET_NAME_PATTERN}$`,
+  "i",
+);
+const ARGV_SECRET_PREFIX_RE = new RegExp(
+  String.raw`^(-{1,2}${SECRET_NAME_PATTERN}=|${SECRET_NAME_PATTERN}\s*=)`,
+  "i",
+);
+// A quoted secret option inside one argument, such as the script of `sh -c`:
+// `--password 'a b'`. The command redaction stops a value at whitespace.
+const ARGV_QUOTED_SECRET_OPTION_RE = new RegExp(
+  String.raw`(\B-{1,2}${SECRET_NAME_PATTERN}(?:\s+|=))(["'])[^"'\r\n]*\2`,
+  "gi",
+);
+
+/**
+ * Redact secrets from an argument vector, such as `/proc/<pid>/cmdline` split
+ * on NUL. Joining argv first loses argument boundaries, so a secret value that
+ * holds whitespace would be redacted only up to its first space. Here a whole
+ * argument is redacted when it is the value of a secret option (`--password
+ * <value>`, `--password=<value>`, `TOKEN=<value>`); other arguments go through
+ * the command redaction.
+ */
+export function redactCommandArgv(
+  argv: readonly string[],
+  redactedValue = REDACTED_COMMAND_TEXT_VALUE,
+): string[] {
+  return argv.map((arg, index) => {
+    if (index > 0 && ARGV_SECRET_OPTION_RE.test(argv[index - 1]!)) {
+      return redactedValue;
+    }
+    const prefix = ARGV_SECRET_PREFIX_RE.exec(arg);
+    if (prefix) return `${prefix[1]}${redactedValue}`;
+    return redactCommandText(
+      arg.replace(ARGV_QUOTED_SECRET_OPTION_RE, `$1$2${redactedValue}$2`),
+      redactedValue,
+    );
+  });
+}

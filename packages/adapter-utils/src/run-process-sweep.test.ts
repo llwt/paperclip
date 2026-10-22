@@ -156,6 +156,48 @@ describe("sweepRunProcesses", () => {
     expect(evidence?.forceKilled).toBe(0);
   });
 
+  it("checks the start time again right before SIGKILL when another target is read in between", async () => {
+    const procs = baseProcs();
+    procs.set(101, { uid: UID, ppid: 400, startTime: "10", env: { PAPERCLIP_RUN_ID: RUN_ID }, cmdline: ["a"], onTerm: "ignore" });
+    procs.set(102, { uid: UID, ppid: 400, startTime: "11", env: { PAPERCLIP_RUN_ID: RUN_ID }, cmdline: ["b"], onTerm: "ignore" });
+    const fake = fakeProc(procs);
+    let clock = 0;
+    const reader: RunProcessSweepProcReader = {
+      ...fake.reader,
+      readStat: async (pid) => {
+        // Once the grace time is over, PID 101 exits and is reused while the
+        // final poll reads PID 102.
+        if (pid === 102 && clock >= 1_000 && procs.get(101)?.startTime === "10") {
+          procs.set(101, { uid: UID, ppid: 400, startTime: "999", env: {}, cmdline: ["unrelated"], onTerm: "ignore" });
+        }
+        return fake.reader.readStat(pid);
+      },
+    };
+
+    const evidence = await sweepRunProcesses(
+      RUN_ID,
+      sweepOptions(fake, {
+        procReader: reader,
+        now: () => clock,
+        sleep: async (ms: number) => {
+          clock += ms;
+        },
+      }),
+    );
+
+    expect(fake.signals).toEqual([
+      [101, "SIGTERM"],
+      [102, "SIGTERM"],
+      [102, "SIGKILL"],
+    ]);
+    expect(procs.get(101)?.startTime).toBe("999");
+    expect(evidence?.forceKilled).toBe(1);
+    expect(evidence?.processes).toEqual([
+      { pid: 101, command: "a", forceKilled: false },
+      { pid: 102, command: "b", forceKilled: true },
+    ]);
+  });
+
   it("skips zombies and processes whose /proc entries cannot be read", async () => {
     const procs = baseProcs();
     procs.set(4001, { uid: UID, ppid: 400, startTime: "400", state: "Z", env: { PAPERCLIP_RUN_ID: RUN_ID }, cmdline: [] });
@@ -195,6 +237,32 @@ describe("sweepRunProcesses", () => {
     const command = evidence?.processes[0]?.command ?? "";
     expect(command.length).toBe(120);
     expect(command).not.toContain("sk-secret-value");
+  });
+
+  it("redacts a whole secret argument that holds whitespace", async () => {
+    const procs = baseProcs();
+    const cmdlines = [
+      ["client", "--password", "synthetic first second"],
+      ["client", "--token=synthetic first second"],
+      ["env", "API_KEY=synthetic first second", "client"],
+      ["sh", "-c", "client --password 'synthetic first second' --verbose"],
+    ];
+    cmdlines.forEach((cmdline, index) => {
+      procs.set(6100 + index, { uid: UID, ppid: 400, startTime: `61${index}`, env: { PAPERCLIP_RUN_ID: RUN_ID }, cmdline, onTerm: "exit" });
+    });
+    const fake = fakeProc(procs);
+
+    const evidence = await sweepRunProcesses(RUN_ID, sweepOptions(fake));
+
+    expect(evidence?.processes.map((p) => p.command)).toEqual([
+      "client --password ***REDACTED***",
+      "client --token=***REDACTED***",
+      "env API_KEY=***REDACTED*** client",
+      "sh -c client --password '***REDACTED***' --verbose",
+    ]);
+    for (const process of evidence?.processes ?? []) {
+      expect(process.command).not.toMatch(/synthetic|first|second/);
+    }
   });
 
   it("is a no-op off Linux", async () => {
@@ -246,6 +314,47 @@ describe.skipIf(process.platform !== "linux")("runChildProcess leftover sweep (L
       expect(await pidsWithRunId(runId)).toEqual([]);
     } finally {
       // Never leave the test's own sleep behind, by exact PID only.
+      for (const pid of await pidsWithRunId(runId)) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // already gone
+        }
+      }
+    }
+  }, 20_000);
+
+  it("resolves within one grace time of adapter exit when a TERM-ignoring leftover holds the pipes", async () => {
+    const runId = `sweep-test-${randomUUID()}`;
+    const graceMs = 3_000;
+    // The leftover ignores SIGTERM and keeps the inherited stdout/stderr open,
+    // so "close" only comes once the sweep has force-killed it.
+    const leftover = `"${process.execPath}" -e 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1e6)'`;
+    try {
+      const startedAt = Date.now();
+      const result = await runChildProcess(
+        runId,
+        "sh",
+        ["-c", `(setsid ${leftover} &); sleep 0.5; echo done`],
+        {
+          cwd: process.cwd(),
+          env: { PAPERCLIP_RUN_ID: runId },
+          timeoutSec: 30,
+          graceSec: 1,
+          onLog: async () => {},
+          leftoverProcessSweep: { graceMs },
+        },
+      );
+      const elapsedMs = Date.now() - startedAt;
+
+      expect(result.exitCode).toBe(0);
+      expect(result.leftoverProcessSweep?.stopped).toBe(1);
+      expect(result.leftoverProcessSweep?.forceKilled).toBe(1);
+      // 0.5 s of script, one /proc scan and one grace time; two grace times
+      // would be 6.5 s or more.
+      expect(elapsedMs).toBeLessThan(500 + graceMs + 2_000);
+      expect(await pidsWithRunId(runId)).toEqual([]);
+    } finally {
       for (const pid of await pidsWithRunId(runId)) {
         try {
           process.kill(pid, "SIGKILL");

@@ -1,5 +1,5 @@
 import { promises as fs } from "node:fs";
-import { redactCommandText } from "./command-redaction.js";
+import { redactCommandArgv } from "./command-redaction.js";
 
 // Processes an agent starts in the background (`(cmd &)`, `setsid`, daemons
 // such as `pg_ctl start`) leave the adapter's process group, so the group kill
@@ -114,9 +114,11 @@ async function collectAncestors(reader: RunProcessSweepProcReader, selfPid: numb
   return skip;
 }
 
+// Redact per argument before joining, so a secret value that holds spaces is
+// redacted whole.
 function formatCommand(cmdline: string | null) {
-  const text = (cmdline ?? "").split("\0").join(" ").trim();
-  return redactCommandText(text).slice(0, RUN_PROCESS_SWEEP_COMMAND_CHARS);
+  const argv = (cmdline ?? "").split("\0").filter((arg) => arg.length > 0);
+  return redactCommandArgv(argv).join(" ").trim().slice(0, RUN_PROCESS_SWEEP_COMMAND_CHARS);
 }
 
 export function formatRunProcessSweepLogLine(evidence: RunProcessSweepEvidence) {
@@ -201,8 +203,11 @@ export async function sweepRunProcesses(
     await sleep(Math.min(RUN_PROCESS_SWEEP_POLL_MS, Math.max(1, deadline - now())));
   }
 
+  // Check each target again right before SIGKILL: while the loop above read
+  // the other targets, this one may have exited and its PID been reused.
   const forceKilled = new Set<number>();
   for (const target of alive) {
+    if (!(await isSameAndAlive(target))) continue;
     if (signal(target.pid, "SIGKILL")) forceKilled.add(target.pid);
   }
 
