@@ -214,7 +214,10 @@ vi.mock("../adapters/index.ts", async () => {
   };
 });
 
+import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
+import { getRunLogStore } from "../services/run-log-store.js";
 import {
+  HOT_RESTART_OUTPUT_NOT_CAPTURED_MESSAGE,
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   heartbeatService,
@@ -3871,6 +3874,250 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       });
     },
   );
+
+  it.skipIf(process.platform === "win32")(
+    "records output an adopted child writes after a hot restart through the output relay",
+    async () => {
+      const { companyId, agentId, runId } = await seedRunFixture({
+        agentStatus: "running",
+        processPid: null,
+        processGroupId: null,
+        contextSnapshot: {
+          executionEngine: "cli",
+          processTopology: "detached",
+        },
+      });
+      const gateDir = await fs.mkdtemp(
+        path.join(os.tmpdir(), "paperclip-relay-gate-"),
+      );
+      const gateFile = path.join(gateDir, "go");
+      // The child writes one line before the restart, waits for the gate,
+      // then writes to both streams after the old server stopped reading.
+      const script = [
+        "const fs = require('node:fs');",
+        "process.stdout.write('before-restart\\n');",
+        `const gate = ${JSON.stringify(gateFile)};`,
+        "const timer = setInterval(() => {",
+        "  if (!fs.existsSync(gate)) return;",
+        "  clearInterval(timer);",
+        "  process.stdout.write('after-adoption stdout\\n');",
+        "  process.stderr.write('after-adoption stderr\\n');",
+        "  setTimeout(() => process.exit(0), 50);",
+        "}, 20);",
+      ].join("\n");
+      const oldServerChunks: string[] = [];
+      let childPid: number | null = null;
+      void runChildProcess(runId, process.execPath, ["-e", script], {
+        cwd: gateDir,
+        env: {},
+        timeoutSec: 0,
+        graceSec: 1,
+        onLog: async (_stream, chunk) => {
+          oldServerChunks.push(chunk);
+        },
+        onSpawn: async ({ pid, processGroupId }) => {
+          childPid = pid;
+          cleanupPids.add(pid);
+          await db
+            .update(heartbeatRuns)
+            .set({ processPid: pid, processGroupId })
+            .where(eq(heartbeatRuns.id, runId));
+        },
+      });
+      const started = Date.now();
+      while (
+        !oldServerChunks.join("").includes("before-restart") &&
+        Date.now() - started < 5_000
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(oldServerChunks.join("")).toContain("before-restart");
+      expect(childPid).toBeGreaterThan(0);
+
+      await withTempPaperclipHome(async (home) => {
+        await writeHotRestartIntent({
+          previousServerPid: process.pid,
+          previousServerVersion: "old-version",
+          requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+        });
+        const oldServer = heartbeatService(db);
+        await oldServer.prepareHotRestartShutdown(
+          "SIGTERM",
+          new Date("2026-03-19T00:06:00.000Z"),
+        );
+        // The old server no longer owns the child's output.
+        expect(runningProcesses.has(runId)).toBe(false);
+        const relayDir = path.join(
+          resolvePaperclipInstanceRoot(),
+          "data",
+          "run-output-relay",
+          runId,
+        );
+        expect(relayDir.startsWith(home)).toBe(true);
+
+        const newServer = heartbeatService(db);
+        const adoption = await newServer.reconcileHotRestartAdoption(
+          new Date("2026-03-19T00:07:00.000Z"),
+        );
+        expect(adoption).toMatchObject({ adoptedRunIds: [runId] });
+
+        await fs.writeFile(gateFile, "go");
+        expect(await waitForPidExit(childPid!, 5_000)).toBe(true);
+        expect(await newServer.waitForAdoptedRunOutputTails()).toBe(true);
+
+        expect(oldServerChunks.join("")).not.toContain("after-adoption");
+        const log = await getRunLogStore().read(
+          {
+            store: "local_file",
+            logRef: path.join(companyId, agentId, `${runId}.ndjson`),
+          },
+          { limitBytes: 1024 * 1024 },
+        );
+        const records = log.content
+          .split("\n")
+          .filter(Boolean)
+          .map(
+            (line) =>
+              JSON.parse(line) as {
+                stream: string;
+                chunk: string;
+                seq?: number;
+              },
+          );
+        expect(records).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              stream: "stdout",
+              chunk: "after-adoption stdout\n",
+            }),
+            expect.objectContaining({
+              stream: "stderr",
+              chunk: "after-adoption stderr\n",
+            }),
+          ]),
+        );
+        const run = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .then((rows) => rows[0] ?? null);
+        expect(run?.lastOutputAt).toBeInstanceOf(Date);
+        expect(run?.lastOutputSeq).toBe(
+          Math.max(...records.map((record) => record.seq ?? 0)),
+        );
+        expect(run?.resultJson).toMatchObject({
+          hotRestart: {
+            adopted: true,
+            outputCapture: { mode: "relay" },
+          },
+        });
+        const events = await db
+          .select()
+          .from(heartbeatRunEvents)
+          .where(eq(heartbeatRunEvents.runId, runId));
+        expect(events.map((event) => event.message)).toEqual(
+          expect.arrayContaining([
+            "Handed child output to a relay for the next server",
+            "Adopted live child process after hot restart",
+            "Child output relay reached the end of the child's output",
+          ]),
+        );
+        // The relay files are removed once their output is in the run log.
+        await expect(fs.stat(relayDir)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      });
+      await fs.rm(gateDir, { recursive: true, force: true });
+    },
+  );
+
+  it("adopts a child without an output relay and marks its output as not captured", async () => {
+    // A child started by a server without the relay (or a failed handoff):
+    // no runningProcesses entry, so nothing hands its output off.
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
+    });
+
+    await withTempPaperclipHome(async () => {
+      const heartbeat = heartbeatService(db);
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+      });
+      await heartbeat.prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+      const adoption = await heartbeat.reconcileHotRestartAdoption(
+        new Date("2026-03-19T00:07:00.000Z"),
+      );
+      expect(adoption).toMatchObject({
+        adoptedRunIds: [runId],
+        lostRunIds: [],
+      });
+      expect(await heartbeat.waitForAdoptedRunOutputTails(0)).toBe(true);
+
+      const adopted = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      expect(adopted?.status).toBe("running");
+      expect(adopted?.resultJson).toMatchObject({
+        hotRestart: {
+          adopted: true,
+          outputCapture: {
+            mode: "not_captured",
+            reason: "no_output_relay",
+            message: HOT_RESTART_OUTPUT_NOT_CAPTURED_MESSAGE,
+          },
+        },
+      });
+      const events = await db
+        .select()
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, runId));
+      expect(events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            level: "warn",
+            message: HOT_RESTART_OUTPUT_NOT_CAPTURED_MESSAGE,
+          }),
+        ]),
+      );
+      expect(await heartbeat.reapOrphanedRuns()).toEqual({
+        reaped: 0,
+        runIds: [],
+      });
+
+      // When the child ends the reaper still settles the run and the task.
+      child.kill("SIGKILL");
+      expect(await waitForPidExit(child.pid!)).toBe(true);
+      const reap = await heartbeat.reapOrphanedRuns();
+      expect(reap.runIds).toEqual([runId]);
+      const settled = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      expect(settled).toMatchObject({
+        status: "failed",
+        errorCode: "process_lost",
+      });
+      expect(settled?.resultJson).toMatchObject({
+        hotRestart: { outputCapture: { mode: "not_captured" } },
+      });
+    });
+  });
 
   it("terminalizes an unsupported legacy session on shutdown without speculative replay", async () => {
     const { agentId, runId, issueId, wakeupRequestId } = await seedRunFixture({

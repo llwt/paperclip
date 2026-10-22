@@ -89,6 +89,7 @@ import { agentInstructionWorkingCopyService, instructionWorkingCopyGuidance } fr
 import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
@@ -351,7 +352,18 @@ import { secretService, type MissingRuntimeBinding } from "./secrets.js";
 import {
   resolveDefaultAgentWorkspaceDir,
   resolveManagedProjectWorkspaceDir,
+  resolvePaperclipInstanceRoot,
 } from "../home-paths.js";
+import {
+  readRunOutputRelayBytes,
+  readRunOutputRelayOffsets,
+  readRunOutputRelayState,
+  RUN_OUTPUT_RELAY_STREAMS,
+  waitForRunOutputRelayState,
+  writeRunOutputRelayOffsets,
+  type RunOutputRelayOffsets,
+  type RunOutputRelayState,
+} from "@paperclipai/adapter-utils/run-output-relay";
 import {
   buildHeartbeatRunIssueComment,
   CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
@@ -612,6 +624,7 @@ import {
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
 import {
+  handOffRunningProcessOutput,
   readPaperclipSkillSyncPreference,
   selectPaperclipTaskMarkdown,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
@@ -835,6 +848,9 @@ export {
 } from "./recovery/service.js";
 export const ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS = 60 * 1000;
 export const ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS = 5 * 1000;
+const ADOPTED_OUTPUT_TAIL_POLL_MS = 1000;
+export const HOT_RESTART_OUTPUT_NOT_CAPTURED_MESSAGE =
+  "Output not captured after hot restart: the previous server did not hand this child's output to a relay, so output written after the restart is lost";
 export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
   30_000, 30_000,
 ] as const;
@@ -9300,6 +9316,7 @@ function mergeHotRestartAdoptionResultJson(
     newServerVersion: string;
     processPid: number | null;
     processGroupId: number | null;
+    outputCapture?: Record<string, unknown>;
   },
 ) {
   const result = parseObject(resultJson);
@@ -9316,6 +9333,7 @@ function mergeHotRestartAdoptionResultJson(
       newServerVersion: input.newServerVersion,
       processPid: input.processPid,
       processGroupId: input.processGroupId,
+      ...(input.outputCapture ? { outputCapture: input.outputCapture } : {}),
     },
   };
 }
@@ -15061,6 +15079,10 @@ export function heartbeatService(
         drainRunIds: activeServerStdioRunIds,
         capturedAt: now,
       });
+      await handOffLocalChildOutputForRestart(
+        activeRuns,
+        new Set(activeServerStdioRunIds),
+      );
 
       logger.warn(
         {
@@ -15116,6 +15138,8 @@ export function heartbeatService(
       .map(({ run }) => run.id);
     const detachedNativeSessions =
       await detachNativeSessionsForRestart(nativeRunIds);
+    const outputRelayRunIds =
+      await handOffLocalChildOutputForRestart(activeRuns);
 
     logger.info(
       {
@@ -15123,6 +15147,7 @@ export function heartbeatService(
         previousServerPid: intent.previousServerPid,
         activeRunIds: snapshotRuns.map((run) => run.runId),
         detachedNativeSessions,
+        outputRelayRunIds,
       },
       "hot-restart shutdown snapshot captured; skipping graceful run drain",
     );
@@ -15132,6 +15157,302 @@ export function heartbeatService(
       skipDrain: true as const,
       activeRunIds: snapshotRuns.map((run) => run.runId),
     };
+  }
+
+  // Fork (SX-1600): output of local children kept across a hot restart. The
+  // old server hands each child's output pipes to a detached relay
+  // (`@paperclipai/adapter-utils/run-output-relay`); the adopting server tails
+  // the relay files into the run log from the saved offsets.
+  const adoptedOutputTails = new Map<string, { stop: () => Promise<void> }>();
+
+  function resolveRunOutputRelayDir(runId: string) {
+    return path.resolve(
+      resolvePaperclipInstanceRoot(),
+      "data",
+      "run-output-relay",
+      runId.replace(/[^a-zA-Z0-9._-]/g, "_"),
+    );
+  }
+
+  async function handOffLocalChildOutputForRestart(
+    activeRuns: Array<{
+      run: typeof heartbeatRuns.$inferSelect;
+      adapterType: string;
+    }>,
+    skipRunIds: ReadonlySet<string> = new Set(),
+  ) {
+    // An adopted run tailed by this server has no pipes left to hand off. Save
+    // its offsets so the next server continues where this one stopped.
+    await stopAdoptedRunOutputTails();
+    const relayedRunIds: string[] = [];
+    for (const { run, adapterType } of activeRuns) {
+      if (skipRunIds.has(run.id)) continue;
+      if (run.runtimeMode === "native" && adapterType === "paperclip_runner")
+        continue;
+      if (!isTrackedLocalChildProcessAdapter(adapterType)) continue;
+      try {
+        const relay = await handOffRunningProcessOutput(
+          run.id,
+          resolveRunOutputRelayDir(run.id),
+        );
+        if (!relay) continue;
+        relayedRunIds.push(run.id);
+        await appendRunEvent(run, {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "info",
+          message: "Handed child output to a relay for the next server",
+          payload: { relayPid: relay.relayPid },
+        });
+      } catch (err) {
+        logger.warn(
+          { err, runId: run.id },
+          "failed to hand child output to a relay before hot restart; output after the restart will not be captured",
+        );
+      }
+    }
+    return relayedRunIds;
+  }
+
+  async function readRunLogSeqAndBytes(handle: RunLogHandle) {
+    let maxSeq = 0;
+    let bytes = 0;
+    let offset = 0;
+    for (;;) {
+      const page = await runLogStore
+        .read(handle, { offset, limitBytes: 1024 * 1024 })
+        .catch(() => null);
+      if (!page) break;
+      bytes += Buffer.byteLength(page.content, "utf8");
+      for (const match of page.content.matchAll(/"seq":(\d+)/g)) {
+        maxSeq = Math.max(maxSeq, Number(match[1]));
+      }
+      if (page.nextOffset === undefined) break;
+      offset = page.nextOffset;
+    }
+    return { maxSeq, bytes };
+  }
+
+  async function startAdoptedRunOutputTail(
+    run: typeof heartbeatRuns.$inferSelect,
+    relayDir: string,
+  ) {
+    if (adoptedOutputTails.has(run.id)) return;
+    const issueId = readNonEmptyString(
+      parseObject(run.contextSnapshot).issueId,
+    );
+    const redactionOptions = await getCurrentUserRedactionOptions();
+    const handle = await runLogStore.begin({
+      companyId: run.companyId,
+      agentId: run.agentId,
+      runId: run.id,
+    });
+    const logState = await readRunLogSeqAndBytes(handle);
+    let outputSeq = Math.max(Number(run.lastOutputSeq ?? 0), logState.maxSeq);
+    let persistedLogBytes = Math.max(Number(run.logBytes ?? 0), logState.bytes);
+    let lastOutputFlushAt = 0;
+    let lastRuntimeStatusTouchMs = 0;
+    let pendingProgress: {
+      at: Date;
+      seq: number;
+      stream: "stdout" | "stderr";
+    } | null = null;
+    const offsets: RunOutputRelayOffsets =
+      await readRunOutputRelayOffsets(relayDir);
+    const decoders = {
+      stdout: new StringDecoder("utf8"),
+      stderr: new StringDecoder("utf8"),
+    };
+    let stopped = false;
+    let timer: NodeJS.Timeout | null = null;
+    let tick: Promise<void> | null = null;
+
+    const flushProgress = async (force: boolean) => {
+      if (!pendingProgress) return;
+      if (
+        !force &&
+        pendingProgress.at.getTime() - lastOutputFlushAt <
+          ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS
+      )
+        return;
+      const progress = pendingProgress;
+      pendingProgress = null;
+      lastOutputFlushAt = progress.at.getTime();
+      await db
+        .update(heartbeatRuns)
+        .set({
+          lastOutputAt: progress.at,
+          lastOutputSeq: progress.seq,
+          lastOutputStream: progress.stream,
+          lastOutputBytes: persistedLogBytes,
+          updatedAt: new Date(),
+        })
+        .where(eq(heartbeatRuns.id, run.id));
+    };
+
+    const record = async (stream: "stdout" | "stderr", chunk: string) => {
+      if (!chunk) return;
+      const sanitizedChunk = compactRunLogChunk(
+        redactCurrentUserText(chunk, redactionOptions),
+      );
+      const ts = new Date().toISOString();
+      outputSeq += 1;
+      const chunkSeq = outputSeq;
+      persistedLogBytes += await runLogStore.append(handle, {
+        stream,
+        chunk: sanitizedChunk,
+        ts,
+        seq: chunkSeq,
+      });
+      pendingProgress = { at: new Date(ts), seq: chunkSeq, stream };
+      await flushProgress(false);
+      const at = new Date(ts);
+      if (
+        at.getTime() - lastRuntimeStatusTouchMs >=
+        ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS
+      ) {
+        lastRuntimeStatusTouchMs = at.getTime();
+        const touchedStatus = touchHeartbeatRunRuntimeStatus({
+          companyId: run.companyId,
+          issueId,
+          agentId: run.agentId,
+          runId: run.id,
+          at,
+        });
+        if (touchedStatus) publishHeartbeatRunRuntimeProgress(touchedStatus);
+      }
+      const payloadChunk =
+        sanitizedChunk.length > MAX_LIVE_LOG_CHUNK_BYTES
+          ? sanitizedChunk.slice(
+              sanitizedChunk.length - MAX_LIVE_LOG_CHUNK_BYTES,
+            )
+          : sanitizedChunk;
+      publishLiveEvent({
+        companyId: run.companyId,
+        type: "heartbeat.run.log",
+        payload: {
+          runId: run.id,
+          agentId: run.agentId,
+          issueId,
+          ts,
+          seq: chunkSeq,
+          stream,
+          chunk: payloadChunk,
+          truncated: payloadChunk.length !== sanitizedChunk.length,
+        },
+      });
+    };
+
+    // Returns true when a stream had bytes past its offset.
+    const drainOnce = async () => {
+      let advanced = false;
+      for (const stream of RUN_OUTPUT_RELAY_STREAMS) {
+        const bytes = await readRunOutputRelayBytes(
+          relayDir,
+          stream,
+          offsets[stream],
+          256 * 1024,
+        );
+        if (bytes.length === 0) continue;
+        advanced = true;
+        offsets[stream] += bytes.length;
+        await record(stream, decoders[stream].write(bytes));
+      }
+      if (advanced) await writeRunOutputRelayOffsets(relayDir, offsets);
+      return advanced;
+    };
+
+    const finish = async (relay: RunOutputRelayState | null) => {
+      for (const stream of RUN_OUTPUT_RELAY_STREAMS) {
+        await record(stream, decoders[stream].end());
+      }
+      await flushProgress(true);
+      adoptedOutputTails.delete(run.id);
+      const current = await getRun(run.id);
+      if (current) {
+        const ended = relay?.status === "ended";
+        await appendRunEvent(current, {
+          eventType: "lifecycle",
+          stream: "system",
+          level: ended ? "info" : "warn",
+          message: ended
+            ? "Child output relay reached the end of the child's output"
+            : "Child output relay stopped before the end of the child's output; later output is not captured",
+          payload: { relayPid: relay?.relayPid ?? null, offsets },
+        });
+      }
+      await fs.rm(relayDir, { recursive: true, force: true });
+    };
+
+    const runTick = async () => {
+      try {
+        while (!stopped && (await drainOnce())) {
+          // keep draining while the files have unread bytes
+        }
+        if (stopped) return;
+        const relay = await readRunOutputRelayState(relayDir);
+        const relayGone =
+          relay?.status !== "ended" && !isProcessAlive(relay?.relayPid);
+        if (relay?.status === "ended" || relayGone) {
+          // The relay writes its end marker after its last append, so one
+          // more read after seeing it gets every byte.
+          while (await drainOnce()) {
+            // final drain
+          }
+          await finish(relay);
+          return;
+        }
+        await flushProgress(false);
+      } catch (err) {
+        logger.warn(
+          { err, runId: run.id },
+          "failed to record adopted child output from its relay",
+        );
+      }
+      if (!stopped && adoptedOutputTails.has(run.id)) schedule();
+    };
+
+    const schedule = () => {
+      timer = setTimeout(() => {
+        timer = null;
+        tick = runTick().finally(() => {
+          tick = null;
+        });
+      }, ADOPTED_OUTPUT_TAIL_POLL_MS);
+      timer.unref?.();
+    };
+
+    adoptedOutputTails.set(run.id, {
+      stop: async () => {
+        stopped = true;
+        if (timer) clearTimeout(timer);
+        timer = null;
+        await tick;
+        await flushProgress(true).catch(() => undefined);
+        await writeRunOutputRelayOffsets(relayDir, offsets).catch(
+          () => undefined,
+        );
+        adoptedOutputTails.delete(run.id);
+      },
+    });
+    tick = runTick().finally(() => {
+      tick = null;
+    });
+  }
+
+  async function stopAdoptedRunOutputTails() {
+    await Promise.all(
+      [...adoptedOutputTails.values()].map((tail) => tail.stop()),
+    );
+  }
+
+  /** Test hook: wait until no adopted run output is being tailed. */
+  async function waitForAdoptedRunOutputTails(timeoutMs = 10_000) {
+    const deadline = Date.now() + timeoutMs;
+    while (adoptedOutputTails.size > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return adoptedOutputTails.size === 0;
   }
 
   async function reconcileHotRestartAdoption(now = new Date()) {
@@ -15321,6 +15642,23 @@ export function heartbeatService(
         continue;
       }
 
+      // A run handed off by a server without the relay (or whose handoff
+      // failed) is still adopted, but its later output cannot be read.
+      const relayDir = resolveRunOutputRelayDir(run.id);
+      const relay = await waitForRunOutputRelayState(relayDir).catch(
+        () => null,
+      );
+      const outputCapture = relay
+        ? {
+            mode: "relay" as const,
+            relayPid: relay.relayPid,
+            relayStartedAt: relay.startedAt,
+          }
+        : {
+            mode: "not_captured" as const,
+            reason: "no_output_relay",
+            message: HOT_RESTART_OUTPUT_NOT_CAPTURED_MESSAGE,
+          };
       const resultJson = mergeHotRestartAdoptionResultJson(
         parseObject(run.resultJson),
         {
@@ -15331,6 +15669,7 @@ export function heartbeatService(
           newServerVersion: serverVersion,
           processPid,
           processGroupId,
+          outputCapture,
         },
       );
       const updated = await db
@@ -15385,8 +15724,25 @@ export function heartbeatService(
           newServerVersion: serverVersion,
           processPid,
           processGroupId,
+          outputCapture,
         },
       });
+      if (relay) {
+        await startAdoptedRunOutputTail(updated, relayDir).catch((err) => {
+          logger.warn(
+            { err, runId: updated.id },
+            "failed to start recording adopted child output from its relay",
+          );
+        });
+      } else {
+        await appendRunEvent(updated, {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message: HOT_RESTART_OUTPUT_NOT_CAPTURED_MESSAGE,
+          payload: { reason: "no_output_relay", processPid, processGroupId },
+        });
+      }
       classify(
         candidate,
         "adopted",
@@ -19756,6 +20112,8 @@ export function heartbeatService(
       const locallyTracked =
         runningProcesses.has(run.id) ||
         activeRunExecutions.has(run.id) ||
+        // An adopted child's relay output is still being recorded.
+        adoptedOutputTails.has(run.id) ||
         coordinatorOwnedByCurrentController;
       if (
         nativeRun &&
@@ -30960,6 +31318,8 @@ export function heartbeatService(
     reconcileHotRestartAdoption,
     recoverNativeRunsAfterRestart,
     reapOrphanedRuns,
+    stopAdoptedRunOutputTails,
+    waitForAdoptedRunOutputTails,
     sweepOrphanedActiveLeases,
     sweepPendingCleanupLeases,
     // Override-aware scheduling-suppression check (honors the worktree
