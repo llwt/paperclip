@@ -26,7 +26,9 @@ describe("git broker decision", () => {
     ["restore", "x"], ["reset", "--hard"], ["worktree", "list"], ["worktree", "add", "../x"], ["cherry", "main"],
     ["patch-id"], ["remote"], ["remote", "-v"], ["remote", "get-url", "origin"], ["remote", "set-url", "origin", "u"],
     ["remote", "add", "origin", "u"], ["remote", "remove", "origin"], ["remote", "show", "-n", "origin"],
-    ["tag"], ["tag", "-l", "v*"], ["tag", "--list"], ["stash", "list"], ["stash", "show", "-p"],
+    ["remote", "-v", "set-url", "--push", "origin", "u"], ["remote", "add", "--no-tags", "origin", "u"],
+    ["remote", "rename", "a", "b"], ["tag"], ["tag", "-l", "v*"], ["tag", "--list"], ["tag", "v*", "-l"],
+    ["stash", "list"], ["stash", "show", "-p"],
   ])("skips the broker for git %s", (...args) => {
     expect(needsBroker(...args)).toBe(false);
   });
@@ -39,6 +41,19 @@ describe("git broker decision", () => {
     ["remote", "show", "origin"], ["remote", "add", "-f", "origin", "u"], ["remote", "prune", "origin"],
     ["co", "main"], ["st"], ["unknown-subcommand"],
   ])("calls the broker for git %s", (...args) => {
+    expect(needsBroker(...args)).toBe(true);
+  });
+
+  // Review round 1: options take values and short options combine, so a form
+  // is local only when every option is one the classifier knows.
+  it.each([
+    ["remote", "add", "-ft", "main", "origin", "u"], ["remote", "add", "-f", "-t", "main", "origin", "u"],
+    ["remote", "add", "-t", "main", "origin", "u"], ["remote", "add", "origin", "u", "--fetch"],
+    ["remote", "add", "--mirror=fetch", "origin", "u"], ["remote", "set-url", "-f", "origin", "u"],
+    ["remote", "show", "origin", "-x"], ["remote", "--verbose", "update"],
+    ["tag", "-m", "-l", "v1"], ["tag", "-a", "-l", "v1"], ["tag", "-l", "-m", "x", "v1"], ["tag", "-lm", "x"],
+    ["tag", "-s", "v1"], ["tag", "--", "-l"],
+  ])("calls the broker for option forms it cannot prove local: git %s", (...args) => {
     expect(needsBroker(...args)).toBe(true);
   });
 

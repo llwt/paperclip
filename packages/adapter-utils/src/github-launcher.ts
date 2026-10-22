@@ -38,15 +38,25 @@ const GIT_BROKER_DECISION_SOURCE = String.raw`function classifyGitInvocation(arg
   const rest = args.slice(i + 1);
   let needsBroker = !local.has(subcommand);
   if (subcommand === 'remote') {
-    // Only the forms that read or edit local remote configuration.
+    // Only the forms that read or edit local remote configuration, with only
+    // the options listed for each form. Option values and combined short
+    // options (remote add -ft main) are not parsed, so they call the broker.
     const words = rest.filter(arg => arg !== '-v' && arg !== '--verbose');
+    const options = {
+      'get-url': ['--push', '--all'], 'set-url': ['--push', '--add', '--delete'], remove: [], rm: [],
+      rename: ['--progress', '--no-progress'], 'set-branches': ['--add'], add: ['--tags', '--no-tags'], show: ['-n'],
+    };
     const action = words[0];
-    needsBroker = !(action === undefined || ['get-url', 'set-url', 'remove', 'rm', 'rename', 'set-branches'].includes(action)
-      || (action === 'add' && !words.some(arg => arg === '-f' || arg === '--fetch'))
-      || (action === 'show' && words.includes('-n')));
+    const allowed = Object.prototype.hasOwnProperty.call(options, action) ? options[action] : null;
+    needsBroker = !(action === undefined || (allowed !== null
+      && words.slice(1).every(arg => !arg.startsWith('-') || allowed.includes(arg))
+      && (action !== 'show' || words.includes('-n'))));
   } else if (subcommand === 'tag') {
     // Listing only: creating an annotated or signed tag records an identity.
-    needsBroker = !(rest.length === 0 || rest.includes('-l') || rest.includes('--list'));
+    // -l counts only as a listing flag when no other option is present, so a
+    // value such as the message in tag -m -l v1 cannot pass as a list.
+    const options = rest.filter(arg => arg.startsWith('-'));
+    needsBroker = !(rest.length === 0 || (options.length > 0 && options.every(arg => arg === '-l' || arg === '--list')));
   } else if (subcommand === 'stash') {
     needsBroker = !(rest[0] === 'list' || rest[0] === 'show');
   }
