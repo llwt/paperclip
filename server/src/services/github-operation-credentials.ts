@@ -28,6 +28,35 @@ export type GitHubCredentialSummary = {
   authenticationMode?: "managed" | "host" | "anonymous";
 };
 
+/**
+ * The launcher asks for credentials on every networked git and every gh
+ * command. Within one run, one access event per secret version per window is
+ * enough to answer who used which token when.
+ */
+export const GITHUB_OPERATION_AUDIT_WINDOW_MS = 5 * 60_000;
+
+/** jsonb drops undefined keys and reorders the rest. */
+function sameSummary(stored: unknown, summary: GitHubCredentialSummary) {
+  if (!stored || typeof stored !== "object") return false;
+  const previous = stored as Record<string, unknown>;
+  const next = summary as Record<string, unknown>;
+  const keys = new Set([...Object.keys(previous), ...Object.keys(next)]);
+  for (const key of keys) if ((previous[key] ?? null) !== (next[key] ?? null)) return false;
+  return true;
+}
+
+async function recordGitHubSummary(
+  db: Db,
+  context: typeof runIdentityContexts.$inferSelect,
+  summary: GitHubCredentialSummary,
+) {
+  if (sameSummary(context.github, summary)) return;
+  await db
+    .update(runIdentityContexts)
+    .set({ github: summary })
+    .where(eq(runIdentityContexts.id, context.id));
+}
+
 /** A raw GitHub token cannot enforce the low-trust read-only tool boundary. */
 async function allowsGitHubCredentialExport(
   db: Db,
@@ -126,10 +155,7 @@ export async function resolveGitHubOperationCredentials(
       reason:
         "GitHub credentials are not available to low-trust or unverified executions; use authorized read-only tools.",
     };
-    await db
-      .update(runIdentityContexts)
-      .set({ github: summary })
-      .where(eq(runIdentityContexts.id, context.id));
+    await recordGitHubSummary(db, context, summary);
     return {
       identityContextId: context.id,
       revision: context.revision,
@@ -146,6 +172,7 @@ export async function resolveGitHubOperationCredentials(
         agentId: input.agentId,
         heartbeatRunId: input.runId,
         allowStandingDelegation: false,
+        auditDedupeWindowMs: GITHUB_OPERATION_AUDIT_WINDOW_MS,
         responsibleUserId:
           context?.cause === "company_default"
             ? null
@@ -180,11 +207,7 @@ export async function resolveGitHubOperationCredentials(
       reason: "GitHub credentials are temporarily unavailable",
     };
   }
-  if (context)
-    await db
-      .update(runIdentityContexts)
-      .set({ github: summary })
-      .where(eq(runIdentityContexts.id, context.id));
+  await recordGitHubSummary(db, context, summary);
   return {
     identityContextId: context?.id ?? null,
     revision: context?.revision ?? null,
