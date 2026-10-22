@@ -54,6 +54,48 @@ export async function managedAiSessionStateMounts(providerHome: string): Promise
   return mounts;
 }
 
+/**
+ * Read-only mounts for the mise tool installs a run env points at: its data
+ * and cache dirs, each MISE_SHARED_INSTALL_DIRS entry, the shims next to those
+ * installs and the `mise` executable on PATH that the shims link to. A
+ * confined run can call `mise` or a shim and reuse tools installed outside
+ * the sandbox, but cannot change them for other runs or for the host user.
+ */
+export async function miseToolInstallMounts(env: Record<string, string | undefined>): Promise<LocalProcessSandboxPath[]> {
+  const absoluteList = (value: string | undefined) =>
+    (value ?? "").split(path.delimiter).map((entry) => entry.trim()).filter((entry) => path.isAbsolute(entry));
+  const dataDirs = absoluteList(env.MISE_DATA_DIR);
+  const installDirs = absoluteList(env.MISE_SHARED_INSTALL_DIRS);
+  const paths = [
+    ...dataDirs,
+    ...absoluteList(env.MISE_CACHE_DIR),
+    ...installDirs,
+    ...[...dataDirs, ...installDirs.map((entry) => path.dirname(path.resolve(entry)))]
+      .map((entry) => path.join(entry, "shims")),
+  ];
+  const executable = await findExecutableOnPath("mise", env.PATH);
+  if (executable) {
+    paths.push(executable);
+    const realExecutable = await fs.realpath(executable).catch(() => executable);
+    paths.push(realExecutable);
+  }
+  return Array.from(new Set(paths.map((entry) => path.resolve(entry)))).map((entry) => ({ path: entry, access: "ro" }));
+}
+
+async function findExecutableOnPath(name: string, searchPath: string | undefined): Promise<string | null> {
+  for (const dir of (searchPath ?? "").split(path.delimiter)) {
+    if (!path.isAbsolute(dir)) continue;
+    const candidate = path.join(dir, name);
+    try {
+      await fs.access(candidate, fs.constants.X_OK);
+      if ((await fs.stat(candidate)).isFile()) return candidate;
+    } catch {
+      // Not here; keep looking.
+    }
+  }
+  return null;
+}
+
 export interface LocalProcessSandboxSpawnTarget {
   command: string;
   args: string[];
@@ -89,6 +131,8 @@ const SYSTEM_READ_PATHS = [
   "/etc/gitconfig",
 ] as const;
 
+const FRESH_ROOT_SYMLINKS = new Set(["/bin", "/sbin", "/lib", "/lib64"]);
+
 const PROXY_ENV_KEYS = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] as const;
 const SANDBOX_PROXY_PORT = 31_337;
 const UNIX_SOCKET_PATH_MAX_BYTES = 107;
@@ -104,6 +148,10 @@ function normalizeAbsolutePath(candidate: string, label: string): string {
 
 async function pathExists(candidate: string): Promise<boolean> {
   return fs.lstat(candidate).then(() => true).catch(() => false);
+}
+
+async function isSymbolicLink(candidate: string): Promise<boolean> {
+  return fs.lstat(candidate).then((stat) => stat.isSymbolicLink()).catch(() => false);
 }
 
 function parentDirectories(candidate: string): string[] {
@@ -425,7 +473,12 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
       mounted.add(normalized);
       created.add(normalized);
     };
-    for (const systemPath of SYSTEM_READ_PATHS) await mount(systemPath, "ro");
+    for (const systemPath of SYSTEM_READ_PATHS) {
+      // On merged-/usr hosts these are symlinks into /usr, already recreated
+      // above; binding them would follow the new root's dangling symlink.
+      if (FRESH_ROOT_SYMLINKS.has(systemPath) && (await isSymbolicLink(systemPath))) continue;
+      await mount(systemPath, "ro");
+    }
     for (const executablePath of await executableReadPaths(input.executable)) await mount(executablePath, "ro");
     if (networkScope === "allowlist") {
       for (const nodePath of await executableReadPaths(process.execPath)) await mount(nodePath, "ro");

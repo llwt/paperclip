@@ -590,7 +590,7 @@ describe("parseClaudeStreamJson usage extraction", () => {
       ...extra,
     });
 
-  it("prefers modelUsage totals over the main-loop usage block and marks them per-run", () => {
+  it("prefers modelUsage totals over the main-loop usage block and marks them session totals", () => {
     const parsed = parseClaudeStreamJson(
       `${resultEvent({
         modelUsage: {
@@ -608,8 +608,33 @@ describe("parseClaudeStreamJson usage extraction", () => {
       outputTokens: 77_000,
       cachedInputTokens: 300_000,
     });
-    expect(parsed.usageBasis).toBe("per_run");
+    expect(parsed.usageBasis).toBe("session_cumulative");
+    expect(parsed.costBasis).toBe("session_cumulative");
     expect(parsed.costUsd).toBeCloseTo(1.25);
+    // The invocation's own main-loop tokens travel alongside the totals.
+    expect(parsed.invocationUsage).toEqual({
+      inputTokens: 10,
+      outputTokens: 1_800,
+      cachedInputTokens: 20,
+    });
+  });
+
+  it("counts cache writes as input in the result usage fallback, like modelUsage", () => {
+    const parsed = parseClaudeStreamJson(
+      `${resultEvent({
+        usage: {
+          input_tokens: 10,
+          output_tokens: 1_800,
+          cache_read_input_tokens: 20,
+          cache_creation_input_tokens: 100,
+        },
+      })}\n`,
+    );
+    expect(parsed.usage).toEqual({
+      inputTokens: 110,
+      outputTokens: 1_800,
+      cachedInputTokens: 20,
+    });
   });
 
   it("falls back to the result usage block when modelUsage is absent", () => {
@@ -620,5 +645,7 @@ describe("parseClaudeStreamJson usage extraction", () => {
       cachedInputTokens: 20,
     });
     expect(parsed.usageBasis).toBe("per_run");
+    // total_cost_usd is still the session total on --resume.
+    expect(parsed.costBasis).toBe("session_cumulative");
   });
 });
