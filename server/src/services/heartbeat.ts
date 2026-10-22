@@ -89,7 +89,6 @@ import { agentInstructionWorkingCopyService, instructionWorkingCopyGuidance } fr
 import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { StringDecoder } from "node:string_decoder";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
@@ -359,6 +358,7 @@ import {
   readRunOutputRelayOffsets,
   readRunOutputRelayState,
   RUN_OUTPUT_RELAY_STREAMS,
+  splitRunOutputRelayBytes,
   waitForRunOutputRelayState,
   writeRunOutputRelayOffsets,
   type RunOutputRelayOffsets,
@@ -849,6 +849,9 @@ export {
 export const ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS = 60 * 1000;
 export const ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS = 5 * 1000;
 const ADOPTED_OUTPUT_TAIL_POLL_MS = 1000;
+const ADOPTED_OUTPUT_TAIL_READ_BYTES = 256 * 1024;
+const ADOPTED_OUTPUT_TAIL_CHUNK_BYTES = 16 * 1024;
+const ADOPTED_OUTPUT_TAIL_MAX_FAILURES = 60;
 export const HOT_RESTART_OUTPUT_NOT_CAPTURED_MESSAGE =
   "Output not captured after hot restart: the previous server did not hand this child's output to a relay, so output written after the restart is lost";
 export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
@@ -15259,11 +15262,8 @@ export function heartbeatService(
     } | null = null;
     const offsets: RunOutputRelayOffsets =
       await readRunOutputRelayOffsets(relayDir);
-    const decoders = {
-      stdout: new StringDecoder("utf8"),
-      stderr: new StringDecoder("utf8"),
-    };
     let stopped = false;
+    let consecutiveFailures = 0;
     let timer: NodeJS.Timeout | null = null;
     let tick: Promise<void> | null = null;
 
@@ -15290,20 +15290,24 @@ export function heartbeatService(
         .where(eq(heartbeatRuns.id, run.id));
     };
 
-    const record = async (stream: "stdout" | "stderr", chunk: string) => {
-      if (!chunk) return;
+    // Appends one relay chunk to the run log. The stream offset moves past
+    // the chunk only once the append succeeded, so a failed append is read
+    // again on the next tick instead of being skipped.
+    const record = async (stream: "stdout" | "stderr", bytes: Buffer) => {
+      if (bytes.length === 0) return;
       const sanitizedChunk = compactRunLogChunk(
-        redactCurrentUserText(chunk, redactionOptions),
+        redactCurrentUserText(bytes.toString("utf8"), redactionOptions),
       );
       const ts = new Date().toISOString();
-      outputSeq += 1;
-      const chunkSeq = outputSeq;
+      const chunkSeq = outputSeq + 1;
       persistedLogBytes += await runLogStore.append(handle, {
         stream,
         chunk: sanitizedChunk,
         ts,
         seq: chunkSeq,
       });
+      outputSeq = chunkSeq;
+      offsets[stream] += bytes.length;
       pendingProgress = { at: new Date(ts), seq: chunkSeq, stream };
       await flushProgress(false);
       const at = new Date(ts);
@@ -15343,29 +15347,43 @@ export function heartbeatService(
       });
     };
 
-    // Returns true when a stream had bytes past its offset.
-    const drainOnce = async () => {
+    // Returns true when a stream had bytes past its offset. Bytes are cut
+    // into chunks well under the persisted chunk limit, so a burst of output
+    // is not truncated, and never inside a UTF-8 character, so the saved
+    // offsets are safe to resume from in a later server.
+    const drainOnce = async (final = false) => {
+      const before = { ...offsets };
       let advanced = false;
-      for (const stream of RUN_OUTPUT_RELAY_STREAMS) {
-        const bytes = await readRunOutputRelayBytes(
-          relayDir,
-          stream,
-          offsets[stream],
-          256 * 1024,
-        );
-        if (bytes.length === 0) continue;
-        advanced = true;
-        offsets[stream] += bytes.length;
-        await record(stream, decoders[stream].write(bytes));
+      try {
+        for (const stream of RUN_OUTPUT_RELAY_STREAMS) {
+          const bytes = await readRunOutputRelayBytes(
+            relayDir,
+            stream,
+            offsets[stream],
+            ADOPTED_OUTPUT_TAIL_READ_BYTES,
+          );
+          const chunks = splitRunOutputRelayBytes(
+            bytes,
+            ADOPTED_OUTPUT_TAIL_CHUNK_BYTES,
+            final,
+          );
+          for (const chunk of chunks) {
+            await record(stream, chunk);
+            advanced = true;
+          }
+        }
+      } finally {
+        if (RUN_OUTPUT_RELAY_STREAMS.some((stream) => offsets[stream] !== before[stream])) {
+          await writeRunOutputRelayOffsets(relayDir, offsets);
+        }
       }
-      if (advanced) await writeRunOutputRelayOffsets(relayDir, offsets);
       return advanced;
     };
 
-    const finish = async (relay: RunOutputRelayState | null) => {
-      for (const stream of RUN_OUTPUT_RELAY_STREAMS) {
-        await record(stream, decoders[stream].end());
-      }
+    const finish = async (
+      relay: RunOutputRelayState | null,
+      gaveUp = false,
+    ) => {
       await flushProgress(true);
       const current = await getRun(run.id);
       if (current) {
@@ -15373,14 +15391,17 @@ export function heartbeatService(
         await appendRunEvent(current, {
           eventType: "lifecycle",
           stream: "system",
-          level: ended ? "info" : "warn",
-          message: ended
-            ? "Child output relay reached the end of the child's output"
-            : "Child output relay stopped before the end of the child's output; later output is not captured",
-          payload: { relayPid: relay?.relayPid ?? null, offsets },
+          level: ended && !gaveUp ? "info" : "warn",
+          message: gaveUp
+            ? "Could not record the child's output from its relay; the rest of the output stays in the relay files"
+            : ended
+              ? "Child output relay reached the end of the child's output"
+              : "Child output relay stopped before the end of the child's output; later output is not captured",
+          payload: { relayPid: relay?.relayPid ?? null, offsets, relayDir: gaveUp ? relayDir : null },
         });
       }
-      await fs.rm(relayDir, { recursive: true, force: true });
+      // On give-up the unread bytes stay on disk for a manual look.
+      if (!gaveUp) await fs.rm(relayDir, { recursive: true, force: true });
       // Last, so the reaper settles the run only after its output is in.
       adoptedOutputTails.delete(run.id);
     };
@@ -15400,15 +15421,31 @@ export function heartbeatService(
           while (await drainOnce()) {
             // final drain
           }
+          // An unfinished character at the very end is written as is.
+          await drainOnce(true);
           await finish(relay);
           return;
         }
         await flushProgress(false);
+        consecutiveFailures = 0;
       } catch (err) {
+        consecutiveFailures += 1;
         logger.warn(
-          { err, runId: run.id },
+          { err, runId: run.id, consecutiveFailures },
           "failed to record adopted child output from its relay",
         );
+        if (consecutiveFailures >= ADOPTED_OUTPUT_TAIL_MAX_FAILURES) {
+          // Do not hold the run open forever: the reaper settles it once
+          // this tail is gone.
+          await finish(null, true).catch((finishErr) => {
+            logger.warn(
+              { err: finishErr, runId: run.id },
+              "failed to close adopted child output tail",
+            );
+          });
+          adoptedOutputTails.delete(run.id);
+          return;
+        }
       }
       if (!stopped && adoptedOutputTails.has(run.id)) schedule();
     };

@@ -204,3 +204,39 @@ export async function readRunOutputRelayBytes(
     await handle.close();
   }
 }
+
+// Length of the trailing bytes that start a UTF-8 character the buffer does
+// not finish yet (0 when the buffer ends on a character boundary).
+function incompleteUtf8TailLength(bytes: Buffer, end = bytes.length) {
+  for (let back = 1; back <= Math.min(3, end); back += 1) {
+    const byte = bytes[end - back]!;
+    if ((byte & 0xc0) === 0x80) continue;
+    const needed = byte >= 0xf0 ? 4 : byte >= 0xe0 ? 3 : byte >= 0xc0 ? 2 : 1;
+    return needed > back ? back : 0;
+  }
+  return 0;
+}
+
+/**
+ * Splits bytes read from a relay log into chunks that each decode to whole
+ * UTF-8 characters and stay within `maxChunkBytes`, cutting after the last
+ * newline in the window when there is one. Unless `final`, an unfinished
+ * character at the end is left out, so a saved offset never splits one.
+ */
+export function splitRunOutputRelayBytes(bytes: Buffer, maxChunkBytes: number, final = false): Buffer[] {
+  const end = final ? bytes.length : bytes.length - incompleteUtf8TailLength(bytes);
+  const chunks: Buffer[] = [];
+  let start = 0;
+  while (start < end) {
+    let cut = Math.min(end, start + maxChunkBytes);
+    if (cut < end) {
+      const newline = bytes.lastIndexOf(0x0a, cut - 1);
+      if (newline >= start) cut = newline + 1;
+      else cut -= incompleteUtf8TailLength(bytes, cut);
+      if (cut <= start) cut = Math.min(end, start + maxChunkBytes);
+    }
+    chunks.push(bytes.subarray(start, cut));
+    start = cut;
+  }
+  return chunks;
+}

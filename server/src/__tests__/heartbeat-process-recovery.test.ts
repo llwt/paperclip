@@ -4031,6 +4031,194 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     },
   );
 
+  async function writeFakeRelay(
+    runId: string,
+    stdout: Buffer,
+    status: "running" | "ended",
+  ) {
+    const relayDir = path.join(
+      resolvePaperclipInstanceRoot(),
+      "data",
+      "run-output-relay",
+      runId,
+    );
+    await fs.mkdir(relayDir, { recursive: true });
+    await fs.appendFile(path.join(relayDir, "stdout.log"), stdout);
+    await fs.writeFile(
+      path.join(relayDir, "state.json"),
+      JSON.stringify({
+        version: 1,
+        status,
+        // This test process stands in for a live relay.
+        relayPid: process.pid,
+        startedAt: "2026-03-19T00:06:00.000Z",
+      }),
+    );
+    return relayDir;
+  }
+
+  async function readRunLogRecords(
+    companyId: string,
+    agentId: string,
+    runId: string,
+  ) {
+    const log = await getRunLogStore()
+      .read(
+        {
+          store: "local_file",
+          logRef: path.join(companyId, agentId, `${runId}.ndjson`),
+        },
+        { limitBytes: 8 * 1024 * 1024 },
+      )
+      .catch(() => ({ content: "" }));
+    return log.content
+      .split("\n")
+      .filter(Boolean)
+      .map(
+        (line) =>
+          JSON.parse(line) as { stream: string; chunk: string; seq?: number },
+      );
+  }
+
+  async function prepareHotRestart(
+    oldServer: ReturnType<typeof heartbeatService>,
+    at: string,
+  ) {
+    await writeHotRestartIntent({
+      previousServerPid: process.pid,
+      previousServerVersion: "old-version",
+      requestedAt: new Date(at),
+    });
+    await oldServer.prepareHotRestartShutdown(
+      "SIGTERM",
+      new Date(new Date(at).getTime() + 30_000),
+    );
+  }
+
+  async function adoptAfterHotRestart(
+    heartbeat: ReturnType<typeof heartbeatService>,
+    at: string,
+  ) {
+    await prepareHotRestart(heartbeat, at);
+    return heartbeat.reconcileHotRestartAdoption(
+      new Date(new Date(at).getTime() + 60_000),
+    );
+  }
+
+  it("records a burst of relay output larger than one log chunk without truncating it", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
+    });
+
+    await withTempPaperclipHome(async () => {
+      const lines = Array.from(
+        { length: 4000 },
+        (_, index) =>
+          `${JSON.stringify({ type: "assistant", n: index, text: "synthetic line" })}\n`,
+      ).join("");
+      expect(Buffer.byteLength(lines)).toBeGreaterThan(192 * 1024);
+      await writeFakeRelay(runId, Buffer.from(lines), "ended");
+
+      const heartbeat = heartbeatService(db);
+      const adoption = await adoptAfterHotRestart(
+        heartbeat,
+        "2026-03-19T00:05:00.000Z",
+      );
+      expect(adoption).toMatchObject({ adoptedRunIds: [runId] });
+      expect(await heartbeat.waitForAdoptedRunOutputTails()).toBe(true);
+
+      const stdout = (await readRunLogRecords(companyId, agentId, runId))
+        .filter((record) => record.stream === "stdout")
+        .map((record) => record.chunk);
+      expect(stdout.length).toBeGreaterThan(1);
+      expect(stdout.join("")).toBe(lines);
+      // Every chunk ends on a line boundary, so each line stays whole.
+      expect(stdout.every((chunk) => chunk.endsWith("\n"))).toBe(true);
+    });
+  });
+
+  it("retries a failed relay append and keeps a UTF-8 character split across two server lifetimes", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
+    });
+    const euro = Buffer.from("\u20ac", "utf8");
+    expect(euro).toHaveLength(3);
+
+    await withTempPaperclipHome(async () => {
+      // The first server sees one line plus the first two bytes of "€".
+      const relayDir = await writeFakeRelay(
+        runId,
+        Buffer.concat([Buffer.from("first line\n"), euro.subarray(0, 2)]),
+        "running",
+      );
+      const append = vi
+        .spyOn(getRunLogStore(), "append")
+        .mockRejectedValueOnce(new Error("synthetic append failure"));
+      try {
+        const firstServer = heartbeatService(db);
+        const first = await adoptAfterHotRestart(
+          firstServer,
+          "2026-03-19T00:05:00.000Z",
+        );
+        expect(first).toMatchObject({ adoptedRunIds: [runId] });
+        // The first append fails; a later tick records the same bytes.
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline) {
+          const records = await readRunLogRecords(companyId, agentId, runId);
+          if (records.some((record) => record.chunk === "first line\n")) break;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        expect(append.mock.calls.length).toBeGreaterThanOrEqual(2);
+
+        // Second hot restart: the first server saves its offsets and stops.
+        await prepareHotRestart(firstServer, "2026-03-19T00:09:00.000Z");
+        expect(await firstServer.waitForAdoptedRunOutputTails(0)).toBe(true);
+        expect(
+          JSON.parse(
+            await fs.readFile(path.join(relayDir, "tail-offsets.json"), "utf8"),
+          ),
+        ).toEqual({ stdout: "first line\n".length, stderr: 0 });
+
+        // The rest of the character arrives while the next server starts.
+        await writeFakeRelay(
+          runId,
+          Buffer.concat([euro.subarray(2), Buffer.from(" rest\n")]),
+          "ended",
+        );
+        const secondServer = heartbeatService(db);
+        const second = await secondServer.reconcileHotRestartAdoption(
+          new Date("2026-03-19T00:10:00.000Z"),
+        );
+        expect(second).toMatchObject({ adoptedRunIds: [runId] });
+        expect(await secondServer.waitForAdoptedRunOutputTails()).toBe(true);
+      } finally {
+        append.mockRestore();
+      }
+
+      const stdout = (await readRunLogRecords(companyId, agentId, runId))
+        .filter((record) => record.stream === "stdout")
+        .map((record) => record.chunk);
+      expect(stdout).toEqual(["first line\n", "\u20ac rest\n"]);
+      expect(stdout.join("")).not.toContain("\ufffd");
+    });
+  });
+
   it("adopts a child without an output relay and marks its output as not captured", async () => {
     // A child started by a server without the relay (or a failed handoff):
     // no runningProcesses entry, so nothing hands its output off.

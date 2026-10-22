@@ -8,6 +8,7 @@ import {
   readRunOutputRelayOffsets,
   readRunOutputRelayState,
   runOutputRelayLogPath,
+  splitRunOutputRelayBytes,
   writeRunOutputRelayOffsets,
 } from "./run-output-relay.js";
 import {
@@ -97,5 +98,31 @@ describe.skipIf(process.platform === "win32")("run output relay", () => {
     await writeRunOutputRelayOffsets(relayDir, { stdout: 11, stderr: 3 });
     expect(await readRunOutputRelayOffsets(relayDir)).toEqual({ stdout: 11, stderr: 3 });
     expect(await readRunOutputRelayState(relayDir)).toBeNull();
+  });
+});
+
+describe("splitRunOutputRelayBytes", () => {
+  it("cuts after the last newline that fits and keeps every byte", () => {
+    const input = Buffer.from("aaaa\nbbbb\ncccc\n");
+    const chunks = splitRunOutputRelayBytes(input, 12);
+    expect(chunks.map((chunk) => chunk.toString())).toEqual(["aaaa\nbbbb\n", "cccc\n"]);
+  });
+
+  it("cuts a line longer than the limit on a character boundary", () => {
+    const input = Buffer.from("ab\u20accd");
+    const chunks = splitRunOutputRelayBytes(input, 4, true);
+    expect(chunks.map((chunk) => chunk.toString())).toEqual(["ab", "\u20acc", "d"]);
+    expect(Buffer.concat(chunks).equals(input)).toBe(true);
+  });
+
+  it("leaves an unfinished character at the end for the next read unless final", () => {
+    const euro = Buffer.from("\u20ac");
+    const input = Buffer.concat([Buffer.from("x"), euro.subarray(0, 2)]);
+    expect(splitRunOutputRelayBytes(input, 1024).map((chunk) => chunk.toString())).toEqual(["x"]);
+    expect(Buffer.concat(splitRunOutputRelayBytes(input, 1024, true)).equals(input)).toBe(true);
+    expect(splitRunOutputRelayBytes(euro.subarray(0, 1), 1024)).toEqual([]);
+    expect(splitRunOutputRelayBytes(Buffer.from("\u{1f600}"), 1024).map((chunk) => chunk.toString())).toEqual([
+      "\u{1f600}",
+    ]);
   });
 });
