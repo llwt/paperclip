@@ -4898,9 +4898,18 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         }
         return found;
       };
-      const leftover = (await findRunProcesses()).find(
-        (proc) => proc.cmdline === "sleep 300",
-      );
+      // The backgrounded setsid still shows the shell's command line until it
+      // exec()s sleep, so poll (bounded, about 10s) for the exec'd leftover
+      // instead of scanning once. On timeout this stays undefined and the
+      // assertion below fails.
+      let leftover: { pid: number; cmdline: string } | undefined;
+      const leftoverDeadline = Date.now() + 10_000;
+      while (!leftover && Date.now() < leftoverDeadline) {
+        leftover = (await findRunProcesses()).find(
+          (proc) => proc.cmdline === "sleep 300",
+        );
+        if (!leftover) await new Promise((resolve) => setTimeout(resolve, 50));
+      }
       expect(leftover).toBeDefined();
       cleanupPids.add(leftover!.pid);
 
@@ -8864,7 +8873,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(next?.contextSnapshot?.wakeCommentIds).toEqual([pending!.id, go!.id]);
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, deferred!.id)))[0]).toMatchObject({ status: "coalesced", runId: next!.id });
-    await vi.waitFor(async () => expect((await heartbeat.getRun(next!.id))?.status).not.toBe("running"));
+    // The adopted run settles asynchronously; vi.waitFor defaults to a 1s
+    // budget, which a loaded CI shard can exceed. Bound the wait at 10s; on
+    // timeout the assertion still fails.
+    await vi.waitFor(async () => expect((await heartbeat.getRun(next!.id))?.status).not.toBe("running"), { timeout: 10_000, interval: 50 });
   });
 
   it.each(["dedicated deferred donor", "non-coalescing recipient", "persistent agent conversation"] as const)(
