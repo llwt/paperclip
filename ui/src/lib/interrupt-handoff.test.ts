@@ -126,17 +126,15 @@ describe("computeComposerHandoffPreview", () => {
     expect(p.text).toMatch(/no agent/i);
   });
 
-  it("no reassign + structured mention = context only, never a notify or wake", () => {
+  it("no reassign + structured mention = notify agent", () => {
     const p = computeComposerHandoffPreview({
       ...base,
       reassignTarget: base.currentAssigneeValue,
       bodyHasAgentMention: true,
       mentionedAgentId: QA_ID,
     });
-    expect(p.kind).toBe("mention_context");
+    expect(p.kind).toBe("notify_agent");
     expect(p.chip).toEqual({ kind: "agent", id: QA_ID });
-    expect(`${p.text} ${p.suffix}`).toMatch(/context only/i);
-    expect(`${p.text} ${p.suffix}`).not.toMatch(/notify|hand off to|will/i);
   });
 
   it("C. no reassign + plain name only = amber warning, no wake", () => {

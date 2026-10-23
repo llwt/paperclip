@@ -52,6 +52,8 @@ import {
   shapePaperclipWorkspaceEnvForExecution,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
+  leftoverProcessSweepResultJson,
+  withLeftoverProcessSweep,
 } from "@paperclipai/adapter-utils/server-utils";
 import { buildSkillLibraryManifestMarkdown } from "@paperclipai/adapter-utils/skill-library-manifest";
 import {
@@ -1062,6 +1064,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: "timeout",
         errorMeta,
+        ...(proc.leftoverProcessSweep?.stopped ? { resultJson: leftoverProcessSweepResultJson(proc) } : {}),
         clearSession: Boolean(opts.clearSessionOnMissingSession),
       };
     }
@@ -1139,6 +1142,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() }
             : {}),
           ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
+          ...leftoverProcessSweepResultJson(proc),
         },
         clearSession: Boolean(opts.clearSessionOnMissingSession),
       };
@@ -1274,6 +1278,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(providerQuota && transientRetryNotBefore ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
+      ...leftoverProcessSweepResultJson(proc),
     };
 
     return {
@@ -1400,7 +1405,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
       }
       const retry = await runAttempt(null);
-      return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
+      return withLeftoverProcessSweep(
+        toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true }),
+        [initial.proc, retry.proc],
+      );
     }
 
     return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
