@@ -12,6 +12,7 @@ export type {
   AdapterOutputRecoveryContext,
   AdapterOutputRecoveryResult,
   AdapterInvocationMeta,
+  AdapterInvocationRecoveryMeta,
   AdapterExecutionContext,
   AdapterRuntimeToolAccess,
   AdapterRuntimeToolDelivery,

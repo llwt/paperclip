@@ -170,6 +170,28 @@ export interface AdapterInvocationMeta {
   prompt?: string;
   promptMetrics?: Record<string, number>;
   context?: Record<string, unknown>;
+  /**
+   * Allowlisted facts about this CLI invocation, sent before its process starts
+   * so a later output-recovery hook can rebuild the final result. Never carries
+   * credentials, env, prompts or tool access.
+   */
+  recovery?: AdapterInvocationRecoveryMeta;
+}
+
+export interface AdapterInvocationRecoveryMeta {
+  version: 1;
+  /** Engine that runs this invocation's child, for example "cli". */
+  engine: string;
+  /** Session this invocation resumes, or null for a fresh session. */
+  sessionIdBefore: string | null;
+  /** Safe local session fields (no session id) that a result's session params extend. */
+  sessionParams: Record<string, unknown> | null;
+  accounting: {
+    provider: string | null;
+    biller: string | null;
+    model: string | null;
+    billingType: AdapterBillingType | null;
+  };
 }
 
 export interface AdapterRuntimeMcpServer {
