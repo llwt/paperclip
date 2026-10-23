@@ -19,11 +19,17 @@
   "dependencies": { "@paperclipai/plugin-sdk": "workspace:*" },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
     "esbuild": "^0.28.2",
+    "jsdom": "^30.0.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11"
   },
   "author": "Somnex",
   "license": "MIT",
-  "engines": { "node": ">=24.11.0" }
+  "engines": { "node": ">=24.11.0" },
+  "peerDependencies": { "react": ">=18" }
 }

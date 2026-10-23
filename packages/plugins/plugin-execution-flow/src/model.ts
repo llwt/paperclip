@@ -138,6 +138,7 @@ function confirmationView(card: Interaction, labels: Labels): ConfirmationView |
 export interface ExecutionFlowView {
   execution: {
     status: "available" | "unavailable";
+    policyKnown: boolean;
     message: "Execution data unavailable" | "No execution stages configured" | null;
     stateStatus: State["status"] | null;
     currentStageId: string | null;
@@ -168,6 +169,8 @@ export interface ExecutionFlowView {
     items: ConfirmationView[];
   };
 }
+
+export type ExecutionFlowResponse = ExecutionFlowView & { subject: { companyId: string; issueId: string } };
 
 export function buildExecutionFlow(input: {
   issue: ExecutionIssue;
@@ -212,6 +215,7 @@ export function buildExecutionFlow(input: {
   return {
     execution: {
       status: available ? "available" : "unavailable",
+      policyKnown: issue.executionPolicy !== undefined,
       message: !available ? "Execution data unavailable" : policyStages.length === 0 ? "No execution stages configured" : null,
       stateStatus: state?.status ?? null,
       currentStageId: state?.currentStageId ?? null,

@@ -1,12 +1,12 @@
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
-import { buildExecutionFlow, type Interaction, type ReadResult } from "./model.js";
+import { buildExecutionFlow, type ExecutionFlowResponse, type Interaction, type ReadResult } from "./model.js";
 import type { PluginIssueExecutionDecisionsPage } from "@paperclipai/plugin-sdk";
 
 export const DATA_KEY = "execution-flow";
 
 const plugin = definePlugin({
   async setup(ctx) {
-    ctx.data.register(DATA_KEY, async (params) => {
+    ctx.data.register(DATA_KEY, async (params): Promise<ExecutionFlowResponse> => {
       const { companyId, issueId, cursor } = params;
       if (typeof companyId !== "string" || !companyId.trim() || typeof issueId !== "string" || !issueId.trim()) {
         throw new Error("companyId and issueId are required");
@@ -23,7 +23,7 @@ const plugin = definePlugin({
         ? { status: "available", value: historyResult.value } : { status: "unavailable" };
       const interactions: ReadResult<Interaction[]> = cardsResult.status === "fulfilled"
         ? { status: "available", value: cardsResult.value } : { status: "unavailable" };
-      return buildExecutionFlow({ issue, history, interactions, requestedCursor: cursor });
+      return { ...buildExecutionFlow({ issue, history, interactions, requestedCursor: cursor }), subject: { companyId, issueId } };
     });
   },
 });
