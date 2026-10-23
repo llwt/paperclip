@@ -8683,6 +8683,28 @@ describeEmbeddedPostgres("tool access service", () => {
         profileId: retainedProfile!.id,
         status: "active",
       });
+      const [retainedEntry] = await db
+        .select()
+        .from(toolCatalogEntries)
+        .where(eq(toolCatalogEntries.connectionId, first.connectionId))
+        .limit(1);
+      const [agentIntentPolicy] = await db
+        .insert(toolPolicies)
+        .values({
+          companyId: company.id,
+          name: `connection-intent:revival:${retainedEntry!.id}`,
+          policyType: "require_approval",
+          priority: 0,
+          selectors: {
+            connectionId: first.connectionId,
+            catalogEntryId: retainedEntry!.id,
+          },
+          config: {
+            source: "connection_intent",
+            connectionId: first.connectionId,
+          },
+        })
+        .returning();
       await service.archiveConnection(first.connectionId, company.id, actor);
       await expect(
         db
@@ -8790,7 +8812,9 @@ describeEmbeddedPostgres("tool access service", () => {
               eq(toolPolicies.enabled, true),
             ),
           ),
-      ).resolves.toEqual([]);
+      ).resolves.toEqual([
+        expect.objectContaining({ id: agentIntentPolicy!.id }),
+      ]);
     } finally {
       driveDefinition.ownershipAvailability = previousOwnershipAvailability;
     }
@@ -15592,6 +15616,7 @@ describeEmbeddedPostgres("tool access service", () => {
           access: { agentIds: [agent.id] },
         },
         { actorType: "user", actorId: "board" },
+        { retireAgentAskFirstForAllowed: true },
       );
 
       expect(await loadPolicy(policyA.id)).toMatchObject({ enabled: false });
@@ -15623,6 +15648,38 @@ describeEmbeddedPostgres("tool access service", () => {
       ).resolves.toMatchObject({ decision: "require_approval" });
     });
 
+    it("keeps the agent's Ask first policy for an action the page sets to Off", async () => {
+      const { company, agent, connection, entryA, entryB, policyA, policyB, loadPolicy } =
+        await setupIntentPolicies();
+      const service = createTestToolAccessService(db);
+
+      await service.finishGalleryAppConnection(
+        company.id,
+        connection.id,
+        {
+          enabledCatalogEntryIds: [entryA.id],
+          askFirstCatalogEntryIds: [],
+          access: { agentIds: [agent.id] },
+        },
+        { actorType: "user", actorId: "board" },
+        { retireAgentAskFirstForAllowed: true },
+      );
+
+      expect(await loadPolicy(policyA.id)).toMatchObject({ enabled: false });
+      expect(await loadPolicy(policyB.id)).toMatchObject({ enabled: true });
+      const decision = await toolAccessPolicyService(db).decide({
+        companyId: company.id,
+        actor: { actorType: "agent", actorId: agent.id, agentId: agent.id },
+        request: {
+          connectionId: connection.id,
+          catalogEntryId: entryB.id,
+          toolName: entryB.toolName,
+          arguments: {},
+        },
+      });
+      expect(decision.decision).not.toBe("allow");
+    });
+
     it("leaves the agent's Ask first policies alone when the save preserves existing access", async () => {
       const { company, agent, connection, entryA, entryB, policyA, policyB, loadPolicy } =
         await setupIntentPolicies();
@@ -15638,6 +15695,7 @@ describeEmbeddedPostgres("tool access service", () => {
           preserveExistingAccess: true,
         },
         { actorType: "user", actorId: "board" },
+        { retireAgentAskFirstForAllowed: true },
       );
 
       expect(await loadPolicy(policyA.id)).toMatchObject({ enabled: true });
@@ -15663,6 +15721,7 @@ describeEmbeddedPostgres("tool access service", () => {
           access: { agentIds: [agent.id] },
         },
         { actorType: "user", actorId: "board" },
+        { retireAgentAskFirstForAllowed: true },
       );
 
       expect(await loadPolicy(otherPolicy.id)).toMatchObject({ enabled: true });
