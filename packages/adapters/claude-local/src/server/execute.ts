@@ -1008,6 +1008,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         prompt,
         promptMetrics,
         context,
+        recovery: {
+          version: 1,
+          engine: "cli",
+          sessionIdBefore: resumeSessionId,
+          sessionParams: {
+            cwd,
+            promptBundleKey: promptBundle.bundleKey,
+            mcpServerIdentity: runtimeMcpIdentity,
+            ...(executionTargetIsRemote
+              ? {
+                  remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
+                }
+              : {}),
+            ...(workspaceId ? { workspaceId } : {}),
+            ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
+            ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
+          },
+          accounting: {
+            provider: "anthropic",
+            biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
+            model,
+            billingType,
+          },
+        },
       });
     }
 
