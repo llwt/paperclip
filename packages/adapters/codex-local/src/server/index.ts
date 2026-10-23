@@ -9,6 +9,7 @@ export {
   type CodexAuthPrecedenceWinner,
 } from "./auth-precedence.js";
 export * from "./acp.js";
+export { recoverCodexResultFromOutput } from "./recover-result.js";
 export { getConfigSchema } from "./config-schema.js";
 export {
   reconcileManagedCodexHome,

@@ -10,6 +10,7 @@ export type {
   AdapterOutputRecoveryContext,
   AdapterOutputRecoveryResult,
   AdapterInvocationMeta,
+  AdapterInvocationRecoveryMeta,
   AdapterRuntimeEvent,
   AdapterRuntimeMcpServer,
   AdapterRuntimeMcpAccess,
