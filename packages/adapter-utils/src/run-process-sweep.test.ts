@@ -357,15 +357,28 @@ describe.skipIf(process.platform !== "linux")("runChildProcess leftover sweep (L
   it("resolves within one grace time of adapter exit when a TERM-ignoring leftover holds the pipes", async () => {
     const runId = `sweep-test-${randomUUID()}`;
     const graceMs = 3_000;
+    const dir = await mkdtemp(path.join(tmpdir(), "run-process-sweep-"));
     // The leftover ignores SIGTERM and keeps the inherited stdout/stderr open,
-    // so "close" only comes once the sweep has force-killed it.
-    const leftover = `"${process.execPath}" -e 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1e6)'`;
+    // so "close" only comes once the sweep has force-killed it. It writes the
+    // ready file only after the SIGTERM handler is installed; the run's shell
+    // waits for that file (about 10s) and fails the run on timeout, so the sweep
+    // can never SIGTERM a node that has not yet installed its handler.
+    const leftover = `"${process.execPath}" -e 'process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(process.argv[1], "ready"); setInterval(() => {}, 1e6)' "${dir}/ready"`;
+    const script = [
+      `(setsid ${leftover} &)`,
+      "i=0",
+      `while [ ! -e "${dir}/ready" ]; do`,
+      `  if [ "$i" -ge 200 ]; then echo "leftover never became ready" >&2; exit 1; fi`,
+      "  i=$((i+1)); sleep 0.05",
+      "done",
+      "echo done",
+    ].join("\n");
     try {
       const startedAt = Date.now();
       const result = await runChildProcess(
         runId,
         "sh",
-        ["-c", `(setsid ${leftover} &); sleep 0.5; echo done`],
+        ["-c", script],
         {
           cwd: process.cwd(),
           env: { PAPERCLIP_RUN_ID: runId },
@@ -380,7 +393,7 @@ describe.skipIf(process.platform !== "linux")("runChildProcess leftover sweep (L
       expect(result.exitCode).toBe(0);
       expect(result.leftoverProcessSweep?.stopped).toBe(1);
       expect(result.leftoverProcessSweep?.forceKilled).toBe(1);
-      // 0.5 s of script, one /proc scan and one grace time; two grace times
+      // Startup handshake (budgeted 0.5 s), one /proc scan and one grace time; two grace times
       // would be 6.5 s or more.
       expect(elapsedMs).toBeLessThan(500 + graceMs + 2_000);
       expect(await pidsWithRunId(runId)).toEqual([]);
@@ -392,6 +405,7 @@ describe.skipIf(process.platform !== "linux")("runChildProcess leftover sweep (L
           // already gone
         }
       }
+      await rm(dir, { recursive: true, force: true });
     }
   }, 20_000);
 
