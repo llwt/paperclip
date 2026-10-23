@@ -228,6 +228,40 @@ describe("recoverCodexResultFromOutput", () => {
     expect(outcome.result.sessionId).toBe(OLD_THREAD);
   });
 
+  describe("clearing a stale session after a fresh-session retry", () => {
+    const runStart = { sessionIdBefore: OLD_THREAD, sessionDisplayId: OLD_THREAD, sessionParams: null };
+
+    it("clears the session when the retry's output names no thread", async () => {
+      const outcome = expectComplete(await recover([turnStarted, completed()], context({ runStart })));
+      expect(outcome.result).toMatchObject({ sessionId: null, sessionParams: null, clearSession: true });
+      const failure = expectComplete(await recover([turnStarted, failed()], context({ runStart })));
+      expect(failure.result).toMatchObject({ sessionId: null, sessionParams: null, clearSession: true });
+    });
+
+    it("keeps the session when the retry's output names a thread", async () => {
+      const outcome = expectComplete(await recover([started(), turnStarted, completed()], context({ runStart })));
+      expect(outcome.result).toMatchObject({ sessionId: THREAD, clearSession: false });
+    });
+
+    it("keeps the session when the invocation resumed one", async () => {
+      const ctx = context({ runStart, invocation: { ...context().invocation, sessionIdBefore: OLD_THREAD } });
+      const outcome = expectComplete(await recover([turnStarted, completed()], ctx));
+      expect(outcome.result).toMatchObject({ sessionId: OLD_THREAD, clearSession: false });
+    });
+
+    it("keeps the session when the run started without one", async () => {
+      const outcome = expectComplete(await recover([turnStarted, completed()]));
+      expect(outcome.result).toMatchObject({ sessionId: null, clearSession: false });
+    });
+  });
+
+  it("keeps remoteExecution from the recovery session params", async () => {
+    const remoteExecution = { transport: "ssh", host: "127.0.0.1", port: 2222, username: "fixture", remoteCwd: "/remote" };
+    const ctx = context({ invocation: { ...context().invocation, sessionParams: { cwd: "/work", remoteExecution } } });
+    const outcome = expectComplete(await recover([started(), turnStarted, completed()], ctx));
+    expect(outcome.result.sessionParams).toMatchObject({ sessionId: THREAD, cwd: "/work", remoteExecution });
+  });
+
   it("rejects ACP runs, other adapters and unknown context versions", async () => {
     expect(await recover([started(), completed()], context({ engine: "acp" }))).toEqual({
       kind: "inconclusive",

@@ -286,7 +286,11 @@ export async function recoverClaudeResultFromOutput(
     costUsd,
     resultJson,
     summary,
-    clearSession: maxTurns || poisoned,
+    // Same as execute(): a fresh-session retry that never produced a session id leaves the old session stale.
+    clearSession:
+      maxTurns ||
+      poisoned ||
+      (!sessionId && context.invocation.sessionIdBefore === null && context.runStart.sessionIdBefore !== null),
   };
 
   return {
