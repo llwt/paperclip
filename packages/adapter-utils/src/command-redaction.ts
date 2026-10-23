@@ -139,3 +139,43 @@ export function redactDiagnosticText(
     .replace(JSON_ESCAPED_SECRET_FIELD_RE, `$1${redactedValue}$2`)
     .replace(JSON_SECRET_FIELD_RE, `$1${redactedValue}$2`);
 }
+
+const ARGV_SECRET_OPTION_RE = new RegExp(
+  String.raw`^-{1,2}${SECRET_NAME_PATTERN}$`,
+  "i",
+);
+// A secret option or assignment inside one argument, such as the script of
+// `sh -c`: `--password 'a b'` or `TOKEN="a b"`. Shell quoting and escapes in
+// such a script cannot be parsed safely here, so everything after the marker
+// up to the end of the argument is redacted.
+const ARGV_EMBEDDED_SECRET_RE = new RegExp(
+  String.raw`(?:\B-{1,2}${SECRET_NAME_PATTERN}(?:\s+|=)|\b${SECRET_NAME_PATTERN}\s*=)`,
+  "i",
+);
+
+/**
+ * Redact secrets from an argument vector, such as `/proc/<pid>/cmdline` split
+ * on NUL. Joining argv first loses argument boundaries, so a secret value that
+ * holds whitespace would be redacted only up to its first space. Here a whole
+ * argument is redacted when it is the value of a secret option (`--password
+ * <value>`). When an argument holds a secret option or assignment
+ * (`--password=<value>`, `TOKEN=<value>`, a `sh -c` script), the rest of that
+ * argument after the marker is redacted. Other arguments go through the
+ * command redaction.
+ */
+export function redactCommandArgv(
+  argv: readonly string[],
+  redactedValue = REDACTED_COMMAND_TEXT_VALUE,
+): string[] {
+  return argv.map((arg, index) => {
+    if (index > 0 && ARGV_SECRET_OPTION_RE.test(argv[index - 1]!)) {
+      return redactedValue;
+    }
+    const marker = ARGV_EMBEDDED_SECRET_RE.exec(arg);
+    if (marker) {
+      const head = arg.slice(0, marker.index + marker[0].length);
+      return `${redactCommandText(head, redactedValue)}${redactedValue}`;
+    }
+    return redactCommandText(arg, redactedValue);
+  });
+}

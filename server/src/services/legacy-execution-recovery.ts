@@ -31,6 +31,10 @@ export function legacyExecutionNeedsReconciliation(
   // agent, so a hold would block the successor's wake and every later comment.
   if (run.status === "cancelled" && run.errorCode === "issue_reassigned" &&
       run.resultJson?.reassignmentStopConfirmed === true) return false;
+  // The dispatch gate cancelled a disposition repair run before the provider
+  // was called, because the task moved on while the repair waited. Nothing ran
+  // that needs a check, and a hold would skip every later wake on the task.
+  if (run.status === "cancelled" && run.errorCode === "legacy_disposition_repair_suppressed") return false;
   // A fresh conversation turn lets the agent decide what remains. The retry
   // scheduler, not an action-outcome hold, owns the automatic attempt limit.
   if (hasConversationContinuationPolicy(run.resultJson)) return false;

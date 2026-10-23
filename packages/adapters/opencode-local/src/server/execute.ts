@@ -51,6 +51,7 @@ import {
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
   resolveLegacyPaperclipDesiredSkillNames,
+  withLeftoverProcessSweep,
 } from "@paperclipai/adapter-utils/server-utils";
 import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl } from "./parse.js";
 import {
@@ -756,10 +757,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           `[paperclip] OpenCode session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
         );
         const retry = await runAttempt(null);
-        return toResult(retry, true);
+        return withLeftoverProcessSweep(toResult(retry, true), [initial.proc, retry.proc]);
       }
 
-      return toResult(initial);
+      return withLeftoverProcessSweep(toResult(initial), [initial.proc]);
     } finally {
       try {
         await providerStop.collectBeforeRestore();

@@ -1,5 +1,4 @@
 import type { ExecutionProjection, ExecutionBlocker } from "./execution-projection.js";
-import type { IssueCommentHandoffOutcome, IssueCommentHandoffReasonCode } from "../agent-mention-handoff.js";
 import type {
   IssueCommentAuthorType,
   IssueCommentMetadataRowType,
@@ -1090,24 +1089,7 @@ export interface IssueCommentMetadata {
     reason: string;
     assigneeAgentId: string | null;
   };
-  /**
-   * Server-authored result of a leading-mention handoff. Never accepted from a
-   * request body and never an authorization input.
-   */
-  handoff?: IssueCommentHandoffReceipt;
   sections: IssueCommentMetadataSection[];
-}
-
-export interface IssueCommentHandoffReceipt {
-  version: 1;
-  outcome: IssueCommentHandoffOutcome;
-  reasonCode?: IssueCommentHandoffReasonCode;
-  /** Only when the target was safely resolved in the issue's company. */
-  targetAgentId?: string;
-  /** Committed assignment version; success only. */
-  statusVersion?: number;
-  /** Run stopped by the handoff; success only. */
-  interruptedRunId?: string;
 }
 
 export interface IssueCommentPresentation {
