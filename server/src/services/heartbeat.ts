@@ -628,9 +628,13 @@ import {
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
 import {
+  formatRunProcessSweepLogLine,
   handOffRunningProcessOutput,
+  mergeLeftoverProcessSweeps,
   readPaperclipSkillSyncPreference,
   selectPaperclipTaskMarkdown,
+  sweepRunProcesses,
+  type RunProcessSweepEvidence,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   writePaperclipSkillSyncPreference,
@@ -9946,6 +9950,11 @@ export interface HeartbeatServiceOptions {
   }) => Promise<void>;
   /** Test seam: failed ticks in a row before an adopted output tail gives up. */
   adoptedOutputTailMaxFailures?: number;
+  /** Test seam: replace the sweep, or shorten its grace, for adopted runs. */
+  adoptedRunLeftoverSweep?: {
+    sweep?: typeof sweepRunProcesses;
+    graceMs?: number;
+  };
 }
 
 export async function cancelHeartbeatNativeRun(input: {
@@ -15733,6 +15742,11 @@ export function heartbeatService(
       await fs.rm(relayDir, { recursive: true, force: true });
       // Last, so the reaper settles the run only after its output is in.
       adoptedOutputTails.delete(run.id);
+      // Only when the child itself is gone: an ended relay of a child that is
+      // still alive must not get it stopped. The reaper sweeps it later.
+      if (relay?.status === "ended" && !isAdoptedRunChildAlive(run)) {
+        void sweepAdoptedRunLeftovers(run);
+      }
     };
 
     // Recording kept failing: mark the run's output as not captured, so the
@@ -15865,6 +15879,91 @@ export function heartbeatService(
     tick = runTick().finally(() => {
       tick = null;
     });
+  }
+
+  // Fork (SX-1851): the old server skips the end-of-run sweep for a run it
+  // handed off, so the adopting server stops that run's leftover processes
+  // (`setsid`, daemons) when the adopted run ends. Once per run, after the
+  // child is gone, and never in the way of the run result.
+  const adoptedRunSweeps = new Map<string, Promise<void>>();
+
+  function isAdoptedRunChildAlive(run: {
+    processPid: number | null;
+    processGroupId: number | null;
+  }) {
+    return run.processPid
+      ? isProcessAlive(run.processPid)
+      : isProcessGroupAlive(run.processGroupId);
+  }
+
+  async function recordAdoptedRunLeftoverSweep(
+    run: { id: string; companyId: string; agentId: string },
+    evidence: RunProcessSweepEvidence,
+  ) {
+    const handle = await runLogStore.begin({
+      companyId: run.companyId,
+      agentId: run.agentId,
+      runId: run.id,
+    });
+    const current = await getRun(run.id);
+    const { maxSeq } = await readRunLogSeqAndBytes(handle);
+    await runLogStore.append(handle, {
+      stream: "stderr",
+      chunk: formatRunProcessSweepLogLine(evidence),
+      ts: new Date().toISOString(),
+      seq: Math.max(Number(current?.lastOutputSeq ?? 0), maxSeq) + 1,
+    });
+    const earlier = parseObject(current?.resultJson).leftoverProcessSweep;
+    const merged = mergeLeftoverProcessSweeps([
+      {
+        leftoverProcessSweep:
+          parseObject(earlier).kind === "leftover_process_sweep"
+            ? (earlier as RunProcessSweepEvidence)
+            : null,
+      },
+      { leftoverProcessSweep: evidence },
+    ]);
+    await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ||
+          ${JSON.stringify({ leftoverProcessSweep: merged })}::jsonb`,
+        updatedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, run.id));
+  }
+
+  function sweepAdoptedRunLeftovers(run: {
+    id: string;
+    companyId: string;
+    agentId: string;
+  }) {
+    const started = adoptedRunSweeps.get(run.id);
+    if (started) return started;
+    const sweep = options.adoptedRunLeftoverSweep?.sweep ?? sweepRunProcesses;
+    const graceMs = options.adoptedRunLeftoverSweep?.graceMs;
+    const promise = (async () => {
+      try {
+        const evidence = await sweep(
+          run.id,
+          graceMs === undefined ? {} : { graceMs },
+        );
+        if (!evidence || evidence.stopped === 0) return;
+        await recordAdoptedRunLeftoverSweep(run, evidence);
+      } catch (err) {
+        logger.warn(
+          { err, runId: run.id },
+          "failed to sweep leftover processes of an adopted run",
+        );
+      }
+    })();
+    adoptedRunSweeps.set(run.id, promise);
+    return promise;
+  }
+
+  /** Test hook: wait until the leftover sweeps of adopted runs have finished. */
+  async function waitForAdoptedRunSweeps() {
+    await Promise.all([...adoptedRunSweeps.values()]);
   }
 
   async function stopAdoptedRunOutputTails() {
@@ -16066,6 +16165,9 @@ export function heartbeatService(
       }
       if (!processPidAlive && !processGroupAlive) {
         classify(candidate, "lost", "process_not_alive", patch);
+        // The child ended while the servers were swapping; the old server did
+        // not sweep a run it handed off, so its leftovers are swept here.
+        void sweepAdoptedRunLeftovers(run);
         continue;
       }
 
@@ -20703,6 +20805,9 @@ export function heartbeatService(
         status: finalizedRun.status,
         failureReason: finalizedRun.error ?? undefined,
       });
+      if (readHotRestartAdoptionMetadata(parseObject(run.resultJson))) {
+        void sweepAdoptedRunLeftovers(finalizedRun);
+      }
 
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
       const retryAgent = await getAgent(run.agentId);
@@ -31965,6 +32070,7 @@ export function heartbeatService(
     reapOrphanedRuns,
     stopAdoptedRunOutputTails,
     waitForAdoptedRunOutputTails,
+    waitForAdoptedRunSweeps,
     sweepOrphanedActiveLeases,
     sweepPendingCleanupLeases,
     // Override-aware scheduling-suppression check (honors the worktree
