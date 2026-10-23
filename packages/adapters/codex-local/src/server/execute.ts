@@ -1263,6 +1263,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             sessionIdBefore: resumeSessionId,
             sessionParams: {
               cwd: effectiveExecutionCwd,
+              ...(executionTargetIsRemote
+                ? {
+                    remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
+                  }
+                : {}),
               ...(workspaceId ? { workspaceId } : {}),
               ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
               ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),

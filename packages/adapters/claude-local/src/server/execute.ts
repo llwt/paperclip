@@ -1016,6 +1016,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             cwd,
             promptBundleKey: promptBundle.bundleKey,
             mcpServerIdentity: runtimeMcpIdentity,
+            ...(executionTargetIsRemote
+              ? {
+                  remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
+                }
+              : {}),
             ...(workspaceId ? { workspaceId } : {}),
             ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
             ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),

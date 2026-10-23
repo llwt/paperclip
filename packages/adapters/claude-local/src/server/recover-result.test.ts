@@ -328,6 +328,39 @@ describe("recoverClaudeResultFromOutput", () => {
     expect(outcome.result.sessionId).toBe(OLD_SESSION);
   });
 
+  describe("clearing a stale session after a fresh-session retry", () => {
+    const runStart = { sessionIdBefore: OLD_SESSION, sessionDisplayId: OLD_SESSION, sessionParams: null };
+    const noSession = json({ type: "result", subtype: "success", is_error: false, result: "ok" });
+
+    it("clears the session when the retry's output names no session id", async () => {
+      const outcome = expectComplete(await recover([noSession], context({ runStart })));
+      expect(outcome.result).toMatchObject({ sessionId: null, sessionParams: null, clearSession: true });
+    });
+
+    it("keeps the session when the retry's output names one", async () => {
+      const outcome = expectComplete(await recover([init(), success()], context({ runStart })));
+      expect(outcome.result).toMatchObject({ sessionId: SESSION, clearSession: false });
+    });
+
+    it("keeps the session when the invocation resumed one", async () => {
+      const ctx = context({ runStart, invocation: { ...context().invocation, sessionIdBefore: OLD_SESSION } });
+      const outcome = expectComplete(await recover([noSession], ctx));
+      expect(outcome.result).toMatchObject({ sessionId: OLD_SESSION, clearSession: false });
+    });
+
+    it("keeps the session when the run started without one", async () => {
+      const outcome = expectComplete(await recover([noSession]));
+      expect(outcome.result).toMatchObject({ sessionId: null, clearSession: false });
+    });
+  });
+
+  it("keeps remoteExecution from the recovery session params", async () => {
+    const remoteExecution = { transport: "ssh", host: "127.0.0.1", port: 2222, username: "fixture", remoteCwd: "/remote" };
+    const ctx = context({ invocation: { ...context().invocation, sessionParams: { cwd: "/work", remoteExecution } } });
+    const outcome = expectComplete(await recover([init(), success()], ctx));
+    expect(outcome.result.sessionParams).toMatchObject({ sessionId: SESSION, cwd: "/work", remoteExecution });
+  });
+
   it("rejects ACP runs, other adapters and unknown context versions", async () => {
     expect(await recover([init(), success()], context({ engine: "acp" }))).toEqual({
       kind: "inconclusive",
