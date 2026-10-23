@@ -51,6 +51,7 @@ import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   joinPromptSections,
+  withLeftoverProcessSweep,
 } from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_CURSOR_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { firstCursorDiagnosticLine, parseCursorJsonl, isCursorUnknownSessionError } from "./parse.js";
@@ -768,9 +769,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[paperclip] Cursor resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
       );
       const retry = await runAttempt(null);
-      return toResult(retry, true);
+      return withLeftoverProcessSweep(toResult(retry, true), [initial.proc, retry.proc]);
     }
-    return toResult(initial);
+    return withLeftoverProcessSweep(toResult(initial), [initial.proc]);
   } finally {
     try {
       await providerStop.collectBeforeRestore();
