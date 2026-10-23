@@ -9435,6 +9435,23 @@ function mergeHotRestartAdoptionResultJson(
   };
 }
 
+// The server-owned hotRestart record of an adopted run, for a result read back
+// from its output: the adoption and output-capture provenance stays, the
+// adapter's result JSON cannot replace it, and recovery diagnostics go next to it.
+function recoveredHotRestartResultJson(
+  existingResultJson: Record<string, unknown> | null | undefined,
+  resultRecovery: Record<string, unknown> | undefined,
+) {
+  const existing = parseObject(parseObject(existingResultJson).hotRestart);
+  if (Object.keys(existing).length === 0 && !resultRecovery) return {};
+  return {
+    hotRestart: {
+      ...existing,
+      ...(resultRecovery ? { resultRecovery } : {}),
+    },
+  };
+}
+
 function truncateDisplayId(value: string | null | undefined, max = 128) {
   if (!value) return null;
   return value.length > max ? value.slice(0, max) : value;
@@ -9549,6 +9566,21 @@ function safeRecoverySessionParams(
   return Object.keys(flat).length > 0 ? flat : null;
 }
 
+// The adapter's recovery facts, or null (no recovery context) when the
+// version is not 1 or a field is missing.
+function readInvocationRecoveryMeta(
+  value: AdapterInvocationRecoveryMeta | null | undefined,
+): AdapterInvocationRecoveryMeta | null {
+  if (!value || typeof value !== "object" || value.version !== 1) return null;
+  const accounting = value.accounting as Partial<AdapterInvocationRecoveryMeta["accounting"]> | null | undefined;
+  if (
+    !("engine" in value) || !("sessionIdBefore" in value) || !("sessionParams" in value) ||
+    !accounting || typeof accounting !== "object" ||
+    !(["provider", "biller", "model", "billingType"] as const).every((key) => key in accounting)
+  ) return null;
+  return value;
+}
+
 export function buildLocalResultRecoverySnapshot(input: {
   adapterType: string;
   codec: AdapterSessionCodec;
@@ -9570,8 +9602,8 @@ export function buildLocalResultRecoverySnapshot(input: {
   startedAt: Date;
   recovery: AdapterInvocationRecoveryMeta | null | undefined;
 }): LocalResultRecoverySnapshot {
-  const recovery = input.recovery ?? null;
-  const billingType = readNonEmptyString(recovery?.billingType);
+  const recovery = readInvocationRecoveryMeta(input.recovery);
+  const billingType = readNonEmptyString(recovery?.accounting.billingType);
   return {
     version: 1,
     adapterType: input.adapterType,
@@ -9601,12 +9633,12 @@ export function buildLocalResultRecoverySnapshot(input: {
       firstSeq: input.firstSeq,
       startedAt: input.startedAt.toISOString(),
       engine: readNonEmptyString(recovery?.engine),
-      sessionIdBefore: readNonEmptyString(recovery?.sessionId),
+      sessionIdBefore: readNonEmptyString(recovery?.sessionIdBefore),
       sessionParams: safeRecoverySessionParams(input.codec, recovery?.sessionParams),
       accounting: {
-        provider: readNonEmptyString(recovery?.provider),
-        biller: readNonEmptyString(recovery?.biller),
-        model: readNonEmptyString(recovery?.model),
+        provider: readNonEmptyString(recovery?.accounting.provider),
+        biller: readNonEmptyString(recovery?.accounting.biller),
+        model: readNonEmptyString(recovery?.accounting.model),
         billingType: billingType && RECOVERY_BILLING_TYPES.has(billingType)
           ? (billingType as NonNullable<AdapterOutputRecoveryContext["accounting"]["billingType"]>)
           : null,
@@ -21548,7 +21580,12 @@ export function heartbeatService(
   } & (
     | { source: "execute" }
     // Only a run whose result was read back from its output carries an explicit verdict.
-    | { source: "adopted_output"; recoveredOutcome: "succeeded" | "failed" }
+    | {
+        source: "adopted_output";
+        recoveredOutcome: "succeeded" | "failed";
+        /** Stored as hotRestart.resultRecovery, next to the adoption provenance. */
+        resultRecovery?: Record<string, unknown>;
+      }
   );
 
   type AdapterRunFinalization = {
@@ -21808,6 +21845,12 @@ export function heartbeatService(
             ...parseObject(adapterResult.resultJson),
             ...(adapterResult.executionRecovery
               ? { executionRecovery: adapterResult.executionRecovery }
+              : {}),
+            ...(input.source === "adopted_output"
+              ? recoveredHotRestartResultJson(
+                  latestRun?.resultJson ?? run.resultJson,
+                  input.resultRecovery,
+                )
               : {}),
             configFreshness: configFreshnessResultMetadata,
           },

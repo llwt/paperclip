@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ChildProcess } from "node:child_process";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import {
@@ -324,8 +324,9 @@ describeSupported("heartbeat run finalization", () => {
       const invoke = async (sessionId: string | null) => {
         await ctx.onMeta!({
           adapterType: "process", command: "cli", env: { OPENAI_API_KEY: "sk-meta-secret" }, prompt: "secret prompt text",
-          recovery: { engine: "cli", provider: "openai", biller: "openai", model: "gpt-x", billingType: "subscription",
-            sessionId, sessionParams: sessionId ? { sessionId, token: "nested-secret", nested: { a: 1 } } : null },
+          recovery: { version: 1, engine: "cli", sessionIdBefore: sessionId,
+            sessionParams: sessionId ? { sessionId, token: "nested-secret", nested: { a: 1 } } : null,
+            accounting: { provider: "openai", biller: "openai", model: "gpt-x", billingType: "subscription" } },
         });
         // The child would start here.
         seenAtInvocation.push(await readSnapshot(ctx.runId));
@@ -364,6 +365,156 @@ describeSupported("heartbeat run finalization", () => {
       .toMatchObject({ invocation: { number: 2 } });
   });
 
+  // Effects that need the issue to stay open; later wakes of the agent end it.
+  async function runOpenIssue(ids: { agentId: string; issueId: string }, first: (ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>) {
+    adapterExecute.mockImplementationOnce(first);
+    adapterExecute.mockImplementation(closingIssue(async () => ({ exitCode: 0, signal: null, timedOut: false })));
+    const run = await heartbeat.wakeup(ids.agentId, { source: "automation", triggerDetail: "system", reason: "issue_commented",
+      contextSnapshot: { issueId: ids.issueId, taskId: ids.issueId } });
+    expect(run).not.toBeNull();
+    await vi.waitFor(async () => {
+      expect(["succeeded", "failed", "cancelled", "timed_out"]).toContain((await heartbeat.getRun(run!.id))?.status);
+    }, { timeout: 15_000 });
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    return run!.id;
+  }
+
+  async function followUps(runId: string, agentId: string) {
+    const rows = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)).orderBy(asc(heartbeatRuns.createdAt));
+    return rows.filter((row) => row.id !== runId).map((row) => ({
+      status: row.status, retryOfRunId: row.retryOfRunId, scheduledRetryReason: row.scheduledRetryReason,
+      scheduledRetryAttempt: row.scheduledRetryAttempt, wakeReason: parseWakeReason(row.contextSnapshot),
+    }));
+  }
+  const parseWakeReason = (context: unknown) => (context as Record<string, unknown> | null)?.wakeReason ?? null;
+
+  // A fault in the database while the run is finalized: the trigger raises
+  // for the rows the condition selects.
+  async function injectFault(table: "heartbeat_runs" | "cost_events", event: "insert" | "update", condition: string, message: string) {
+    const name = `finalization_fault_${randomUUID().replaceAll("-", "")}`;
+    await db.execute(sql.raw(`create function ${name}() returns trigger language plpgsql as $$ begin raise exception '${message}'; end $$`));
+    await db.execute(sql.raw(`create trigger ${name} before ${event} on ${table} for each row when (${condition}) execute function ${name}()`));
+    return async () => {
+      await db.execute(sql.raw(`drop trigger if exists ${name} on ${table}`));
+      await db.execute(sql.raw(`drop function if exists ${name}()`));
+    };
+  }
+
+  it("schedules the max-turn continuation of a failed run on its open issue", async () => {
+    const ids = await seed();
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxTurnContinuation: { delayMs: 300_000 } } } })
+      .where(eq(agents.id, ids.agentId));
+    const runId = await runOpenIssue(ids, async () => ({
+      exitCode: 1, signal: null, timedOut: false, errorMessage: "hit max turns", errorCode: "max_turns_exhausted",
+      resultJson: { stopReason: "max_turns_exhausted" }, sessionId: "session-6", sessionParams: { sessionId: "session-6" },
+    }));
+    const seen = await observe(runId, ids);
+    expect(seen.run).toMatchObject({ status: "failed", errorCode: "max_turns_exhausted", error: "hit max turns" });
+    expect(await followUps(runId, ids.agentId)).toEqual([{ status: "scheduled_retry", retryOfRunId: runId,
+      scheduledRetryReason: "max_turns_continuation", scheduledRetryAttempt: 1, wakeReason: "max_turns_continuation_retry" }]);
+    expect(seen.wakeup.status).toBe("failed");
+    expect(seen.sessions[0]).toMatchObject({ sessionDisplayId: "session-6", lastRunId: runId });
+  });
+
+  it("holds a transient failure of a legacy process run for reconciliation instead of retrying it", async () => {
+    const ids = await seed();
+    const retryNotBefore = new Date(Date.now() + 3_600_000).toISOString();
+    const runId = await runOpenIssue(ids, async () => ({
+      exitCode: 1, signal: null, timedOut: false, errorMessage: "upstream overloaded", errorCode: "upstream_overloaded",
+      errorFamily: "transient_upstream", retryNotBefore,
+    }));
+    const seen = await observe(runId, ids);
+    expect(seen.run).toMatchObject({ status: "failed", errorCode: "upstream_overloaded" });
+    expect(seen.run.resultJson).toMatchObject({ errorFamily: "transient_upstream", retryNotBefore, transientRetryNotBefore: retryNotBefore });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, ids.issueId));
+    // Not a conversation adapter: the run needs reconciliation, so no retry run.
+    expect(await followUps(runId, ids.agentId)).toEqual([]);
+    expect(seen.lifecycle).toEqual(["run started", "run failed", "run presentation resolved", "run scratch cleaned"]);
+    expect(issue.status).toBe("in_progress");
+    expect(seen.wakeup.status).toBe("failed");
+    expect(seen.agent.status).toBe("error");
+  });
+
+  it("starts the continuation wake of a successful run that left its issue open", async () => {
+    const ids = await seed();
+    const runId = await runOpenIssue(ids, async () => ({ exitCode: 0, signal: null, timedOut: false, summary: "Partway." }));
+    const seen = await observe(runId, ids);
+    expect(seen.run).toMatchObject({ status: "succeeded" });
+    expect(seen.comments.map((comment) => comment.body)).toEqual(["Partway."]);
+    // The missing disposition is repaired by one follow-up wake.
+    expect(await followUps(runId, ids.agentId)).toEqual([{ status: "succeeded", retryOfRunId: null,
+      scheduledRetryReason: null, scheduledRetryAttempt: 0, wakeReason: "issue_disposition_repair" }]);
+  });
+
+  it("keeps the semantic result of a run that native reconciliation ended first, with its issue effects", async () => {
+    const ids = await seed();
+    adapterExecute.mockImplementation(closingIssue(async (ctx) => {
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, ctx.runId));
+      return { exitCode: 0, signal: null, timedOut: false, summary: "Native done.", usage, usageBasis: "per_run",
+        costUsd: 0.5, provider: "openai", model: "gpt-x", sessionId: "session-7", sessionParams: { sessionId: "session-7" },
+        nativeFinalization: { terminal: { runTerminalState: "succeeded" } } as AdapterExecutionResult["nativeFinalization"] };
+    }));
+    const runId = await runToEnd(ids);
+    const seen = await observe(runId, ids);
+    expect(seen.run).toMatchObject({ status: "succeeded", sessionIdAfter: "session-7" });
+    expect(seen.run.usageJson).toMatchObject({ inputTokens: 1_000, costUsd: 0.5 });
+    expect(seen.run.resultJson).toMatchObject({ summary: "Native done." });
+    expect(seen.lifecycle).toEqual(["run started", "run succeeded", "run presentation resolved", "run scratch cleaned"]);
+    expect(seen.costs).toHaveLength(1);
+    expect(seen.runtime).toMatchObject({ lastRunId: runId, lastRunStatus: "succeeded", totalInputTokens: 1_000, totalCostCents: 50 });
+    expect(seen.sessions[0]).toMatchObject({ sessionDisplayId: "session-7", lastRunId: runId });
+    expect(seen.comments.map((comment) => comment.body)).toEqual(["Native done."]);
+    expect(seen.wakeup.status).toBe("completed");
+  });
+
+  it("fails the run through the executor's error path when the terminal write throws", async () => {
+    const ids = await seed();
+    const removeFault = await injectFault("heartbeat_runs", "update",
+      `new.agent_id = '${ids.agentId}' and old.status = 'running' and new.status = 'succeeded'`, "terminal write exploded");
+    try {
+      adapterExecute.mockImplementation(closingIssue(async () => ({ exitCode: 0, signal: null, timedOut: false, summary: "Lost.",
+        usage, usageBasis: "per_run", costUsd: 0.5, provider: "openai", model: "gpt-x",
+        sessionId: "session-8", sessionParams: { sessionId: "session-8" } })));
+      const runId = await runToEnd(ids);
+      const seen = await observe(runId, ids);
+      expect(seen.run).toMatchObject({ status: "failed", errorCode: "adapter_failed", usageJson: null, sessionIdAfter: null });
+      // The executor's catch records the failed query.
+      expect(seen.run.error).toMatch(/^Failed query: update "heartbeat_runs"/);
+      expect(seen.run.logBytes).toBeGreaterThan(0);
+      expect(seen.wakeup.status).toBe("failed");
+      expect(seen.costs).toHaveLength(0);
+      expect(seen.sessions).toHaveLength(0);
+      expect(seen.comments).toHaveLength(0);
+      expect(seen.agent.status).toBe("error");
+    } finally {
+      await removeFault();
+    }
+  });
+
+  it("keeps a terminal run as written when accounting throws after the terminal write", async () => {
+    const ids = await seed();
+    const removeFault = await injectFault("cost_events", "insert", `new.agent_id = '${ids.agentId}'`, "cost ledger exploded");
+    try {
+      adapterExecute.mockImplementation(closingIssue(async () => ({ exitCode: 0, signal: null, timedOut: false, summary: "Done.",
+        usage, usageBasis: "per_run", costUsd: 0.5, provider: "openai", model: "gpt-x",
+        sessionId: "session-9", sessionParams: { sessionId: "session-9" } })));
+      const runId = await runToEnd(ids);
+      const seen = await observe(runId, ids);
+      expect(seen.run).toMatchObject({ status: "succeeded", error: null, sessionIdAfter: "session-9" });
+      expect(seen.run.usageJson).toMatchObject({ inputTokens: 1_000 });
+      expect(seen.costs).toHaveLength(0);
+      // Effects before the cost insert stay; the task session and agent status after it are not written.
+      expect(seen.lifecycle).toEqual(["run started", "run succeeded", "run presentation resolved", "run scratch cleaned"]);
+      expect(seen.comments.map((comment) => comment.body)).toEqual(["Done."]);
+      expect(seen.wakeup.status).toBe("completed");
+      expect(seen.runtime).toMatchObject({ lastRunStatus: "succeeded", totalInputTokens: 1_000 });
+      expect(seen.sessions).toHaveLength(0);
+      expect(seen.agent.status).toBe("running");
+    } finally {
+      await removeFault();
+    }
+  });
+
   describe("finalizeAdapterRun", () => {
     const sessionConfig = {
       version: 1, fingerprint: "fp", categories: [], categoryFingerprints: {}, fingerprints: {},
@@ -383,7 +534,9 @@ describeSupported("heartbeat run finalization", () => {
     function finalizeInput(
       row: Awaited<ReturnType<typeof runningRun>>,
       adapterResult: AdapterExecutionResult,
-      source: { source: "execute" } | { source: "adopted_output"; recoveredOutcome: "succeeded" | "failed" },
+      source:
+        | { source: "execute" }
+        | { source: "adopted_output"; recoveredOutcome: "succeeded" | "failed"; resultRecovery?: Record<string, unknown> },
     ): Parameters<typeof heartbeat.finalizeAdapterRunForTests>[0] {
       return {
         ...source,
@@ -414,6 +567,41 @@ describeSupported("heartbeat run finalization", () => {
         finalizeInput(row, { ...nullExit }, { source: "adopted_output", recoveredOutcome: "failed" }));
       expect(result).toMatchObject({ won: true, lateWrite: false, outcome: "failed" });
       expect(result.run).toMatchObject({ status: "failed", exitCode: null, errorCode: "adapter_failed", error: "Adapter failed" });
+    });
+
+    it("keeps the adoption and output-capture provenance of an adopted run, whatever the recovered outcome", async () => {
+      const hotRestart = {
+        adopted: true, adoptedAt: "2026-10-23T10:00:00.000Z", previousServerPid: 11, newServerPid: 22,
+        previousServerVersion: "1.0.0", newServerVersion: "1.0.1", processPid: 33, processGroupId: 33,
+        outputCapture: { mode: "relay", relayPid: 44, lastSeq: 9 },
+      };
+      const resultRecovery = { version: 1, source: "run_log", decision: "recovered", exitCodeKnown: false };
+      for (const recoveredOutcome of ["succeeded", "failed"] as const) {
+        const ids = await seed();
+        const row = await runningRun(ids);
+        await db.update(heartbeatRuns).set({ resultJson: { hotRestart } }).where(eq(heartbeatRuns.id, row.run.id));
+        const result = await heartbeat.finalizeAdapterRunForTests(finalizeInput(row, {
+          ...nullExit, summary: "Recovered.",
+          // Adapter JSON cannot replace the server-owned record.
+          resultJson: { result: "parsed", hotRestart: { adopted: false, outputCapture: null } },
+        }, { source: "adopted_output", recoveredOutcome, resultRecovery }));
+        expect(result).toMatchObject({ won: true, outcome: recoveredOutcome });
+        const [stored] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, row.run.id));
+        expect(stored.status).toBe(recoveredOutcome);
+        expect(stored.resultJson).toMatchObject({ result: "parsed", summary: "Recovered." });
+        expect((stored.resultJson as Record<string, unknown>).hotRestart).toEqual({ ...hotRestart, resultRecovery });
+      }
+    });
+
+    it("leaves resultJson without hotRestart for an adopted run that has none, and for the live executor", async () => {
+      for (const source of [{ source: "execute" }, { source: "adopted_output", recoveredOutcome: "succeeded" }] as const) {
+        const ids = await seed();
+        const row = await runningRun(ids);
+        await heartbeat.finalizeAdapterRunForTests(finalizeInput(row, { ...nullExit, resultJson: { result: "parsed" } }, source));
+        const [stored] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, row.run.id));
+        expect(stored.resultJson).toMatchObject({ result: "parsed" });
+        expect(stored.resultJson).not.toHaveProperty("hotRestart");
+      }
     });
 
     it("lets one of two racing finalizers win and accounts the run once", async () => {
@@ -477,8 +665,8 @@ describeSupported("heartbeat run finalization", () => {
     }
 
     it("keeps only flat codec fields and the session config the finalizer attaches", () => {
-      const snapshot = build({ engine: "cli", provider: "anthropic", biller: "anthropic", model: "opus",
-        billingType: "subscription", sessionId: "s-0", sessionParams: { sessionId: "s-0", cwd: "/w" } });
+      const snapshot = build({ version: 1, engine: "cli", sessionIdBefore: "s-0", sessionParams: { sessionId: "s-0", cwd: "/w" },
+        accounting: { provider: "anthropic", biller: "anthropic", model: "opus", billingType: "subscription" } });
       expect(snapshot.session.previousParams).toEqual({ sessionId: "s-0", cwd: "/w" });
       expect(snapshot.invocation.sessionParams).toEqual({ sessionId: "s-0", cwd: "/w" });
       expect(snapshot.session.config).toEqual({ version: 1, fingerprint: "fp", categories: ["adapter"],
@@ -488,8 +676,8 @@ describeSupported("heartbeat run finalization", () => {
     });
 
     it("maps to the recovery hook context, and has none without a known engine", () => {
-      const snapshot = build({ engine: "cli", provider: "anthropic", biller: null, model: "opus",
-        billingType: "bogus" as never, sessionId: "s-0", sessionParams: null });
+      const snapshot = build({ version: 1, engine: "cli", sessionIdBefore: "s-0", sessionParams: null,
+        accounting: { provider: "anthropic", biller: null, model: "opus", billingType: "bogus" as never } });
       expect(adapterOutputRecoveryContextFromSnapshot(snapshot)).toEqual({
         version: 1, adapterType: "claude_local", engine: "cli",
         invocation: { firstSeq: 7, sessionIdBefore: "s-0", sessionParams: null },
@@ -497,6 +685,23 @@ describeSupported("heartbeat run finalization", () => {
         runStart: { sessionIdBefore: "s-0", sessionDisplayId: "s-0", sessionParams: { sessionId: "s-0", cwd: "/w" } },
       });
       expect(adapterOutputRecoveryContextFromSnapshot(build(undefined))).toBeNull();
+    });
+
+    it("treats another version or a missing field as no recovery context", () => {
+      const valid = { version: 1, engine: "cli", sessionIdBefore: "s-0", sessionParams: null,
+        accounting: { provider: "anthropic", biller: null, model: "opus", billingType: null } } as const;
+      const { accounting: _accounting, ...withoutAccounting } = valid;
+      const { model: _model, ...accountingWithoutModel } = valid.accounting;
+      const { sessionIdBefore: _sessionIdBefore, ...withoutSession } = valid;
+      for (const recovery of [
+        { ...valid, version: 2 }, withoutAccounting, withoutSession, { ...valid, accounting: accountingWithoutModel },
+      ]) {
+        const snapshot = build(recovery as never);
+        expect(snapshot.invocation).toMatchObject({ engine: null, sessionIdBefore: null, sessionParams: null,
+          accounting: { provider: null, biller: null, model: null, billingType: null } });
+        expect(adapterOutputRecoveryContextFromSnapshot(snapshot)).toBeNull();
+      }
+      expect(build(valid).invocation).toMatchObject({ engine: "cli", sessionIdBefore: "s-0" });
     });
   });
 });
