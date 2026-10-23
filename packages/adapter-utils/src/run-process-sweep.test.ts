@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   formatRunProcessSweepLogLine,
@@ -293,15 +296,33 @@ async function pidsWithRunId(runId: string) {
   return found;
 }
 
+// The leftover writes its own PID, then exec()s sleep. The run's process prints
+// "done" only once /proc/<pid>/cmdline reads "sleep 300", so the sweep can never
+// observe the pre-exec shell command line. The wait is bounded (about 10s); on
+// timeout the script still exits and the command assertion fails.
+function leftoverScript(dir: string) {
+  return [
+    `(setsid sh -c 'echo $$ > "${dir}/pid"; exec sleep 300' &)`,
+    "i=0",
+    `while [ "$i" -lt 200 ]; do`,
+    `  pid=$(cat "${dir}/pid" 2>/dev/null)`,
+    `  if [ -n "$pid" ] && [ "$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)" = "sleep 300 " ]; then break; fi`,
+    "  i=$((i+1)); sleep 0.05",
+    "done",
+    "echo done",
+  ].join("\n");
+}
+
 describe.skipIf(process.platform !== "linux")("runChildProcess leftover sweep (Linux)", () => {
   it("stops a setsid background process of the run after the run resolves", async () => {
     const runId = `sweep-test-${randomUUID()}`;
     const logs: string[] = [];
+    const dir = await mkdtemp(path.join(tmpdir(), "run-process-sweep-"));
     try {
       const result = await runChildProcess(
         runId,
         "sh",
-        ["-c", "(setsid sleep 300 &); echo done"],
+        ["-c", leftoverScript(dir)],
         {
           cwd: process.cwd(),
           env: { PAPERCLIP_RUN_ID: runId },
@@ -329,6 +350,7 @@ describe.skipIf(process.platform !== "linux")("runChildProcess leftover sweep (L
           // already gone
         }
       }
+      await rm(dir, { recursive: true, force: true });
     }
   }, 20_000);
 
