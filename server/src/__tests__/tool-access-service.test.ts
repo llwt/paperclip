@@ -15520,6 +15520,155 @@ describeEmbeddedPostgres("tool access service", () => {
     }
   });
 
+  describe("connector page save and agent access request Ask first policies", () => {
+    async function setupIntentPolicies() {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { connection, catalogEntry: entryA } = await createRemoteToolFixture(
+        db,
+        company.id,
+      );
+      const [entryB] = await db
+        .insert(toolCatalogEntries)
+        .values({
+          ...entryA,
+          id: undefined,
+          name: `update_task-${randomUUID()}`,
+          toolName: "update_task",
+          versionHash: randomUUID(),
+          schemaHash: randomUUID(),
+        })
+        .returning();
+      const intentPolicy = async (
+        catalogEntryId: string,
+        connectionId = connection.id,
+      ) => {
+        const [policy] = await db
+          .insert(toolPolicies)
+          .values({
+            companyId: company.id,
+            name: `connection-intent:${agent.id}:${catalogEntryId}`,
+            policyType: "require_approval",
+            priority: 0,
+            selectors: { connectionId, catalogEntryId },
+            conditions: { actor: { agentId: agent.id } },
+            config: {
+              source: "connection_intent",
+              connectionId,
+              agentId: agent.id,
+            },
+          })
+          .returning();
+        return policy!;
+      };
+      const policyA = await intentPolicy(entryA.id);
+      const policyB = await intentPolicy(entryB!.id);
+      const loadPolicy = async (id: string) =>
+        (await db.select().from(toolPolicies).where(eq(toolPolicies.id, id)))[0]!;
+      return {
+        company,
+        agent,
+        connection,
+        entryA,
+        entryB: entryB!,
+        policyA,
+        policyB,
+        intentPolicy,
+        loadPolicy,
+      };
+    }
+
+    it("disables the agent's Ask first policy for an action the page sets to Allow", async () => {
+      const { company, agent, connection, entryA, entryB, policyA, policyB, loadPolicy } =
+        await setupIntentPolicies();
+      const service = createTestToolAccessService(db);
+
+      await service.finishGalleryAppConnection(
+        company.id,
+        connection.id,
+        {
+          enabledCatalogEntryIds: [entryA.id, entryB.id],
+          askFirstCatalogEntryIds: [entryB.id],
+          access: { agentIds: [agent.id] },
+        },
+        { actorType: "user", actorId: "board" },
+      );
+
+      expect(await loadPolicy(policyA.id)).toMatchObject({ enabled: false });
+      expect(await loadPolicy(policyB.id)).toMatchObject({ enabled: true });
+      const policy = toolAccessPolicyService(db);
+      await expect(
+        policy.decide({
+          companyId: company.id,
+          actor: { actorType: "agent", actorId: agent.id, agentId: agent.id },
+          request: {
+            connectionId: connection.id,
+            catalogEntryId: entryA.id,
+            toolName: entryA.toolName,
+            arguments: {},
+          },
+        }),
+      ).resolves.toMatchObject({ decision: "allow" });
+      await expect(
+        policy.decide({
+          companyId: company.id,
+          actor: { actorType: "agent", actorId: agent.id, agentId: agent.id },
+          request: {
+            connectionId: connection.id,
+            catalogEntryId: entryB.id,
+            toolName: entryB.toolName,
+            arguments: {},
+          },
+        }),
+      ).resolves.toMatchObject({ decision: "require_approval" });
+    });
+
+    it("leaves the agent's Ask first policies alone when the save preserves existing access", async () => {
+      const { company, agent, connection, entryA, entryB, policyA, policyB, loadPolicy } =
+        await setupIntentPolicies();
+      const service = createTestToolAccessService(db);
+
+      await service.finishGalleryAppConnection(
+        company.id,
+        connection.id,
+        {
+          enabledCatalogEntryIds: [entryA.id, entryB.id],
+          askFirstCatalogEntryIds: [entryB.id],
+          access: { agentIds: [agent.id] },
+          preserveExistingAccess: true,
+        },
+        { actorType: "user", actorId: "board" },
+      );
+
+      expect(await loadPolicy(policyA.id)).toMatchObject({ enabled: true });
+      expect(await loadPolicy(policyB.id)).toMatchObject({ enabled: true });
+    });
+
+    it("leaves the agent's Ask first policy for another connection alone", async () => {
+      const { company, agent, connection, entryA, entryB, intentPolicy, loadPolicy } =
+        await setupIntentPolicies();
+      const other = await createRemoteToolFixture(db, company.id);
+      const otherPolicy = await intentPolicy(
+        other.catalogEntry.id,
+        other.connection.id,
+      );
+      const service = createTestToolAccessService(db);
+
+      await service.finishGalleryAppConnection(
+        company.id,
+        connection.id,
+        {
+          enabledCatalogEntryIds: [entryA.id, entryB.id],
+          askFirstCatalogEntryIds: [entryB.id],
+          access: { agentIds: [agent.id] },
+        },
+        { actorType: "user", actorId: "board" },
+      );
+
+      expect(await loadPolicy(otherPolicy.id)).toMatchObject({ enabled: true });
+    });
+  });
+
   it("resolves Notion reads as allowed, mutations as ask-first, and denies cross-company use", async () => {
     const company = await createCompany(db);
     const otherCompany = await createCompany(db);

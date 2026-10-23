@@ -13842,7 +13842,24 @@ export function toolAccessService(
           !askFirstIds.has(config.catalogEntryId)
         );
       });
-      for (const policy of stalePolicies) {
+      // The connector page decides Allow or Ask first for every agent, so an
+      // agent-scoped Ask first from an approved access request must not
+      // outlive an Allow set here.
+      const staleAgentIntentPolicies = existingPolicies.filter((policy) => {
+        if (!policy.enabled) return false;
+        const config = asRecord(policy.config);
+        if (
+          config.source !== "connection_intent" ||
+          config.connectionId !== input.connection.id
+        ) {
+          return false;
+        }
+        const catalogEntryId = asRecord(policy.selectors).catalogEntryId;
+        return (
+          typeof catalogEntryId === "string" && !askFirstIds.has(catalogEntryId)
+        );
+      });
+      for (const policy of [...stalePolicies, ...staleAgentIntentPolicies]) {
         await dbClient
           .update(toolPolicies)
           .set({ enabled: false, updatedAt: new Date() })
