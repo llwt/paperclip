@@ -5,9 +5,11 @@ import {
   extractCodexRetryNotBefore,
   isCodexHarnessCrash,
   isCodexProviderQuotaError,
+  isCodexReconnectNotice,
   isCodexTransientUpstreamError,
   isCodexUnknownSessionError,
   parseCodexJsonl,
+  readCodexTurnUsage,
 } from "./parse.js";
 
 describe("parseCodexJsonl", () => {
@@ -257,5 +259,36 @@ describe("isCodexTransientUpstreamError", () => {
         ].join("\n"),
       }),
     ).toBe(false);
+  });
+});
+
+describe("isCodexReconnectNotice", () => {
+  it("recognises progress notices and nothing else", () => {
+    expect(isCodexReconnectNotice("Reconnecting... 2/5")).toBe(true);
+    expect(isCodexReconnectNotice("  reconnecting (stream closed)")).toBe(true);
+    expect(isCodexReconnectNotice("Failed after reconnecting")).toBe(false);
+    expect(isCodexReconnectNotice("")).toBe(false);
+  });
+});
+
+describe("readCodexTurnUsage", () => {
+  it("reads the session counters", () => {
+    expect(
+      readCodexTurnUsage({ type: "turn.completed", usage: { input_tokens: 5, cached_input_tokens: 2, output_tokens: 1 } }),
+    ).toEqual({ inputTokens: 5, cachedInputTokens: 2, outputTokens: 1 });
+  });
+
+  it("reports unknown usage instead of zero when no counters exist", () => {
+    expect(readCodexTurnUsage({ type: "turn.completed" })).toBeNull();
+    expect(readCodexTurnUsage({ type: "turn.completed", usage: {} })).toBeNull();
+    expect(readCodexTurnUsage({ type: "turn.completed", usage: { input_tokens: "7" } })).toBeNull();
+  });
+
+  it("keeps a real zero", () => {
+    expect(readCodexTurnUsage({ type: "turn.completed", usage: { output_tokens: 0 } })).toEqual({
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+    });
   });
 });
