@@ -109,14 +109,15 @@ type Disclosure = (key: string) => { open: boolean; toggle: () => void; panelId:
 
 function Body({ snapshot, loading, disclosure, onLoadMore }: { snapshot: Snapshot; loading: boolean; disclosure: Disclosure; onLoadMore: () => void }) {
   const { view } = snapshot;
+  const headingId = useId();
   const grouped = useMemo(() => groupDecisions(view, snapshot.decisions), [view, snapshot.decisions]);
   const listed = [...grouped.current, ...grouped.unclassified];
   const history = view.history;
   return (
     <>
       <ExecutionSection view={view} grouped={grouped.byStage} />
-      <section className="ef-section" aria-labelledby="ef-decisions-heading">
-        <h3 className="ef-h3" id="ef-decisions-heading">{history.label}</h3>
+      <section className="ef-section" aria-labelledby={headingId}>
+        <h3 className="ef-h3" id={headingId}>{history.label}</h3>
         <p className="ef-muted ef-small">{history.notice}</p>
         {history.status === "unavailable" ? <p className="ef-alert" role="alert">{history.message}</p> : null}
         {history.status === "available" && snapshot.decisions.length === 0 ? <p className="ef-note">No decisions are recorded for this task.</p> : null}
@@ -146,14 +147,15 @@ function Body({ snapshot, loading, disclosure, onLoadMore }: { snapshot: Snapsho
 
 function ExecutionSection({ view, grouped }: { view: ExecutionFlowResponse; grouped: Map<string, DecisionView[]> }) {
   const { execution } = view;
+  const headingId = useId();
   return (
-    <section className="ef-section" aria-labelledby="ef-stages-heading">
-      <h3 className="ef-h3" id="ef-stages-heading">Stages</h3>
+    <section className="ef-section" aria-labelledby={headingId}>
+      <h3 className="ef-h3" id={headingId}>Stages</h3>
       {execution.message ? <p className={execution.status === "unavailable" ? "ef-alert" : "ef-note"} role={execution.status === "unavailable" ? "alert" : undefined}>{execution.message}</p> : null}
       {execution.stateStatus ? (
         <p className="ef-small">
           Execution state: <strong>{titleCase(execution.stateStatus)}</strong>
-          {execution.workReturned ? <> . Work was returned to <PrincipalText principal={execution.returnAssignee} fallback="an unrecorded assignee" /></> : null}
+          {execution.workReturned ? <>. Work was returned to <PrincipalText principal={execution.returnAssignee} fallback="an unrecorded assignee" /></> : null}
         </p>
       ) : null}
       {execution.warnings.length > 0 ? (
@@ -229,9 +231,10 @@ function DecisionRow({ decision, disclosure }: { decision: DecisionView; disclos
 
 function ConfirmationsSection({ view, disclosure }: { view: ExecutionFlowResponse; disclosure: Disclosure }) {
   const { confirmations } = view;
+  const headingId = useId();
   return (
-    <section className="ef-section" aria-labelledby="ef-cards-heading">
-      <h3 className="ef-h3" id="ef-cards-heading">{confirmations.label}</h3>
+    <section className="ef-section" aria-labelledby={headingId}>
+      <h3 className="ef-h3" id={headingId}>{confirmations.label}</h3>
       <p className="ef-muted ef-small">Cards are listed on their own. A card response is not a stage decision and does not complete a stage.</p>
       {confirmations.status === "unavailable" ? <p className="ef-alert" role="alert">{confirmations.message}</p> : null}
       {confirmations.status === "available" && confirmations.items.length === 0 ? <p className="ef-note">No task confirmations.</p> : null}
