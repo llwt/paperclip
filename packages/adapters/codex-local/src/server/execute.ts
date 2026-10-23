@@ -1257,6 +1257,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           prompt,
           promptMetrics,
           context,
+          recovery: {
+            version: 1,
+            engine: "cli",
+            sessionIdBefore: resumeSessionId,
+            sessionParams: {
+              cwd: effectiveExecutionCwd,
+              ...(executionTargetIsRemote
+                ? {
+                    remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
+                  }
+                : {}),
+              ...(workspaceId ? { workspaceId } : {}),
+              ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
+              ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
+            },
+            accounting: {
+              provider: "openai",
+              biller: resolveCodexBiller(effectiveEnv, billingType),
+              model,
+              billingType,
+            },
+          },
         });
       }
 

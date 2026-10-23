@@ -328,3 +328,33 @@ export function isCodexProviderQuotaError(input: {
   const haystack = buildCodexErrorHaystack(input);
   return CODEX_PROVIDER_QUOTA_RE.test(haystack) || extractCodexRetryNotBefore(input) != null;
 }
+
+const CODEX_RECONNECT_NOTICE_RE = /^\s*reconnecting\b/i;
+
+/**
+ * Codex prints "Reconnecting... 2/5" as a top-level `error` event while it
+ * retries a dropped stream. It is progress, not the end of the run.
+ */
+export function isCodexReconnectNotice(message: string): boolean {
+  return CODEX_RECONNECT_NOTICE_RE.test(message);
+}
+
+/**
+ * Token totals of a `turn.completed` event, or null when the event carries no
+ * usage numbers at all, so recovery reports unknown usage instead of zero.
+ */
+export function readCodexTurnUsage(
+  event: Record<string, unknown>,
+): { inputTokens: number; cachedInputTokens: number; outputTokens: number } | null {
+  const usageObj = parseObject(event.usage);
+  const input = usageObj.input_tokens;
+  const cached = usageObj.cached_input_tokens;
+  const output = usageObj.output_tokens;
+  const isCount = (value: unknown) => typeof value === "number" && Number.isFinite(value);
+  if (!isCount(input) && !isCount(cached) && !isCount(output)) return null;
+  return {
+    inputTokens: asNumber(input, 0),
+    cachedInputTokens: asNumber(cached, 0),
+    outputTokens: asNumber(output, 0),
+  };
+}
