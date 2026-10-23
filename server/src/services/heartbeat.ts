@@ -305,6 +305,10 @@ import type {
   AdapterSessionCodec,
   UsageSummary,
 } from "../adapters/index.js";
+import type {
+  AdapterInvocationRecoveryMeta,
+  AdapterOutputRecoveryContext,
+} from "../adapters/types.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { createRuntimeToolsToken } from "../runtime-tools-token.js";
 import {
@@ -9435,6 +9439,32 @@ function mergeHotRestartAdoptionResultJson(
   };
 }
 
+// The server-owned records of an adopted run, for a result read back from its
+// output: the adoption and output-capture provenance and the leftover process
+// sweep (SX-1851) stay, the adapter's result JSON cannot replace them, and
+// recovery diagnostics go next to the hotRestart record.
+function recoveredHotRestartResultJson(
+  existingResultJson: Record<string, unknown> | null | undefined,
+  resultRecovery: Record<string, unknown> | undefined,
+) {
+  const existingResult = parseObject(existingResultJson);
+  const existing = parseObject(existingResult.hotRestart);
+  const leftoverProcessSweep = parseObject(existingResult.leftoverProcessSweep);
+  return {
+    ...(Object.keys(existing).length > 0 || resultRecovery
+      ? {
+          hotRestart: {
+            ...existing,
+            ...(resultRecovery ? { resultRecovery } : {}),
+          },
+        }
+      : {}),
+    ...(leftoverProcessSweep.kind === "leftover_process_sweep"
+      ? { leftoverProcessSweep }
+      : {}),
+  };
+}
+
 function truncateDisplayId(value: string | null | undefined, max = 128) {
   if (!value) return null;
   return value.length > max ? value.slice(0, max) : value;
@@ -9468,6 +9498,213 @@ const defaultSessionCodec: AdapterSessionCodec = {
 function getAdapterSessionCodec(adapterType: string) {
   const adapter = getServerAdapter(adapterType);
   return adapter.sessionCodec ?? defaultSessionCodec;
+}
+
+export const LOCAL_RESULT_RECOVERY_CONTEXT_KEY = "localResultRecovery";
+
+/**
+ * What finalizing a local CLI run needs once its parent process is gone,
+ * recorded in the run's contextSnapshot before each CLI invocation. An
+ * allowlist: no runtimeConfig, env, prompt, tools or credentials, and session
+ * params only as the adapter's session codec keeps them.
+ */
+export interface LocalResultRecoverySnapshot {
+  version: 1;
+  /** Adapter the run started with, not today's agent setting. */
+  adapterType: string;
+  taskKey: string | null;
+  configuredModel: string | null;
+  session: {
+    previousParams: Record<string, unknown> | null;
+    /** The session the adapter was dispatched with. */
+    dispatched: {
+      sessionId: string | null;
+      sessionDisplayId: string | null;
+      params: Record<string, unknown> | null;
+    };
+    taskSessionReused: boolean;
+    rotated: boolean;
+    rotationReason: string | null;
+    config: {
+      version: number;
+      fingerprint: string;
+      categories: string[];
+      categoryFingerprints: Record<string, string>;
+      aiCredentialIdentity: string | null;
+    };
+  };
+  configFreshness: Record<string, unknown>;
+  /** The latest CLI invocation; a fresh-session retry replaces it. */
+  invocation: {
+    /** 1 for the first invocation of the run, 2 after one retry, and so on. */
+    number: number;
+    /** First run-log seq that belongs to this invocation. */
+    firstSeq: number;
+    startedAt: string;
+    engine: string | null;
+    sessionIdBefore: string | null;
+    sessionParams: Record<string, unknown> | null;
+    accounting: {
+      provider: string | null;
+      biller: string | null;
+      model: string | null;
+      billingType: AdapterOutputRecoveryContext["accounting"]["billingType"];
+    };
+  };
+}
+
+const RECOVERY_BILLING_TYPES = new Set<string>([
+  "api", "subscription", "metered_api", "subscription_included",
+  "subscription_overage", "credits", "fixed", "unknown",
+]);
+
+// Session params as the codec keeps them, flat values only. Without an
+// adapter codec only the session id is kept.
+function safeRecoverySessionParams(
+  codec: AdapterSessionCodec,
+  params: Record<string, unknown> | null | undefined,
+) {
+  const stripped = stripPaperclipSessionMetadataFromSessionParams(params);
+  if (!stripped) return null;
+  if (codec === defaultSessionCodec) {
+    const sessionId = readNonEmptyString(stripped.sessionId);
+    return sessionId ? { sessionId } : null;
+  }
+  const serialized = codec.serialize(stripped);
+  if (!serialized) return null;
+  const flat = Object.fromEntries(
+    Object.entries(serialized).filter(([, value]) =>
+      value === null || ["string", "number", "boolean"].includes(typeof value)),
+  );
+  return Object.keys(flat).length > 0 ? flat : null;
+}
+
+const RECOVERY_TEMPLATE_SESSION_ID = "paperclip-recovery-template";
+
+// An adapter's invocation session template carries no session id (the hook
+// adds the one it observes), and the CLI codecs keep nothing without one. So
+// the template goes through the codec with a stand-in id, which is removed
+// again: the codec still decides which fields are kept.
+function safeRecoveryTemplateParams(
+  codec: AdapterSessionCodec,
+  params: Record<string, unknown> | null | undefined,
+) {
+  const stripped = stripPaperclipSessionMetadataFromSessionParams(params);
+  if (!stripped) return null;
+  if (readNonEmptyString(stripped.sessionId) ?? readNonEmptyString(stripped.session_id)) {
+    return safeRecoverySessionParams(codec, stripped);
+  }
+  const kept = safeRecoverySessionParams(codec, stripped)
+    ?? safeRecoverySessionParams(codec, { ...stripped, sessionId: RECOVERY_TEMPLATE_SESSION_ID });
+  if (!kept) return null;
+  const template = Object.fromEntries(
+    Object.entries(kept).filter(([key]) => key !== "sessionId" && key !== "session_id"),
+  );
+  return Object.keys(template).length > 0 ? template : null;
+}
+
+// The adapter's recovery facts, or null (no recovery context) when the
+// version is not 1 or a field is missing.
+function readInvocationRecoveryMeta(
+  value: AdapterInvocationRecoveryMeta | null | undefined,
+): AdapterInvocationRecoveryMeta | null {
+  if (!value || typeof value !== "object" || value.version !== 1) return null;
+  const accounting = value.accounting as Partial<AdapterInvocationRecoveryMeta["accounting"]> | null | undefined;
+  if (
+    !("engine" in value) || !("sessionIdBefore" in value) || !("sessionParams" in value) ||
+    !accounting || typeof accounting !== "object" ||
+    !(["provider", "biller", "model", "billingType"] as const).every((key) => key in accounting)
+  ) return null;
+  return value;
+}
+
+export function buildLocalResultRecoverySnapshot(input: {
+  adapterType: string;
+  codec: AdapterSessionCodec;
+  taskKey: string | null;
+  configuredModel: string | null;
+  previousSessionParams: Record<string, unknown> | null;
+  dispatched: {
+    sessionId: string | null;
+    sessionDisplayId: string | null;
+    sessionParams: Record<string, unknown> | null;
+  };
+  taskSessionReused: boolean;
+  rotated: boolean;
+  rotationReason: string | null;
+  sessionConfig: EffectiveRunSessionConfigMetadata;
+  configFreshness: Record<string, unknown>;
+  invocationNumber: number;
+  firstSeq: number;
+  startedAt: Date;
+  recovery: AdapterInvocationRecoveryMeta | null | undefined;
+}): LocalResultRecoverySnapshot {
+  const recovery = readInvocationRecoveryMeta(input.recovery);
+  const billingType = readNonEmptyString(recovery?.accounting.billingType);
+  return {
+    version: 1,
+    adapterType: input.adapterType,
+    taskKey: input.taskKey,
+    configuredModel: input.configuredModel,
+    session: {
+      previousParams: safeRecoverySessionParams(input.codec, input.previousSessionParams),
+      dispatched: {
+        sessionId: input.dispatched.sessionId,
+        sessionDisplayId: input.dispatched.sessionDisplayId,
+        params: safeRecoverySessionParams(input.codec, input.dispatched.sessionParams),
+      },
+      taskSessionReused: input.taskSessionReused,
+      rotated: input.rotated,
+      rotationReason: input.rotationReason,
+      config: {
+        version: input.sessionConfig.version,
+        fingerprint: input.sessionConfig.fingerprint,
+        categories: [...input.sessionConfig.categories],
+        categoryFingerprints: { ...input.sessionConfig.categoryFingerprints },
+        aiCredentialIdentity: input.sessionConfig.aiCredentialIdentity ?? null,
+      },
+    },
+    configFreshness: input.configFreshness,
+    invocation: {
+      number: input.invocationNumber,
+      firstSeq: input.firstSeq,
+      startedAt: input.startedAt.toISOString(),
+      engine: readNonEmptyString(recovery?.engine),
+      sessionIdBefore: readNonEmptyString(recovery?.sessionIdBefore),
+      sessionParams: safeRecoveryTemplateParams(input.codec, recovery?.sessionParams),
+      accounting: {
+        provider: readNonEmptyString(recovery?.accounting.provider),
+        biller: readNonEmptyString(recovery?.accounting.biller),
+        model: readNonEmptyString(recovery?.accounting.model),
+        billingType: billingType && RECOVERY_BILLING_TYPES.has(billingType)
+          ? (billingType as NonNullable<AdapterOutputRecoveryContext["accounting"]["billingType"]>)
+          : null,
+      },
+    },
+  };
+}
+
+/** The parser-only view of a snapshot handed to an adapter's recovery hook. */
+export function adapterOutputRecoveryContextFromSnapshot(
+  snapshot: LocalResultRecoverySnapshot,
+): AdapterOutputRecoveryContext | null {
+  if (!snapshot.invocation.engine) return null;
+  return {
+    version: 1,
+    adapterType: snapshot.adapterType,
+    engine: snapshot.invocation.engine,
+    invocation: {
+      firstSeq: snapshot.invocation.firstSeq,
+      sessionIdBefore: snapshot.invocation.sessionIdBefore,
+      sessionParams: snapshot.invocation.sessionParams,
+    },
+    accounting: { ...snapshot.invocation.accounting },
+    runStart: {
+      sessionIdBefore: snapshot.session.dispatched.sessionId,
+      sessionDisplayId: snapshot.session.dispatched.sessionDisplayId,
+      sessionParams: snapshot.session.dispatched.params,
+    },
+  };
 }
 
 export function normalizeSessionParams(
@@ -21442,6 +21679,778 @@ export function heartbeatService(
     return promise;
   }
 
+  type AdapterRunFinalizationLog = {
+    summary: { bytes: number | null; sha256?: string | null; compressed: boolean } | null;
+    stdoutExcerpt: string;
+    stderrExcerpt: string;
+  };
+
+  type AdapterRunFinalizationInput = {
+    /** The run row as the caller read it before the adapter result. */
+    run: typeof heartbeatRuns.$inferSelect;
+    /** The agent as the run started. Later config changes must not reach here. */
+    agent: typeof agents.$inferSelect;
+    adapterResult: AdapterExecutionResult;
+    session: {
+      codec: AdapterSessionCodec;
+      taskKey: string | null;
+      previousParams: Record<string, unknown> | null;
+      /** The session the adapter was dispatched with. */
+      dispatched: { sessionId: string | null; sessionDisplayId: string | null };
+      taskSessionReused: boolean;
+      rotated: boolean;
+      rotationReason: string | null;
+      configuredModel: string | null;
+      configMetadata: EffectiveRunSessionConfigMetadata;
+      configFreshness: Record<string, unknown>;
+    };
+    issue: {
+      id: string | null;
+      ref: { identifier: string | null; title: string | null; workMode: string | null } | null;
+      context: Awaited<ReturnType<typeof getIssueExecutionContext>> | null;
+    };
+    redaction: CurrentUserRedactionOptions;
+    isAborted: () => boolean;
+    secretValues: () => string[];
+    onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+    /** Closes the run log. Called once the outcome is known, before the terminal write. */
+    finalizeLog: () => Promise<AdapterRunFinalizationLog>;
+  } & (
+    | { source: "execute" }
+    // Only a run whose result was read back from its output carries an explicit verdict.
+    | {
+        source: "adopted_output";
+        recoveredOutcome: "succeeded" | "failed";
+        /** Stored as hotRestart.resultRecovery, next to the adoption provenance. */
+        resultRecovery?: Record<string, unknown>;
+      }
+  );
+
+  type AdapterRunFinalization = {
+    /** This caller's terminal compare-and-set changed the run. */
+    won: boolean;
+    /** Lost the compare-and-set, but the existing native or owned-Stop exception let it record its result. */
+    lateWrite: boolean;
+    run: typeof heartbeatRuns.$inferSelect | null;
+    outcome: RunSessionOutcome;
+  };
+
+  // Post-run handling of an adapter result: outcome, terminal write, effects,
+  // accounting and task session. Only a caller that wins the terminal write
+  // (or, for the live executor, takes the existing late-write exception) runs
+  // the effects and accounting; a loser returns without changing anything.
+  async function finalizeAdapterRun(
+    input: AdapterRunFinalizationInput,
+  ): Promise<AdapterRunFinalization> {
+    const { run, agent, onLog } = input;
+    let adapterResult = input.adapterResult;
+    const {
+      codec: sessionCodec,
+      taskKey,
+      previousParams: previousSessionParams,
+      dispatched: runtimeForAdapter,
+      taskSessionReused,
+      rotated: sessionRotated,
+      rotationReason: sessionRotationReason,
+      configuredModel,
+      configMetadata: sessionConfigMetadata,
+      configFreshness: configFreshnessResultMetadata,
+    } = input.session;
+    const { id: issueId, ref: issueRef, context: issueContext } = input.issue;
+    const currentUserRedactionOptions = input.redaction;
+    const processCancellation =
+      processRunCancellationSettlements.get(run.id) ??
+      failedProcessRunCancellations.get(run.id);
+    await processCancellation?.settled;
+    let outcome: RunSessionOutcome;
+    const latestRun = await getRun(run.id);
+    if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
+      outcome = latestRun.status;
+    } else if (input.isAborted()) {
+      outcome = "cancelled";
+    } else if (input.source === "adopted_output") {
+      // The provider's own verdict; never the null-exit heuristic below.
+      outcome = input.recoveredOutcome;
+    } else if (adapterResult.nativeFinalization) {
+      const nativeTerminal =
+        adapterResult.nativeFinalization.terminal.runTerminalState;
+      outcome =
+        nativeTerminal === "succeeded"
+          ? "succeeded"
+          : nativeTerminal === "cancelled"
+            ? "cancelled"
+            : "failed";
+    } else if (adapterResult.timedOut) {
+      outcome = "timed_out";
+    } else if (adapterResult.resultJson?.status === "cancelled") {
+      outcome = "cancelled";
+    } else if (
+      (adapterResult.exitCode ?? 0) === 0 &&
+      !adapterResult.errorMessage &&
+      !adapterResult.signal &&
+      !processCancellation?.failed
+    ) {
+      outcome = "succeeded";
+    } else {
+      outcome = "failed";
+    }
+
+    const nextSessionState = resolveNextSessionState({
+      adapterType: agent.adapterType,
+      codec: sessionCodec,
+      adapterResult,
+      outcome,
+      previousParams: previousSessionParams,
+      previousDisplayId: runtimeForAdapter.sessionDisplayId,
+      previousLegacySessionId: runtimeForAdapter.sessionId,
+    });
+    // Usage belongs to the session this run reported, even when the
+    // adapter clears it for the next run (e.g. Claude max turns).
+    const usageSessionState = adapterResult.clearSession
+      ? resolveNextSessionState({
+          adapterType: agent.adapterType,
+          codec: sessionCodec,
+          adapterResult: { ...adapterResult, clearSession: false },
+          outcome,
+          previousParams: previousSessionParams,
+          previousDisplayId: runtimeForAdapter.sessionDisplayId,
+          previousLegacySessionId: runtimeForAdapter.sessionId,
+        })
+      : nextSessionState;
+    const rawUsage = normalizeUsageTotals(adapterResult.usage);
+    const rawCostUsd = adapterResult.costUsd ?? null;
+    const costBasis =
+      adapterResult.costBasis ?? adapterResult.usageBasis ?? null;
+    const sessionUsageResolution = await resolveNormalizedUsageForSession({
+      sessionId:
+        usageSessionState.displayId ?? usageSessionState.legacySessionId,
+      rawUsage,
+      usageBasis: adapterResult.usageBasis ?? null,
+      costBasis,
+      rawCostUsd,
+      invocationUsage: normalizeUsageTotals(adapterResult.invocationUsage),
+      getPreviousUsageJson: (sessionId) =>
+        getLatestSessionUsageJson(db, {
+          companyId: agent.companyId,
+          agentId: agent.id,
+          sessionId,
+          excludeRunId: run.id,
+        }),
+    });
+    const normalizedUsage = sessionUsageResolution.normalizedUsage;
+    if (sessionUsageResolution.normalizedCostUsd !== rawCostUsd) {
+      // A session-total cost must not be billed again on every resumed
+      // run; usage_json and the cost ledger below both read this field.
+      adapterResult = {
+        ...adapterResult,
+        costUsd: sessionUsageResolution.normalizedCostUsd,
+      };
+    }
+    const runErrorMessage =
+      outcome === "cancelled"
+        ? redactCurrentUserText(latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled", currentUserRedactionOptions)
+        : outcome === "succeeded"
+          ? null
+          : redactCurrentUserText(
+              adapterResult.errorMessage ??
+                (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
+              currentUserRedactionOptions,
+            );
+    const recordedResponsibleUserDenialCode =
+      normalizeResponsibleUserDenialCode(latestRun?.errorCode);
+    const runErrorCode =
+      outcome === "timed_out"
+        ? "timeout"
+        : outcome === "cancelled"
+          ? (latestRun?.errorCode ?? "cancelled")
+          : outcome === "failed"
+            ? (adapterResult.errorCode ??
+              recordedResponsibleUserDenialCode ??
+              "adapter_failed")
+            : null;
+
+    const {
+      summary: logSummary,
+      stdoutExcerpt,
+      stderrExcerpt,
+    } = await input.finalizeLog();
+
+    const status =
+      outcome === "succeeded"
+        ? "succeeded"
+        : outcome === "cancelled"
+          ? "cancelled"
+          : outcome === "timed_out"
+            ? "timed_out"
+            : "failed";
+
+    const cacheAdjustedCostUsd = resolveCacheAdjustedCostUsd(adapterResult);
+    const usageJson =
+      normalizedUsage ||
+      adapterResult.costUsd != null ||
+      cacheAdjustedCostUsd != null
+        ? ({
+            ...(normalizedUsage ?? {}),
+            ...(sessionUsageResolution.sessionRawUsage
+              ? {
+                  rawInputTokens:
+                    sessionUsageResolution.sessionRawUsage.inputTokens,
+                  rawCachedInputTokens:
+                    sessionUsageResolution.sessionRawUsage
+                      .cachedInputTokens,
+                  rawOutputTokens:
+                    sessionUsageResolution.sessionRawUsage.outputTokens,
+                }
+              : {}),
+            // Raw token counters miss subagent tokens (lower bound).
+            ...(sessionUsageResolution.sessionRawUsageIncomplete
+              ? { rawUsageIncomplete: true }
+              : {}),
+            // The next resumed run subtracts this cumulative cost.
+            ...(costBasis === "session_cumulative" && rawCostUsd != null
+              ? { rawCostUsd }
+              : {}),
+            ...(sessionUsageResolution.derivedFromSessionTotals
+              ? { usageSource: "session_delta" }
+              : sessionUsageResolution.usageFromInvocation
+                ? { usageSource: "invocation" }
+              : adapterResult.usageBasis === "per_run"
+                ? { usageSource: "per_run" }
+                : adapterResult.usageBasis === "session_cumulative"
+                  ? // No earlier usage in this session to subtract:
+                    // stored as reported (a fresh session's own usage).
+                    { usageSource: "session_total" }
+                  : {}),
+            // Per-run tokens with a session-total cost: say how the cost
+            // was stored, since usageSource covers only the tokens.
+            ...(adapterResult.usageBasis === "per_run" &&
+            costBasis === "session_cumulative" &&
+            rawCostUsd != null
+              ? {
+                  costSource:
+                    sessionUsageResolution.previousRawCostUsd !== null
+                      ? "session_delta"
+                      : "session_total",
+                }
+              : {}),
+            ...((nextSessionState.displayId ??
+            nextSessionState.legacySessionId)
+              ? {
+                  persistedSessionId:
+                    nextSessionState.displayId ??
+                    nextSessionState.legacySessionId,
+                }
+              : {}),
+            sessionReused:
+              runtimeForAdapter.sessionId != null ||
+              runtimeForAdapter.sessionDisplayId != null,
+            taskSessionReused,
+            freshSession:
+              runtimeForAdapter.sessionId == null &&
+              runtimeForAdapter.sessionDisplayId == null,
+            sessionRotated,
+            sessionRotationReason,
+            configFreshness: configFreshnessResultMetadata,
+            provider:
+              readNonEmptyString(adapterResult.provider) ?? "unknown",
+            biller: resolveLedgerBiller(adapterResult),
+            model: readNonEmptyString(adapterResult.model) ?? "unknown",
+            ...(adapterResult.costUsd != null
+              ? { costUsd: adapterResult.costUsd }
+              : {}),
+            ...(cacheAdjustedCostUsd != null
+              ? { cacheAdjustedCostUsd }
+              : {}),
+            costStatus: resolveLedgerCostStatus({
+              costUsd: cacheAdjustedCostUsd,
+              inputTokens: normalizedUsage?.inputTokens ?? 0,
+              cachedInputTokens: normalizedUsage?.cachedInputTokens ?? 0,
+              outputTokens: normalizedUsage?.outputTokens ?? 0,
+            }),
+            billingType: normalizeLedgerBillingType(
+              adapterResult.billingType,
+            ),
+          } as Record<string, unknown>)
+        : null;
+
+    const persistedResultJson = cancellationResultJson(latestRun ?? run, outcome, mergeHeartbeatRunResultJson(
+      mergeRunStopMetadataForAgent(agent, outcome, {
+        resultJson: mergeAdapterRecoveryMetadata({
+          resultJson: {
+            ...(adapterResult.nativeFinalization || outcome === "cancelled"
+              ? parseObject(latestRun?.resultJson)
+              : {}),
+            ...parseObject(adapterResult.resultJson),
+            ...(adapterResult.executionRecovery
+              ? { executionRecovery: adapterResult.executionRecovery }
+              : {}),
+            ...(input.source === "adopted_output"
+              ? recoveredHotRestartResultJson(
+                  latestRun?.resultJson ?? run.resultJson,
+                  input.resultRecovery,
+                )
+              : {}),
+            configFreshness: configFreshnessResultMetadata,
+          },
+          errorFamily: adapterResult.errorFamily ?? null,
+          retryNotBefore: adapterResult.retryNotBefore ?? null,
+        }),
+        errorCode: runErrorCode,
+        errorMessage: runErrorMessage,
+      }),
+      adapterResult.summary ?? null,
+    ), runErrorCode, runErrorMessage);
+
+    const finalRunPatch: Partial<typeof heartbeatRuns.$inferInsert> = {
+      finishedAt: new Date(),
+      error: runErrorMessage,
+      errorCode: runErrorCode,
+      exitCode: adapterResult.exitCode,
+      signal: adapterResult.signal,
+      usageJson,
+      resultJson: persistedResultJson,
+      sessionIdAfter:
+        nextSessionState.displayId ?? nextSessionState.legacySessionId,
+      stdoutExcerpt,
+      stderrExcerpt,
+      logBytes: logSummary?.bytes,
+      logSha256: logSummary?.sha256,
+      logCompressed: logSummary?.compressed ?? false,
+    };
+    const persistedRunWrite = await setRunStatusIfRunning(
+      run.id,
+      status,
+      finalRunPatch,
+      { adapterErrorMeta: adapterResult.errorMeta, secretValues: input.secretValues() },
+    );
+    let persistedRun: typeof heartbeatRuns.$inferSelect | null =
+      persistedRunWrite.run;
+    let lateWrite = false;
+    if (!persistedRunWrite.updated) {
+      persistedRun = null;
+      // Native reconciliation can commit and project the terminal status in
+      // the narrow window between adapter completion and this live write.
+      // The status is authoritative, but it must not make us discard the
+      // adapter's semantic result, usage, logs, or presentation decision.
+      // Only complete the late metadata write when the reconciler chose the
+      // same terminal status; a conflicting terminal outcome remains owned
+      // by the path that won the compare-and-set. Owned legacy cancellation
+      // likewise keeps the provider session, logs, and usage after Stop wins.
+      if (
+        input.source === "execute" &&
+        (adapterResult.nativeFinalization ||
+          (processCancellation && !processCancellation.failed && status === "cancelled")) &&
+        persistedRunWrite.run?.status === status
+      ) {
+        persistedRun = await db
+          .update(heartbeatRuns)
+          .set({
+            ...finalRunPatch,
+            resultJson: cancellationResultJson(persistedRunWrite.run, status, finalRunPatch.resultJson, runErrorCode, runErrorMessage),
+            finishedAt:
+              persistedRunWrite.run.finishedAt ?? finalRunPatch.finishedAt,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(heartbeatRuns.id, run.id),
+              eq(heartbeatRuns.status, status),
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null);
+      }
+      lateWrite = persistedRun != null;
+      if (!persistedRun) {
+        logger.info(
+          {
+            runId: run.id,
+            attemptedStatus: status,
+            currentStatus: persistedRunWrite.run?.status ?? null,
+          },
+          "skipping late run finalization because the run already left running state",
+        );
+        return { won: false, lateWrite: false, run: null, outcome };
+      }
+    }
+    if (persistedRun) {
+      persistedRun =
+        (await classifyAndPersistRunLiveness(
+          persistedRun,
+          persistedResultJson,
+        )) ?? persistedRun;
+    }
+
+    await setWakeupStatus(
+      run.wakeupRequestId,
+      outcome === "succeeded" ? "completed" : status,
+      {
+        finishedAt: new Date(),
+        error: runErrorMessage,
+      },
+    );
+
+    const finalizedRun = persistedRun ?? (await getRun(run.id));
+    if (finalizedRun) {
+      await appendRunEvent(finalizedRun, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: outcome === "succeeded" ? "info" : "error",
+        message: `run ${outcome}`,
+        payload: {
+          status,
+          exitCode: adapterResult.exitCode,
+          ...(readRunCancellation(finalizedRun.resultJson) ? { cancellation: readRunCancellation(finalizedRun.resultJson) } : {}),
+        },
+      });
+      try {
+        await completeSkillTestRunForHeartbeatOutcome({
+          run: finalizedRun,
+          issueId,
+          issueWorkMode: issueRef?.workMode ?? null,
+          outcome,
+          error: runErrorMessage,
+        });
+      } catch (err) {
+        logger.warn(
+          { err, runId: finalizedRun.id, issueId },
+          "failed to complete skill test run after heartbeat finalization",
+        );
+        await onLog(
+          "stderr",
+          `[paperclip] Failed to complete skill test run: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+      }
+      const livenessRun = finalizedRun;
+      await refreshContinuationSummaryForRun(livenessRun, agent);
+      const skipRunIssueComment =
+        parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
+      let resolvedPresentationDecision: RunPresentationDecision | null =
+        null;
+      try {
+        const existingRunComment = issueId
+          ? await findRunIssueComment(
+              livenessRun.id,
+              livenessRun.companyId,
+              issueId,
+              persistedResultJson,
+            )
+          : null;
+        const finalAgentMessage =
+          await findLatestCompletedFinalAgentMessage(
+            livenessRun.id,
+            livenessRun.companyId,
+          );
+        const externalChatPresentationCandidate =
+          isExternalChatPresentationContext(livenessRun.contextSnapshot) ||
+          parseObject(livenessRun.contextSnapshot).source === "tool_action_review" ||
+          String(parseObject(livenessRun.contextSnapshot).source ?? "").startsWith("issue.comment") ||
+          parseObject(livenessRun.contextSnapshot).source === "issue.update";
+        const externalChatPresentationAuthorization =
+          issueId && externalChatPresentationCandidate
+            ? await resolveChatRunPresentationAuthorizationReason(db, {
+                companyId: livenessRun.companyId,
+                issueId,
+                runId: livenessRun.id,
+              })
+            : null;
+        const externalChatPresentationContext = isExternalChatPresentationContext(
+          livenessRun.contextSnapshot,
+          externalChatPresentationAuthorization === CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
+        );
+        const resolved = resolveHeartbeatRunResponse({
+          resultJson: persistedResultJson,
+          conversationTurnFinished: isConversation(issueContext) && livenessRun.status === "succeeded"
+            && persistedResultJson?.finalizationReasonCode === "conversation_turn_finished",
+          existingComment: existingRunComment,
+          finalAgentMessage,
+          preferFinalResponseOverExistingComment:
+            externalChatPresentationContext,
+          externalChatReviewResponseSummaryAuthorized:
+            persistedResultJson?.finalizationReasonCode ===
+              "governed_response_waiting" &&
+            externalChatPresentationAuthorization ===
+              CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
+          externalChatResponseWakeSummaryAuthorized:
+            Boolean(adapterResult.nativeFinalization) &&
+            externalChatPresentationAuthorization ===
+              CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
+        });
+        let presentationDecision: RunPresentationDecision =
+          resolved.decision;
+
+        if (
+          issueId &&
+          !skipRunIssueComment &&
+          presentationDecision.commentAction === "create" &&
+          resolved.text
+        ) {
+          // The presentation resolver exposes only the final assistant
+          // surface selected from completed final messages or accepted
+          // semantic results. For an exactly bound external-chat run,
+          // authorize that narrow presentation as the provider reply;
+          // ordinary internal runs retain the private default.
+          const presentationAuthorizationReason =
+            await resolveChatRunPresentationAuthorizationReason(db, {
+              companyId: livenessRun.companyId,
+              issueId,
+              runId: livenessRun.id,
+            });
+          const comment = await issuesSvc.addComment(
+            issueId,
+            resolved.text,
+            { agentId: agent.id, runId: livenessRun.id },
+            { authorizationReason: presentationAuthorizationReason, completionReply: true },
+          );
+          presentationDecision = {
+            ...presentationDecision,
+            commentId: comment.id,
+            reasonCodes: [
+              ...presentationDecision.reasonCodes,
+              "resolved_response_materialized",
+            ],
+          };
+          await logActivity(db, {
+            companyId: livenessRun.companyId,
+            actorType: "agent",
+            actorId: agent.id,
+            agentId: agent.id,
+            runId: livenessRun.id,
+            issueId,
+            action: "issue.comment_added",
+            entityType: "issue",
+            entityId: issueId,
+            details: {
+              commentId: comment.id,
+              bodySnippet: comment.body.slice(0, 120),
+              identifier: issueRef?.identifier ?? null,
+              issueTitle: issueRef?.title ?? null,
+              authorizationReason: presentationAuthorizationReason,
+              source: "run_presentation_resolver",
+              presentationSource: presentationDecision.chosenSource,
+            },
+          });
+        } else if (presentationDecision.commentAction === "create") {
+          presentationDecision = {
+            ...presentationDecision,
+            commentAction: "none",
+            reasonCodes: [
+              ...presentationDecision.reasonCodes,
+              skipRunIssueComment
+                ? "issue_comment_suppressed"
+                : "run_has_no_issue",
+            ],
+          };
+        }
+
+        await db
+          .update(heartbeatRuns)
+          .set({
+            resultJson: {
+              ...persistedResultJson,
+              presentationDecision,
+            },
+            updatedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, livenessRun.id));
+        await appendRunEvent(livenessRun, {
+          eventType: "run.presentation.resolved",
+          stream: "system",
+          level: "info",
+          message: "run presentation resolved",
+          payload: { presentationDecision },
+        });
+        resolvedPresentationDecision = presentationDecision;
+      } catch (err) {
+        await onLog(
+          "stderr",
+          `[paperclip] Failed to resolve run presentation: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+      }
+      if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
+        const policy = parseMaxTurnContinuationPolicy(agent);
+        if (policy.enabled && policy.maxAttempts > 0) {
+          await scheduleBoundedRetryForRun(livenessRun, agent, {
+            retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
+            wakeReason: MAX_TURN_CONTINUATION_WAKE_REASON,
+            maxAttempts: policy.maxAttempts,
+            delayMs: policy.delayMs,
+          });
+        } else {
+          await appendRunEvent(livenessRun, {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message:
+              "Max-turn continuation suppressed because the policy is disabled",
+            payload: {
+              retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
+              policy,
+            },
+          });
+        }
+      } else if (
+        outcome === "failed" &&
+        readTransientRecoveryContractFromRun(livenessRun)
+      ) {
+        await scheduleBoundedRetryForRun(livenessRun, agent);
+      } else if (
+        outcome === "failed" &&
+        !(await legacyExecutionNeedsReconciliationWithEvidence(db, livenessRun))
+      ) {
+        await scheduleInteractionContinuationInfrastructureRetryIfEligible(
+          livenessRun,
+          agent,
+        );
+      }
+      const issueCommentPolicyResult = await finalizeIssueCommentPolicy(
+        livenessRun,
+        agent,
+        resolvedPresentationDecision,
+      );
+      const conversationSettled = await settleConversationTurn(db, livenessRun);
+      await releaseIssueExecutionAndPromote(livenessRun, {
+        suppressImmediateRecovery: conversationSettled ||
+          readNonEmptyString(
+            parseObject(livenessRun.contextSnapshot).goalControlRequestId,
+          ) !== null ||
+          parseObject(livenessRun.contextSnapshot)
+            .resumeSessionGoalHeartbeat === true,
+      });
+      if (!conversationSettled) {
+        await handleIssueReviewPathDisposition(livenessRun);
+        if (livenessRun.runtimeMode !== "native") {
+          await recovery.reconcileLegacyContinuation(livenessRun.id);
+        } else {
+          await handleRunLivenessContinuation(livenessRun);
+          await handleSuccessfulRunHandoff(
+            issueCommentPolicyResult.outcome === "retry_queued" ||
+              issueCommentPolicyResult.outcome === "retry_exhausted"
+              ? { ...livenessRun, issueCommentStatus: issueCommentPolicyResult.outcome }
+              : livenessRun,
+            agent,
+          );
+        }
+      }
+      if (
+        outcome === "succeeded" &&
+        issueId &&
+        parseObject(adapterResult.resultJson).goalRolloverRequired === true
+      ) {
+        const rolloverProjection = await runnerGoalService(db).projection(
+          livenessRun.companyId,
+          issueId,
+          agent.id,
+        );
+        if (rolloverProjection?.goal?.status === "active") {
+          await enqueueWakeup(agent.id, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "goal_control",
+            payload: {
+              issueId,
+              intent: "goal_rollover",
+              predecessorRunId: livenessRun.id,
+            },
+            idempotencyKey: `goal_rollover:${livenessRun.id}`,
+            requestedByActorType: "system",
+            contextSnapshot: {
+              issueId,
+              taskKey: issueId,
+              resumeSessionGoalHeartbeat: true,
+              skipIssueComment: true,
+              goalRolloverFromRunId: livenessRun.id,
+            },
+          });
+        }
+      }
+
+      // Dependency wake re-check: if this run's issue was marked done mid-run,
+      // the route-time `issue_blockers_resolved` wake may have been gated by
+      // workspace finalization or merged into this run. Reuse the level-triggered
+      // dependency backstop so finalize and periodic recovery share idempotency,
+      // readiness, active-path, and observability rules.
+      if (issueId && finalizedRun) {
+        try {
+          const blockerIssueStatus = await db
+            .select({ status: issues.status })
+            .from(issues)
+            .where(eq(issues.id, issueId))
+            .then((rows) => rows[0]?.status ?? null);
+          if (blockerIssueStatus === "done") {
+            await recovery.reconcileResolvedDependencyWakeBackstop({
+              runId: finalizedRun.id,
+              companyId: finalizedRun.companyId,
+              blockerIssueId: issueId,
+              source: "workspace.finalize",
+            });
+          }
+        } catch (finalizeWakeErr) {
+          logger.warn(
+            { err: finalizeWakeErr, runId: run.id, issueId },
+            "failed to evaluate dependent wakes after workspace_finalize",
+          );
+        }
+      }
+    }
+
+    if (finalizedRun) {
+      await updateRuntimeState(
+        agent,
+        finalizedRun,
+        adapterResult,
+        {
+          legacySessionId: nextSessionState.legacySessionId,
+        },
+        normalizedUsage,
+      );
+      if (taskKey) {
+        if (
+          adapterResult.clearSession ||
+          (!nextSessionState.params && !nextSessionState.displayId)
+        ) {
+          await clearTaskSessions(agent.companyId, agent.id, {
+            taskKey,
+            adapterType: agent.adapterType,
+            expectedRunId: finalizedRun.id,
+          });
+        } else {
+          await upsertTaskSession({
+            companyId: agent.companyId,
+            agentId: agent.id,
+            adapterType: agent.adapterType,
+            taskKey,
+            sessionParamsJson:
+              attachPaperclipSessionMetadataToSessionParams(
+                nextSessionState.params,
+                configuredModel,
+                sessionConfigMetadata,
+              ),
+            sessionDisplayId: nextSessionState.displayId,
+            lastRunId: finalizedRun.id,
+            lastError: runErrorMessage,
+          });
+        }
+      }
+    }
+    await finalizeAgentStatus(agent.id, outcome, runErrorMessage, {
+      keepIdleOnFailure:
+        outcome === "failed" &&
+        ((finalizedRun
+          ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota"
+          : runErrorCode === "provider_quota") ||
+          isWorkspaceSyncConflictFailure(adapterResult.errorMessage)),
+      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+    });
+    return {
+      won: persistedRunWrite.updated,
+      lateWrite,
+      run: finalizedRun ?? null,
+      outcome,
+    };
+  }
+
+
   async function executeRun(
     runId: string,
     runOptions: {
@@ -24722,12 +25731,42 @@ export function heartbeatService(
             );
           }
         }
+        let adapterInvocationCount = 0;
         const onAdapterMeta = async (meta: AdapterInvocationMeta) => {
           if (meta.env && secretKeys.size > 0) {
             for (const key of secretKeys) {
               if (key in meta.env) meta.env[key] = "***REDACTED***";
             }
           }
+          // Recorded before each CLI invocation, a fresh-session retry
+          // included, so a run whose parent is lost can still be finalized
+          // from the output of its latest invocation alone.
+          adapterInvocationCount += 1;
+          const localResultRecovery = buildLocalResultRecoverySnapshot({
+            adapterType: agent.adapterType,
+            codec: sessionCodec,
+            taskKey,
+            configuredModel,
+            previousSessionParams,
+            dispatched: runtimeForAdapter,
+            taskSessionReused: taskSessionForRun != null,
+            rotated: sessionCompaction.rotate,
+            rotationReason: sessionCompaction.reason,
+            sessionConfig: sessionConfigMetadata,
+            configFreshness: configFreshnessResultMetadata,
+            invocationNumber: adapterInvocationCount,
+            firstSeq: outputSeq + 1,
+            startedAt: new Date(),
+            recovery: meta.recovery,
+          });
+          context[LOCAL_RESULT_RECOVERY_CONTEXT_KEY] = localResultRecovery;
+          await db
+            .update(heartbeatRuns)
+            .set({
+              contextSnapshot: sql`jsonb_set(coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb), ${`{${LOCAL_RESULT_RECOVERY_CONTEXT_KEY}}`}::text[], ${JSON.stringify(localResultRecovery)}::jsonb)`,
+              updatedAt: new Date(),
+            })
+            .where(eq(heartbeatRuns.id, run.id));
           await appendRunEvent(currentRun, {
             eventType: "adapter.invoke",
             stream: "system",
@@ -26610,697 +27649,60 @@ export function heartbeatService(
             }
           }
         }
-        const processCancellation =
-          processRunCancellationSettlements.get(run.id) ??
-          failedProcessRunCancellations.get(run.id);
-        await processCancellation?.settled;
-        let outcome: RunSessionOutcome;
-        const latestRun = await getRun(run.id);
-        if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
-          outcome = latestRun.status;
-        } else if (executionControl.controller.signal.aborted) {
-          outcome = "cancelled";
-        } else if (adapterResult.nativeFinalization) {
-          const nativeTerminal =
-            adapterResult.nativeFinalization.terminal.runTerminalState;
-          outcome =
-            nativeTerminal === "succeeded"
-              ? "succeeded"
-              : nativeTerminal === "cancelled"
-                ? "cancelled"
-                : "failed";
-        } else if (adapterResult.timedOut) {
-          outcome = "timed_out";
-        } else if (adapterResult.resultJson?.status === "cancelled") {
-          outcome = "cancelled";
-        } else if (
-          (adapterResult.exitCode ?? 0) === 0 &&
-          !adapterResult.errorMessage &&
-          !adapterResult.signal &&
-          !processCancellation?.failed
-        ) {
-          outcome = "succeeded";
-        } else {
-          outcome = "failed";
-        }
-
-        const nextSessionState = resolveNextSessionState({
-          adapterType: agent.adapterType,
-          codec: sessionCodec,
+        await finalizeAdapterRun({
+          source: "execute",
+          run,
+          agent,
           adapterResult,
-          outcome,
-          previousParams: previousSessionParams,
-          previousDisplayId: runtimeForAdapter.sessionDisplayId,
-          previousLegacySessionId: runtimeForAdapter.sessionId,
-        });
-        // Usage belongs to the session this run reported, even when the
-        // adapter clears it for the next run (e.g. Claude max turns).
-        const usageSessionState = adapterResult.clearSession
-          ? resolveNextSessionState({
-              adapterType: agent.adapterType,
-              codec: sessionCodec,
-              adapterResult: { ...adapterResult, clearSession: false },
-              outcome,
-              previousParams: previousSessionParams,
-              previousDisplayId: runtimeForAdapter.sessionDisplayId,
-              previousLegacySessionId: runtimeForAdapter.sessionId,
-            })
-          : nextSessionState;
-        const rawUsage = normalizeUsageTotals(adapterResult.usage);
-        const rawCostUsd = adapterResult.costUsd ?? null;
-        const costBasis =
-          adapterResult.costBasis ?? adapterResult.usageBasis ?? null;
-        const sessionUsageResolution = await resolveNormalizedUsageForSession({
-          sessionId:
-            usageSessionState.displayId ?? usageSessionState.legacySessionId,
-          rawUsage,
-          usageBasis: adapterResult.usageBasis ?? null,
-          costBasis,
-          rawCostUsd,
-          invocationUsage: normalizeUsageTotals(adapterResult.invocationUsage),
-          getPreviousUsageJson: (sessionId) =>
-            getLatestSessionUsageJson(db, {
-              companyId: agent.companyId,
-              agentId: agent.id,
-              sessionId,
-              excludeRunId: run.id,
-            }),
-        });
-        const normalizedUsage = sessionUsageResolution.normalizedUsage;
-        if (sessionUsageResolution.normalizedCostUsd !== rawCostUsd) {
-          // A session-total cost must not be billed again on every resumed
-          // run; usage_json and the cost ledger below both read this field.
-          adapterResult = {
-            ...adapterResult,
-            costUsd: sessionUsageResolution.normalizedCostUsd,
-          };
-        }
-        const runErrorMessage =
-          outcome === "cancelled"
-            ? redactCurrentUserText(latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled", currentUserRedactionOptions)
-            : outcome === "succeeded"
-              ? null
-              : redactCurrentUserText(
-                  adapterResult.errorMessage ??
-                    (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
-                  currentUserRedactionOptions,
-                );
-        const recordedResponsibleUserDenialCode =
-          normalizeResponsibleUserDenialCode(latestRun?.errorCode);
-        const runErrorCode =
-          outcome === "timed_out"
-            ? "timeout"
-            : outcome === "cancelled"
-              ? (latestRun?.errorCode ?? "cancelled")
-              : outcome === "failed"
-                ? (adapterResult.errorCode ??
-                  recordedResponsibleUserDenialCode ??
-                  "adapter_failed")
-                : null;
-
-        let logSummary: {
-          bytes: number | null;
-          sha256?: string | null;
-          compressed: boolean;
-        } | null = null;
-        if (handle) {
-          logSummary = await runLogStore.finalize(handle);
-        }
-        const finalLogBytes = logSummary?.bytes;
-        if (outputProgressState.pending && typeof finalLogBytes === "number") {
-          outputProgressState.pending.bytes = finalLogBytes;
-        }
-        await flushOutputProgress({ force: true });
-
-        if (providerTraceCapture) {
-          try {
-            await traceStore.finalize(run.id, run.companyId);
-            providerTraceFinalized = true;
-          } catch (error) {
-            logger.warn(
-              { error, runId: run.id },
-              "provider trace finalization failed without affecting run outcome",
-            );
-          }
-        }
-
-        const status =
-          outcome === "succeeded"
-            ? "succeeded"
-            : outcome === "cancelled"
-              ? "cancelled"
-              : outcome === "timed_out"
-                ? "timed_out"
-                : "failed";
-
-        const cacheAdjustedCostUsd = resolveCacheAdjustedCostUsd(adapterResult);
-        const usageJson =
-          normalizedUsage ||
-          adapterResult.costUsd != null ||
-          cacheAdjustedCostUsd != null
-            ? ({
-                ...(normalizedUsage ?? {}),
-                ...(sessionUsageResolution.sessionRawUsage
-                  ? {
-                      rawInputTokens:
-                        sessionUsageResolution.sessionRawUsage.inputTokens,
-                      rawCachedInputTokens:
-                        sessionUsageResolution.sessionRawUsage
-                          .cachedInputTokens,
-                      rawOutputTokens:
-                        sessionUsageResolution.sessionRawUsage.outputTokens,
-                    }
-                  : {}),
-                // Raw token counters miss subagent tokens (lower bound).
-                ...(sessionUsageResolution.sessionRawUsageIncomplete
-                  ? { rawUsageIncomplete: true }
-                  : {}),
-                // The next resumed run subtracts this cumulative cost.
-                ...(costBasis === "session_cumulative" && rawCostUsd != null
-                  ? { rawCostUsd }
-                  : {}),
-                ...(sessionUsageResolution.derivedFromSessionTotals
-                  ? { usageSource: "session_delta" }
-                  : sessionUsageResolution.usageFromInvocation
-                    ? { usageSource: "invocation" }
-                  : adapterResult.usageBasis === "per_run"
-                    ? { usageSource: "per_run" }
-                    : adapterResult.usageBasis === "session_cumulative"
-                      ? // No earlier usage in this session to subtract:
-                        // stored as reported (a fresh session's own usage).
-                        { usageSource: "session_total" }
-                      : {}),
-                // Per-run tokens with a session-total cost: say how the cost
-                // was stored, since usageSource covers only the tokens.
-                ...(adapterResult.usageBasis === "per_run" &&
-                costBasis === "session_cumulative" &&
-                rawCostUsd != null
-                  ? {
-                      costSource:
-                        sessionUsageResolution.previousRawCostUsd !== null
-                          ? "session_delta"
-                          : "session_total",
-                    }
-                  : {}),
-                ...((nextSessionState.displayId ??
-                nextSessionState.legacySessionId)
-                  ? {
-                      persistedSessionId:
-                        nextSessionState.displayId ??
-                        nextSessionState.legacySessionId,
-                    }
-                  : {}),
-                sessionReused:
-                  runtimeForAdapter.sessionId != null ||
-                  runtimeForAdapter.sessionDisplayId != null,
-                taskSessionReused: taskSessionForRun != null,
-                freshSession:
-                  runtimeForAdapter.sessionId == null &&
-                  runtimeForAdapter.sessionDisplayId == null,
-                sessionRotated: sessionCompaction.rotate,
-                sessionRotationReason: sessionCompaction.reason,
-                configFreshness: configFreshnessResultMetadata,
-                provider:
-                  readNonEmptyString(adapterResult.provider) ?? "unknown",
-                biller: resolveLedgerBiller(adapterResult),
-                model: readNonEmptyString(adapterResult.model) ?? "unknown",
-                ...(adapterResult.costUsd != null
-                  ? { costUsd: adapterResult.costUsd }
-                  : {}),
-                ...(cacheAdjustedCostUsd != null
-                  ? { cacheAdjustedCostUsd }
-                  : {}),
-                costStatus: resolveLedgerCostStatus({
-                  costUsd: cacheAdjustedCostUsd,
-                  inputTokens: normalizedUsage?.inputTokens ?? 0,
-                  cachedInputTokens: normalizedUsage?.cachedInputTokens ?? 0,
-                  outputTokens: normalizedUsage?.outputTokens ?? 0,
-                }),
-                billingType: normalizeLedgerBillingType(
-                  adapterResult.billingType,
-                ),
-              } as Record<string, unknown>)
-            : null;
-
-        const persistedResultJson = cancellationResultJson(latestRun ?? run, outcome, mergeHeartbeatRunResultJson(
-          mergeRunStopMetadataForAgent(agent, outcome, {
-            resultJson: mergeAdapterRecoveryMetadata({
-              resultJson: {
-                ...(adapterResult.nativeFinalization || outcome === "cancelled"
-                  ? parseObject(latestRun?.resultJson)
-                  : {}),
-                ...parseObject(adapterResult.resultJson),
-                ...(adapterResult.executionRecovery
-                  ? { executionRecovery: adapterResult.executionRecovery }
-                  : {}),
-                configFreshness: configFreshnessResultMetadata,
-              },
-              errorFamily: adapterResult.errorFamily ?? null,
-              retryNotBefore: adapterResult.retryNotBefore ?? null,
-            }),
-            errorCode: runErrorCode,
-            errorMessage: runErrorMessage,
-          }),
-          adapterResult.summary ?? null,
-        ), runErrorCode, runErrorMessage);
-
-        const finalRunPatch: Partial<typeof heartbeatRuns.$inferInsert> = {
-          finishedAt: new Date(),
-          error: runErrorMessage,
-          errorCode: runErrorCode,
-          exitCode: adapterResult.exitCode,
-          signal: adapterResult.signal,
-          usageJson,
-          resultJson: persistedResultJson,
-          sessionIdAfter:
-            nextSessionState.displayId ?? nextSessionState.legacySessionId,
-          stdoutExcerpt,
-          stderrExcerpt,
-          logBytes: logSummary?.bytes,
-          logSha256: logSummary?.sha256,
-          logCompressed: logSummary?.compressed ?? false,
-        };
-        const persistedRunWrite = await setRunStatusIfRunning(
-          run.id,
-          status,
-          finalRunPatch,
-          { adapterErrorMeta: adapterResult.errorMeta, secretValues: readFailureReportSecrets() },
-        );
-        let persistedRun: typeof heartbeatRuns.$inferSelect | null =
-          persistedRunWrite.run;
-        if (!persistedRunWrite.updated) {
-          persistedRun = null;
-          // Native reconciliation can commit and project the terminal status in
-          // the narrow window between adapter completion and this live write.
-          // The status is authoritative, but it must not make us discard the
-          // adapter's semantic result, usage, logs, or presentation decision.
-          // Only complete the late metadata write when the reconciler chose the
-          // same terminal status; a conflicting terminal outcome remains owned
-          // by the path that won the compare-and-set. Owned legacy cancellation
-          // likewise keeps the provider session, logs, and usage after Stop wins.
-          if (
-            (adapterResult.nativeFinalization ||
-              (processCancellation && !processCancellation.failed && status === "cancelled")) &&
-            persistedRunWrite.run?.status === status
-          ) {
-            persistedRun = await db
-              .update(heartbeatRuns)
-              .set({
-                ...finalRunPatch,
-                resultJson: cancellationResultJson(persistedRunWrite.run, status, finalRunPatch.resultJson, runErrorCode, runErrorMessage),
-                finishedAt:
-                  persistedRunWrite.run.finishedAt ?? finalRunPatch.finishedAt,
-                updatedAt: new Date(),
-              })
-              .where(
-                and(
-                  eq(heartbeatRuns.id, run.id),
-                  eq(heartbeatRuns.status, status),
-                ),
-              )
-              .returning()
-              .then((rows) => rows[0] ?? null);
-          }
-          if (!persistedRun) {
-            logger.info(
-              {
-                runId: run.id,
-                attemptedStatus: status,
-                currentStatus: persistedRunWrite.run?.status ?? null,
-              },
-              "skipping late run finalization because the run already left running state",
-            );
-            return;
-          }
-        }
-        if (persistedRun) {
-          persistedRun =
-            (await classifyAndPersistRunLiveness(
-              persistedRun,
-              persistedResultJson,
-            )) ?? persistedRun;
-        }
-
-        await setWakeupStatus(
-          run.wakeupRequestId,
-          outcome === "succeeded" ? "completed" : status,
-          {
-            finishedAt: new Date(),
-            error: runErrorMessage,
+          session: {
+            codec: sessionCodec,
+            taskKey,
+            previousParams: previousSessionParams,
+            dispatched: runtimeForAdapter,
+            taskSessionReused: taskSessionForRun != null,
+            rotated: sessionCompaction.rotate,
+            rotationReason: sessionCompaction.reason,
+            configuredModel,
+            configMetadata: sessionConfigMetadata,
+            configFreshness: configFreshnessResultMetadata,
           },
-        );
-
-        const finalizedRun = persistedRun ?? (await getRun(run.id));
-        if (finalizedRun) {
-          await appendRunEvent(finalizedRun, {
-            eventType: "lifecycle",
-            stream: "system",
-            level: outcome === "succeeded" ? "info" : "error",
-            message: `run ${outcome}`,
-            payload: {
-              status,
-              exitCode: adapterResult.exitCode,
-              ...(readRunCancellation(finalizedRun.resultJson) ? { cancellation: readRunCancellation(finalizedRun.resultJson) } : {}),
-            },
-          });
-          try {
-            await completeSkillTestRunForHeartbeatOutcome({
-              run: finalizedRun,
-              issueId,
-              issueWorkMode: issueRef?.workMode ?? null,
-              outcome,
-              error: runErrorMessage,
-            });
-          } catch (err) {
-            logger.warn(
-              { err, runId: finalizedRun.id, issueId },
-              "failed to complete skill test run after heartbeat finalization",
-            );
-            await onLog(
-              "stderr",
-              `[paperclip] Failed to complete skill test run: ${err instanceof Error ? err.message : String(err)}\n`,
-            );
-          }
-          const livenessRun = finalizedRun;
-          await refreshContinuationSummaryForRun(livenessRun, agent);
-          const skipRunIssueComment =
-            parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
-          let resolvedPresentationDecision: RunPresentationDecision | null =
-            null;
-          try {
-            const existingRunComment = issueId
-              ? await findRunIssueComment(
-                  livenessRun.id,
-                  livenessRun.companyId,
-                  issueId,
-                  persistedResultJson,
-                )
-              : null;
-            const finalAgentMessage =
-              await findLatestCompletedFinalAgentMessage(
-                livenessRun.id,
-                livenessRun.companyId,
-              );
-            const externalChatPresentationCandidate =
-              isExternalChatPresentationContext(livenessRun.contextSnapshot) ||
-              parseObject(livenessRun.contextSnapshot).source === "tool_action_review" ||
-              String(parseObject(livenessRun.contextSnapshot).source ?? "").startsWith("issue.comment") ||
-              parseObject(livenessRun.contextSnapshot).source === "issue.update";
-            const externalChatPresentationAuthorization =
-              issueId && externalChatPresentationCandidate
-                ? await resolveChatRunPresentationAuthorizationReason(db, {
-                    companyId: livenessRun.companyId,
-                    issueId,
-                    runId: livenessRun.id,
-                  })
-                : null;
-            const externalChatPresentationContext = isExternalChatPresentationContext(
-              livenessRun.contextSnapshot,
-              externalChatPresentationAuthorization === CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
-            );
-            const resolved = resolveHeartbeatRunResponse({
-              resultJson: persistedResultJson,
-              conversationTurnFinished: isConversation(issueContext) && livenessRun.status === "succeeded"
-                && persistedResultJson?.finalizationReasonCode === "conversation_turn_finished",
-              existingComment: existingRunComment,
-              finalAgentMessage,
-              preferFinalResponseOverExistingComment:
-                externalChatPresentationContext,
-              externalChatReviewResponseSummaryAuthorized:
-                persistedResultJson?.finalizationReasonCode ===
-                  "governed_response_waiting" &&
-                externalChatPresentationAuthorization ===
-                  CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
-              externalChatResponseWakeSummaryAuthorized:
-                Boolean(adapterResult.nativeFinalization) &&
-                externalChatPresentationAuthorization ===
-                  CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
-            });
-            let presentationDecision: RunPresentationDecision =
-              resolved.decision;
-
-            if (
-              issueId &&
-              !skipRunIssueComment &&
-              presentationDecision.commentAction === "create" &&
-              resolved.text
-            ) {
-              // The presentation resolver exposes only the final assistant
-              // surface selected from completed final messages or accepted
-              // semantic results. For an exactly bound external-chat run,
-              // authorize that narrow presentation as the provider reply;
-              // ordinary internal runs retain the private default.
-              const presentationAuthorizationReason =
-                await resolveChatRunPresentationAuthorizationReason(db, {
-                  companyId: livenessRun.companyId,
-                  issueId,
-                  runId: livenessRun.id,
-                });
-              const comment = await issuesSvc.addComment(
-                issueId,
-                resolved.text,
-                { agentId: agent.id, runId: livenessRun.id },
-                { authorizationReason: presentationAuthorizationReason, completionReply: true },
-              );
-              presentationDecision = {
-                ...presentationDecision,
-                commentId: comment.id,
-                reasonCodes: [
-                  ...presentationDecision.reasonCodes,
-                  "resolved_response_materialized",
-                ],
-              };
-              await logActivity(db, {
-                companyId: livenessRun.companyId,
-                actorType: "agent",
-                actorId: agent.id,
-                agentId: agent.id,
-                runId: livenessRun.id,
-                issueId,
-                action: "issue.comment_added",
-                entityType: "issue",
-                entityId: issueId,
-                details: {
-                  commentId: comment.id,
-                  bodySnippet: comment.body.slice(0, 120),
-                  identifier: issueRef?.identifier ?? null,
-                  issueTitle: issueRef?.title ?? null,
-                  authorizationReason: presentationAuthorizationReason,
-                  source: "run_presentation_resolver",
-                  presentationSource: presentationDecision.chosenSource,
-                },
-              });
-            } else if (presentationDecision.commentAction === "create") {
-              presentationDecision = {
-                ...presentationDecision,
-                commentAction: "none",
-                reasonCodes: [
-                  ...presentationDecision.reasonCodes,
-                  skipRunIssueComment
-                    ? "issue_comment_suppressed"
-                    : "run_has_no_issue",
-                ],
-              };
+          issue: {
+            id: issueId,
+            ref: issueRef,
+            context: issueContext,
+          },
+          redaction: currentUserRedactionOptions,
+          isAborted: () => executionControl.controller.signal.aborted,
+          secretValues: () => readFailureReportSecrets(),
+          onLog,
+          finalizeLog: async () => {
+            let logSummary: {
+              bytes: number | null;
+              sha256?: string | null;
+              compressed: boolean;
+            } | null = null;
+            if (handle) {
+              logSummary = await runLogStore.finalize(handle);
             }
+            const finalLogBytes = logSummary?.bytes;
+            if (outputProgressState.pending && typeof finalLogBytes === "number") {
+              outputProgressState.pending.bytes = finalLogBytes;
+            }
+            await flushOutputProgress({ force: true });
 
-            await db
-              .update(heartbeatRuns)
-              .set({
-                resultJson: {
-                  ...persistedResultJson,
-                  presentationDecision,
-                },
-                updatedAt: new Date(),
-              })
-              .where(eq(heartbeatRuns.id, livenessRun.id));
-            await appendRunEvent(livenessRun, {
-              eventType: "run.presentation.resolved",
-              stream: "system",
-              level: "info",
-              message: "run presentation resolved",
-              payload: { presentationDecision },
-            });
-            resolvedPresentationDecision = presentationDecision;
-          } catch (err) {
-            await onLog(
-              "stderr",
-              `[paperclip] Failed to resolve run presentation: ${err instanceof Error ? err.message : String(err)}\n`,
-            );
-          }
-          if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
-            const policy = parseMaxTurnContinuationPolicy(agent);
-            if (policy.enabled && policy.maxAttempts > 0) {
-              await scheduleBoundedRetryForRun(livenessRun, agent, {
-                retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
-                wakeReason: MAX_TURN_CONTINUATION_WAKE_REASON,
-                maxAttempts: policy.maxAttempts,
-                delayMs: policy.delayMs,
-              });
-            } else {
-              await appendRunEvent(livenessRun, {
-                eventType: "lifecycle",
-                stream: "system",
-                level: "warn",
-                message:
-                  "Max-turn continuation suppressed because the policy is disabled",
-                payload: {
-                  retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
-                  policy,
-                },
-              });
-            }
-          } else if (
-            outcome === "failed" &&
-            readTransientRecoveryContractFromRun(livenessRun)
-          ) {
-            await scheduleBoundedRetryForRun(livenessRun, agent);
-          } else if (
-            outcome === "failed" &&
-            !(await legacyExecutionNeedsReconciliationWithEvidence(db, livenessRun))
-          ) {
-            await scheduleInteractionContinuationInfrastructureRetryIfEligible(
-              livenessRun,
-              agent,
-            );
-          }
-          const issueCommentPolicyResult = await finalizeIssueCommentPolicy(
-            livenessRun,
-            agent,
-            resolvedPresentationDecision,
-          );
-          const conversationSettled = await settleConversationTurn(db, livenessRun);
-          await releaseIssueExecutionAndPromote(livenessRun, {
-            suppressImmediateRecovery: conversationSettled ||
-              readNonEmptyString(
-                parseObject(livenessRun.contextSnapshot).goalControlRequestId,
-              ) !== null ||
-              parseObject(livenessRun.contextSnapshot)
-                .resumeSessionGoalHeartbeat === true,
-          });
-          if (!conversationSettled) {
-            await handleIssueReviewPathDisposition(livenessRun);
-            if (livenessRun.runtimeMode !== "native") {
-              await recovery.reconcileLegacyContinuation(livenessRun.id);
-            } else {
-              await handleRunLivenessContinuation(livenessRun);
-              await handleSuccessfulRunHandoff(
-                issueCommentPolicyResult.outcome === "retry_queued" ||
-                  issueCommentPolicyResult.outcome === "retry_exhausted"
-                  ? { ...livenessRun, issueCommentStatus: issueCommentPolicyResult.outcome }
-                  : livenessRun,
-                agent,
-              );
-            }
-          }
-          if (
-            outcome === "succeeded" &&
-            issueId &&
-            parseObject(adapterResult.resultJson).goalRolloverRequired === true
-          ) {
-            const rolloverProjection = await runnerGoalService(db).projection(
-              livenessRun.companyId,
-              issueId,
-              agent.id,
-            );
-            if (rolloverProjection?.goal?.status === "active") {
-              await enqueueWakeup(agent.id, {
-                source: "automation",
-                triggerDetail: "system",
-                reason: "goal_control",
-                payload: {
-                  issueId,
-                  intent: "goal_rollover",
-                  predecessorRunId: livenessRun.id,
-                },
-                idempotencyKey: `goal_rollover:${livenessRun.id}`,
-                requestedByActorType: "system",
-                contextSnapshot: {
-                  issueId,
-                  taskKey: issueId,
-                  resumeSessionGoalHeartbeat: true,
-                  skipIssueComment: true,
-                  goalRolloverFromRunId: livenessRun.id,
-                },
-              });
-            }
-          }
-
-          // Dependency wake re-check: if this run's issue was marked done mid-run,
-          // the route-time `issue_blockers_resolved` wake may have been gated by
-          // workspace finalization or merged into this run. Reuse the level-triggered
-          // dependency backstop so finalize and periodic recovery share idempotency,
-          // readiness, active-path, and observability rules.
-          if (issueId && finalizedRun) {
-            try {
-              const blockerIssueStatus = await db
-                .select({ status: issues.status })
-                .from(issues)
-                .where(eq(issues.id, issueId))
-                .then((rows) => rows[0]?.status ?? null);
-              if (blockerIssueStatus === "done") {
-                await recovery.reconcileResolvedDependencyWakeBackstop({
-                  runId: finalizedRun.id,
-                  companyId: finalizedRun.companyId,
-                  blockerIssueId: issueId,
-                  source: "workspace.finalize",
-                });
+            if (providerTraceCapture) {
+              try {
+                await traceStore.finalize(run.id, run.companyId);
+                providerTraceFinalized = true;
+              } catch (error) {
+                logger.warn(
+                  { error, runId: run.id },
+                  "provider trace finalization failed without affecting run outcome",
+                );
               }
-            } catch (finalizeWakeErr) {
-              logger.warn(
-                { err: finalizeWakeErr, runId: run.id, issueId },
-                "failed to evaluate dependent wakes after workspace_finalize",
-              );
             }
-          }
-        }
-
-        if (finalizedRun) {
-          await updateRuntimeState(
-            agent,
-            finalizedRun,
-            adapterResult,
-            {
-              legacySessionId: nextSessionState.legacySessionId,
-            },
-            normalizedUsage,
-          );
-          if (taskKey) {
-            if (
-              adapterResult.clearSession ||
-              (!nextSessionState.params && !nextSessionState.displayId)
-            ) {
-              await clearTaskSessions(agent.companyId, agent.id, {
-                taskKey,
-                adapterType: agent.adapterType,
-                expectedRunId: finalizedRun.id,
-              });
-            } else {
-              await upsertTaskSession({
-                companyId: agent.companyId,
-                agentId: agent.id,
-                adapterType: agent.adapterType,
-                taskKey,
-                sessionParamsJson:
-                  attachPaperclipSessionMetadataToSessionParams(
-                    nextSessionState.params,
-                    configuredModel,
-                    sessionConfigMetadata,
-                  ),
-                sessionDisplayId: nextSessionState.displayId,
-                lastRunId: finalizedRun.id,
-                lastError: runErrorMessage,
-              });
-            }
-          }
-        }
-        await finalizeAgentStatus(agent.id, outcome, runErrorMessage, {
-          keepIdleOnFailure:
-            outcome === "failed" &&
-            ((finalizedRun
-              ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota"
-              : runErrorCode === "provider_quota") ||
-              isWorkspaceSyncConflictFailure(adapterResult.errorMessage)),
-          wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+            return { summary: logSummary, stdoutExcerpt, stderrExcerpt };
+          },
         });
       } catch (err) {
         if (err instanceof NativeControllerDetachedForRestartError) {
@@ -31385,6 +31787,7 @@ export function heartbeatService(
   }
 
   return {
+    finalizeAdapterRunForTests: finalizeAdapterRun,
     waitForRunExecutionDrain: async (
       runId: string,
       options: { timeoutMs?: number; intervalMs?: number } = {},
