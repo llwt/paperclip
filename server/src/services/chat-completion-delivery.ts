@@ -148,9 +148,12 @@ export async function existingChatCompletionReply(tx: Connection, runId: string,
   if (rows.length !== ids(run).length) throw new Error("chat_completion_superseded");
   return null;
 }
-export async function acknowledgeChatCompletionReply(tx: Connection, runId: string, commentId: string) {
+/** Only `queued` rows change, so acknowledging again is a no-op. With `conversationId`, only deliveries handed off from that conversation issue are acknowledged. */
+export async function acknowledgeChatCompletionReply(tx: Connection, runId: string, commentId: string, conversationId?: string) {
   await tx.update(deliveries).set({ status: "delivered", responseCommentId: commentId, error: null })
-    .where(and(eq(deliveries.targetRunId, runId), eq(deliveries.status, "queued")));
+    .where(and(eq(deliveries.targetRunId, runId), eq(deliveries.status, "queued"),
+      ...(conversationId ? [inArray(deliveries.taskId, tx.select({ id: handoffs.taskId }).from(handoffs)
+        .where(eq(handoffs.conversationId, conversationId)))] : [])));
 }
 
 export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentId: string, options: {

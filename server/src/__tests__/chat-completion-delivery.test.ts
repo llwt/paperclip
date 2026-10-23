@@ -93,13 +93,50 @@ const support = await getEmbeddedPostgresTestSupport();
     const run = await f.run();
     expect(run.contextSnapshot?.chatCompletionDeliveryIds).toHaveLength(2);
     expect(run.contextSnapshot?.chatCompletionUpdates).toEqual(expect.arrayContaining([expect.objectContaining({ id: f.task.id, status: "done", hasSavedDocuments: true })]));
-    await issueService(db).addComment(f.sourceId, "Reading the results", { agentId: f.agentId, runId: run.id });
+    await issueService(db).addComment(f.sourceId, "Operator note", { userId: "operator" });
     expect((await f.rows()).every(d => d.status === "queued")).toBe(true);
     const reply = await issueService(db).addComment(f.sourceId, "Both notes are ready.", { agentId: f.agentId, runId: run.id }, { completionReply: true });
     expect((await f.rows()).every(d => d.status === "delivered" && d.responseCommentId === reply.id)).toBe(true);
     const replay = await issueService(db).addComment(f.sourceId, "A differently worded duplicate", { agentId: f.agentId, runId: run.id }, { completionReply: true });
     expect(replay.id).toBe(reply.id);
     await f.due(); await f.service.sweepPending(); expect(f.wakeup).toHaveBeenCalledTimes(1);
+  });
+  describe("a reply the woken agent posts itself", () => {
+    const endRun = (runId: string) => db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, runId));
+    it("acknowledges the delivery so the finished run is not woken again", async () => {
+      const f = await seed(); await f.finish(); const run = await f.run();
+      const reply = await issueService(db).addComment(f.sourceId, "The note is ready.", { agentId: f.agentId, runId: run.id });
+      expect(await f.rows()).toMatchObject([{ status: "delivered", responseCommentId: reply.id, attempts: 0 }]);
+      await endRun(run.id); await f.due(); await f.service.sweepPending();
+      expect(f.wakeup).toHaveBeenCalledTimes(1);
+      expect(await f.rows()).toMatchObject([{ status: "delivered", attempts: 0 }]);
+    });
+    it("is harmless to acknowledge again through the completion presentation path", async () => {
+      const f = await seed(); await f.finish(); const run = await f.run();
+      const own = await issueService(db).addComment(f.sourceId, "The note is ready.", { agentId: f.agentId, runId: run.id });
+      const again = await issueService(db).addComment(f.sourceId, "The note is ready.", { agentId: f.agentId, runId: run.id }, { completionReply: true });
+      expect(again.id).toBe(own.id);
+      expect(await f.rows()).toMatchObject([{ status: "delivered", responseCommentId: own.id }]);
+    });
+    it("retries as before when the run ends without any reply comment", async () => {
+      const f = await seed(); await f.finish(); const run = await f.run();
+      await endRun(run.id); await f.due(); await f.service.sweepPending();
+      expect(f.wakeup).toHaveBeenCalledTimes(2);
+      expect((await f.rows())[0]).toMatchObject({ status: "queued", attempts: 1 });
+    });
+    it.each(["other-run", "user", "other-issue"])("is not acknowledged by a comment from %s", async kind => {
+      const f = await seed(); await f.finish(); const run = await f.run();
+      if (kind === "other-run") {
+        const [other] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running",
+          contextSnapshot: { issueId: f.sourceId, conversationSessionGeneration: 0 } }).returning();
+        await issueService(db).addComment(f.sourceId, "Unrelated run", { agentId: f.agentId, runId: other.id });
+      } else if (kind === "user") await issueService(db).addComment(f.sourceId, "Any news?", { userId: "operator" });
+      else await issueService(db).addComment(f.task.id, "Working note", { agentId: f.agentId, runId: run.id });
+      expect(await f.rows()).toMatchObject([{ status: "queued", responseCommentId: null }]);
+      await endRun(run.id); await f.due(); await f.service.sweepPending();
+      expect(f.wakeup).toHaveBeenCalledTimes(2);
+      expect((await f.rows())[0].attempts).toBe(1);
+    });
   });
   it.each([false, true])("does not inject any worker-authored text, including quarantined=%s", async quarantined => {
     const f = await seed(); await f.finish();
