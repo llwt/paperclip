@@ -12,6 +12,14 @@ import {
 } from "./local-process-sandbox.js";
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
+import {
+  RUN_PROCESS_SWEEP_INVOCATION_ENV,
+  RUN_PROCESS_SWEEP_RUN_ID_ENV,
+  formatRunProcessSweepLogLine,
+  sweepRunProcesses,
+  type RunProcessSweepEvidence,
+  type RunProcessSweepOptions,
+} from "./run-process-sweep.js";
 import { spawnRunOutputRelay } from "./run-output-relay.js";
 import { paperclipChatFilePreparationDelivery } from "./chat-file-delivery.js";
 import {
@@ -65,6 +73,58 @@ export interface RunProcessResult {
   // duplex control channel died before a clean completion.
   errorCode?: string | null;
   terminalResultCleanup?: TerminalResultCleanupEvidence | null;
+  // What the end-of-run sweep stopped; null when no sweep ran (non-Linux, or
+  // the child env does not carry this run's PAPERCLIP_RUN_ID).
+  leftoverProcessSweep?: RunProcessSweepEvidence | null;
+}
+
+export {
+  sweepRunProcesses,
+  formatRunProcessSweepLogLine,
+  type RunProcessSweepEvidence,
+  type RunProcessSweepOptions,
+};
+
+// The resultJson fragment that records an end-of-run sweep that stopped
+// something; empty when nothing was stopped, so ordinary runs stay unchanged.
+export function leftoverProcessSweepResultJson(
+  proc: Pick<RunProcessResult, "leftoverProcessSweep">,
+): { leftoverProcessSweep?: RunProcessSweepEvidence } {
+  const sweep = proc.leftoverProcessSweep;
+  return sweep && sweep.stopped > 0 ? { leftoverProcessSweep: sweep } : {};
+}
+
+type LeftoverProcessSweepSource = Pick<RunProcessResult, "leftoverProcessSweep"> | null | undefined;
+
+// One evidence record for every attempt of a run (initial attempt plus a
+// retry), so a retry does not hide what the first attempt left behind.
+export function mergeLeftoverProcessSweeps(
+  procs: readonly LeftoverProcessSweepSource[],
+): RunProcessSweepEvidence | null {
+  const sweeps = procs
+    .map((proc) => proc?.leftoverProcessSweep)
+    .filter((sweep): sweep is RunProcessSweepEvidence => Boolean(sweep && sweep.stopped > 0));
+  if (sweeps.length === 0) return null;
+  if (sweeps.length === 1) return sweeps[0]!;
+  return {
+    kind: "leftover_process_sweep",
+    stopped: sweeps.reduce((sum, sweep) => sum + sweep.stopped, 0),
+    forceKilled: sweeps.reduce((sum, sweep) => sum + sweep.forceKilled, 0),
+    processes: sweeps.flatMap((sweep) => sweep.processes),
+  };
+}
+
+// Put the sweep evidence of the given attempts on an adapter result's
+// resultJson. Every adapter result path goes through this, so the server
+// records the stopped processes for every adapter that uses runChildProcess.
+export function withLeftoverProcessSweep<T extends object>(
+  result: T,
+  procs: readonly LeftoverProcessSweepSource[],
+): T {
+  const sweep = mergeLeftoverProcessSweeps(procs);
+  if (!sweep) return result;
+  const resultJson = (result as { resultJson?: Record<string, unknown> | null }).resultJson;
+  return { ...result, resultJson: { ...(resultJson ?? {}), leftoverProcessSweep: sweep } };
 }
 
 export interface TerminalResultCleanupOptions {
@@ -4691,6 +4751,11 @@ export async function runChildProcess(
       startedAt: string;
     }) => Promise<void>;
     terminalResultCleanup?: TerminalResultCleanupOptions;
+    // Tuning for the end-of-run sweep; tests inject a fake /proc reader here.
+    leftoverProcessSweep?: Pick<
+      RunProcessSweepOptions,
+      "graceMs" | "procReader" | "kill" | "platform" | "selfPid" | "selfUid"
+    >;
     stdin?: string;
     remoteExecution?: RemoteExecutionSpec | null;
     localProcessSandbox?: LocalProcessSandboxOptions | null;
@@ -4734,6 +4799,38 @@ export async function runChildProcess(
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }
+        // Sweep only when the child carries this run's id, so leftovers can be
+        // found by it. The per-spawn invocation id narrows the sweep to this
+        // spawn's own descendants.
+        const sweepInvocationId =
+          childEnv[RUN_PROCESS_SWEEP_RUN_ID_ENV] === runId ? randomUUID() : null;
+        if (sweepInvocationId) {
+          childEnv[RUN_PROCESS_SWEEP_INVOCATION_ENV] = sweepInvocationId;
+        }
+        let leftoverSweep: Promise<RunProcessSweepEvidence | null> | null =
+          null;
+        const runLeftoverSweep = () => {
+          if (!sweepInvocationId) return Promise.resolve(null);
+          leftoverSweep ??= sweepRunProcesses(runId, {
+            ...opts.leftoverProcessSweep,
+            invocationId: sweepInvocationId,
+          })
+            .then(async (evidence) => {
+              if (evidence && evidence.stopped > 0) {
+                await opts
+                  .onLog("stderr", formatRunProcessSweepLogLine(evidence))
+                  .catch((err) =>
+                    onLogError(err, runId, "failed to log leftover process sweep"),
+                  );
+              }
+              return evidence;
+            })
+            .catch((err) => {
+              onLogError(err, runId, "failed to sweep leftover run processes");
+              return null;
+            });
+          return leftoverSweep;
+        };
         const child = spawn(target.command, target.args, {
           cwd: target.cwd ?? opts.cwd,
           env: childEnv,
@@ -4957,12 +5054,18 @@ export async function runChildProcess(
             errno === "ENOENT"
               ? `Failed to start command "${command}" in "${opts.cwd}". Verify adapter command, working directory, and PATH (${pathValue}).`
               : `Failed to start command "${command}" in "${opts.cwd}": ${err.message}`;
-          reject(new Error(msg));
+          void runLeftoverSweep().finally(() => reject(new Error(msg)));
         });
 
         child.on("exit", () => {
           if (outputHandedOff) return;
           maybeArmTerminalResultCleanup();
+          // The adapter process has ended, so whatever still carries this
+          // spawn's ids is a leftover. Sweep now rather than on "close": a
+          // leftover that inherited stdout/stderr keeps the pipes open, and
+          // "close" waits for it. Starting here keeps the whole wait within one
+          // grace time from adapter exit; "close" reuses this sweep.
+          void runLeftoverSweep();
         });
 
         child.on(
@@ -4978,7 +5081,11 @@ export async function runChildProcess(
             void logChain.finally(() => {
               void Promise.resolve()
                 .then(() => target.cleanup?.())
-                .finally(() => {
+                .catch((err) =>
+                  onLogError(err, runId, "failed to clean up spawn target"),
+                )
+                .then(() => runLeftoverSweep())
+                .then((leftoverProcessSweep) => {
                   resolve({
                     exitCode: code,
                     signal,
@@ -4998,6 +5105,7 @@ export async function runChildProcess(
                           forceKilled: terminalCleanupForceKilled,
                         }
                       : null,
+                    ...(leftoverProcessSweep ? { leftoverProcessSweep } : {}),
                   });
                 });
             });
