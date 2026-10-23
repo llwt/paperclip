@@ -13,6 +13,9 @@ export function executionBlockerPredicate() {
   return and(
     not(conversationRecoveryActionPredicate()!),
     inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
+    // A repair run cancelled at the dispatch gate never reached the provider.
+    // Holds that earlier code wrote for it must not block or skip later wakes.
+    sql`coalesce(${issueRecoveryActions.evidence}->>'originalFailureCode', '') <> 'legacy_disposition_repair_suppressed'`,
     or(inArray(issueRecoveryActions.status, ["active", "escalated"]),
       sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`),
   );
