@@ -37,7 +37,13 @@ vi.mock("../services/local-service-supervisor.js", async () => ({
   ...await vi.importActual<typeof import("../services/local-service-supervisor.js")>("../services/local-service-supervisor.js"),
   terminateLocalService,
 }));
-import { heartbeatService } from "../services/heartbeat.js";
+import {
+  adapterOutputRecoveryContextFromSnapshot,
+  buildLocalResultRecoverySnapshot,
+  heartbeatService,
+  LOCAL_RESULT_RECOVERY_CONTEXT_KEY,
+  type LocalResultRecoverySnapshot,
+} from "../services/heartbeat.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeSupported = support.supported ? describe : describe.skip;
@@ -301,5 +307,196 @@ describeSupported("heartbeat run finalization", () => {
     expect(seen.sessions[0]).toMatchObject({ adapterType: "process", sessionDisplayId: "session-5" });
     expect(seen.sessions[0].sessionParamsJson).toMatchObject({ __paperclipConfiguredModel: "model-at-start" });
     expect(seen.runtime.adapterType).toBe("process");
+  });
+
+  it("records the recovery snapshot before every invocation, a fresh-session retry included", async () => {
+    const ids = await seed();
+    await db.update(agents).set({
+      adapterConfig: { model: "model-at-start", env: { OPENAI_API_KEY: "sk-config-secret" } },
+      runtimeConfig: { env: { RUNTIME_TOKEN: "runtime-secret" } },
+    }).where(eq(agents.id, ids.agentId));
+    const seenAtInvocation: Array<LocalResultRecoverySnapshot | undefined> = [];
+    const readSnapshot = async (runId: string) => {
+      const [row] = await db.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      return (row?.context as Record<string, unknown> | null)?.[LOCAL_RESULT_RECOVERY_CONTEXT_KEY] as LocalResultRecoverySnapshot | undefined;
+    };
+    adapterExecute.mockImplementation(closingIssue(async (ctx) => {
+      const invoke = async (sessionId: string | null) => {
+        await ctx.onMeta!({
+          adapterType: "process", command: "cli", env: { OPENAI_API_KEY: "sk-meta-secret" }, prompt: "secret prompt text",
+          recovery: { engine: "cli", provider: "openai", biller: "openai", model: "gpt-x", billingType: "subscription",
+            sessionId, sessionParams: sessionId ? { sessionId, token: "nested-secret", nested: { a: 1 } } : null },
+        });
+        // The child would start here.
+        seenAtInvocation.push(await readSnapshot(ctx.runId));
+      };
+      await invoke("old-session");
+      await ctx.onLog("stdout", "first child output\n");
+      await ctx.onLog("stdout", "first child final\n");
+      await invoke(null);
+      await ctx.onLog("stdout", "second child output\n");
+      return { exitCode: 0, signal: null, timedOut: false, sessionId: "new-session", sessionParams: { sessionId: "new-session" } };
+    }));
+    const runId = await runToEnd(ids);
+
+    expect(seenAtInvocation).toHaveLength(2);
+    const [first, second] = seenAtInvocation;
+    expect(first).toMatchObject({ version: 1, adapterType: "process", taskKey: ids.issueId, configuredModel: "model-at-start",
+      invocation: { number: 1, engine: "cli", sessionIdBefore: "old-session", sessionParams: { sessionId: "old-session" },
+        accounting: { provider: "openai", biller: "openai", model: "gpt-x", billingType: "subscription" } } });
+    expect(second).toMatchObject({ invocation: { number: 2, sessionIdBefore: null, sessionParams: null } });
+    // The retry starts after the first child's two output records.
+    expect(second!.invocation.firstSeq).toBe(first!.invocation.firstSeq + 2);
+    // Without an adapter session codec only the session id is kept.
+    expect(first!.invocation.sessionParams).toEqual({ sessionId: "old-session" });
+    for (const snapshot of [first, second]) {
+      const text = JSON.stringify(snapshot);
+      for (const secret of ["sk-config-secret", "runtime-secret", "sk-meta-secret", "secret prompt text", "nested-secret"]) {
+        expect(text).not.toContain(secret);
+      }
+      expect(Object.keys(snapshot!).sort()).toEqual(
+        ["adapterType", "configFreshness", "configuredModel", "invocation", "session", "taskKey", "version"]);
+    }
+    const seen = await observe(runId, ids);
+    expect(seen.run.status).toBe("succeeded");
+    // Later contextSnapshot writes keep the latest invocation's snapshot.
+    expect((seen.run.contextSnapshot as Record<string, unknown>)[LOCAL_RESULT_RECOVERY_CONTEXT_KEY])
+      .toMatchObject({ invocation: { number: 2 } });
+  });
+
+  describe("finalizeAdapterRun", () => {
+    const sessionConfig = {
+      version: 1, fingerprint: "fp", categories: [], categoryFingerprints: {}, fingerprints: {},
+    } as unknown as Parameters<typeof buildLocalResultRecoverySnapshot>[0]["sessionConfig"];
+
+    async function runningRun(ids: { companyId: string; agentId: string; issueId: string }) {
+      // A closed issue gets no follow-up wake that would run the adapter mock.
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, ids.issueId));
+      const [run] = await db.insert(heartbeatRuns).values({
+        companyId: ids.companyId, agentId: ids.agentId, invocationSource: "automation", status: "running",
+        startedAt: new Date(), contextSnapshot: { issueId: ids.issueId, skipIssueComment: true },
+      }).returning();
+      const [agent] = await db.select().from(agents).where(eq(agents.id, ids.agentId));
+      return { run: run!, agent: agent! };
+    }
+
+    function finalizeInput(
+      row: Awaited<ReturnType<typeof runningRun>>,
+      adapterResult: AdapterExecutionResult,
+      source: { source: "execute" } | { source: "adopted_output"; recoveredOutcome: "succeeded" | "failed" },
+    ): Parameters<typeof heartbeat.finalizeAdapterRunForTests>[0] {
+      return {
+        ...source,
+        run: row.run,
+        agent: row.agent,
+        adapterResult,
+        session: {
+          codec: { deserialize: (raw) => raw as Record<string, unknown> | null, serialize: (params) => params },
+          taskKey: null, previousParams: null, dispatched: { sessionId: null, sessionDisplayId: null },
+          taskSessionReused: false, rotated: false, rotationReason: null, configuredModel: null,
+          configMetadata: sessionConfig, configFreshness: {},
+        },
+        issue: { id: null, ref: null, context: null },
+        redaction: { enabled: false },
+        isAborted: () => false,
+        secretValues: () => [],
+        onLog: async () => {},
+        finalizeLog: async () => ({ summary: null, stdoutExcerpt: "", stderrExcerpt: "" }),
+      };
+    }
+
+    const nullExit = { exitCode: null, signal: null, timedOut: false } as const;
+
+    it("uses the recovered verdict of adopted output, not the null-exit rule", async () => {
+      const ids = await seed();
+      const row = await runningRun(ids);
+      const result = await heartbeat.finalizeAdapterRunForTests(
+        finalizeInput(row, { ...nullExit }, { source: "adopted_output", recoveredOutcome: "failed" }));
+      expect(result).toMatchObject({ won: true, lateWrite: false, outcome: "failed" });
+      expect(result.run).toMatchObject({ status: "failed", exitCode: null, errorCode: "adapter_failed", error: "Adapter failed" });
+    });
+
+    it("lets one of two racing finalizers win and accounts the run once", async () => {
+      const ids = await seed();
+      const row = await runningRun(ids);
+      const result: AdapterExecutionResult = { ...nullExit, usage, usageBasis: "per_run", costUsd: 0.5, provider: "openai", model: "gpt-x" };
+      const outcomes = await Promise.all([
+        heartbeat.finalizeAdapterRunForTests(finalizeInput(row, result, { source: "adopted_output", recoveredOutcome: "succeeded" })),
+        heartbeat.finalizeAdapterRunForTests(finalizeInput(row, result, { source: "adopted_output", recoveredOutcome: "succeeded" })),
+      ]);
+      expect(outcomes.map((outcome) => outcome.won).sort()).toEqual([false, true]);
+      expect(outcomes.find((outcome) => !outcome.won)).toMatchObject({ lateWrite: false, run: null });
+      expect(await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, row.run.id))).toHaveLength(1);
+      const [runtime] = await db.select().from(agentRuntimeState).where(eq(agentRuntimeState.agentId, ids.agentId));
+      expect(runtime).toMatchObject({ totalInputTokens: 1_000, totalCostCents: 50 });
+    });
+
+    it("keeps the native late write for the live executor only", async () => {
+      for (const source of [{ source: "execute" }, { source: "adopted_output", recoveredOutcome: "succeeded" }] as const) {
+        const ids = await seed();
+        const row = await runningRun(ids);
+        // Native reconciliation committed the same terminal status first.
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, row.run.id));
+        const result = await heartbeat.finalizeAdapterRunForTests(finalizeInput(row, {
+          ...nullExit, usage, usageBasis: "per_run", provider: "openai", model: "gpt-x",
+          nativeFinalization: { terminal: { runTerminalState: "succeeded" } } as AdapterExecutionResult["nativeFinalization"],
+        }, source));
+        const [stored] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, row.run.id));
+        const costs = await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, row.run.id));
+        if (source.source === "execute") {
+          expect(result).toMatchObject({ won: false, lateWrite: true });
+          expect(stored.usageJson).toMatchObject({ inputTokens: 1_000 });
+          expect(costs).toHaveLength(1);
+        } else {
+          expect(result).toMatchObject({ won: false, lateWrite: false, run: null });
+          expect(stored.usageJson).toBeNull();
+          expect(costs).toHaveLength(0);
+        }
+      }
+    });
+  });
+
+  describe("recovery snapshot", () => {
+    const sessionConfig = {
+      version: 1, fingerprint: "fp", categories: ["adapter"], categoryFingerprints: { adapter: "a" },
+      fingerprints: { secret: "do-not-copy" }, aiCredentialIdentity: "identity-1",
+    } as unknown as Parameters<typeof buildLocalResultRecoverySnapshot>[0]["sessionConfig"];
+    const codec = {
+      deserialize: (raw: unknown) => raw as Record<string, unknown> | null,
+      serialize: (params: Record<string, unknown> | null) => params ? { ...params, nested: { token: "nested-secret" } } : null,
+    };
+
+    function build(recovery: Parameters<typeof buildLocalResultRecoverySnapshot>[0]["recovery"]) {
+      return buildLocalResultRecoverySnapshot({
+        adapterType: "claude_local", codec, taskKey: "task-1", configuredModel: "opus",
+        previousSessionParams: { sessionId: "s-0", cwd: "/w", __paperclipConfiguredModel: "opus" },
+        dispatched: { sessionId: "s-0", sessionDisplayId: "s-0", sessionParams: { sessionId: "s-0", cwd: "/w" } },
+        taskSessionReused: true, rotated: false, rotationReason: null, sessionConfig, configFreshness: { version: 1 },
+        invocationNumber: 1, firstSeq: 7, startedAt: new Date("2026-10-23T00:00:00.000Z"), recovery,
+      });
+    }
+
+    it("keeps only flat codec fields and the session config the finalizer attaches", () => {
+      const snapshot = build({ engine: "cli", provider: "anthropic", biller: "anthropic", model: "opus",
+        billingType: "subscription", sessionId: "s-0", sessionParams: { sessionId: "s-0", cwd: "/w" } });
+      expect(snapshot.session.previousParams).toEqual({ sessionId: "s-0", cwd: "/w" });
+      expect(snapshot.invocation.sessionParams).toEqual({ sessionId: "s-0", cwd: "/w" });
+      expect(snapshot.session.config).toEqual({ version: 1, fingerprint: "fp", categories: ["adapter"],
+        categoryFingerprints: { adapter: "a" }, aiCredentialIdentity: "identity-1" });
+      expect(JSON.stringify(snapshot)).not.toContain("nested-secret");
+      expect(JSON.stringify(snapshot)).not.toContain("do-not-copy");
+    });
+
+    it("maps to the recovery hook context, and has none without a known engine", () => {
+      const snapshot = build({ engine: "cli", provider: "anthropic", biller: null, model: "opus",
+        billingType: "bogus" as never, sessionId: "s-0", sessionParams: null });
+      expect(adapterOutputRecoveryContextFromSnapshot(snapshot)).toEqual({
+        version: 1, adapterType: "claude_local", engine: "cli",
+        invocation: { firstSeq: 7, sessionIdBefore: "s-0", sessionParams: null },
+        accounting: { provider: "anthropic", biller: null, model: "opus", billingType: null },
+        runStart: { sessionIdBefore: "s-0", sessionDisplayId: "s-0", sessionParams: { sessionId: "s-0", cwd: "/w" } },
+      });
+      expect(adapterOutputRecoveryContextFromSnapshot(build(undefined))).toBeNull();
+    });
   });
 });

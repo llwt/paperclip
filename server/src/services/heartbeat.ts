@@ -305,6 +305,10 @@ import type {
   AdapterSessionCodec,
   UsageSummary,
 } from "../adapters/index.js";
+import type {
+  AdapterInvocationRecoveryMeta,
+  AdapterOutputRecoveryContext,
+} from "../adapters/types.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { createRuntimeToolsToken } from "../runtime-tools-token.js";
 import {
@@ -9464,6 +9468,174 @@ const defaultSessionCodec: AdapterSessionCodec = {
 function getAdapterSessionCodec(adapterType: string) {
   const adapter = getServerAdapter(adapterType);
   return adapter.sessionCodec ?? defaultSessionCodec;
+}
+
+export const LOCAL_RESULT_RECOVERY_CONTEXT_KEY = "localResultRecovery";
+
+/**
+ * What finalizing a local CLI run needs once its parent process is gone,
+ * recorded in the run's contextSnapshot before each CLI invocation. An
+ * allowlist: no runtimeConfig, env, prompt, tools or credentials, and session
+ * params only as the adapter's session codec keeps them.
+ */
+export interface LocalResultRecoverySnapshot {
+  version: 1;
+  /** Adapter the run started with, not today's agent setting. */
+  adapterType: string;
+  taskKey: string | null;
+  configuredModel: string | null;
+  session: {
+    previousParams: Record<string, unknown> | null;
+    /** The session the adapter was dispatched with. */
+    dispatched: {
+      sessionId: string | null;
+      sessionDisplayId: string | null;
+      params: Record<string, unknown> | null;
+    };
+    taskSessionReused: boolean;
+    rotated: boolean;
+    rotationReason: string | null;
+    config: {
+      version: number;
+      fingerprint: string;
+      categories: string[];
+      categoryFingerprints: Record<string, string>;
+      aiCredentialIdentity: string | null;
+    };
+  };
+  configFreshness: Record<string, unknown>;
+  /** The latest CLI invocation; a fresh-session retry replaces it. */
+  invocation: {
+    /** 1 for the first invocation of the run, 2 after one retry, and so on. */
+    number: number;
+    /** First run-log seq that belongs to this invocation. */
+    firstSeq: number;
+    startedAt: string;
+    engine: string | null;
+    sessionIdBefore: string | null;
+    sessionParams: Record<string, unknown> | null;
+    accounting: {
+      provider: string | null;
+      biller: string | null;
+      model: string | null;
+      billingType: AdapterOutputRecoveryContext["accounting"]["billingType"];
+    };
+  };
+}
+
+const RECOVERY_BILLING_TYPES = new Set<string>([
+  "api", "subscription", "metered_api", "subscription_included",
+  "subscription_overage", "credits", "fixed", "unknown",
+]);
+
+// Session params as the codec keeps them, flat values only. Without an
+// adapter codec only the session id is kept.
+function safeRecoverySessionParams(
+  codec: AdapterSessionCodec,
+  params: Record<string, unknown> | null | undefined,
+) {
+  const stripped = stripPaperclipSessionMetadataFromSessionParams(params);
+  if (!stripped) return null;
+  if (codec === defaultSessionCodec) {
+    const sessionId = readNonEmptyString(stripped.sessionId);
+    return sessionId ? { sessionId } : null;
+  }
+  const serialized = codec.serialize(stripped);
+  if (!serialized) return null;
+  const flat = Object.fromEntries(
+    Object.entries(serialized).filter(([, value]) =>
+      value === null || ["string", "number", "boolean"].includes(typeof value)),
+  );
+  return Object.keys(flat).length > 0 ? flat : null;
+}
+
+export function buildLocalResultRecoverySnapshot(input: {
+  adapterType: string;
+  codec: AdapterSessionCodec;
+  taskKey: string | null;
+  configuredModel: string | null;
+  previousSessionParams: Record<string, unknown> | null;
+  dispatched: {
+    sessionId: string | null;
+    sessionDisplayId: string | null;
+    sessionParams: Record<string, unknown> | null;
+  };
+  taskSessionReused: boolean;
+  rotated: boolean;
+  rotationReason: string | null;
+  sessionConfig: EffectiveRunSessionConfigMetadata;
+  configFreshness: Record<string, unknown>;
+  invocationNumber: number;
+  firstSeq: number;
+  startedAt: Date;
+  recovery: AdapterInvocationRecoveryMeta | null | undefined;
+}): LocalResultRecoverySnapshot {
+  const recovery = input.recovery ?? null;
+  const billingType = readNonEmptyString(recovery?.billingType);
+  return {
+    version: 1,
+    adapterType: input.adapterType,
+    taskKey: input.taskKey,
+    configuredModel: input.configuredModel,
+    session: {
+      previousParams: safeRecoverySessionParams(input.codec, input.previousSessionParams),
+      dispatched: {
+        sessionId: input.dispatched.sessionId,
+        sessionDisplayId: input.dispatched.sessionDisplayId,
+        params: safeRecoverySessionParams(input.codec, input.dispatched.sessionParams),
+      },
+      taskSessionReused: input.taskSessionReused,
+      rotated: input.rotated,
+      rotationReason: input.rotationReason,
+      config: {
+        version: input.sessionConfig.version,
+        fingerprint: input.sessionConfig.fingerprint,
+        categories: [...input.sessionConfig.categories],
+        categoryFingerprints: { ...input.sessionConfig.categoryFingerprints },
+        aiCredentialIdentity: input.sessionConfig.aiCredentialIdentity ?? null,
+      },
+    },
+    configFreshness: input.configFreshness,
+    invocation: {
+      number: input.invocationNumber,
+      firstSeq: input.firstSeq,
+      startedAt: input.startedAt.toISOString(),
+      engine: readNonEmptyString(recovery?.engine),
+      sessionIdBefore: readNonEmptyString(recovery?.sessionId),
+      sessionParams: safeRecoverySessionParams(input.codec, recovery?.sessionParams),
+      accounting: {
+        provider: readNonEmptyString(recovery?.provider),
+        biller: readNonEmptyString(recovery?.biller),
+        model: readNonEmptyString(recovery?.model),
+        billingType: billingType && RECOVERY_BILLING_TYPES.has(billingType)
+          ? (billingType as NonNullable<AdapterOutputRecoveryContext["accounting"]["billingType"]>)
+          : null,
+      },
+    },
+  };
+}
+
+/** The parser-only view of a snapshot handed to an adapter's recovery hook. */
+export function adapterOutputRecoveryContextFromSnapshot(
+  snapshot: LocalResultRecoverySnapshot,
+): AdapterOutputRecoveryContext | null {
+  if (!snapshot.invocation.engine) return null;
+  return {
+    version: 1,
+    adapterType: snapshot.adapterType,
+    engine: snapshot.invocation.engine,
+    invocation: {
+      firstSeq: snapshot.invocation.firstSeq,
+      sessionIdBefore: snapshot.invocation.sessionIdBefore,
+      sessionParams: snapshot.invocation.sessionParams,
+    },
+    accounting: { ...snapshot.invocation.accounting },
+    runStart: {
+      sessionIdBefore: snapshot.session.dispatched.sessionId,
+      sessionDisplayId: snapshot.session.dispatched.sessionDisplayId,
+      sessionParams: snapshot.session.dispatched.params,
+    },
+  };
 }
 
 export function normalizeSessionParams(
@@ -25378,12 +25550,42 @@ export function heartbeatService(
             );
           }
         }
+        let adapterInvocationCount = 0;
         const onAdapterMeta = async (meta: AdapterInvocationMeta) => {
           if (meta.env && secretKeys.size > 0) {
             for (const key of secretKeys) {
               if (key in meta.env) meta.env[key] = "***REDACTED***";
             }
           }
+          // Recorded before each CLI invocation, a fresh-session retry
+          // included, so a run whose parent is lost can still be finalized
+          // from the output of its latest invocation alone.
+          adapterInvocationCount += 1;
+          const localResultRecovery = buildLocalResultRecoverySnapshot({
+            adapterType: agent.adapterType,
+            codec: sessionCodec,
+            taskKey,
+            configuredModel,
+            previousSessionParams,
+            dispatched: runtimeForAdapter,
+            taskSessionReused: taskSessionForRun != null,
+            rotated: sessionCompaction.rotate,
+            rotationReason: sessionCompaction.reason,
+            sessionConfig: sessionConfigMetadata,
+            configFreshness: configFreshnessResultMetadata,
+            invocationNumber: adapterInvocationCount,
+            firstSeq: outputSeq + 1,
+            startedAt: new Date(),
+            recovery: meta.recovery,
+          });
+          context[LOCAL_RESULT_RECOVERY_CONTEXT_KEY] = localResultRecovery;
+          await db
+            .update(heartbeatRuns)
+            .set({
+              contextSnapshot: sql`jsonb_set(coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb), ${`{${LOCAL_RESULT_RECOVERY_CONTEXT_KEY}}`}::text[], ${JSON.stringify(localResultRecovery)}::jsonb)`,
+              updatedAt: new Date(),
+            })
+            .where(eq(heartbeatRuns.id, run.id));
           await appendRunEvent(currentRun, {
             eventType: "adapter.invoke",
             stream: "system",
@@ -31404,6 +31606,7 @@ export function heartbeatService(
   }
 
   return {
+    finalizeAdapterRunForTests: finalizeAdapterRun,
     waitForRunExecutionDrain: async (
       runId: string,
       options: { timeoutMs?: number; intervalMs?: number } = {},

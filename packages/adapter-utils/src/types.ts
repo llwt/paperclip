@@ -160,6 +160,23 @@ export interface AdapterSessionCodec {
   getDisplayId?: (params: Record<string, unknown> | null) => string | null;
 }
 
+/**
+ * Facts about one local CLI invocation that its result cannot be read back
+ * without, sent before the child starts. The server keeps only these fields.
+ */
+export interface AdapterInvocationRecoveryMeta {
+  /** Engine that runs the child, for example "cli". */
+  engine: string;
+  provider: string | null;
+  biller: string | null;
+  model: string | null;
+  billingType: AdapterBillingType | null;
+  /** Session this invocation resumes; null when it starts a fresh one. */
+  sessionId: string | null;
+  /** Safe local session fields only, as the adapter's session codec keeps them. */
+  sessionParams: Record<string, unknown> | null;
+}
+
 export interface AdapterInvocationMeta {
   adapterType: string;
   command: string;
@@ -170,6 +187,7 @@ export interface AdapterInvocationMeta {
   prompt?: string;
   promptMetrics?: Record<string, number>;
   context?: Record<string, unknown>;
+  recovery?: AdapterInvocationRecoveryMeta;
 }
 
 export interface AdapterRuntimeMcpServer {
