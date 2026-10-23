@@ -9439,20 +9439,29 @@ function mergeHotRestartAdoptionResultJson(
   };
 }
 
-// The server-owned hotRestart record of an adopted run, for a result read back
-// from its output: the adoption and output-capture provenance stays, the
-// adapter's result JSON cannot replace it, and recovery diagnostics go next to it.
+// The server-owned records of an adopted run, for a result read back from its
+// output: the adoption and output-capture provenance and the leftover process
+// sweep (SX-1851) stay, the adapter's result JSON cannot replace them, and
+// recovery diagnostics go next to the hotRestart record.
 function recoveredHotRestartResultJson(
   existingResultJson: Record<string, unknown> | null | undefined,
   resultRecovery: Record<string, unknown> | undefined,
 ) {
-  const existing = parseObject(parseObject(existingResultJson).hotRestart);
-  if (Object.keys(existing).length === 0 && !resultRecovery) return {};
+  const existingResult = parseObject(existingResultJson);
+  const existing = parseObject(existingResult.hotRestart);
+  const leftoverProcessSweep = parseObject(existingResult.leftoverProcessSweep);
   return {
-    hotRestart: {
-      ...existing,
-      ...(resultRecovery ? { resultRecovery } : {}),
-    },
+    ...(Object.keys(existing).length > 0 || resultRecovery
+      ? {
+          hotRestart: {
+            ...existing,
+            ...(resultRecovery ? { resultRecovery } : {}),
+          },
+        }
+      : {}),
+    ...(leftoverProcessSweep.kind === "leftover_process_sweep"
+      ? { leftoverProcessSweep }
+      : {}),
   };
 }
 

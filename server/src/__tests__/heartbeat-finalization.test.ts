@@ -569,27 +569,30 @@ describeSupported("heartbeat run finalization", () => {
       expect(result.run).toMatchObject({ status: "failed", exitCode: null, errorCode: "adapter_failed", error: "Adapter failed" });
     });
 
-    it("keeps the adoption and output-capture provenance of an adopted run, whatever the recovered outcome", async () => {
+    it("keeps the adoption, output-capture and leftover-sweep provenance of an adopted run, whatever the recovered outcome", async () => {
       const hotRestart = {
         adopted: true, adoptedAt: "2026-10-23T10:00:00.000Z", previousServerPid: 11, newServerPid: 22,
         previousServerVersion: "1.0.0", newServerVersion: "1.0.1", processPid: 33, processGroupId: 33,
         outputCapture: { mode: "relay", relayPid: 44, lastSeq: 9 },
       };
       const resultRecovery = { version: 1, source: "run_log", decision: "recovered", exitCodeKnown: false };
+      // Written by the SX-1851 sweep when the adopted child ended, before finalization.
+      const leftoverProcessSweep = { kind: "leftover_process_sweep", stopped: 1, processes: [{ pid: 55 }] };
       for (const recoveredOutcome of ["succeeded", "failed"] as const) {
         const ids = await seed();
         const row = await runningRun(ids);
-        await db.update(heartbeatRuns).set({ resultJson: { hotRestart } }).where(eq(heartbeatRuns.id, row.run.id));
+        await db.update(heartbeatRuns).set({ resultJson: { hotRestart, leftoverProcessSweep } }).where(eq(heartbeatRuns.id, row.run.id));
         const result = await heartbeat.finalizeAdapterRunForTests(finalizeInput(row, {
           ...nullExit, summary: "Recovered.",
           // Adapter JSON cannot replace the server-owned record.
-          resultJson: { result: "parsed", hotRestart: { adopted: false, outputCapture: null } },
+          resultJson: { result: "parsed", hotRestart: { adopted: false, outputCapture: null }, leftoverProcessSweep: null },
         }, { source: "adopted_output", recoveredOutcome, resultRecovery }));
         expect(result).toMatchObject({ won: true, outcome: recoveredOutcome });
         const [stored] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, row.run.id));
         expect(stored.status).toBe(recoveredOutcome);
         expect(stored.resultJson).toMatchObject({ result: "parsed", summary: "Recovered." });
         expect((stored.resultJson as Record<string, unknown>).hotRestart).toEqual({ ...hotRestart, resultRecovery });
+        expect((stored.resultJson as Record<string, unknown>).leftoverProcessSweep).toEqual(leftoverProcessSweep);
       }
     });
 
