@@ -887,10 +887,14 @@ export function toolAccessPolicyService(db: Db) {
     body: UpdateToolPolicy;
   }) {
     const existing = await getGenericPolicyRow(db, input.companyId, input.policyId);
-    const nextPolicyType = input.body.policyType ?? existing.policyType;
-    const nextConditions = input.body.conditions !== undefined ? input.body.conditions ?? null : existing.conditions ?? null;
-    const nextConfig = input.body.config !== undefined ? input.body.config ?? null : existing.config ?? null;
-    assertSupportedGenericPolicyShape(nextPolicyType, nextConditions, nextConfig);
+    const changesShape =
+      input.body.policyType !== undefined || input.body.conditions !== undefined || input.body.config !== undefined;
+    if (changesShape) {
+      const nextPolicyType = input.body.policyType ?? existing.policyType;
+      const nextConditions = input.body.conditions !== undefined ? input.body.conditions ?? null : existing.conditions ?? null;
+      const nextConfig = input.body.config !== undefined ? input.body.config ?? null : existing.config ?? null;
+      assertSupportedGenericPolicyShape(nextPolicyType, nextConditions, nextConfig);
+    }
     const now = new Date();
     const [policy] = await db
       .update(toolPolicies)

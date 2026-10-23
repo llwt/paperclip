@@ -124,11 +124,15 @@ export function DecisionTriageStrip({ item, companyId, agents }: DecisionTriageS
   const routeToAgent = useMutation({
     mutationFn: (agent: Agent) => {
       if (!relatedIssueId) throw new Error("This decision has no linked task to route from.");
-      return issuesApi.addComment(relatedIssueId, buildRecommendationRequestBody(agent, taskRef?.identifier ?? null));
+      const mention = `[@${agent.name}](${buildAgentMentionHref(agent.id)})`;
+      const body =
+        `${mention} — could you look at this decision${taskRef ? ` on ${taskRef.identifier}` : ""}, `
+        + `prepare a recommendation, and re-surface it on the decisions desk? (routed from the desk)`;
+      return issuesApi.addComment(relatedIssueId, body);
     },
     onSuccess: (_result, agent) => {
       invalidate();
-      pushToast(recommendationRequestToast(agent.name));
+      pushToast({ title: `Asked ${agent.name} for a recommendation`, tone: "success" });
     },
     onError: onError("ask that agent for a recommendation"),
   });
@@ -412,25 +416,6 @@ function QueuePicker({
 
 function DropdownMenuSeparatorLike() {
   return <div className="my-1 h-px bg-border" />;
-}
-
-/**
- * Comment body for "Ask agent for recommendation". Context text comes first so
- * the mention is never a leading-mention handoff: this button only comments.
- */
-export function buildRecommendationRequestBody(agent: Pick<Agent, "id" | "name">, taskIdentifier: string | null): string {
-  const mention = `[@${agent.name}](${buildAgentMentionHref(agent.id)})`;
-  return `Recommendation request from the decisions desk (no reassignment): ${mention}, could you look at this decision`
-    + `${taskIdentifier ? ` on ${taskIdentifier}` : ""}, prepare a recommendation, and re-surface it on the decisions desk?`;
-}
-
-/** Success toast for "Ask agent for recommendation": a comment, not a dispatch. */
-export function recommendationRequestToast(agentName: string) {
-  return {
-    title: "Comment saved",
-    body: `Asked ${agentName} for a recommendation. The task was not reassigned.`,
-    tone: "success" as const,
-  };
 }
 
 /**

@@ -64,7 +64,7 @@ Status quick guide:
 ## 8. Exit
 
 - Comment on any in_progress work before exiting.
-- If no assignments and no valid mention-handoff, exit cleanly.
+- If no assignments, exit cleanly.
 
 ---
 

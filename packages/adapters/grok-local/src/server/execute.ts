@@ -44,6 +44,7 @@ import {
   refreshPaperclipWorkspaceEnvForExecution,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
+  withLeftoverProcessSweep,
 } from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_GROK_LOCAL_MODEL } from "../index.js";
 import { copyBackGrokAuth } from "./grok-auth-copyback.js";
@@ -719,10 +720,10 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
         `[paperclip] Grok resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
       );
       const retry = await runAttempt(null);
-      return toResult(retry, true, true);
+      return withLeftoverProcessSweep(toResult(retry, true, true), [initial.proc, retry.proc]);
     }
 
-    return toResult(initial);
+    return withLeftoverProcessSweep(toResult(initial), [initial.proc]);
   };
 
   try {

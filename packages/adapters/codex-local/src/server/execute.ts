@@ -1,3 +1,4 @@
+import type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -51,6 +52,8 @@ import {
   isPaperclipRecoveryWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
+  leftoverProcessSweepResultJson,
+  withLeftoverProcessSweep,
   joinPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
@@ -1383,7 +1386,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const toResult = (
       attempt: {
-        proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null };
+        proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null; leftoverProcessSweep?: RunProcessResult["leftoverProcessSweep"] };
         rawStderr: string;
         parsed: ReturnType<typeof parseCodexJsonl>;
         monitor?:
@@ -1421,6 +1424,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               elapsedMsSinceLastEvent: attempt.monitor.elapsedMsSinceLastEvent,
               terminationSignal: attempt.monitor.terminationSignal,
             },
+            ...leftoverProcessSweepResultJson(attempt.proc),
           },
           summary: attempt.parsed.summary,
           clearSession: clearSessionOnMissingSession,
@@ -1432,6 +1436,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           signal: attempt.proc.signal,
           timedOut: true,
           errorMessage: `Timed out after ${timeoutSec}s`,
+          ...(attempt.proc.leftoverProcessSweep?.stopped
+            ? { resultJson: leftoverProcessSweepResultJson(attempt.proc) }
+            : {}),
           clearSession: clearSessionOnMissingSession,
         };
       }
@@ -1548,6 +1555,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
           ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
           ...(providerQuota && transientRetryNotBefore ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
+          ...leftoverProcessSweepResultJson(attempt.proc),
         },
         summary: attempt.parsed.summary,
         clearSession: Boolean((clearSessionOnMissingSession || forceFreshSession) && !resolvedSessionId),
@@ -1572,7 +1580,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           `[paperclip] Codex resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
         );
         const retry = await runAttempt(null);
-        const retryResult = toResult(retry, true, true);
+        const retryResult = withLeftoverProcessSweep(toResult(retry, true, true), [initial.proc, retry.proc]);
         if (retryResult.errorMessage) {
           executionError = new Error(retryResult.errorMessage);
         }
