@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { readdir, readFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { execute } from "../adapters/process/execute.js";
 
@@ -47,7 +49,27 @@ async function runProcessAdapter(runId: string, script: string, config: Record<s
 describe.skipIf(process.platform !== "linux")("process adapter leftover sweep evidence (Linux)", () => {
   it("records the stopped process in resultJson on a normal exit", async () => {
     const runId = `process-sweep-${randomUUID()}`;
-    const { result, logs } = await runProcessAdapter(runId, "(setsid sleep 300 &); echo done");
+    const dir = await mkdtemp(path.join(tmpdir(), "process-sweep-"));
+    // The leftover writes its own PID, then exec()s sleep. The adapter process only
+    // prints "done" once /proc/<pid>/cmdline reads "sleep 300", so the sweep can never
+    // observe the pre-exec shell command line. The loop is bounded (about 10s).
+    const script = [
+      `(setsid sh -c 'echo $$ > "${dir}/pid"; exec sleep 300' &)`,
+      "i=0",
+      `while [ "$i" -lt 200 ]; do`,
+      `  pid=$(cat "${dir}/pid" 2>/dev/null)`,
+      `  if [ -n "$pid" ] && [ "$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)" = "sleep 300 " ]; then break; fi`,
+      "  i=$((i+1)); sleep 0.05",
+      "done",
+      "echo done",
+    ].join("\n");
+    let outcome: Awaited<ReturnType<typeof runProcessAdapter>>;
+    try {
+      outcome = await runProcessAdapter(runId, script);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+    const { result, logs } = outcome;
 
     expect(result.exitCode).toBe(0);
     expect(result.resultJson?.stdout).toBe("done\n");
