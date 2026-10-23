@@ -17,6 +17,8 @@ import {
   issueComments,
   issues,
 } from "@paperclipai/db";
+import { sessionCodec as claudeSessionCodec } from "@paperclipai/adapter-claude-local/server";
+import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-local/server";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
@@ -706,5 +708,51 @@ describeSupported("heartbeat run finalization", () => {
       }
       expect(build(valid).invocation).toMatchObject({ engine: "cli", sessionIdBefore: "s-0" });
     });
+
+    // The id-less templates the Claude and Codex adapters send with each
+    // invocation, through their real session codecs.
+    const realTemplates = [
+      {
+        adapterType: "claude_local", codec: claudeSessionCodec,
+        template: { cwd: "/w", promptBundleKey: "bundle-1", mcpServerIdentity: "[]", workspaceId: "ws-1",
+          repoUrl: "https://example.test/repo.git", repoRef: "main" },
+        provider: "anthropic",
+      },
+      {
+        adapterType: "codex_local", codec: codexSessionCodec,
+        template: { cwd: "/w", workspaceId: "ws-1", repoUrl: "https://example.test/repo.git", repoRef: "main" },
+        provider: "openai",
+      },
+    ];
+    for (const { adapterType, codec: realCodec, template, provider } of realTemplates) {
+      it(`keeps the ${adapterType} invocation template on fresh, resumed and fresh-session retry invocations`, () => {
+        const cases = [
+          { name: "fresh", invocationNumber: 1, sessionIdBefore: null, dispatchedSessionId: null },
+          { name: "resumed", invocationNumber: 1, sessionIdBefore: "s-1", dispatchedSessionId: "s-1" },
+          { name: "fresh-session retry", invocationNumber: 2, sessionIdBefore: null, dispatchedSessionId: "s-1" },
+        ];
+        for (const entry of cases) {
+          const dispatchedParams = entry.dispatchedSessionId ? { sessionId: entry.dispatchedSessionId, ...template } : null;
+          const snapshot = buildLocalResultRecoverySnapshot({
+            adapterType, codec: realCodec, taskKey: "task-1", configuredModel: "m",
+            previousSessionParams: dispatchedParams,
+            dispatched: { sessionId: entry.dispatchedSessionId, sessionDisplayId: entry.dispatchedSessionId,
+              sessionParams: dispatchedParams },
+            taskSessionReused: entry.dispatchedSessionId != null, rotated: false, rotationReason: null,
+            sessionConfig, configFreshness: { version: 1 },
+            invocationNumber: entry.invocationNumber, firstSeq: 3, startedAt: new Date("2026-10-23T00:00:00.000Z"),
+            recovery: { version: 1, engine: "cli", sessionIdBefore: entry.sessionIdBefore,
+              sessionParams: { ...template, apiKey: "template-secret" },
+              accounting: { provider, biller: provider, model: "m", billingType: "subscription" } },
+          });
+          expect(snapshot.invocation.sessionParams, entry.name).toEqual(template);
+          expect(JSON.stringify(snapshot), entry.name).not.toContain("template-secret");
+          expect(snapshot.session.dispatched.params, entry.name).toEqual(dispatchedParams);
+          expect(adapterOutputRecoveryContextFromSnapshot(snapshot)?.invocation, entry.name).toEqual({
+            firstSeq: 3, sessionIdBefore: entry.sessionIdBefore, sessionParams: template,
+          });
+        }
+      });
+    }
   });
 });

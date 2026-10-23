@@ -9579,6 +9579,30 @@ function safeRecoverySessionParams(
   return Object.keys(flat).length > 0 ? flat : null;
 }
 
+const RECOVERY_TEMPLATE_SESSION_ID = "paperclip-recovery-template";
+
+// An adapter's invocation session template carries no session id (the hook
+// adds the one it observes), and the CLI codecs keep nothing without one. So
+// the template goes through the codec with a stand-in id, which is removed
+// again: the codec still decides which fields are kept.
+function safeRecoveryTemplateParams(
+  codec: AdapterSessionCodec,
+  params: Record<string, unknown> | null | undefined,
+) {
+  const stripped = stripPaperclipSessionMetadataFromSessionParams(params);
+  if (!stripped) return null;
+  if (readNonEmptyString(stripped.sessionId) ?? readNonEmptyString(stripped.session_id)) {
+    return safeRecoverySessionParams(codec, stripped);
+  }
+  const kept = safeRecoverySessionParams(codec, stripped)
+    ?? safeRecoverySessionParams(codec, { ...stripped, sessionId: RECOVERY_TEMPLATE_SESSION_ID });
+  if (!kept) return null;
+  const template = Object.fromEntries(
+    Object.entries(kept).filter(([key]) => key !== "sessionId" && key !== "session_id"),
+  );
+  return Object.keys(template).length > 0 ? template : null;
+}
+
 // The adapter's recovery facts, or null (no recovery context) when the
 // version is not 1 or a field is missing.
 function readInvocationRecoveryMeta(
@@ -9647,7 +9671,7 @@ export function buildLocalResultRecoverySnapshot(input: {
       startedAt: input.startedAt.toISOString(),
       engine: readNonEmptyString(recovery?.engine),
       sessionIdBefore: readNonEmptyString(recovery?.sessionIdBefore),
-      sessionParams: safeRecoverySessionParams(input.codec, recovery?.sessionParams),
+      sessionParams: safeRecoveryTemplateParams(input.codec, recovery?.sessionParams),
       accounting: {
         provider: readNonEmptyString(recovery?.accounting.provider),
         biller: readNonEmptyString(recovery?.accounting.biller),
