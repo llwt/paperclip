@@ -13515,6 +13515,7 @@ export function issueRoutes(
               resultJson: { reassignmentStopConfirmed: true, issueMutationStopId },
               eventMessage: "run cancelled before issue reassignment",
               eventPayload: { issueId: existing.id },
+              suppressImmediateRecovery: true,
             },
           );
           if (!cancelled || cancelled.status !== "cancelled") {

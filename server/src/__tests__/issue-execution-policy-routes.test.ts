@@ -657,6 +657,60 @@ describe("issue execution policy routes", () => {
     );
   });
 
+  it("stops the author's run for the review hand-off without queuing its own recovery", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1005",
+      title: "Execution participant",
+      executionPolicy: null,
+      executionState: null,
+      executionRunId: "55555555-5555-4555-8555-555555555555",
+    };
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          type: "review",
+          participants: [{ type: "agent", agentId: "44444444-4444-4444-8444-444444444444" }],
+        },
+      ],
+    })!;
+    const run = { id: "55555555-5555-4555-8555-555555555555", status: "running" };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    mockHeartbeatService.getRun.mockResolvedValue(run as never);
+    mockHeartbeatService.cancelRun.mockResolvedValue({ ...run, status: "cancelled" } as never);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_review", executionPolicy: policy });
+
+    expect(res.status).toBe(200);
+    // The stop is part of the hand-off: it must not queue a recovery for the
+    // author, and the run it leaves must not hold the task's later wakes.
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      "55555555-5555-4555-8555-555555555555",
+      "Cancelled before issue reassignment",
+      expect.objectContaining({ errorCode: "issue_reassigned", suppressImmediateRecovery: true }),
+    );
+    mockHeartbeatService.getRun.mockResolvedValue(null as never);
+    mockHeartbeatService.cancelRun.mockResolvedValue(null as never);
+  });
+
   it("allows an agent-authored in_review transition with a scheduled monitor", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
