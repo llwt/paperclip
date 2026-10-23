@@ -1,15 +1,38 @@
-# Execution flow: worker and data model
+# Execution flow: worker, data model and task page view
 
 Fork-local package `@somnex/paperclip-plugin-execution-flow`, plugin ID
-`somnex.execution-flow`. This is Step B: the read-only worker and normalized data
-model. Step A's workspace SDK supplies the execution history read. No public SDK
-release or npm publication is needed.
+`somnex.execution-flow`. Step B is the read-only worker and normalized data
+model; Step C is the task page view. Step A's workspace SDK supplies the execution
+history read. No public SDK release or npm publication is needed.
 
-The manifest reserves the issue `taskDetailView` slot named **Execution flow** and
-its `ExecutionFlow` export. The UI entrypoint is declared to satisfy the manifest
-contract, but is not built in this step. Step C supplies that component. **Do not
-install this package yet.** No installation or live instance verification was
-performed as part of this step.
+The manifest declares the issue `taskDetailView` slot named **Execution flow**.
+Its `ExecutionFlow` export lives in `src/ui/index.tsx` and builds to
+`dist/ui/index.js`. **Nothing installs this package automatically.** Install it
+only into an isolated, non-primary instance with the host's plugin install route
+(local path to this package directory).
+
+## Task page view
+
+The component is read-only. Its only controls are **Refresh**, **Load more**,
+**Collapse all** and the per-record disclosure buttons. It shows ordered stages
+with configured participants and the current or returned holder, **Recorded
+decisions** (native stage decisions, with actor type, name, ID and a timestamp with
+time zone), **Stages no longer in the current policy**, and a separate **Task
+confirmations** list. A card response is never shown as a stage decision.
+
+Decision and card text is rendered through the SDK `MarkdownBlock`, which
+sanitizes it. The view reloads when the task or company changes (the component is
+keyed by both, and the worker echoes a `subject` that the view checks, so a late or
+mismatched response is discarded), on Refresh, and on window focus or becoming
+visible (at most once a second, never while loading or hidden). It never polls and
+shows the last refreshed time.
+
+The host loads only the plugin's JavaScript, never its CSS, so the stylesheet is
+shipped in the bundle as a `<style id="execution-flow-styles">` element. It uses
+the host's semantic CSS variables (`--foreground`, `--border`, `--card`,
+`--status-task-icon-*` and so on) and no literal colors, so the root `.dark` class
+switches the theme without code here. `react`, `react/jsx-runtime` and
+`@paperclipai/plugin-sdk/ui` are provided by the host and are build externals.
 
 ## Read contract
 
@@ -71,11 +94,11 @@ of the same hash are not conflicting. Bare hashes, partial hashes, target
 revision IDs, card results, and work products are not SHA evidence. A reported
 hash is not verified against GitHub.
 
-Bodies and card text remain plain strings. The future component must render them
-as text or sanitized SDK Markdown. It must clear old data on task/company changes,
-ignore late requests, refresh on focus/manual refresh, show refresh time, and
-append/deduplicate loaded decision pages by ID. Refresh restarts pagination. The
-worker is stateless and never polls or automatically drains history pages.
+Bodies and card text remain plain strings and the view renders them as sanitized
+Markdown. The view clears old data on task/company changes, ignores late responses,
+refreshes on focus and manual refresh, shows the refresh time, and appends and
+deduplicates loaded decision pages by ID. Refresh restarts pagination. The worker
+is stateless and never polls or automatically drains history pages.
 
 ## Development and checks
 
@@ -98,5 +121,9 @@ them. Fixtures cover no/two/four stages, repeated types and decisions, candidate
 and actual holders, human escalation, changes requested, completed-without-verdict,
 policy replacement, missing fields/names, partial failures, card statuses and
 resolvers, authorization-card exclusion, pagination, and conservative SHA evidence.
-The worker tests reject access to any host surface other than data registration
+UI tests (jsdom, with a `usePluginData` double that keeps old data on parameter
+change like the host does) cover read-only controls, stylesheet injection, separate
+decision and card lists, disclosure state, load-more dedupe, task and company
+switching with late responses ignored, error and empty states, and a check that the
+stylesheet has no literal colors. The worker tests reject access to any host surface other than data registration
 and the three read methods, and exercise the workspace SDK harness too.
