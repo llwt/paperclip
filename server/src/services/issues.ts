@@ -12721,7 +12721,7 @@ export function issueService(db: Db) {
             !shouldUpgradeAttachmentAuthorization &&
             !shouldBindAttachments
           ) {
-            if (actor.agentId && createdByRunId) await acknowledgeChatCompletionReply(dbOrTx, createdByRunId, existing.id, issueId);
+            if (actor.agentId && createdByRunId) await acknowledgeChatCompletionReply(dbOrTx, createdByRunId, existing.id, issueId, Boolean(options?.completionReply));
             return redactIssueComment(
               existing,
               currentUserRedactionOptions.enabled,
@@ -12781,7 +12781,7 @@ export function issueService(db: Db) {
       }
       if (!comment) throw new Error("Failed to create issue comment");
       // A reply the woken agent posts itself (no completionReply flag) must also settle its delivery.
-      if (actor.agentId && createdByRunId) await acknowledgeChatCompletionReply(dbOrTx, createdByRunId, comment.id, issueId);
+      if (actor.agentId && createdByRunId) await acknowledgeChatCompletionReply(dbOrTx, createdByRunId, comment.id, issueId, Boolean(options?.completionReply));
 
       const boundAttachments: Array<{
         id: string;

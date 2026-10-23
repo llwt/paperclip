@@ -95,7 +95,11 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(run.contextSnapshot?.chatCompletionUpdates).toEqual(expect.arrayContaining([expect.objectContaining({ id: f.task.id, status: "done", hasSavedDocuments: true })]));
     await issueService(db).addComment(f.sourceId, "Operator note", { userId: "operator" });
     expect((await f.rows()).every(d => d.status === "queued")).toBe(true);
+    const progress = await issueService(db).addComment(f.sourceId, "Reading the results", { agentId: f.agentId, runId: run.id });
+    expect((await f.rows()).every(d => d.status === "delivered" && d.responseCommentId === null)).toBe(true);
     const reply = await issueService(db).addComment(f.sourceId, "Both notes are ready.", { agentId: f.agentId, runId: run.id }, { completionReply: true });
+    expect(reply.id).not.toBe(progress.id);
+    expect(reply.body).toBe("Both notes are ready.");
     expect((await f.rows()).every(d => d.status === "delivered" && d.responseCommentId === reply.id)).toBe(true);
     const replay = await issueService(db).addComment(f.sourceId, "A differently worded duplicate", { agentId: f.agentId, runId: run.id }, { completionReply: true });
     expect(replay.id).toBe(reply.id);
@@ -106,12 +110,23 @@ const support = await getEmbeddedPostgresTestSupport();
     it("acknowledges the delivery so the finished run is not woken again", async () => {
       const f = await seed(); await f.finish(); const run = await f.run();
       const reply = await issueService(db).addComment(f.sourceId, "The note is ready.", { agentId: f.agentId, runId: run.id });
-      expect(await f.rows()).toMatchObject([{ status: "delivered", responseCommentId: reply.id, attempts: 0 }]);
+      expect(await f.rows()).toMatchObject([{ status: "delivered", responseCommentId: null, attempts: 0 }]);
       await endRun(run.id); await f.due(); await f.service.sweepPending();
       expect(f.wakeup).toHaveBeenCalledTimes(1);
       expect(await f.rows()).toMatchObject([{ status: "delivered", attempts: 0 }]);
     });
-    it("is harmless to acknowledge again through the completion presentation path", async () => {
+    it("still publishes the final reply after a progress comment, and records only that reply", async () => {
+      const f = await seed(); await f.finish(); const run = await f.run();
+      const progress = await issueService(db).addComment(f.sourceId, "Reading the results", { agentId: f.agentId, runId: run.id });
+      const final = await issueService(db).addComment(f.sourceId, "The note is ready.", { agentId: f.agentId, runId: run.id }, { completionReply: true });
+      expect(final.id).not.toBe(progress.id);
+      expect(final.body).toBe("The note is ready.");
+      expect(await f.rows()).toMatchObject([{ status: "delivered", responseCommentId: final.id }]);
+      const replay = await issueService(db).addComment(f.sourceId, "Another wording", { agentId: f.agentId, runId: run.id }, { completionReply: true });
+      expect(replay.id).toBe(final.id);
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.sourceId))).toHaveLength(2);
+    });
+    it("records the reply when the final text equals the agent's own comment", async () => {
       const f = await seed(); await f.finish(); const run = await f.run();
       const own = await issueService(db).addComment(f.sourceId, "The note is ready.", { agentId: f.agentId, runId: run.id });
       const again = await issueService(db).addComment(f.sourceId, "The note is ready.", { agentId: f.agentId, runId: run.id }, { completionReply: true });
