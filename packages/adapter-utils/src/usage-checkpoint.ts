@@ -80,7 +80,11 @@ export function createUsageCheckpointLog(
     let raw: unknown;
     try { raw = JSON.parse(line); } catch { return; }
     const compact = JSON.stringify(project(raw));
-    if (!compact || !/usage|tokens|cost|"result"|"turn.started"|"turn.completed"|"turn.failed"|"error"|"agent_end"|"step_finish"|"model"|"modelID"/.test(compact)) return;
+    // Differs from upstream (fork #31, SX-2057): keep Codex `thread.started`,
+    // the only record that names a fresh session. Its checkpoints report
+    // session totals, which the server can only turn into this run's part
+    // (and keep as the next run's baseline) when it knows the session.
+    if (!compact || !/usage|tokens|cost|"result"|"thread.started"|"turn.started"|"turn.completed"|"turn.failed"|"error"|"agent_end"|"step_finish"|"model"|"modelID"/.test(compact)) return;
     accounting += compact + "\n";
     if (accounting.length > 8 * 1024 * 1024) throw new Error("Accounting checkpoint chunk exceeds 8 MiB");
   }

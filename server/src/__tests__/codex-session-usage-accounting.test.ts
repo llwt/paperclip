@@ -57,13 +57,14 @@ const support = await getEmbeddedPostgresTestSupport();
       });
     }
 
-    /** Resume the session; the CLI reports these exclusive session totals. */
-    async function resume(totals: Totals, options: { timedOut?: boolean } = {}) {
+    /** Resume the session (or start it with `fresh`); the CLI reports these exclusive session totals. */
+    async function resume(totals: Totals, options: { timedOut?: boolean; fresh?: boolean } = {}) {
       const runId = randomUUID();
       await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", status: "running", createdAt: at() });
       const recorder = await createRunUsageRecorder(db, { companyId, runId, adapterType: "codex_local" }, dir);
       // `codex exec resume` reports the session's running totals, cache hits included in input.
-      const stdout = JSON.stringify({ type: "turn.completed", usage: {
+      // A fresh `codex exec` names its new session only in `thread.started`.
+      const stdout = (options.fresh ? JSON.stringify({ type: "thread.started", thread_id: sessionId }) + "\n" : "") + JSON.stringify({ type: "turn.completed", usage: {
         input_tokens: totals.inputTokens + totals.cachedInputTokens,
         cached_input_tokens: totals.cachedInputTokens,
         output_tokens: totals.outputTokens,
@@ -76,7 +77,9 @@ const support = await getEmbeddedPostgresTestSupport();
       });
       const result = await execute({
         runId, agent: { id: agentId, companyId, name: "Codex", adapterType: "codex_local", adapterConfig: {} },
-        runtime: { sessionId, sessionParams: { sessionId, cwd: dir }, sessionDisplayId: sessionId, taskKey: null },
+        runtime: options.fresh
+          ? { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null }
+          : { sessionId, sessionParams: { sessionId, cwd: dir }, sessionDisplayId: sessionId, taskKey: null },
         config: { engine: "cli", command, cwd: dir, model: "gpt-6.1-sol", paperclipRuntimeSkills: [],
           env: { XDG_CONFIG_HOME: dir, OPENAI_API_KEY: "test-placeholder" } },
         context: {}, onLog: async () => {},
@@ -171,6 +174,27 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(lostEvent.inputTokens + nextEvent.inputTokens).toBe(500);
     expect(lostEvent.cachedInputTokens + nextEvent.cachedInputTokens).toBe(200);
     expect(lostEvent.outputTokens + nextEvent.outputTokens).toBe(100);
+  });
+
+  it("keeps a fresh session's checkpoint as the baseline when its run is lost", async () => {
+    const { sessionId, resume, heartbeatUsage, ledger } = await session();
+    // No earlier run: the CLI starts the session and names it in thread.started.
+    const lost = await resume({ inputTokens: 1_000_000, cachedInputTokens: 200_000, outputTokens: 100_000 }, { fresh: true });
+    const [lostRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, lost.runId));
+    expect(lostRun.sessionIdAfter).toBeNull();
+    expect(lostRun.usageJson).toMatchObject({
+      inputTokens: 1_000_000, cachedInputTokens: 200_000, outputTokens: 100_000, accountingReceiptReady: true,
+      rawUsageSessionId: sessionId, rawInputTokens: 1_000_000, rawCachedInputTokens: 200_000, rawOutputTokens: 100_000,
+    });
+    const [lostEvent] = await ledger(lost.runId, "failed");
+    expect(lostEvent).toMatchObject({ inputTokens: 1_000_000, cachedInputTokens: 200_000, outputTokens: 100_000, costCents: 302 });
+
+    const next = await resume({ inputTokens: 1_300_000, cachedInputTokens: 250_000, outputTokens: 120_000 });
+    const captured = await next.recorder.complete(next.result);
+    expect(captured.usage).toEqual({ inputTokens: 300_000, cachedInputTokens: 50_000, outputTokens: 20_000 });
+    expect((await heartbeatUsage(next.runId, captured.sessionUsage, captured.costUsd)).normalizedUsage).toEqual(captured.usage);
+    const [nextEvent] = await ledger(next.runId, "succeeded");
+    expect(nextEvent).toMatchObject({ inputTokens: 300_000, cachedInputTokens: 50_000, outputTokens: 20_000 });
   });
 
   it("subtracts a baseline saved before the upgrade, whose input included cache hits", async () => {
