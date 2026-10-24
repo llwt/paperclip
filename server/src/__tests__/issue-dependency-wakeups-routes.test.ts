@@ -5,6 +5,12 @@ import {
   buildIssueBlockersResolvedWakeStateKey,
 } from "../services/issue-dependency-wakeups.ts";
 
+// Since v2026.1023.0 a route comment can enqueue a fast response, which reads
+// instance settings from the database. These route tests mock the database.
+vi.mock("../services/fast-responses.js", () => ({
+  enqueueFastResponse: vi.fn(async () => undefined),
+}));
+
 // The first test in this suite imports the large `routes/issues.ts` module
 // through `vi.importActual` inside `createApp`. `vi.resetModules()` in
 // `beforeEach` forces a fresh import each test, so the first test pays the
@@ -41,6 +47,12 @@ vi.mock("../services/index.js", () => ({
   }),
   accessService: () => ({
     canUser: vi.fn(),
+    decide: vi.fn(async (input: { action: string }) => ({
+      allowed: input.action === "issue:read" || input.action === "project:read",
+      action: input.action,
+      reason: "allow_test_read",
+      explanation: "The fixture actor can read the task.",
+    })),
     hasPermission: vi.fn(),
   }),
   agentService: () => ({
