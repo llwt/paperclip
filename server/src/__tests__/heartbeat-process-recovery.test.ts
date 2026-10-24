@@ -4617,6 +4617,341 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  function fakeLeftoverSweep() {
+    const evidence = {
+      kind: "leftover_process_sweep" as const,
+      stopped: 2,
+      forceKilled: 0,
+      processes: [
+        { pid: 111111, command: "sleep 300", forceKilled: false },
+        { pid: 111112, command: "sleep 301", forceKilled: false },
+      ],
+    };
+    const sweep = vi.fn(async (_runId: string, _options?: { graceMs?: number }) => evidence);
+    return { sweep, evidence };
+  }
+
+  it("sweeps the leftover processes of an adopted run once its output relay has ended", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
+    });
+
+    await withTempPaperclipHome(async () => {
+      const { sweep, evidence } = fakeLeftoverSweep();
+      const heartbeat = heartbeatService(db, {
+        adoptedRunLeftoverSweep: { sweep, graceMs: 1_234 },
+      });
+      await writeFakeRelay(runId, Buffer.from("line\n"), "running");
+      const adoption = await adoptAfterHotRestart(
+        heartbeat,
+        "2026-03-19T00:05:00.000Z",
+      );
+      expect(adoption).toMatchObject({ adoptedRunIds: [runId] });
+      expect(sweep).not.toHaveBeenCalled();
+
+      child.kill("SIGKILL");
+      expect(await waitForPidExit(child.pid!)).toBe(true);
+      await writeFakeRelay(runId, Buffer.alloc(0), "ended");
+      expect(await heartbeat.waitForAdoptedRunOutputTails()).toBe(true);
+      await heartbeat.waitForAdoptedRunSweeps();
+
+      expect(sweep).toHaveBeenCalledTimes(1);
+      expect(sweep).toHaveBeenCalledWith(runId, { graceMs: 1_234 });
+      const swept = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      expect(swept?.resultJson).toMatchObject({
+        leftoverProcessSweep: evidence,
+        hotRestart: { adopted: true },
+      });
+      const records = await readRunLogRecords(companyId, agentId, runId);
+      expect(records.at(-1)).toMatchObject({
+        stream: "stderr",
+        chunk: "[paperclip] stopped 2 leftover processes from this run\n",
+      });
+      expect(new Set(records.map((record) => record.seq)).size).toBe(
+        records.length,
+      );
+
+      // Settling the run later does not sweep it a second time and keeps the
+      // evidence on the run.
+      const reap = await heartbeat.reapOrphanedRuns();
+      expect(reap.runIds).toEqual([runId]);
+      await heartbeat.waitForAdoptedRunSweeps();
+      expect(sweep).toHaveBeenCalledTimes(1);
+      const settled = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      expect(settled).toMatchObject({
+        status: "failed",
+        errorCode: "process_lost",
+      });
+      expect(settled?.resultJson).toMatchObject({
+        leftoverProcessSweep: evidence,
+      });
+    });
+  });
+
+  it("does not sweep an adopted run whose relay ended while its child is still alive", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
+    });
+
+    await withTempPaperclipHome(async () => {
+      const { sweep } = fakeLeftoverSweep();
+      const heartbeat = heartbeatService(db, {
+        adoptedRunLeftoverSweep: { sweep },
+      });
+      await writeFakeRelay(runId, Buffer.from("line\n"), "ended");
+      await adoptAfterHotRestart(heartbeat, "2026-03-19T00:05:00.000Z");
+      expect(await heartbeat.waitForAdoptedRunOutputTails()).toBe(true);
+      await heartbeat.waitForAdoptedRunSweeps();
+      expect(sweep).not.toHaveBeenCalled();
+    });
+  });
+
+  it("sweeps an adopted run without a relay when the reaper settles it as process_lost", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
+    });
+
+    await withTempPaperclipHome(async () => {
+      const { sweep, evidence } = fakeLeftoverSweep();
+      const heartbeat = heartbeatService(db, {
+        adoptedRunLeftoverSweep: { sweep },
+      });
+      const adoption = await adoptAfterHotRestart(
+        heartbeat,
+        "2026-03-19T00:05:00.000Z",
+      );
+      expect(adoption).toMatchObject({ adoptedRunIds: [runId] });
+      expect(await heartbeat.reapOrphanedRuns()).toEqual({
+        reaped: 0,
+        runIds: [],
+      });
+      expect(sweep).not.toHaveBeenCalled();
+
+      child.kill("SIGKILL");
+      expect(await waitForPidExit(child.pid!)).toBe(true);
+      const reap = await heartbeat.reapOrphanedRuns();
+      expect(reap.runIds).toEqual([runId]);
+      await heartbeat.waitForAdoptedRunSweeps();
+
+      expect(sweep).toHaveBeenCalledTimes(1);
+      expect(sweep).toHaveBeenCalledWith(runId, {});
+      const settled = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      expect(settled).toMatchObject({
+        status: "failed",
+        errorCode: "process_lost",
+      });
+      expect(settled?.resultJson).toMatchObject({
+        leftoverProcessSweep: evidence,
+      });
+      const records = await readRunLogRecords(companyId, agentId, runId);
+      expect(records.map((record) => record.chunk)).toEqual([
+        "[paperclip] stopped 2 leftover processes from this run\n",
+      ]);
+    });
+  });
+
+  it("sweeps a handed-off run whose child ended before the new server could adopt it", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+      },
+    });
+
+    await withTempPaperclipHome(async () => {
+      const { sweep, evidence } = fakeLeftoverSweep();
+      const heartbeat = heartbeatService(db, {
+        adoptedRunLeftoverSweep: { sweep },
+      });
+      await prepareHotRestart(heartbeat, "2026-03-19T00:05:00.000Z");
+      child.kill("SIGKILL");
+      expect(await waitForPidExit(child.pid!)).toBe(true);
+      const adoption = await heartbeat.reconcileHotRestartAdoption(
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+      expect(adoption).toMatchObject({ lostRunIds: [runId] });
+      await heartbeat.waitForAdoptedRunSweeps();
+
+      expect(sweep).toHaveBeenCalledTimes(1);
+      expect(sweep).toHaveBeenCalledWith(runId, {});
+      const lost = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      expect(lost?.resultJson).toMatchObject({ leftoverProcessSweep: evidence });
+    });
+  });
+
+  it.skipIf(process.platform !== "linux")(
+    "stops a setsid process a handed-off shell left behind once the adopted run ends",
+    async () => {
+      const { runId } = await seedRunFixture({
+        agentStatus: "running",
+        processPid: null,
+        processGroupId: null,
+        contextSnapshot: {
+          executionEngine: "cli",
+          processTopology: "detached",
+        },
+      });
+      const gateDir = await fs.mkdtemp(
+        path.join(os.tmpdir(), "paperclip-sweep-gate-"),
+      );
+      const gateFile = path.join(gateDir, "go");
+      // The shell starts a session leader with redirected stdio, so it leaves
+      // the shell's process group and holds none of the run's pipes. Then it
+      // waits for the gate and exits.
+      const script = [
+        "setsid sleep 300 </dev/null >/dev/null 2>&1 &",
+        "echo before-restart",
+        `while [ ! -f ${JSON.stringify(gateFile)} ]; do sleep 0.05; done`,
+        "exit 0",
+      ].join("\n");
+      const oldServerChunks: string[] = [];
+      let childPid: number | null = null;
+      void runChildProcess(runId, "sh", ["-c", script], {
+        cwd: gateDir,
+        env: { PAPERCLIP_RUN_ID: runId },
+        timeoutSec: 0,
+        graceSec: 1,
+        onLog: async (_stream, chunk) => {
+          oldServerChunks.push(chunk);
+        },
+        onSpawn: async ({ pid, processGroupId }) => {
+          childPid = pid;
+          cleanupPids.add(pid);
+          await db
+            .update(heartbeatRuns)
+            .set({ processPid: pid, processGroupId })
+            .where(eq(heartbeatRuns.id, runId));
+        },
+      });
+      const started = Date.now();
+      while (
+        !oldServerChunks.join("").includes("before-restart") &&
+        Date.now() - started < 5_000
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(oldServerChunks.join("")).toContain("before-restart");
+
+      // Find the sleep by the run's exact environment entry, then track it by
+      // pid so cleanup stops only this process.
+      const runEntry = `PAPERCLIP_RUN_ID=${runId}`;
+      const findRunProcesses = async () => {
+        const found: Array<{ pid: number; cmdline: string }> = [];
+        for (const entry of await fs.readdir("/proc")) {
+          if (!/^\d+$/.test(entry)) continue;
+          const environ = await fs
+            .readFile(`/proc/${entry}/environ`, "utf8")
+            .catch(() => "");
+          if (!environ.split("\0").includes(runEntry)) continue;
+          const cmdline = await fs
+            .readFile(`/proc/${entry}/cmdline`, "utf8")
+            .catch(() => "");
+          found.push({
+            pid: Number(entry),
+            cmdline: cmdline.replace(/\0/g, " ").trim(),
+          });
+        }
+        return found;
+      };
+      // The backgrounded setsid still shows the shell's command line until it
+      // exec()s sleep, so poll (bounded, about 10s) for the exec'd leftover
+      // instead of scanning once. On timeout this stays undefined and the
+      // assertion below fails.
+      let leftover: { pid: number; cmdline: string } | undefined;
+      const leftoverDeadline = Date.now() + 10_000;
+      while (!leftover && Date.now() < leftoverDeadline) {
+        leftover = (await findRunProcesses()).find(
+          (proc) => proc.cmdline === "sleep 300",
+        );
+        if (!leftover) await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(leftover).toBeDefined();
+      cleanupPids.add(leftover!.pid);
+
+      await withTempPaperclipHome(async () => {
+        const oldServer = heartbeatService(db);
+        await prepareHotRestart(oldServer, "2026-03-19T00:05:00.000Z");
+        // The old server hands the run off and does not sweep it.
+        expect(runningProcesses.has(runId)).toBe(false);
+        const newServer = heartbeatService(db, {
+          adoptedRunLeftoverSweep: { graceMs: 1_000 },
+        });
+        const adoption = await newServer.reconcileHotRestartAdoption(
+          new Date("2026-03-19T00:06:00.000Z"),
+        );
+        expect(adoption).toMatchObject({ adoptedRunIds: [runId] });
+
+        await fs.writeFile(gateFile, "go");
+        expect(await waitForPidExit(childPid!, 5_000)).toBe(true);
+        expect(await newServer.waitForAdoptedRunOutputTails()).toBe(true);
+        // The reaper settles the run if the tail ended before the child did.
+        await newServer.reapOrphanedRuns();
+        await newServer.waitForAdoptedRunSweeps();
+
+        expect(await waitForPidExit(leftover!.pid, 5_000)).toBe(true);
+        expect(await findRunProcesses()).toEqual([]);
+        const run = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .then((rows) => rows[0] ?? null);
+        expect(run?.resultJson).toMatchObject({
+          leftoverProcessSweep: {
+            kind: "leftover_process_sweep",
+            stopped: 1,
+            processes: [{ pid: leftover!.pid, command: "sleep 300" }],
+          },
+        });
+      });
+      await fs.rm(gateDir, { recursive: true, force: true });
+    },
+  );
+
   it("terminalizes an unsupported legacy session on shutdown without speculative replay", async () => {
     const { agentId, runId, issueId, wakeupRequestId } = await seedRunFixture({
       adapterType: "process",
@@ -8538,7 +8873,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(next?.contextSnapshot?.wakeCommentIds).toEqual([pending!.id, go!.id]);
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, deferred!.id)))[0]).toMatchObject({ status: "coalesced", runId: next!.id });
-    await vi.waitFor(async () => expect((await heartbeat.getRun(next!.id))?.status).not.toBe("running"));
+    // The adopted run settles asynchronously; vi.waitFor defaults to a 1s
+    // budget, which a loaded CI shard can exceed. Bound the wait at 10s; on
+    // timeout the assertion still fails.
+    await vi.waitFor(async () => expect((await heartbeat.getRun(next!.id))?.status).not.toBe("running"), { timeout: 10_000, interval: 50 });
   });
 
   it.each(["dedicated deferred donor", "non-coalescing recipient", "persistent agent conversation"] as const)(

@@ -584,3 +584,31 @@ export function isClaudeProviderQuotaError(input: {
   if (!haystack) return false;
   return CLAUDE_PROVIDER_QUOTA_RE.test(haystack);
 }
+
+const CLAUDE_ERROR_RESULT_SUBTYPES = new Set([
+  "error_max_turns",
+  "error_during_execution",
+  "error_max_budget_usd",
+  "error_max_structured_output_retries",
+]);
+
+export type ClaudeTerminalVerdict =
+  | { verdict: "succeeded" }
+  | { verdict: "failed"; refusalOnly: boolean }
+  | { verdict: "unsupported"; subtype: string };
+
+/**
+ * Verdict of a Claude `result` event when no exit status is known. Success
+ * needs subtype `success` with no error flag; a policy refusal stays a failure
+ * even though the CLI exits cleanly; any subtype this adapter does not know is
+ * unsupported, never success.
+ */
+export function classifyClaudeTerminalResult(parsed: Record<string, unknown>): ClaudeTerminalVerdict {
+  const subtype = asString(parsed.subtype, "").trim().toLowerCase();
+  if (asBoolean(parsed.is_error, false) || CLAUDE_ERROR_RESULT_SUBTYPES.has(subtype)) {
+    return { verdict: "failed", refusalOnly: false };
+  }
+  if (isClaudeRefusalResult(parsed)) return { verdict: "failed", refusalOnly: true };
+  if (subtype === "success") return { verdict: "succeeded" };
+  return { verdict: "unsupported", subtype };
+}

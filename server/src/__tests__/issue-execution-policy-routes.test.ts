@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
 
 const mockIssueService = vi.hoisted(() => ({
@@ -1259,5 +1259,241 @@ describe("issue execution policy routes", () => {
         details: expect.not.objectContaining({ externalRef: expect.anything() }),
       }),
     );
+  });
+
+  describe("current approval participant updates", () => {
+    const issueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const blockerId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const approverAgentId = "33333333-3333-4333-8333-333333333333";
+    const authorAgentId = "44444444-4444-4444-8444-444444444444";
+    const reviewerAgentId = "66666666-6666-4666-8666-666666666666";
+    const otherAgentId = "77777777-7777-4777-8777-777777777777";
+    const responsibleUserId = "user-responsible";
+    const reviewStageId = "11111111-1111-4111-8111-111111111111";
+    const approvalStageId = "22222222-2222-4222-8222-222222222222";
+    const runId = "55555555-5555-4555-8555-555555555555";
+
+    function approvalStageIssue(changesRequestedCount: number) {
+      // No maxReviewRounds: the default cap (3) applies, as on SX-1612.
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [
+          { id: reviewStageId, type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] },
+          { id: approvalStageId, type: "approval", participants: [{ type: "agent", agentId: approverAgentId }] },
+        ],
+      })!;
+      return {
+        id: issueId,
+        companyId: "company-1",
+        status: "in_review",
+        assigneeAgentId: approverAgentId,
+        assigneeUserId: null,
+        createdByUserId: null,
+        responsibleUserId,
+        identifier: "PAP-1700",
+        title: "Task in an approval stage",
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: approvalStageId,
+          currentStageIndex: 1,
+          currentStageType: "approval",
+          currentParticipant: { type: "agent", agentId: approverAgentId },
+          returnAssignee: { type: "agent", agentId: authorAgentId },
+          completedStageIds: [reviewStageId],
+          lastDecisionId: null,
+          lastDecisionOutcome: "changes_requested",
+          changesRequestedCount,
+        },
+      };
+    }
+
+    function approverActor(): TestActor {
+      return { type: "agent", agentId: approverAgentId, companyId: "company-1", runId };
+    }
+
+    function useBlockingDbRows() {
+      const rows = [{ id: runId, companyId: "company-1", agentId: approverAgentId, permissions: null, contextSnapshot: { issueId } }];
+      const original = mockDbSelectWhere.getMockImplementation()!;
+      mockDbSelectWhere.mockImplementation((...args: []) => ({
+        ...(original(...args) as object),
+        limit: async () => rows,
+        orderBy: async () => [],
+      }));
+      mockDbSelectFrom.mockImplementation(() => {
+        const query: Record<string, unknown> = { where: mockDbSelectWhere };
+        query.innerJoin = () => query;
+        return query as never;
+      });
+    }
+
+    afterEach(() => {
+      mockDb.transaction.mockImplementation(async (callback) => callback({ select: mockDbSelect }));
+    });
+
+    function seed(issue: ReturnType<typeof approvalStageIssue>) {
+      mockDb.transaction.mockImplementation(async (callback) =>
+        callback({ select: mockDbSelect, insert: () => ({ values: async () => undefined }) } as never));
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+      mockIssueService.addComment.mockResolvedValue({
+        id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        issueId,
+        companyId: "company-1",
+        body: "comment",
+        createdAt: new Date(),
+      } as never);
+      mockHeartbeatService.getRun.mockResolvedValue(null);
+      mockHeartbeatService.getActiveRunForAgent.mockResolvedValue({
+        id: runId,
+        status: "running",
+        contextSnapshot: { issueId },
+      } as never);
+      mockHeartbeatService.cancelRun.mockResolvedValue({ id: runId, status: "cancelled" } as never);
+    }
+
+    it("keeps the approver as assignee and participant when it blocks the task on another issue", async () => {
+      // Production shape (SX-1612): two earlier changes-requested rounds, so a
+      // third counted decision reaches the default cap and escalates to a human.
+      const issue = approvalStageIssue(2);
+      seed(issue);
+      useBlockingDbRows();
+
+      const res = await request(await createApp(approverActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "blocked", blockedByIssueIds: [blockerId], comment: "Waiting for a fresh review." });
+
+      expect(res.status).toBe(200);
+      const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect({
+        status: updatePatch.status,
+        assigneeAgentId: updatePatch.assigneeAgentId,
+        assigneeUserId: updatePatch.assigneeUserId,
+        executionState: updatePatch.executionState,
+        blockedByIssueIds: updatePatch.blockedByIssueIds,
+        cancelledRunIds: mockHeartbeatService.cancelRun.mock.calls.map((call) => call[0]),
+      }).toEqual({
+        status: "blocked",
+        assigneeAgentId: undefined,
+        assigneeUserId: undefined,
+        executionState: undefined,
+        blockedByIssueIds: [blockerId],
+        cancelledRunIds: [],
+      });
+
+      // The blocker closes: the dependent is still assigned to the approver agent, so it is woken.
+      const updated = { ...issue, ...updatePatch };
+      const blocker = {
+        id: blockerId,
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: reviewerAgentId,
+        assigneeUserId: null,
+        createdByUserId: null,
+        identifier: "PAP-1701",
+        title: "Fresh review",
+        executionPolicy: null,
+        executionState: null,
+      };
+      mockIssueService.getById.mockResolvedValue(blocker);
+      mockIssueService.update.mockResolvedValue({ ...blocker, status: "done", updatedAt: new Date() });
+      mockIssueService.listWakeableBlockedDependents.mockResolvedValue([
+        {
+          id: issueId,
+          assigneeAgentId: updated.assigneeAgentId,
+          blockerIssueIds: [blockerId],
+          blockedTransitionAt: null,
+        },
+      ]);
+
+      const closeRes = await request(await createApp())
+        .patch(`/api/issues/${blockerId}`)
+        .send({ status: "done" });
+
+      expect(closeRes.status).toBe(200);
+      await vi.waitFor(() => {
+        expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+          approverAgentId,
+          expect.objectContaining({
+            reason: "issue_blockers_resolved",
+            payload: expect.objectContaining({ issueId, resolvedBlockerIssueId: blockerId }),
+          }),
+        );
+      });
+    });
+
+    it.each([
+      ["todo", 0],
+      ["in_progress", 0],
+    ])("treats %s from the approver as request-changes and returns the task to the author (round %i)", async (status, count) => {
+      seed(approvalStageIssue(count));
+
+      const res = await request(await createApp(approverActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status, comment: "Changes requested: fix the evidence." });
+
+      expect(res.status).toBe(200);
+      const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(updatePatch.status).toBe("in_progress");
+      expect(updatePatch.assigneeAgentId).toBe(authorAgentId);
+      expect(updatePatch.assigneeUserId).toBeNull();
+      expect(updatePatch.executionState).toMatchObject({ status: "changes_requested", changesRequestedCount: 1 });
+    });
+
+    it.each(["todo", "in_progress"])(
+      "escalates %s from the approver to the responsible user once the round cap is reached",
+      async (status) => {
+        seed(approvalStageIssue(2));
+
+        const res = await request(await createApp(approverActor()))
+          .patch(`/api/issues/${issueId}`)
+          .send({ status, comment: "Changes requested: still not converging." });
+
+        expect(res.status).toBe(200);
+        const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+        expect(updatePatch.status).toBe("in_review");
+        expect(updatePatch.assigneeAgentId).toBeNull();
+        expect(updatePatch.assigneeUserId).toBe(responsibleUserId);
+        expect(updatePatch.executionState).toMatchObject({
+          status: "pending",
+          currentParticipant: { type: "user", userId: responsibleUserId },
+          changesRequestedCount: 3,
+        });
+      },
+    );
+
+    it("rejects blocked combined with a reassign to another agent from the approver and changes nothing", async () => {
+      seed(approvalStageIssue(2));
+
+      const res = await request(await createApp(approverActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({
+          status: "blocked",
+          assigneeAgentId: otherAgentId,
+          blockedByIssueIds: [blockerId],
+          comment: "Blocked, handing this over.",
+        });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toContain("Only the active reviewer or approver can advance");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
+
+    it("rejects an explicit reassign to another agent from the approver and changes nothing", async () => {
+      seed(approvalStageIssue(2));
+
+      const res = await request(await createApp(approverActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: otherAgentId, comment: "Handing this over." });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toContain("Only the active reviewer or approver can advance");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
   });
 });

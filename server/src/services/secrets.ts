@@ -640,9 +640,10 @@ type SecretConsumerContext = {
   pluginId?: string | null;
   allowedBindingIds?: string[] | null;
   /**
-   * Opt-in for hot paths that resolve the same secret over and over within one
-   * run. A successful resolution then writes its access event and
-   * `last_resolved_at` at most once per run, secret version and window.
+   * Opt-in for hot paths that resolve the same secret over and over, within one
+   * run or, when `heartbeatRunId` is unset, from a system caller such as a
+   * background sweep. A successful resolution then writes its access event and
+   * `last_resolved_at` at most once per run (or null run), secret version and window.
    */
   auditDedupeWindowMs?: number;
 };
@@ -1430,10 +1431,10 @@ export function secretService(db: Db | DbTransaction) {
       });
       // Failures below are always audited; only repeated successes are bounded.
       const dedupeWindowMs = accessContext?.auditDedupeWindowMs;
-      const auditKey = dedupeWindowMs && dedupeWindowMs > 0 && accessContext?.heartbeatRunId
+      const auditKey = dedupeWindowMs && dedupeWindowMs > 0 && accessContext
         ? JSON.stringify([
-          companyId, secret.id, resolvedVersion, accessContext.heartbeatRunId, accessContext.consumerType,
-          accessContext.consumerId, accessContext.actorId ?? null, accessContext.responsibleUserId ?? null,
+          companyId, secret.id, resolvedVersion, accessContext.heartbeatRunId ?? null, accessContext.consumerType,
+          accessContext.consumerId, accessContext.actorType ?? null, accessContext.actorId ?? null, accessContext.responsibleUserId ?? null,
           accessContext.issueId ?? null, accessContext.configPath ?? null,
         ])
         : null;

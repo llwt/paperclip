@@ -189,6 +189,11 @@ export function projectExecution(
   };
   const set = (phase: ExecutionProjection["phase"], label: string) =>
     Object.assign(projection, { phase, label });
+  // A repair run the dispatch gate cancelled before the provider was called has
+  // nothing to recover, even when earlier code left a hold row for it.
+  if (run.status === "cancelled" && run.errorCode === "legacy_disposition_repair_suppressed") {
+    recoveryAction = undefined;
+  }
   if (recoveryAction?.status === "resolved" && recoveryAction.evidence?.automaticRecovery) {
     projection.cause = recoveryAction.cause;
     projection.nextAction = recoveryAction.nextAction;

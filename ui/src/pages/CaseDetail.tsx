@@ -524,7 +524,7 @@ export function CaseDetail() {
       },
       upsertDocument: async (key: string, data: { title: string | null; format: "markdown"; body: string; baseRevisionId: string | null }) => {
         const result = await casesApi.upsertDocument(caseIdentifier, key, data);
-        return caseDocumentToIssueDocument(caseData.id, result.document.key, result.document);
+        return caseDocumentToIssueDocument(caseData.id, key, result.document);
       },
       deleteDocument: (key: string) => casesApi.deleteDocument(caseIdentifier, key),
       restoreDocumentRevision: async (key: string, revisionId: string) => {

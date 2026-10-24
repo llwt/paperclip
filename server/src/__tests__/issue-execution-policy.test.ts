@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
+import { applyIssueExecutionPolicyTransition, buildIssueMonitorClearedPatch, buildIssueMonitorTriggeredPatch, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
 const coderAgentId = "11111111-1111-4111-8111-111111111111";
@@ -1899,6 +1899,48 @@ describe("review round circuit breaker", () => {
     });
   });
 
+  it("does not treat a blocked update from the current participant as a decision, even at the round cap", () => {
+    const result = applyIssueExecutionPolicyTransition({
+      issue: reviewPendingIssue({}, { changesRequestedCount: 2 }),
+      policy,
+      requestedStatus: "blocked",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Waiting for a fresh review",
+    });
+
+    expect(result.patch).toEqual({});
+    expect(result.decision).toBeUndefined();
+    expect(result.workflowControlledAssignment).toBeUndefined();
+  });
+
+  it("rejects a blocked update that also reassigns to someone other than the current participant", () => {
+    expect(() =>
+      applyIssueExecutionPolicyTransition({
+        issue: reviewPendingIssue({}, { changesRequestedCount: 2 }),
+        policy,
+        requestedStatus: "blocked",
+        requestedAssigneePatch: { assigneeAgentId: ctoAgentId },
+        actor: { agentId: qaAgentId },
+        commentBody: "Waiting, handing over",
+      }),
+    ).toThrow("Only the active reviewer or approver can advance");
+  });
+
+  it("accepts a blocked update that names the current participant as assignee", () => {
+    const result = applyIssueExecutionPolicyTransition({
+      issue: reviewPendingIssue({}, { changesRequestedCount: 2 }),
+      policy,
+      requestedStatus: "blocked",
+      requestedAssigneePatch: { assigneeAgentId: qaAgentId },
+      actor: { agentId: qaAgentId },
+      commentBody: "Waiting for a fresh review",
+    });
+
+    expect(result.patch).toEqual({});
+    expect(result.decision).toBeUndefined();
+  });
+
   it("keeps the escalated hold sticky across unrelated transitions", () => {
     const result = applyIssueExecutionPolicyTransition({
       issue: reviewPendingIssue(
@@ -2083,5 +2125,61 @@ describe("review round circuit breaker", () => {
       currentParticipant: { type: "user", userId: boardUserId },
       changesRequestedCount: 1,
     });
+  });
+});
+
+describe("maxReviewRounds survives the monitor lifecycle", () => {
+  const nextCheckAt = "2099-01-01T00:00:00.000Z";
+
+  function policyWithMonitor() {
+    return normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+      maxReviewRounds: 10,
+      monitor: { nextCheckAt, scheduledBy: "assignee" },
+    })!;
+  }
+
+  it("keeps maxReviewRounds when a fired monitor is stripped from the policy", () => {
+    const policy = policyWithMonitor();
+    expect(policy.maxReviewRounds).toBe(10);
+
+    const patch = buildIssueMonitorTriggeredPatch({
+      issue: { status: "in_progress", assigneeAgentId: coderAgentId, assigneeUserId: null, executionPolicy: policy, executionState: null },
+      policy,
+      triggeredAt: new Date("2099-01-01T00:00:01.000Z"),
+    });
+
+    const stored = normalizeIssueExecutionPolicy(patch.executionPolicy);
+    expect(stored?.monitor).toBeUndefined();
+    expect(stored?.maxReviewRounds).toBe(10);
+  });
+
+  it("keeps maxReviewRounds when a monitor is cleared", () => {
+    const policy = policyWithMonitor();
+
+    const patch = buildIssueMonitorClearedPatch({
+      issue: { status: "in_progress", assigneeAgentId: coderAgentId, assigneeUserId: null, executionPolicy: policy, executionState: null },
+      policy,
+      clearReason: "manual",
+    });
+
+    expect(normalizeIssueExecutionPolicy(patch.executionPolicy)?.maxReviewRounds).toBe(10);
+  });
+
+  it("keeps maxReviewRounds when a status change clears the monitor", () => {
+    const policy = policyWithMonitor();
+
+    const result = applyIssueExecutionPolicyTransition({
+      issue: { status: "in_progress", assigneeAgentId: coderAgentId, assigneeUserId: null, executionPolicy: policy, executionState: null },
+      policy,
+      previousPolicy: policy,
+      requestedStatus: "cancelled",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId, userId: null },
+      commentBody: "cancel",
+    });
+
+    expect(result.patch.executionPolicy).toBeDefined();
+    expect(normalizeIssueExecutionPolicy(result.patch.executionPolicy)?.maxReviewRounds).toBe(10);
   });
 });
