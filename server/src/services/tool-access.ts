@@ -317,6 +317,20 @@ const OAUTH_REFRESH_LEASE_MS = 120_000;
 const OAUTH_REFRESH_LEASE_WAIT_MS = 30_000;
 const OAUTH_REFRESH_LEASE_POLL_MS = 25;
 
+// The health sweep re-checks each connection about every 15 minutes and reads its
+// credentials with no run id. One audit row per hour per connection and config path
+// still shows the credential is in use, without a row per sweep.
+export const TOOL_CONNECTION_SYSTEM_AUDIT_WINDOW_MS = 60 * 60_000;
+
+function systemAuditDedupe(
+  actor: { actorType?: string | null } | undefined,
+  heartbeatRunId?: string | null,
+): { auditDedupeWindowMs?: number } {
+  return (actor?.actorType ?? "system") === "system" && !heartbeatRunId
+    ? { auditDedupeWindowMs: TOOL_CONNECTION_SYSTEM_AUDIT_WINDOW_MS }
+    : {};
+}
+
 /**
  * Upstream OAuth error redaction (PAP-17108).
  *
@@ -3114,6 +3128,7 @@ export function toolAccessService(
             consumerType: "tool_connection", consumerId: connection.id,
             configPath: REMOTE_URL_SECRET_CONFIG_PATH,
             actorType: actor?.actorType ?? "system", actorId: actor?.actorId ?? null,
+            ...systemAuditDedupe(actor),
           });
     } catch (error) {
       if (error instanceof HttpError) throw error;
@@ -7024,6 +7039,7 @@ export function toolAccessService(
                   consumerId: connection.id,
                   configPath,
                   actorType: "system",
+                  auditDedupeWindowMs: TOOL_CONNECTION_SYSTEM_AUDIT_WINDOW_MS,
                 },
               );
       } catch (error) {
@@ -7406,6 +7422,7 @@ export function toolAccessService(
         : await secrets.resolveSecretValue(connection.companyId, ref.secretId, ref.versionSelector ?? "latest", {
             consumerType: "tool_connection", consumerId: connection.id, configPath: ref.configPath,
             actorType: "system", actorId: null,
+            auditDedupeWindowMs: TOOL_CONNECTION_SYSTEM_AUDIT_WINDOW_MS,
           });
     }
     let base: URL;
@@ -7465,6 +7482,7 @@ export function toolAccessService(
         configPath,
         actorType: "system",
         actorId: null,
+        auditDedupeWindowMs: TOOL_CONNECTION_SYSTEM_AUDIT_WINDOW_MS,
       },
     );
     await agentmailApi(key).whoami();
@@ -8982,6 +9000,7 @@ export function toolAccessService(
             configPath: "oauth.client_secret",
             actorType: actor?.actorType ?? "system",
             actorId: actor?.actorId ?? null,
+            ...systemAuditDedupe(actor),
           },
         )
       : null;
@@ -10948,6 +10967,7 @@ export function toolAccessService(
               actorSource: accessContext?.actorSource,
               issueId: accessContext?.issueId,
               heartbeatRunId: accessContext?.heartbeatRunId,
+              ...systemAuditDedupe(actor, accessContext?.heartbeatRunId),
             },
           )
         : null;
@@ -11179,6 +11199,7 @@ export function toolAccessService(
       consumerType: "tool_connection", consumerId: connection.id,
       actorType: actor?.actorType ?? "system", actorId: actor?.actorId ?? null,
       issueId: accessContext?.issueId, heartbeatRunId: accessContext?.heartbeatRunId,
+      ...systemAuditDedupe(actor, accessContext?.heartbeatRunId),
     });
   }
 
