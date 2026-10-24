@@ -1,4 +1,5 @@
-import { and, asc, eq, inArray, lte, sql } from "drizzle-orm";
+import { notifyDeliveryWork, DELIVERY_QUEUES } from "./delivery-work-notifications.js";
+import { and, asc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import { agents, agentWakeupRequests, chatCompletionDeliveries as deliveries, chatTaskHandoffs as handoffs,
   heartbeatRuns, issueComments, issueDocuments, issues, type Db } from "@paperclipai/db";
 import { instanceSettingsService } from "./instance-settings.js";
@@ -31,13 +32,16 @@ export async function recordChatHandoff(tx: Connection, task: Issue, actorRunId:
 }
 
 /** Must run on the same transaction as status projection (including native arbitration). */
-export async function recordChatCompletion(tx: Connection, before: Issue, after: Issue) {
-  if (before.status === after.status) return;
+export async function recordChatCompletion(tx: Connection, before: Issue, after: Issue): Promise<boolean> {
+  if (before.status === after.status) return false;
   await tx.update(deliveries).set({ status: "superseded" }).where(and(eq(deliveries.taskId, after.id),
     eq(deliveries.companyId, after.companyId), inArray(deliveries.status, [...pending])));
-  if (after.status !== "done") return;
+  if (after.status !== "done") return false;
   const [handoff] = await tx.select().from(handoffs).where(and(eq(handoffs.taskId, after.id), eq(handoffs.companyId, after.companyId)));
-  if (handoff) await tx.insert(deliveries).values({ companyId: after.companyId, taskId: after.id, statusVersion: after.statusVersion }).onConflictDoNothing();
+  if (!handoff) return false;
+  await notifyDeliveryWork(tx, DELIVERY_QUEUES.chatCompletion);
+  await tx.insert(deliveries).values({ companyId: after.companyId, taskId: after.id, statusVersion: after.statusVersion }).onConflictDoNothing();
+  return true;
 }
 
 async function loadAudience(tx: Connection, deliveryId: string) {
@@ -143,14 +147,20 @@ export async function existingChatCompletionReply(tx: Connection, runId: string,
       const [comment] = await tx.select().from(issueComments).where(and(eq(issueComments.id, delivery.responseCommentId), eq(issueComments.issueId, issueId)));
       if (comment) return comment;
     }
+    // Settled by a comment the agent posted itself: the final reply must still be published.
+    if (delivery.status === "delivered" && delivery.targetRunId === runId) continue;
     if (delivery.status !== "queued" || delivery.targetRunId !== runId) throw new Error("chat_completion_superseded");
   }
   if (rows.length !== ids(run).length) throw new Error("chat_completion_superseded");
   return null;
 }
-export async function acknowledgeChatCompletionReply(tx: Connection, runId: string, commentId: string) {
-  await tx.update(deliveries).set({ status: "delivered", responseCommentId: commentId, error: null })
-    .where(and(eq(deliveries.targetRunId, runId), eq(deliveries.status, "queued")));
+/** An agent's own comment settles `queued` rows without recording a reply. The final reply (`final`) also settles rows
+ * left `delivered` without a reply and records itself, so a progress comment cannot swallow it. A repeat changes nothing. */
+export async function acknowledgeChatCompletionReply(tx: Connection, runId: string, commentId: string, conversationId: string, final: boolean) {
+  const open = final ? or(eq(deliveries.status, "queued"), and(eq(deliveries.status, "delivered"), isNull(deliveries.responseCommentId))) : eq(deliveries.status, "queued");
+  await tx.update(deliveries).set({ status: "delivered", error: null, ...(final ? { responseCommentId: commentId } : {}) })
+    .where(and(eq(deliveries.targetRunId, runId), open, inArray(deliveries.taskId, tx.select({ id: handoffs.taskId }).from(handoffs)
+      .where(eq(handoffs.conversationId, conversationId)))));
 }
 
 export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentId: string, options: {
@@ -243,5 +253,9 @@ export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentI
       .orderBy(asc(deliveries.nextAttemptAt)).limit(100);
     for (const row of due) await deliver(row.id);
   }
-  return { deliver, sweepPending };
+  async function hasPending() {
+    return (await db.select({ id: deliveries.id }).from(deliveries)
+      .where(inArray(deliveries.status, [...pending])).limit(1)).length > 0;
+  }
+  return { deliver, sweepPending, hasPending };
 }

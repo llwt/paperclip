@@ -355,6 +355,8 @@ describe("agent live run routes", () => {
     mockHeartbeatService.getRunLogAccess.mockResolvedValue({
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",
+      scopeKind: "company",
+      issueId: null,
       logStore: "local_file",
       logRef: "logs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.ndjson",
     });
@@ -599,6 +601,8 @@ describe("agent live run routes", () => {
       {
         id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         companyId: "company-1",
+      scopeKind: "company",
+      issueId: null,
         logStore: "local_file",
         logRef: "logs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.ndjson",
       },
@@ -688,7 +692,8 @@ describe("agent live run routes", () => {
       lastOutputStream: null,
       lastOutputBytes: 0,
       processStartedAt: null,
-      issueId: "issue-1",
+      scopeKind: "company",
+      issueId: null,
     }));
     const { db, limit } = createLiveRunsDbStub(rows);
 
@@ -732,7 +737,8 @@ describe("agent live run routes", () => {
       lastOutputStream: null,
       lastOutputBytes: 0,
       processStartedAt: null,
-      issueId: "issue-1",
+      scopeKind: "company",
+      issueId: null,
     }));
     const { db, limit } = createLiveRunsDbStub(rows);
 
@@ -775,7 +781,8 @@ describe("agent live run routes", () => {
       lastOutputStream: null,
       lastOutputBytes: 0,
       processStartedAt: null,
-      issueId: "issue-1",
+      scopeKind: "company",
+      issueId: null,
     }));
 
     const selectCalls: Array<ReturnType<typeof vi.fn>> = [];
@@ -835,7 +842,8 @@ describe("agent live run routes", () => {
       lastOutputStream: null,
       lastOutputBytes: 0,
       processStartedAt: null,
-      issueId: "issue-1",
+      scopeKind: "company",
+      issueId: null,
     }));
     const recentRows = Array.from({ length: 4 }, (_, index) => ({
       id: `run-recent-${index}`,
@@ -862,7 +870,8 @@ describe("agent live run routes", () => {
       lastOutputStream: null,
       lastOutputBytes: 0,
       processStartedAt: null,
-      issueId: "issue-1",
+      scopeKind: "company",
+      issueId: null,
     }));
 
     let selectCallCount = 0;
@@ -1944,4 +1953,10 @@ describe("agent live run routes", () => {
       limit, { summary: query.includes("summary=true") });
     expect(mockRunSecretRedactionRegistry.redactForRuns).toHaveBeenCalled();
   });
+});
+
+vi.mock("../services/agent-lifecycle.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/agent-lifecycle.js")>();
+  return { ...actual, createAgentLifecycle: () => ({
+  }) };
 });

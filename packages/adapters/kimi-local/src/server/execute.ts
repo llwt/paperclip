@@ -247,7 +247,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const hasExplicitApiKey =
     typeof envConfig.PAPERCLIP_API_KEY === "string" && envConfig.PAPERCLIP_API_KEY.trim().length > 0;
   const env: Record<string, string> = {
-    ...buildPaperclipEnv(agent),
+    ...buildPaperclipEnv(agent, ctx.agentIdentity),
     ...buildRuntimeToolsEnv(ctx.runtimeTools),
   };
   env.PAPERCLIP_RUN_ID = runId;
@@ -649,6 +649,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: attempt.proc.exitCode,
         signal: attempt.proc.signal,
         timedOut: true,
+        // This stream protocol has no usage receipt to recover after exit.
+        // Close collection with an explicitly unknown price, never a free run.
+        usageComplete: true,
+        costStatus: "unpriced",
+        usageBasis: "per_run",
+        provider: "moonshot",
+        biller: "moonshot",
+        model: model || null,
+        billingType,
+        costUsd: null,
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: authMeta.requiresAuth
           ? "kimi_auth_required"
@@ -705,6 +715,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       exitCode: attempt.proc.exitCode,
       signal: attempt.proc.signal,
       timedOut: false,
+      usageComplete: true,
+      costStatus: "unpriced",
+      usageBasis: "per_run",
       errorMessage: failed ? fallbackErrorMessage : null,
       // Forward the transport-level error code from the run-disposition seam
       // first. A lost duplex control channel surfaces the typed

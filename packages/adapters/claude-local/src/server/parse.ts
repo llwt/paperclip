@@ -69,81 +69,118 @@ export function claudeResultUsageTotals(usage: unknown): UsageSummary {
   };
 }
 
+export function claudeModelReceipts(modelUsage: unknown) {
+  const entries = Object.entries(parseObject(modelUsage));
+  if (!entries.length) return undefined;
+  const receipts = entries.map(([model, raw]) => {
+    const entry = parseObject(raw);
+    const usage = claudeModelUsageTotals({ [model]: entry });
+    const costUsd = entry.costUSD;
+    return usage && typeof costUsd === "number" && Number.isFinite(costUsd) && costUsd >= 0 ? { model, usage, costUsd } : null;
+  });
+  return receipts.every((part) => part !== null) ? receipts : undefined;
+}
+
 export function parseClaudeStreamJson(stdout: string) {
+  return createClaudeStreamParser()(stdout);
+}
+
+/** Consume complete JSONL records once, retaining protocol accounting state. */
+export function createClaudeStreamParser() {
   let sessionId: string | null = null;
   let model = "";
   let finalResult: Record<string, unknown> | null = null;
   const assistantTexts: string[] = [];
+  const messageUsage = new Map<string, UsageSummary>();
+  let anonymousMessage = 0;
+  const observedTotals = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
 
-  for (const rawLine of stdout.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    const event = parseJson(line);
-    if (!event) continue;
+  return (stdout: string) => {
+    for (const rawLine of stdout.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      const event = parseJson(line);
+      if (!event) continue;
 
-    const type = asString(event.type, "");
-    if (type === "system" && asString(event.subtype, "") === "init") {
-      sessionId = asString(event.session_id, sessionId ?? "") || sessionId;
-      model = asString(event.model, model);
-      continue;
-    }
-
-    if (type === "assistant") {
-      sessionId = asString(event.session_id, sessionId ?? "") || sessionId;
-      const message = parseObject(event.message);
-      const content = Array.isArray(message.content) ? message.content : [];
-      for (const entry of content) {
-        if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
-        const block = entry as Record<string, unknown>;
-        if (asString(block.type, "") === "text") {
-          const text = asString(block.text, "");
-          if (text) assistantTexts.push(text);
-        }
+      const type = asString(event.type, "");
+      if (type === "system" && asString(event.subtype, "") === "init") {
+        sessionId = asString(event.session_id, sessionId ?? "") || sessionId;
+        model = asString(event.model, model);
+        continue;
       }
-      continue;
+
+      if (type === "assistant") {
+        sessionId = asString(event.session_id, sessionId ?? "") || sessionId;
+        const message = parseObject(event.message);
+        const observed = parseObject(message.usage);
+        if (Object.keys(observed).length > 0) {
+          const key = asString(message.id, "") || `anonymous:${anonymousMessage++}`;
+          const previous = messageUsage.get(key);
+          const next = {
+            inputTokens: Math.max(previous?.inputTokens ?? 0, asNumber(observed.input_tokens, 0) + asNumber(observed.cache_creation_input_tokens, 0)),
+            cachedInputTokens: Math.max(previous?.cachedInputTokens ?? 0, asNumber(observed.cache_read_input_tokens, 0)),
+            outputTokens: Math.max(previous?.outputTokens ?? 0, asNumber(observed.output_tokens, 0)),
+          };
+          observedTotals.inputTokens += next.inputTokens - (previous?.inputTokens ?? 0);
+          observedTotals.outputTokens += next.outputTokens - (previous?.outputTokens ?? 0);
+          observedTotals.cachedInputTokens += next.cachedInputTokens - (previous?.cachedInputTokens ?? 0);
+          messageUsage.set(key, next);
+        }
+        const content = Array.isArray(message.content) ? message.content : [];
+        for (const entry of content) {
+          if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
+          const block = entry as Record<string, unknown>;
+          if (asString(block.type, "") === "text") {
+            const text = asString(block.text, "");
+            if (text) assistantTexts.push(text);
+          }
+        }
+        continue;
+      }
+
+      if (type === "result") {
+        finalResult = event;
+        sessionId = asString(event.session_id, sessionId ?? "") || sessionId;
+      }
     }
 
-    if (type === "result") {
-      finalResult = event;
-      sessionId = asString(event.session_id, sessionId ?? "") || sessionId;
+    if (!finalResult) {
+      return {
+        sessionId,
+        model,
+        costUsd: null as number | null,
+        usage: messageUsage.size ? { ...observedTotals } : null,
+        usageBasis: "per_run" as "per_run" | "session_cumulative",
+        costBasis: null as "session_cumulative" | null,
+        invocationUsage: null as UsageSummary | null,
+        summary: assistantTexts.join("\n\n").trim(),
+        resultJson: null as Record<string, unknown> | null,
+      };
     }
-  }
 
-  if (!finalResult) {
+    const modelUsageTotals = claudeModelUsageTotals(finalResult.modelUsage);
+    const invocationUsage = claudeResultUsageTotals(finalResult.usage);
+    const usage: UsageSummary = modelUsageTotals ?? invocationUsage;
+    const costRaw = finalResult.total_cost_usd;
+    const costUsd = typeof costRaw === "number" && Number.isFinite(costRaw) ? costRaw : null;
+    const summary = asString(finalResult.result, assistantTexts.join("\n\n")).trim();
+
     return {
       sessionId,
       model,
-      costUsd: null as number | null,
-      usage: null as UsageSummary | null,
-      usageBasis: null as "per_run" | "session_cumulative" | null,
-      costBasis: null as "session_cumulative" | null,
-      invocationUsage: null as UsageSummary | null,
-      summary: assistantTexts.join("\n\n").trim(),
-      resultJson: null as Record<string, unknown> | null,
+      costUsd,
+      usage,
+      // Differs from upstream (fork, SX-1378): on --resume, modelUsage and
+      // total_cost_usd are session totals; only result.usage covers this
+      // invocation. Let the server subtract the previous run's raw counters
+      // and cost. Without modelUsage the tokens are the per-invocation
+      // result.usage, but the cost is still the session total.
+      usageBasis: modelUsageTotals ? ("session_cumulative" as const) : ("per_run" as const),
+      costBasis: "session_cumulative" as "session_cumulative" | null,
+      invocationUsage: invocationUsage as UsageSummary | null,
+      summary,
+      resultJson: finalResult,
     };
-  }
-
-  const modelUsageTotals = claudeModelUsageTotals(finalResult.modelUsage);
-  const invocationUsage = claudeResultUsageTotals(finalResult.usage);
-  const usage: UsageSummary = modelUsageTotals ?? invocationUsage;
-  const costRaw = finalResult.total_cost_usd;
-  const costUsd = typeof costRaw === "number" && Number.isFinite(costRaw) ? costRaw : null;
-  const summary = asString(finalResult.result, assistantTexts.join("\n\n")).trim();
-
-  return {
-    sessionId,
-    model,
-    costUsd,
-    usage,
-    // On --resume, modelUsage and total_cost_usd are session totals; only
-    // result.usage covers this invocation. Let the server subtract the
-    // previous run's raw counters and cost. Without modelUsage the tokens are
-    // the per-invocation result.usage, but the cost is still the session total.
-    usageBasis: modelUsageTotals ? ("session_cumulative" as const) : ("per_run" as const),
-    costBasis: "session_cumulative" as const,
-    invocationUsage,
-    summary,
-    resultJson: finalResult,
   };
 }
 
