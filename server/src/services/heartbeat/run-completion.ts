@@ -429,6 +429,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       costBasis,
       rawCostUsd,
       invocationUsage: normalizeUsageTotals(adapterResult.invocationUsage),
+      legacyRawInputIncludesCached: agent.adapterType === "codex_local",
       getPreviousUsageJson: (sessionId) =>
         getLatestSessionUsageJson(db, {
           companyId: agent.companyId,

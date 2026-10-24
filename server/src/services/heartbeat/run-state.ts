@@ -670,16 +670,13 @@ export function normalizeUsageTotals(
   };
 }
 
-function readRawUsageTotals(usageJson: unknown): UsageTotals | null {
+export function readRawUsageTotals(
+  usageJson: unknown,
+  options: { legacyRawInputIncludesCached?: boolean } = {},
+): UsageTotals | null {
   const parsed = parseObject(usageJson);
   if (Object.keys(parsed).length === 0) return null;
 
-  const inputTokens = Math.max(
-    0,
-    Math.floor(
-      asNumber(parsed.rawInputTokens, asNumber(parsed.inputTokens, 0)),
-    ),
-  );
   const cachedInputTokens = Math.max(
     0,
     Math.floor(
@@ -688,6 +685,19 @@ function readRawUsageTotals(usageJson: unknown): UsageTotals | null {
         asNumber(parsed.cachedInputTokens, 0),
       ),
     ),
+  );
+  // Differs from upstream (fork #31, SX-2057): rows written before
+  // v2026.1023.0 stored the Codex CLI's raw input, which includes cache hits.
+  // Newer rows mark exclusive input with rawInputIncludesCached: false.
+  const legacyInclusiveInput =
+    options.legacyRawInputIncludesCached === true &&
+    parsed.rawInputTokens !== undefined &&
+    parsed.rawInputIncludesCached !== false;
+  const inputTokens = Math.max(
+    0,
+    Math.floor(
+      asNumber(parsed.rawInputTokens, asNumber(parsed.inputTokens, 0)),
+    ) - (legacyInclusiveInput ? cachedInputTokens : 0),
   );
   const outputTokens = Math.max(
     0,
@@ -750,7 +760,13 @@ export async function getLatestSessionUsageJson(
     const conditions = [
       eq(heartbeatRuns.companyId, input.companyId),
       eq(heartbeatRuns.agentId, input.agentId),
-      eq(heartbeatRuns.sessionIdAfter, input.sessionId),
+      // Differs from upstream (fork #31, SX-2057): a run lost after a usage
+      // checkpoint has no sessionIdAfter, but its checkpoint saved the
+      // session totals that its receipt already counted.
+      or(
+        eq(heartbeatRuns.sessionIdAfter, input.sessionId),
+        sql`${heartbeatRuns.usageJson}->>'rawUsageSessionId' = ${input.sessionId}`,
+      ),
       ne(heartbeatRuns.id, input.excludeRunId),
       sql`${heartbeatRuns.createdAt} <= (
         select created_at from heartbeat_runs where id = ${input.excludeRunId}
@@ -804,6 +820,7 @@ export async function resolveNormalizedUsageForSession(input: {
   costBasis?: "per_run" | "session_cumulative" | null;
   rawCostUsd?: number | null;
   invocationUsage?: UsageTotals | null;
+  legacyRawInputIncludesCached?: boolean;
   getPreviousUsageJson: (sessionId: string) => Promise<unknown>;
 }) {
   const { sessionId, rawUsage, usageBasis } = input;
@@ -834,7 +851,9 @@ export async function resolveNormalizedUsageForSession(input: {
   }
 
   const previousUsageJson = await input.getPreviousUsageJson(sessionId);
-  const previousRawUsage = readRawUsageTotals(previousUsageJson);
+  const previousRawUsage = readRawUsageTotals(previousUsageJson, {
+    legacyRawInputIncludesCached: input.legacyRawInputIncludesCached,
+  });
   // Only adapters that declare session totals report a cumulative cost (the
   // Claude CLI's total_cost_usd on --resume).
   const previousRawCostUsd =

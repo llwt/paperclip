@@ -239,7 +239,8 @@ describe("CLI adapter accounting on timeout", () => {
     expect(result.timedOut).toBe(true);
     expect(result.usageComplete).toBe(["codex", "cursor", "gemini", "kimi"].includes(fixture.name));
     if (fixture.name === "kimi") expect(result.costStatus).toBe("unpriced");
-    expect(result.usageBasis).toBe("per_run");
+    // Differs from upstream (fork #31): Codex CLI counters are session totals.
+    expect(result.usageBasis).toBe(fixture.name === "codex" ? "session_cumulative" : "per_run");
     expect(result.provider).toBeTruthy();
     expect(result.billingType).toBeTruthy();
     if (fixture.tokens) expect(result.usage).toMatchObject(fixture.tokens);

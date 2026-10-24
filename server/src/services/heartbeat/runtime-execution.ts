@@ -29,7 +29,7 @@ import {
   NativeWorkspaceFinalizationOwnershipLostError,
   type NativeWorkspaceFinalizationOwnership,
 } from "../native-runtime/native-workspace-finalization-ownership.js";
-import { createRunUsageRecorder } from "../usage-receipts.js";
+import { applyCapturedUsage, createRunUsageRecorder } from "../usage-receipts.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { isConversation } from "../agent-conversations.js";
@@ -897,7 +897,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
 
     if (parseObject(adapterResult.executionRecovery).providerWorkStarted !== false) {
       const captured = await usageRecorder.complete(adapterResult);
-      adapterResult = { ...adapterResult, ...captured, usageComplete: captured.complete };
+      adapterResult = applyCapturedUsage(adapterResult, captured);
     } else {
       // Stop may already own the terminal result. Preserve its metadata
       // while durably recording the proof needed to release admission.

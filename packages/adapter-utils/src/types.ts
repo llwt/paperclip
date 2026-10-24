@@ -45,6 +45,14 @@ export interface AdapterUsageCheckpoint {
   usage?: UsageSummary;
   usageByModel?: Array<{ model: string; usage: UsageSummary; costUsd: number }>;
   usageBasis?: "per_run" | "session_cumulative" | null;
+  /**
+   * Differs from upstream (fork #31): the provider session whose running
+   * totals a "session_cumulative" usage reports. The server subtracts that
+   * session's earlier runs before pricing.
+   */
+  sessionId?: string | null;
+  /** Set by the server: the session totals behind a subtracted usage. */
+  sessionUsage?: UsageSummary;
   provider?: string | null;
   biller?: string | null;
   model?: string | null;

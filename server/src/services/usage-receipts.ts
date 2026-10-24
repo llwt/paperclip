@@ -15,6 +15,7 @@ import { logger } from "../middleware/logger.js";
 import { receiptFingerprint } from "./receipt-fingerprint.js";
 import { withAccountingTransaction } from "./accounting-transaction.js";
 import { ensureDurableDirectory, syncDirectory } from "../lib/durable-directory.js";
+import { getLatestSessionUsageJson, normalizeAdapterRunUsage, normalizeUsageTotals, readRawUsageTotals, type UsageTotals } from "./heartbeat/run-state.js";
 
 const token = z.number().int().nonnegative().max(2_147_483_647);
 const price = z.number().finite().nonnegative().nullable().optional();
@@ -23,6 +24,7 @@ const checkpointSchema = z.object({
   attemptId: z.string().uuid().optional(), usage: usage.optional(),
   usageByModel: z.array(z.object({ model: z.string().min(1).max(250), usage, costUsd: z.number().finite().nonnegative() })).max(500).optional(),
   usageBasis: z.enum(["per_run", "session_cumulative"]).nullable().optional(),
+  sessionId: z.string().max(250).nullable().optional(), sessionUsage: usage.optional(),
   provider: z.string().max(250).nullable().optional(), biller: z.string().max(250).nullable().optional(),
   model: z.string().max(250).nullable().optional(), billingType: z.string().max(100).nullable().optional(),
   costUsd: price, cacheAdjustedCostUsd: price,
@@ -80,6 +82,14 @@ export async function persistUsageReceipt(db: Db, raw: UsageReceiptEnvelope) {
         provider: receipt.provider ?? "unknown", biller: receipt.biller ?? receipt.provider ?? "unknown", model: receipt.model ?? "unknown", billingType,
         costUsd: receipt.costUsd ?? null, costUsdExact: receipt.costUsdExact ?? null, cacheAdjustedCostUsd: receipt.cacheAdjustedCostUsd ?? null,
         usageByModel: receipt.usageByModel ?? null, usageSource: receipt.usageBasis ?? "per_run", providerRequestId: receipt.providerRequestId ?? null,
+        // Differs from upstream (fork #31, SX-2057): keep the session totals
+        // behind a subtracted receipt, so a run lost after this checkpoint is
+        // still the baseline of the session's next run.
+        ...(receipt.sessionUsage && receipt.sessionId ? {
+          rawInputTokens: receipt.sessionUsage.inputTokens, rawInputIncludesCached: false,
+          rawCachedInputTokens: receipt.sessionUsage.cachedInputTokens ?? 0, rawOutputTokens: receipt.sessionUsage.outputTokens,
+          rawUsageSessionId: receipt.sessionId,
+        } : {}),
         accountingReceiptReady: previous.accountingCaptureFailed !== true && receipt.complete && receipt.usageBasis !== "session_cumulative", accountingReceiptId: envelope.id,
         accountingReceiptSequence: envelope.sequence, accountingReceiptReceivedAt: envelope.receivedAt,
         costStatus: receipt.costStatus ?? null,
@@ -186,6 +196,18 @@ export async function recoverPendingRunUsageReceipts(db: Db, input: { companyId:
   throw new Error("Accounting spool changed during recovery; retry required");
 }
 
+/** Differs from upstream (fork #31, SX-2057): the receipt names the session
+ * behind its totals; that is not the run's next session. A receipt that
+ * subtracted session totals gives the heartbeat those totals back, so it
+ * stores them as the next run's baseline and subtracts the same baseline from
+ * the tokens. The price is already this run's own. */
+export function applyCapturedUsage(result: AdapterExecutionResult, captured: AdapterUsageCheckpoint): AdapterExecutionResult {
+  const { sessionId: _sessionId, sessionUsage, ...receipt } = captured;
+  return sessionUsage
+    ? { ...result, ...receipt, usage: sessionUsage, usageBasis: "session_cumulative", costBasis: "per_run", usageComplete: captured.complete }
+    : { ...result, ...receipt, usageComplete: captured.complete };
+}
+
 export async function createRunUsageRecorder(db: Db, input: { companyId: string; runId: string; adapterType: string }, directory = usageReceiptSpoolPath()) {
   registerIdleSpoolDirectory(directory);
   const sourceId = randomUUID();
@@ -197,7 +219,7 @@ export async function createRunUsageRecorder(db: Db, input: { companyId: string;
   await syncDirectory(directory);
   await recoverPendingRunUsageReceipts(db, input, directory);
   const bound = await db.update(heartbeatRuns).set({ usageJson: sql`coalesce(${heartbeatRuns.usageJson}, '{}'::jsonb) || ${JSON.stringify({ accountingReceiptSourceId: sourceId, accountingReceiptSequence: 0, accountingReceiptReady: false })}::jsonb` })
-    .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId), isNull(heartbeatRuns.costAccountedAt))).returning({ id: heartbeatRuns.id, runtimeMode: heartbeatRuns.runtimeMode, usageJson: heartbeatRuns.usageJson });
+    .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId), isNull(heartbeatRuns.costAccountedAt))).returning({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, runtimeMode: heartbeatRuns.runtimeMode, usageJson: heartbeatRuns.usageJson });
   if (bound.length !== 1) throw conflict("Run cannot accept a new usage recorder");
   let sequence = 0;
   let currentAttempt = "default";
@@ -241,11 +263,32 @@ export async function createRunUsageRecorder(db: Db, input: { companyId: string;
     chain = result.then(() => undefined, () => undefined).finally(finishQueuedCapture);
     return result;
   }
+  // Differs from upstream (fork #31, SX-2057): an adapter that names its
+  // session reports session totals (the Codex CLI on resume). Price and record
+  // only this run's part: subtract the session's previous run, as the
+  // heartbeat does for the final usage.
+  const sessionBaselines = new Map<string, Promise<UsageTotals | null>>();
+  async function toInvocationReceipt(receipt: AdapterUsageCheckpoint, previous: AdapterUsageCheckpoint | undefined): Promise<AdapterUsageCheckpoint> {
+    if (receipt.usageBasis !== "session_cumulative") return receipt;
+    const sessionId = receipt.sessionId ?? previous?.sessionId;
+    if (sessionId === undefined) return receipt;
+    if (!receipt.usage) return { ...receipt, sessionId, usageBasis: "per_run", sessionUsage: previous?.sessionUsage };
+    let baseline = sessionId ? sessionBaselines.get(sessionId) : undefined;
+    if (sessionId && !baseline) {
+      baseline = getLatestSessionUsageJson(db, { companyId: input.companyId, agentId: bound[0].agentId, sessionId, excludeRunId: input.runId })
+        .then(json => readRawUsageTotals(json, { legacyRawInputIncludesCached: input.adapterType === "codex_local" }));
+      sessionBaselines.set(sessionId, baseline);
+    }
+    const sessionUsage = normalizeUsageTotals(receipt.usage)!;
+    const usage = normalizeAdapterRunUsage(sessionUsage, baseline ? await baseline : null, "session_cumulative")!;
+    return { ...receipt, sessionId, usage, usageBasis: "per_run", sessionUsage };
+  }
   async function capture(raw: AdapterUsageCheckpoint) {
-    const parsed = checkpointSchema.parse(raw) as AdapterUsageCheckpoint;
-    const attempt = parsed.attemptId ?? currentAttempt;
-    if (!attempts.has(attempt)) currentAttempt = attempt;
+    const checkpoint = checkpointSchema.parse(raw) as AdapterUsageCheckpoint;
+    const attempt = checkpoint.attemptId ?? currentAttempt;
     const previous = attempts.get(attempt);
+    const parsed = await toInvocationReceipt(checkpoint, previous);
+    if (!attempts.has(attempt)) currentAttempt = attempt;
     const priced = priceAnthropicReceipt(priceCodexReceipt({ ...parsed, usage: parsed.usage ?? previous?.usage,
       complete: parsed.complete && !(previous?.usage && !parsed.usage) }));
     priced.pricingProvenance ??= {
@@ -301,8 +344,10 @@ export async function createRunUsageRecorder(db: Db, input: { companyId: string;
     // terminal. A failed retry must propagate and leave finalization pending.
     persistFailure: async () => { await chain; await persistFailure(); },
     complete: (result: AdapterExecutionResult) => enqueue(async () => {
-      const final = checkpointSchema.parse({ ...result, complete: result.usageComplete !== false }) as AdapterUsageCheckpoint;
       const previous = attempts.get(currentAttempt);
+      // The result's sessionId is the session after the run, not a receipt
+      // field: only usage checkpoints name the session behind their totals.
+      const final = await toInvocationReceipt(checkpointSchema.parse({ ...result, sessionId: undefined, complete: result.usageComplete !== false }) as AdapterUsageCheckpoint, previous);
       // A bounded stdout tail can lose a terminal record already saved from the
       // full stream. Keep that stronger evidence, but never hide additional
       // usage/charges or certify a snapshot inherited from a replaced recorder.
