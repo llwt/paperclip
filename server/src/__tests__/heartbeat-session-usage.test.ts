@@ -18,9 +18,11 @@ function parseTurn(turn: "fresh" | "resumed") {
   ].join("\n"));
 }
 
+// Since upstream v2026.1023.0 the Codex adapter reports input without cache
+// hits (Paperclip stores them separately), so the request totals do the same.
 function requestTotals(turn: "fresh" | "resumed") {
   return cliSessionUsage[turn].requests.reduce((totals, usage) => ({
-    inputTokens: totals.inputTokens + usage.input_tokens,
+    inputTokens: totals.inputTokens + usage.input_tokens - usage.cached_input_tokens,
     cachedInputTokens: totals.cachedInputTokens + usage.cached_input_tokens,
     outputTokens: totals.outputTokens + usage.output_tokens,
   }), { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 });
@@ -55,12 +57,11 @@ describe("resolveNormalizedUsageForSession", () => {
 
     expect(cliSessionUsage.resumed.requests).toHaveLength(9);
     expect(result.normalizedUsage).toEqual({
-      inputTokens: 1_108_431,
+      inputTokens: 22_607,
       cachedInputTokens: 1_085_824,
       outputTokens: 3_402,
     });
     expect(result.normalizedUsage).toEqual(requestTotals("resumed"));
-    expect(result.normalizedUsage!.cachedInputTokens).toBeLessThanOrEqual(result.normalizedUsage!.inputTokens);
     expect(result.derivedFromSessionTotals).toBe(true);
   });
 
