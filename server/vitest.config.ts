@@ -46,6 +46,6 @@ export default defineConfig({
       concurrent: false,
       hooks: "list",
     },
-    setupFiles: ["./src/__tests__/setup-supertest.ts"],
+    setupFiles: ["./src/__tests__/setup-notify-socket.ts", "./src/__tests__/setup-supertest.ts"],
   },
 });

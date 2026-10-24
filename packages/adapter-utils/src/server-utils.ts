@@ -3565,11 +3565,21 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
   return shapedWorkspaceEnv;
 }
 
+const INHERITED_SYSTEMD_ENV_KEYS = [
+  "NOTIFY_SOCKET",
+  "WATCHDOG_USEC",
+  "WATCHDOG_PID",
+  "LISTEN_FDS",
+  "LISTEN_PID",
+  "LISTEN_FDNAMES",
+] as const;
+
 export function sanitizeInheritedPaperclipEnv(
   baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.PAPERCLIPAI_CMD;
+  for (const key of INHERITED_SYSTEMD_ENV_KEYS) delete env[key];
   for (const key of Object.keys(env)) {
     if (!key.startsWith("PAPERCLIP_")) continue;
     if (key === "PAPERCLIP_RUNTIME_API_URL") continue;

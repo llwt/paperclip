@@ -401,6 +401,7 @@ vi.mock("../services/plugin-worker-manager.js", () => ({
   createPluginWorkerManager: vi.fn(() => ({ id: "plugin-worker-manager" })),
 }));
 
+vi.mock("../services/systemd-notify.js", () => ({ systemdNotify: vi.fn(async () => false) }));
 vi.mock("../startup-banner.js", () => ({
   printStartupBanner: vi.fn(),
 }));
