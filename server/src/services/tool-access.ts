@@ -14009,6 +14009,7 @@ export function toolAccessService(
       askFirstEntries: Array<typeof toolCatalogEntries.$inferSelect>;
       actor?: ActorInfo;
       disableStale?: boolean;
+      allowedCatalogEntryIds?: string[];
     },
     dbClient: ToolAccessMutationDb = db,
   ): Promise<ToolPolicy[]> {
@@ -14094,7 +14095,27 @@ export function toolAccessService(
           !askFirstIds.has(config.catalogEntryId)
         );
       });
-      for (const policy of stalePolicies) {
+      // The connector page decides Allow or Ask first for every agent, so an
+      // agent-scoped Ask first from an approved access request must not
+      // outlive an Allow set here. Actions set to Off keep the agent's policy.
+      const allowedIds = new Set(input.allowedCatalogEntryIds ?? []);
+      const staleAgentIntentPolicies = existingPolicies.filter((policy) => {
+        if (!policy.enabled || allowedIds.size === 0) return false;
+        const config = asRecord(policy.config);
+        if (
+          config.source !== "connection_intent" ||
+          config.connectionId !== input.connection.id
+        ) {
+          return false;
+        }
+        const catalogEntryId = asRecord(policy.selectors).catalogEntryId;
+        return (
+          typeof catalogEntryId === "string" &&
+          allowedIds.has(catalogEntryId) &&
+          !askFirstIds.has(catalogEntryId)
+        );
+      });
+      for (const policy of [...stalePolicies, ...staleAgentIntentPolicies]) {
         await dbClient
           .update(toolPolicies)
           .set({ enabled: false, updatedAt: new Date() })
@@ -14109,6 +14130,7 @@ export function toolAccessService(
     connectionId: string,
     input: FinishToolApp,
     actor?: ActorInfo,
+    options: { retireAgentAskFirstForAllowed?: boolean } = {},
   ): Promise<FinishToolAppResult> {
     const connection = await getConnectionRow(connectionId, companyId);
     if (connection.status === "archived")
@@ -14468,6 +14490,9 @@ export function toolAccessService(
           connection,
           askFirstEntries: askFirstRows,
           disableStale: !input.preserveExistingAccess,
+          allowedCatalogEntryIds: options.retireAgentAskFirstForAllowed
+            ? input.enabledCatalogEntryIds
+            : undefined,
           actor,
         },
         tx,
