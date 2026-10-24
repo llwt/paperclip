@@ -322,7 +322,7 @@ const OAUTH_REFRESH_LEASE_POLL_MS = 25;
 // still shows the credential is in use, without a row per sweep.
 export const TOOL_CONNECTION_SYSTEM_AUDIT_WINDOW_MS = 60 * 60_000;
 
-function systemAuditDedupe(
+export function systemAuditDedupe(
   actor: { actorType?: string | null } | undefined,
   heartbeatRunId?: string | null,
 ): { auditDedupeWindowMs?: number } {
@@ -7039,7 +7039,7 @@ export function toolAccessService(
                   consumerId: connection.id,
                   configPath,
                   actorType: "system",
-                  auditDedupeWindowMs: TOOL_CONNECTION_SYSTEM_AUDIT_WINDOW_MS,
+                  ...systemAuditDedupe(actor),
                 },
               );
       } catch (error) {
@@ -7422,7 +7422,7 @@ export function toolAccessService(
         : await secrets.resolveSecretValue(connection.companyId, ref.secretId, ref.versionSelector ?? "latest", {
             consumerType: "tool_connection", consumerId: connection.id, configPath: ref.configPath,
             actorType: "system", actorId: null,
-            auditDedupeWindowMs: TOOL_CONNECTION_SYSTEM_AUDIT_WINDOW_MS,
+            ...systemAuditDedupe(actor),
           });
     }
     let base: URL;
@@ -7460,6 +7460,7 @@ export function toolAccessService(
 
   async function validateAgentMailConnection(
     connection: typeof toolConnections.$inferSelect,
+    actor?: ActorInfo,
   ) {
     const configPath = connection.config.emailCredential
       ? "credentials.controlKey"
@@ -7482,7 +7483,7 @@ export function toolAccessService(
         configPath,
         actorType: "system",
         actorId: null,
-        auditDedupeWindowMs: TOOL_CONNECTION_SYSTEM_AUDIT_WINDOW_MS,
+        ...systemAuditDedupe(actor),
       },
     );
     await agentmailApi(key).whoami();
@@ -7507,7 +7508,7 @@ export function toolAccessService(
       return BROWSER_USE_TOOLS;
     }
     if (isAgentMailConnection(connection)) {
-      await validateAgentMailConnection(connection);
+      await validateAgentMailConnection(connection, actor);
       return [];
     }
     if (connection.transport === "mcp_remote")
@@ -7659,7 +7660,7 @@ export function toolAccessService(
       } else if (isBrowserUseConnection(connection)) {
         await discoverTools(connection, undefined, actor);
       } else if (isAgentMailConnection(connection)) {
-        await validateAgentMailConnection(connection);
+        await validateAgentMailConnection(connection, actor);
       } else if (connection.transport === "mcp_remote") {
         const canProbeWithoutAuthorization =
           options.allowUnauthenticatedProbe === true &&

@@ -1434,7 +1434,7 @@ export function secretService(db: Db | DbTransaction) {
       const auditKey = dedupeWindowMs && dedupeWindowMs > 0 && accessContext
         ? JSON.stringify([
           companyId, secret.id, resolvedVersion, accessContext.heartbeatRunId ?? null, accessContext.consumerType,
-          accessContext.consumerId, accessContext.actorId ?? null, accessContext.responsibleUserId ?? null,
+          accessContext.consumerId, accessContext.actorType ?? null, accessContext.actorId ?? null, accessContext.responsibleUserId ?? null,
           accessContext.issueId ?? null, accessContext.configPath ?? null,
         ])
         : null;

@@ -16,7 +16,7 @@ import {
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { syncConnectionCredentialBindings } from "../services/connection-credential-bindings.js";
 import { secretService } from "../services/secrets.js";
-import { TOOL_CONNECTION_SYSTEM_AUDIT_WINDOW_MS, toolAccessService } from "../services/tool-access.js";
+import { systemAuditDedupe, TOOL_CONNECTION_SYSTEM_AUDIT_WINDOW_MS, toolAccessService } from "../services/tool-access.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 
@@ -156,6 +156,18 @@ const support = await getEmbeddedPostgresTestSupport();
       .toEqual(["headers.Authorization", "oauth.access_token"]);
   });
 
+  it("keeps one row per read for a user actor on the header path", async () => {
+    const fixture = await seed();
+    mockUpstream();
+    const service = sweepService();
+    for (let call = 0; call < 3; call++) {
+      await service.checkHealth(fixture.connectionId, { actorType: "user", actorId: "board-user" });
+    }
+    const rows = await accessRows(fixture.secretId);
+    expect(rows).toHaveLength(3);
+    expect(rows.every((row) => row.heartbeatRunId === null)).toBe(true);
+  });
+
   it("keeps one row per read for a caller that does not opt in", async () => {
     const fixture = await seed();
     for (let call = 0; call < 3; call++) {
@@ -166,9 +178,7 @@ const support = await getEmbeddedPostgresTestSupport();
         },
       });
     }
-    const rows = await accessRows(fixture.secretId);
-    expect(rows).toHaveLength(3);
-    expect(rows.every((row) => row.actorType === "user")).toBe(true);
+    expect(await accessRows(fixture.secretId)).toHaveLength(3);
   });
 
   it("keeps one row per read for a read with a run id and no opt-in", async () => {
@@ -190,5 +200,14 @@ const support = await getEmbeddedPostgresTestSupport();
       eq(secretAccessEvents.secretId, fixture.secretId), eq(secretAccessEvents.heartbeatRunId, runId),
     ));
     expect(rows).toHaveLength(3);
+  });
+
+  it("opts in only system or unset actors with no run id", () => {
+    const optIn = { auditDedupeWindowMs: TOOL_CONNECTION_SYSTEM_AUDIT_WINDOW_MS };
+    expect(systemAuditDedupe({ actorType: "system", actorId: "tool_health_sweep" })).toEqual(optIn);
+    expect(systemAuditDedupe(undefined)).toEqual(optIn);
+    expect(systemAuditDedupe({ actorType: "user", actorId: "board-user" })).toEqual({});
+    expect(systemAuditDedupe({ actorType: "agent", actorId: "agent-1" })).toEqual({});
+    expect(systemAuditDedupe({ actorType: "system" }, randomUUID())).toEqual({});
   });
 });
