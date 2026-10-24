@@ -217,6 +217,9 @@ export {
   stripConfiguredModelFromSessionParams,
   stripPaperclipSessionMetadataFromSessionParams,
   resolveTaskSessionConfigFreshness,
+  // Fork (SX-1134).
+  resolveSharedProjectPrimaryWorkspaceRebindCwd,
+  applySharedWorkspaceRebindToConfigFreshness,
 } from "./heartbeat/workspaces.js";
 import {
   appendExcerpt,

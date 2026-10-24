@@ -1129,8 +1129,10 @@ describe("agent issue mutation checkout ownership", () => {
       .put(`/api/issues/${issueId}/documents/plan`)
       .send({ format: "markdown", body: "# Hidden" });
 
-    expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.details?.code).toBe("issue_write_not_visible");
+    // Since v2026.1023.0 (upstream #10633, private tasks) an issue the agent
+    // cannot read is answered as not found before any write check.
+    expect(res.status, JSON.stringify(res.body)).toBe(404);
+    expect(res.body.error).toBe("Issue not found");
     expect(mockDocumentService.upsertIssueDocument).not.toHaveBeenCalled();
   });
 

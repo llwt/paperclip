@@ -403,14 +403,11 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     // Differs from upstream (fork, SX-1386): a stage hand-off saved behind this
     // run's lease can start now. Wake-queue promotion skips an acknowledged
     // stop, and the route that decided the stage stops its own run.
-    const issueId = await db
-      .select({ contextSnapshot: heartbeatRuns.contextSnapshot, nativeIssueId: heartbeatRuns.nativeIssueId })
-      .from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId)))
-      .then((rows) => rows[0]
-        ? readNonEmptyString(parseObject(rows[0].contextSnapshot).issueId) ?? rows[0].nativeIssueId
-        : null)
-      .catch(() => null);
+    // Upstream v2026.1023.0 reads the run above (`leaseOwnerRun`); reuse it
+    // instead of the fork's own query.
+    const issueId = leaseOwnerRun && leaseOwnerRun.companyId === input.companyId
+      ? readNonEmptyString(parseObject(leaseOwnerRun.contextSnapshot).issueId) ?? leaseOwnerRun.nativeIssueId ?? null
+      : null;
     if (issueId) await resumeDeferredExecutionStageWakes(input.companyId, issueId);
   }
 
