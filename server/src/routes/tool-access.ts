@@ -1513,7 +1513,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
     const companyId = req.params.companyId as string;
     const existing = await svc.getConnection(req.params.connectionId as string, companyId);
     await assertToolConnectionConfigureAccess(req, existing);
-    const result = await svc.finishGalleryAppConnection(companyId, existing.id, req.body, getActorInfo(req));
+    const result = await svc.finishGalleryAppConnection(companyId, existing.id, req.body, getActorInfo(req), { retireAgentAskFirstForAllowed: true });
     await logActivity(db, {
       companyId,
       actorType: "user",
