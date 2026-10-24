@@ -15,7 +15,7 @@ import { logger } from "../middleware/logger.js";
 import { receiptFingerprint } from "./receipt-fingerprint.js";
 import { withAccountingTransaction } from "./accounting-transaction.js";
 import { ensureDurableDirectory, syncDirectory } from "../lib/durable-directory.js";
-import { getLatestSessionUsageJson, normalizeAdapterRunUsage, normalizeUsageTotals, readRawUsageTotals, type UsageTotals } from "./heartbeat/run-state.js";
+import { getLatestSessionUsageJson, normalizeUsageTotals, resolveNormalizedUsageForSession } from "./heartbeat/run-state.js";
 
 const token = z.number().int().nonnegative().max(2_147_483_647);
 const price = z.number().finite().nonnegative().nullable().optional();
@@ -25,6 +25,8 @@ const checkpointSchema = z.object({
   usageByModel: z.array(z.object({ model: z.string().min(1).max(250), usage, costUsd: z.number().finite().nonnegative() })).max(500).optional(),
   usageBasis: z.enum(["per_run", "session_cumulative"]).nullable().optional(),
   sessionId: z.string().max(250).nullable().optional(), sessionUsage: usage.optional(),
+  costBasis: z.enum(["per_run", "session_cumulative"]).nullable().optional(), invocationUsage: usage.optional(),
+  rawCostUsd: price, sessionUsageIncomplete: z.boolean().optional(),
   provider: z.string().max(250).nullable().optional(), biller: z.string().max(250).nullable().optional(),
   model: z.string().max(250).nullable().optional(), billingType: z.string().max(100).nullable().optional(),
   costUsd: price, cacheAdjustedCostUsd: price,
@@ -89,8 +91,11 @@ export async function persistUsageReceipt(db: Db, raw: UsageReceiptEnvelope) {
           rawInputTokens: receipt.sessionUsage.inputTokens, rawInputIncludesCached: false,
           rawCachedInputTokens: receipt.sessionUsage.cachedInputTokens ?? 0, rawOutputTokens: receipt.sessionUsage.outputTokens,
           rawUsageSessionId: receipt.sessionId,
+          // Differs from upstream (fork, SX-1378): the Claude CLI's session
+          // cost and lower-bound marker, as the heartbeat stores them.
+          rawCostUsd: receipt.rawCostUsd ?? undefined, rawUsageIncomplete: receipt.sessionUsageIncomplete || undefined,
         } : {}),
-        accountingReceiptReady: previous.accountingCaptureFailed !== true && receipt.complete && receipt.usageBasis !== "session_cumulative", accountingReceiptId: envelope.id,
+        accountingReceiptReady: previous.accountingCaptureFailed !== true && receipt.complete && receipt.usageBasis !== "session_cumulative" && receipt.costBasis !== "session_cumulative", accountingReceiptId: envelope.id,
         accountingReceiptSequence: envelope.sequence, accountingReceiptReceivedAt: envelope.receivedAt,
         costStatus: receipt.costStatus ?? null,
         pricingProvenance: receipt.pricingProvenance ?? { source: receipt.costUsd != null || receipt.costUsdExact != null ? "provider_reported" : "unknown", version: "accounting-receipt/v1" },
@@ -202,10 +207,18 @@ export async function recoverPendingRunUsageReceipts(db: Db, input: { companyId:
  * stores them as the next run's baseline and subtracts the same baseline from
  * the tokens. The price is already this run's own. */
 export function applyCapturedUsage(result: AdapterExecutionResult, captured: AdapterUsageCheckpoint): AdapterExecutionResult {
-  const { sessionId: _sessionId, sessionUsage, ...receipt } = captured;
-  return sessionUsage
-    ? { ...result, ...receipt, usage: sessionUsage, usageBasis: "session_cumulative", costBasis: "per_run", usageComplete: captured.complete }
-    : { ...result, ...receipt, usageComplete: captured.complete };
+  const { sessionId: _sessionId, sessionUsage, costBasis: _costBasis, invocationUsage: _invocationUsage,
+    rawCostUsd: _rawCostUsd, sessionUsageIncomplete: _incomplete, ...receipt } = captured;
+  if (!sessionUsage) return { ...result, ...receipt, usageComplete: captured.complete };
+  // Differs from upstream (fork, SX-1378): a session-total cost (Claude CLI)
+  // is provider reported, not priced here. Give the heartbeat the adapter's
+  // own totals and bases; it subtracts the same baseline, stores the session
+  // cost and keeps the lower-bound marker.
+  if (result.costBasis === "session_cumulative") {
+    return { ...result, ...receipt, usage: result.usage, usageBasis: result.usageBasis, costUsd: result.costUsd,
+      costUsdExact: result.costUsdExact, cacheAdjustedCostUsd: result.cacheAdjustedCostUsd, usageComplete: captured.complete };
+  }
+  return { ...result, ...receipt, usage: sessionUsage, usageBasis: "session_cumulative", costBasis: "per_run", usageComplete: captured.complete };
 }
 
 export async function createRunUsageRecorder(db: Db, input: { companyId: string; runId: string; adapterType: string }, directory = usageReceiptSpoolPath()) {
@@ -263,25 +276,41 @@ export async function createRunUsageRecorder(db: Db, input: { companyId: string;
     chain = result.then(() => undefined, () => undefined).finally(finishQueuedCapture);
     return result;
   }
-  // Differs from upstream (fork #31, SX-2057): an adapter that names its
-  // session reports session totals (the Codex CLI on resume). Price and record
-  // only this run's part: subtract the session's previous run, as the
-  // heartbeat does for the final usage.
-  const sessionBaselines = new Map<string, Promise<UsageTotals | null>>();
+  // Differs from upstream (fork #31, SX-1378, SX-2057): an adapter that names
+  // its session reports session totals (the Codex CLI on resume; the Claude
+  // CLI's modelUsage and total_cost_usd on --resume). Price and record only
+  // this run's part: subtract the session's previous run, as the heartbeat
+  // does for the final usage.
+  const sessionBaselines = new Map<string, Promise<unknown>>();
   async function toInvocationReceipt(receipt: AdapterUsageCheckpoint, previous: AdapterUsageCheckpoint | undefined): Promise<AdapterUsageCheckpoint> {
-    if (receipt.usageBasis !== "session_cumulative") return receipt;
+    const costBasis = receipt.costBasis ?? receipt.usageBasis;
+    if (receipt.usageBasis !== "session_cumulative" && costBasis !== "session_cumulative") return receipt;
     const sessionId = receipt.sessionId ?? previous?.sessionId;
     if (sessionId === undefined) return receipt;
-    if (!receipt.usage) return { ...receipt, sessionId, usageBasis: "per_run", sessionUsage: previous?.sessionUsage };
-    let baseline = sessionId ? sessionBaselines.get(sessionId) : undefined;
-    if (sessionId && !baseline) {
-      baseline = getLatestSessionUsageJson(db, { companyId: input.companyId, agentId: bound[0].agentId, sessionId, excludeRunId: input.runId })
-        .then(json => readRawUsageTotals(json, { legacyRawInputIncludesCached: input.adapterType === "codex_local" }));
-      sessionBaselines.set(sessionId, baseline);
+    const { costBasis: _costBasis, invocationUsage: _invocationUsage, ...rest } = receipt;
+    if (!receipt.usage) {
+      return { ...rest, sessionId, usageBasis: "per_run", sessionUsage: previous?.sessionUsage, rawCostUsd: previous?.rawCostUsd,
+        sessionUsageIncomplete: previous?.sessionUsageIncomplete, ...(costBasis === "session_cumulative" ? { costUsd: previous?.costUsd } : {}) };
     }
-    const sessionUsage = normalizeUsageTotals(receipt.usage)!;
-    const usage = normalizeAdapterRunUsage(sessionUsage, baseline ? await baseline : null, "session_cumulative")!;
-    return { ...receipt, sessionId, usage, usageBasis: "per_run", sessionUsage };
+    const resolution = await resolveNormalizedUsageForSession({
+      sessionId, rawUsage: normalizeUsageTotals(receipt.usage), usageBasis: receipt.usageBasis, costBasis,
+      rawCostUsd: receipt.costUsd ?? null, invocationUsage: normalizeUsageTotals(receipt.invocationUsage),
+      legacyRawInputIncludesCached: input.adapterType === "codex_local",
+      getPreviousUsageJson: (id) => {
+        let baseline = sessionBaselines.get(id);
+        if (!baseline) {
+          baseline = getLatestSessionUsageJson(db, { companyId: input.companyId, agentId: bound[0].agentId, sessionId: id, excludeRunId: input.runId });
+          sessionBaselines.set(id, baseline);
+        }
+        return baseline;
+      },
+    });
+    // Per-model parts are session totals too; there is no per-model baseline.
+    const subtracted = resolution.previousRawUsage !== null || resolution.previousRawCostUsd !== null || resolution.usageFromInvocation;
+    return { ...rest, sessionId, usage: resolution.normalizedUsage!, usageBasis: "per_run", costUsd: resolution.normalizedCostUsd,
+      sessionUsage: resolution.sessionRawUsage!, usageByModel: subtracted ? undefined : receipt.usageByModel,
+      ...(costBasis === "session_cumulative" && receipt.costUsd != null ? { rawCostUsd: receipt.costUsd } : {}),
+      ...(resolution.sessionRawUsageIncomplete ? { sessionUsageIncomplete: true } : {}) };
   }
   async function capture(raw: AdapterUsageCheckpoint) {
     const checkpoint = checkpointSchema.parse(raw) as AdapterUsageCheckpoint;

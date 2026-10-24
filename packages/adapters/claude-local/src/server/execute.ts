@@ -1042,7 +1042,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const consumeAccounting = createClaudeStreamParser();
     const accountingLog = createUsageCheckpointLog(onLog, ctx.onUsage, stdout => {
       const parsed = consumeAccounting(stdout);
-      return { usage: parsed.usage ?? undefined, usageBasis: "per_run", costUsd: parsed.costUsd,
+      // Differs from upstream (fork, SX-1378): on --resume the result's
+      // modelUsage and total_cost_usd are session totals. Keep the parser's
+      // bases and name the session, so the server records only this run's part.
+      return { usage: parsed.usage ?? undefined, usageBasis: parsed.usageBasis, costUsd: parsed.costUsd,
+        ...(parsed.costBasis ? { costBasis: parsed.costBasis } : {}),
+        ...(parsed.invocationUsage ? { invocationUsage: parsed.invocationUsage } : {}),
+        sessionId: parsed.sessionId ?? resumeSessionId,
         provider: "anthropic", biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
         billingType, model: Object.keys(parseObject(parsed.resultJson?.modelUsage)).length > 1 ? "mixed" : parsed.model || model,
           usageByModel: claudeModelReceipts(parsed.resultJson?.modelUsage), complete: parsed.resultJson !== null };
@@ -1100,7 +1106,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         timedOut: true,
         usageComplete: parsedStream.resultJson !== null,
         usage: parsedStream.usage ?? undefined,
-        usageBasis: "per_run",
+        // Differs from upstream (fork, SX-1378): a timed-out resume that got
+        // its result still reports session totals.
+        usageBasis: parsedStream.usageBasis,
+        ...(parsedStream.costBasis ? { costBasis: parsedStream.costBasis } : {}),
+        ...(parsedStream.invocationUsage ? { invocationUsage: parsedStream.invocationUsage } : {}),
         provider: "anthropic",
         biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
         model: Object.keys(parseObject(parsedStream.resultJson?.modelUsage)).length > 1 ? "mixed" : parsedStream.model || model,

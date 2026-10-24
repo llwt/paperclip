@@ -53,6 +53,18 @@ export interface AdapterUsageCheckpoint {
   sessionId?: string | null;
   /** Set by the server: the session totals behind a subtracted usage. */
   sessionUsage?: UsageSummary;
+  /**
+   * Differs from upstream (fork, SX-1378): "session_cumulative" when costUsd is
+   * the session's running total (the Claude CLI's total_cost_usd on --resume),
+   * also when the tokens are per run.
+   */
+  costBasis?: "per_run" | "session_cumulative" | null;
+  /** This invocation's own tokens, when usage reports session totals. */
+  invocationUsage?: UsageSummary;
+  /** Set by the server: the session-total cost behind a subtracted costUsd. */
+  rawCostUsd?: number | null;
+  /** Set by the server: sessionUsage is a lower bound (Claude without modelUsage). */
+  sessionUsageIncomplete?: boolean;
   provider?: string | null;
   biller?: string | null;
   model?: string | null;
