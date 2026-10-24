@@ -33,7 +33,7 @@ d("activity_log source issue index migration (SX-1597)", () => {
     expect(planText).toContain("activity_log_company_source_issue_idx");
 
     const migrationSql = await readFile(
-      fileURLToPath(new URL("./migrations/0307_activity_log_source_issue_index.sql", import.meta.url)),
+      fileURLToPath(new URL("./migrations/0335_activity_log_source_issue_index.sql", import.meta.url)),
       "utf8",
     );
     const statements = migrationSql

@@ -197,7 +197,14 @@ export async function recoverCodexResultFromOutput(
         errorCode: null,
         errorFamily: null,
         retryNotBefore: null,
-        ...(usage ? { usage, usageBasis: "session_cumulative" as const } : {}),
+        // Same counters as parseCodexJsonl: since upstream v2026.1023.0 the
+        // input count excludes cache hits, which Paperclip stores separately.
+        ...(usage
+          ? {
+              usage: { ...usage, inputTokens: Math.max(0, usage.inputTokens - usage.cachedInputTokens) },
+              usageBasis: "session_cumulative" as const,
+            }
+          : {}),
         resultJson: { terminalEvent: ending.event },
         clearSession,
       },

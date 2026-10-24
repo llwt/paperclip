@@ -83,7 +83,7 @@ describe("recoverCodexResultFromOutput", () => {
       model: "gpt-5",
       billingType: "subscription",
       costUsd: null,
-      usage: { inputTokens: 100, cachedInputTokens: 40, outputTokens: 9 },
+      usage: { inputTokens: 60, cachedInputTokens: 40, outputTokens: 9 },
       usageBasis: "session_cumulative",
       clearSession: false,
     });
