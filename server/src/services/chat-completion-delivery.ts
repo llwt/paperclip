@@ -1,5 +1,5 @@
 import { notifyDeliveryWork, DELIVERY_QUEUES } from "./delivery-work-notifications.js";
-import { and, asc, eq, inArray, lte, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import { agents, agentWakeupRequests, chatCompletionDeliveries as deliveries, chatTaskHandoffs as handoffs,
   heartbeatRuns, issueComments, issueDocuments, issues, type Db } from "@paperclipai/db";
 import { instanceSettingsService } from "./instance-settings.js";
@@ -147,14 +147,20 @@ export async function existingChatCompletionReply(tx: Connection, runId: string,
       const [comment] = await tx.select().from(issueComments).where(and(eq(issueComments.id, delivery.responseCommentId), eq(issueComments.issueId, issueId)));
       if (comment) return comment;
     }
+    // Settled by a comment the agent posted itself: the final reply must still be published.
+    if (delivery.status === "delivered" && delivery.targetRunId === runId) continue;
     if (delivery.status !== "queued" || delivery.targetRunId !== runId) throw new Error("chat_completion_superseded");
   }
   if (rows.length !== ids(run).length) throw new Error("chat_completion_superseded");
   return null;
 }
-export async function acknowledgeChatCompletionReply(tx: Connection, runId: string, commentId: string) {
-  await tx.update(deliveries).set({ status: "delivered", responseCommentId: commentId, error: null })
-    .where(and(eq(deliveries.targetRunId, runId), eq(deliveries.status, "queued")));
+/** An agent's own comment settles `queued` rows without recording a reply. The final reply (`final`) also settles rows
+ * left `delivered` without a reply and records itself, so a progress comment cannot swallow it. A repeat changes nothing. */
+export async function acknowledgeChatCompletionReply(tx: Connection, runId: string, commentId: string, conversationId: string, final: boolean) {
+  const open = final ? or(eq(deliveries.status, "queued"), and(eq(deliveries.status, "delivered"), isNull(deliveries.responseCommentId))) : eq(deliveries.status, "queued");
+  await tx.update(deliveries).set({ status: "delivered", error: null, ...(final ? { responseCommentId: commentId } : {}) })
+    .where(and(eq(deliveries.targetRunId, runId), open, inArray(deliveries.taskId, tx.select({ id: handoffs.taskId }).from(handoffs)
+      .where(eq(handoffs.conversationId, conversationId)))));
 }
 
 export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentId: string, options: {
