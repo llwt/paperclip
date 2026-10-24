@@ -12,4 +12,20 @@ describe("sanitizeInheritedPaperclipEnv", () => {
       PATH: "/usr/bin",
     });
   });
+
+  it("drops the systemd notify, watchdog and socket-activation variables", () => {
+    expect(sanitizeInheritedPaperclipEnv({
+      NOTIFY_SOCKET: "/run/systemd/notify",
+      WATCHDOG_USEC: "1000000",
+      WATCHDOG_PID: "123",
+      LISTEN_FDS: "1",
+      LISTEN_PID: "123",
+      LISTEN_FDNAMES: "http",
+      HOME: "/home/agent",
+      PATH: "/usr/bin",
+    })).toEqual({
+      HOME: "/home/agent",
+      PATH: "/usr/bin",
+    });
+  });
 });
