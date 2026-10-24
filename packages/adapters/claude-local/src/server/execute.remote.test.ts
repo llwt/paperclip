@@ -79,6 +79,8 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
 
 import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixtures/prompt-context";
 import { execute } from "./execute.js";
+import type { AdapterInvocationMeta } from "@paperclipai/adapter-utils";
+import { recoverClaudeResultFromOutput } from "./recover-result.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
 import { resetClaudeCliCapabilitiesCacheForTests } from "./cli-capabilities.js";
 
@@ -677,6 +679,68 @@ describe("claude remote execution", () => {
         expect(call[3].stdin.includes("registered copy")).toBe(mode === "managed");
       }
     }
+  });
+
+  it("gives a recovered result the same remoteExecution as the normal result, without credentials", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-remote-recovery-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+    const stdout = [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "claude-session-1", model: "claude-sonnet" }),
+      JSON.stringify({ type: "result", subtype: "success", is_error: false, session_id: "claude-session-1", result: "hello" }),
+    ].join("\n");
+    runChildProcess.mockResolvedValueOnce({
+      exitCode: 0, signal: null, timedOut: false, stdout, stderr: "", pid: 123, startedAt: new Date().toISOString(),
+    });
+    const metas: AdapterInvocationMeta[] = [];
+
+    const result = await execute({
+      runId: "run-ssh-recovery",
+      agent: { id: "agent-1", companyId: "company-1", name: "Claude Coder", adapterType: "claude_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { engine: "cli", command: "claude" },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      executionTransport: {
+        remoteExecution: {
+          host: "127.0.0.1",
+          port: 2222,
+          username: "fixture",
+          remoteWorkspacePath: "/remote/workspace",
+          remoteCwd: "/remote/workspace",
+          privateKey: "PRIVATE KEY",
+          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+          strictHostKeyChecking: true,
+        },
+      },
+      onLog: async () => {},
+      onMeta: async (meta) => {
+        metas.push(meta);
+      },
+    });
+
+    const normalParams = result.sessionParams as Record<string, unknown>;
+    expect(normalParams.remoteExecution).toMatchObject({ transport: "ssh", host: "127.0.0.1", port: 2222, username: "fixture" });
+    const recovery = metas.at(-1)?.recovery;
+    expect(recovery?.sessionParams?.remoteExecution).toEqual(normalParams.remoteExecution);
+    expect(JSON.stringify(recovery)).not.toContain("PRIVATE KEY");
+    expect(JSON.stringify(recovery)).not.toContain("ssh-ed25519");
+
+    const outcome = await recoverClaudeResultFromOutput({
+      output: (async function* () {
+        yield { stream: "stdout" as const, chunk: stdout, seq: 1 };
+      })(),
+      context: {
+        version: 1,
+        adapterType: "claude_local",
+        engine: "cli",
+        invocation: { firstSeq: null, sessionIdBefore: recovery!.sessionIdBefore, sessionParams: recovery!.sessionParams },
+        accounting: recovery!.accounting,
+        runStart: { sessionIdBefore: null, sessionDisplayId: null, sessionParams: null },
+      },
+    });
+    if (outcome.kind !== "complete") throw new Error(`expected complete, got ${JSON.stringify(outcome)}`);
+    expect(outcome.result.sessionParams).toEqual(normalParams);
   });
 
 });

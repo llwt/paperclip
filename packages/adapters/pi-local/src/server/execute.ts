@@ -52,6 +52,7 @@ import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   runChildProcess,
+  withLeftoverProcessSweep,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import { isPiUnknownSessionError, parsePiJsonl } from "./parse.js";
@@ -867,10 +868,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           }
         }
         const retry = await runAttempt(newSessionPath);
-        return toResult(retry, true);
+        return withLeftoverProcessSweep(toResult(retry, true), [initial.proc, retry.proc]);
       }
 
-      return toResult(initial);
+      return withLeftoverProcessSweep(toResult(initial), [initial.proc]);
     } finally {
       try {
         await providerStop.collectBeforeRestore();

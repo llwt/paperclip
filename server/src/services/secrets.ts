@@ -639,6 +639,12 @@ type SecretConsumerContext = {
   heartbeatRunId?: string | null;
   pluginId?: string | null;
   allowedBindingIds?: string[] | null;
+  /**
+   * Opt-in for hot paths that resolve the same secret over and over within one
+   * run. A successful resolution then writes its access event and
+   * `last_resolved_at` at most once per run, secret version and window.
+   */
+  auditDedupeWindowMs?: number;
 };
 
 type SecretBindingContext = Omit<SecretConsumerContext, "consumerType"> & {
@@ -965,6 +971,28 @@ function assertSelectableProviderConfig(config: {
   if (config.status === "disabled") {
     throw unprocessable("Provider vault is disabled");
   }
+}
+
+// Process-local: a restart can add at most one extra row per run and secret.
+const recentSuccessfulResolutionAudits = new Map<string, number>();
+
+/** True when this success should be audited; claims the window for the key. */
+function claimSuccessfulResolutionAudit(key: string, windowMs: number): number | null {
+  const now = Date.now();
+  const expiresAt = recentSuccessfulResolutionAudits.get(key);
+  if (expiresAt !== undefined && expiresAt > now) return null;
+  if (recentSuccessfulResolutionAudits.size >= 10_000) {
+    for (const [entry, expiry] of recentSuccessfulResolutionAudits) {
+      if (expiry <= now) recentSuccessfulResolutionAudits.delete(entry);
+    }
+  }
+  recentSuccessfulResolutionAudits.set(key, now + windowMs);
+  return now + windowMs;
+}
+
+/** A failed audit write gives the window back so the next resolution retries it. */
+function releaseSuccessfulResolutionAudit(key: string, claim: number) {
+  if (recentSuccessfulResolutionAudits.get(key) === claim) recentSuccessfulResolutionAudits.delete(key);
 }
 
 export function secretService(db: Db | DbTransaction) {
@@ -1400,7 +1428,17 @@ export function secretService(db: Db | DbTransaction) {
           version: resolvedVersion,
         },
       });
-      await Promise.all([
+      // Failures below are always audited; only repeated successes are bounded.
+      const dedupeWindowMs = accessContext?.auditDedupeWindowMs;
+      const auditKey = dedupeWindowMs && dedupeWindowMs > 0 && accessContext?.heartbeatRunId
+        ? JSON.stringify([
+          companyId, secret.id, resolvedVersion, accessContext.heartbeatRunId, accessContext.consumerType,
+          accessContext.consumerId, accessContext.actorId ?? null, accessContext.responsibleUserId ?? null,
+          accessContext.issueId ?? null, accessContext.configPath ?? null,
+        ])
+        : null;
+      const auditClaim = auditKey ? claimSuccessfulResolutionAudit(auditKey, dedupeWindowMs!) : null;
+      if (!auditKey || auditClaim !== null) await Promise.all([
         db
           .update(companySecrets)
           .set({ lastResolvedAt: new Date(), updatedAt: new Date() })
@@ -1418,7 +1456,9 @@ export function secretService(db: Db | DbTransaction) {
           credentialSubjectType: secret.scope === "user" ? "user" : null,
           credentialSubjectId: secret.ownerUserId ?? null,
           outcome: "success",
-        }).catch(() => undefined),
+        }).catch(() => {
+          if (auditKey && auditClaim !== null) releaseSuccessfulResolutionAudit(auditKey, auditClaim);
+        }),
       ]);
       return {
         value,

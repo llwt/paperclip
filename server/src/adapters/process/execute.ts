@@ -15,6 +15,7 @@ import {
   ensurePathInEnv,
   resolveCommandForLogs,
   runChildProcess,
+  withLeftoverProcessSweep,
 } from "../utils.js";
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
@@ -85,16 +86,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   if (proc.timedOut) {
-    return {
+    return withLeftoverProcessSweep({
       exitCode: proc.exitCode,
       signal: proc.signal,
       timedOut: true,
       errorMessage: `Timed out after ${timeoutSec}s`,
-    };
+    }, [proc]);
   }
 
   if ((proc.exitCode ?? 0) !== 0) {
-    return {
+    return withLeftoverProcessSweep({
       exitCode: proc.exitCode,
       signal: proc.signal,
       timedOut: false,
@@ -103,10 +104,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         stdout: proc.stdout,
         stderr: proc.stderr,
       },
-    };
+    }, [proc]);
   }
 
-  return {
+  return withLeftoverProcessSweep({
     exitCode: proc.exitCode,
     signal: proc.signal,
     timedOut: false,
@@ -114,5 +115,5 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       stdout: proc.stdout,
       stderr: proc.stderr,
     },
-  };
+  }, [proc]);
 }

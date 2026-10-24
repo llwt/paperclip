@@ -3,7 +3,7 @@ import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import manifest from "../src/manifest.js";
 import plugin, { DATA_KEY } from "../src/worker.js";
-import type { ExecutionFlowView } from "../src/model.js";
+import type { ExecutionFlowResponse } from "../src/model.js";
 import { card, decision, hostIssue, page } from "./fixtures.js";
 
 const params = { companyId: "company", issueId: "issue" };
@@ -33,7 +33,7 @@ async function strictWorker() {
   }) as PluginContext;
   await plugin.definition.setup(ctx);
   expect(register).toHaveBeenCalledTimes(1);
-  return { ...reads, read: (input: Record<string, unknown> = params) => handler!(input) as Promise<ExecutionFlowView> };
+  return { ...reads, read: (input: Record<string, unknown> = params) => handler!(input) as Promise<ExecutionFlowResponse> };
 }
 
 describe("read-only worker", () => {
@@ -53,6 +53,7 @@ describe("read-only worker", () => {
     expect(worker.listInteractions).toHaveBeenCalledExactlyOnceWith("issue", "company");
     expect(view.execution.stages).toHaveLength(2);
     expect(view.history.decisions).toHaveLength(1);
+    expect(view.subject).toEqual({ companyId: "company", issueId: "issue" });
     expect(JSON.stringify(view)).not.toContain("Unrelated private data");
     expect(JSON.stringify(view)).not.toContain("Do not return this");
     expect(JSON.stringify(view)).not.toContain("createdByRunId");
@@ -142,7 +143,7 @@ describe("read-only worker", () => {
     const harness = createTestHarness({ manifest });
     harness.seed({ issues: [hostIssue()], issueExecutionDecisions: [decision()], issueInteractions: [card()] });
     await plugin.definition.setup(harness.ctx);
-    const view = await harness.getData<ExecutionFlowView>(DATA_KEY, params);
+    const view = await harness.getData<ExecutionFlowResponse>(DATA_KEY, params);
     expect(view.history.status).toBe("available");
     expect(view.history.decisions[0].id).toBe("decision");
     expect(view.confirmations.items[0].id).toBe("card");
