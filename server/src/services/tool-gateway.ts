@@ -5745,7 +5745,7 @@ export function createToolGatewayService(
       // the byte limit and says which response was too large.
       initializingSession
         ? `Remote MCP initialization response exceeded the response reader size limit of ${maxBytes} bytes. The server must return a smaller initialization response.`
-        : `Remote MCP response exceeded the gateway size limit of ${maxBytes} bytes. Narrow the request: use a smaller page or limit, or request fewer fields.`,
+        : `Remote MCP response exceeded the gateway size limit of ${maxBytes} bytes. Request a smaller result, for example a narrower query or a smaller page size.`,
       "mcp_remote_response_too_large",
       { maxBytes },
     );

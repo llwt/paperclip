@@ -4434,9 +4434,11 @@ rl.on("line", (line) => {
           (error) => expectGatewayError(error, scenario.status, scenario.reasonCode),
         );
 
+        // Since v2026.1023.0 (upstream #15462) a bad response body leaves
+        // connection health unchanged, as fork #24 did for oversized ones.
         if (scenario.reasonCode === "mcp_remote_invalid_json"
           || scenario.reasonCode === "remote_mcp_malformed_response") {
-          expect(await connectionHealth(remoteTool.connection.id)).toBe("error");
+          expect(await connectionHealth(remoteTool.connection.id)).toBe("ok");
         }
 
         const [invocation] = await db.select().from(toolInvocations);
@@ -4634,8 +4636,7 @@ rl.on("line", (line) => {
       expectGatewayError(error, 502, "mcp_remote_response_too_large");
       expect(error.details).toMatchObject({ maxBytes: 1_000_000 });
       expect(error.message).toContain("1000000 bytes");
-      expect(error.message).toContain("smaller page or limit");
-      expect(error.message).toContain("fewer fields");
+      expect(error.message).toContain("smaller page size");
 
       expect(await connectionHealth(connection.id)).toBe("ok");
       const listed = (await gateway.listToolsForSession(session.token)).map((tool) => tool.name);
@@ -4695,7 +4696,7 @@ rl.on("line", (line) => {
     }
   });
 
-  it("fails a stream without the tools/call response as malformed, with a content-free summary, and marks the connection errored", async () => {
+  it("fails a stream without the tools/call response as malformed, with a content-free summary, and keeps the connection healthy", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
@@ -4738,10 +4739,9 @@ rl.on("line", (line) => {
       });
       expect(JSON.stringify(error.details.responseSummary)).not.toContain(marker);
 
-      expect(await connectionHealth(connection.id)).toBe("error");
+      expect(await connectionHealth(connection.id)).toBe("ok");
       const listed = (await gateway.listToolsForSession(session.token)).map((tool) => tool.name);
-      expect(listed).not.toContain(slowTool);
-      expect(listed).not.toContain(fastTool);
+      expect(listed).toEqual(expect.arrayContaining([slowTool, fastTool]));
     } finally {
       await fake.close();
     }
@@ -4751,7 +4751,7 @@ rl.on("line", (line) => {
     ["a plain JSON body with the wrong ID", { body: { jsonrpc: "2.0", id: "not-the-request-id", result: {} } }],
     ["a JSON scalar", { headers: { "content-type": "application/json" }, rawBody: "42" }],
     ["an empty stream body", { headers: { "content-type": "text/event-stream" }, rawBody: "" }],
-  ])("marks the connection errored when the tools/call response is %s", async (_label, response) => {
+  ])("keeps the connection healthy when the tools/call response is %s", async (_label, response) => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
@@ -4771,10 +4771,9 @@ rl.on("line", (line) => {
       }).catch((caught) => caught);
       expectGatewayError(error, 502, "remote_mcp_malformed_response");
 
-      expect(await connectionHealth(connection.id)).toBe("error");
+      expect(await connectionHealth(connection.id)).toBe("ok");
       const listed = (await gateway.listToolsForSession(session.token)).map((tool) => tool.name);
-      expect(listed).not.toContain(slowTool);
-      expect(listed).not.toContain(fastTool);
+      expect(listed).toEqual(expect.arrayContaining([slowTool, fastTool]));
     } finally {
       await fake.close();
     }
