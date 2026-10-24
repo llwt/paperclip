@@ -1,9 +1,5 @@
 import { z } from "zod";
 import {
-  ISSUE_COMMENT_HANDOFF_OUTCOMES,
-  ISSUE_COMMENT_HANDOFF_REASON_CODES,
-} from "../agent-mention-handoff.js";
-import {
   ISSUE_EXECUTION_DECISION_OUTCOMES,
   ISSUE_EXECUTION_MONITOR_CLEAR_REASONS,
   ISSUE_EXECUTION_MONITOR_KINDS,
@@ -568,6 +564,10 @@ export const retryWorkspaceExportSchema = z.object({
 
 export const resolveIssueRecoveryActionSchema = z
   .object({
+    workspaceBaseRef: z.object({
+      requestedRef: z.string().trim().min(1).max(1024),
+      branch: z.string().trim().refine(isValidExistingBranchName, { message: "Choose a valid Git branch name" }),
+    }).strict().optional(),
     executionReconciliation: z
       .object({
         runId: z.string().guid(),
@@ -580,12 +580,18 @@ export const resolveIssueRecoveryActionSchema = z
       .optional(),
     actionId: z.string().guid().optional(),
     outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
-    sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]),
+    sourceIssueStatus: z.enum(ISSUE_STATUSES),
     resolutionNote: multilineTextSchema.optional().nullable(),
   })
   .strict()
   .superRefine((value, ctx) => {
+    if (value.workspaceBaseRef && (!value.actionId || value.outcome !== "restored" || value.sourceIssueStatus !== "todo" || value.executionReconciliation)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["workspaceBaseRef"], message: "Branch repair must retry the exact recovery action" });
+    }
     if (value.outcome === "restored") {
+      // A retained-source repair records evidence without changing task state.
+      // The route verifies the exact server-owned source and unchanged status.
+      if (value.executionReconciliation?.workspaceRepairEvidence) return;
       if (
         value.sourceIssueStatus !== "todo" &&
         value.sourceIssueStatus !== "done" &&
@@ -693,6 +699,7 @@ const createIssueBaseSchema = z.object({
   projectId: z.string().guid().optional().nullable(),
   projectWorkspaceId: z.string().guid().optional().nullable(),
   goalId: z.string().guid().optional().nullable(),
+  visibility: z.enum(["open", "private"]).optional().default("open"),
   parentId: z.string().guid().optional().nullable(),
   blockedByIssueIds: z.array(z.string().guid()).optional(),
   unblockDescriptor: z
@@ -884,6 +891,8 @@ export const updateIssueSchema = objectWithoutDefaults(
 )
   .partial()
   .extend({
+    /** Reject a policy write if the policy changed after the caller read it. */
+    expectedExecutionPolicy: z.record(z.string(), z.unknown()).optional().nullable(),
     requestDepth: issueRequestDepthInputSchema.optional(),
     assigneeAgentId: z.string().trim().min(1).optional().nullable(),
     comment: multilineTextSchema.pipe(z.string().min(1)).optional(),
@@ -1030,35 +1039,6 @@ export const issueCommentMetadataSectionSchema = z
   })
   .strict();
 
-export const issueCommentHandoffReceiptSchema = z
-  .object({
-    version: z.literal(1),
-    outcome: z.enum(ISSUE_COMMENT_HANDOFF_OUTCOMES),
-    reasonCode: z.enum(ISSUE_COMMENT_HANDOFF_REASON_CODES).optional(),
-    targetAgentId: z.string().guid().optional(),
-    statusVersion: z.number().int().nonnegative().optional(),
-    interruptedRunId: z.string().guid().optional(),
-  })
-  .strict()
-  .superRefine((receipt, ctx) => {
-    const fail = (path: string, message: string) =>
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message, path: [path] });
-    if (receipt.outcome === "assigned") {
-      if (receipt.reasonCode) fail("reasonCode", "An assigned handoff has no refusal reason");
-      if (!receipt.targetAgentId) fail("targetAgentId", "An assigned handoff requires targetAgentId");
-      if (receipt.statusVersion === undefined) fail("statusVersion", "An assigned handoff requires statusVersion");
-      return;
-    }
-    if (receipt.statusVersion !== undefined) fail("statusVersion", "Only an assigned handoff has statusVersion");
-    if (receipt.interruptedRunId !== undefined) fail("interruptedRunId", "Only an assigned handoff has interruptedRunId");
-    if (receipt.outcome === "context_only" && !receipt.reasonCode) {
-      fail("reasonCode", "A context-only handoff requires reasonCode");
-    }
-    if (receipt.outcome === "unchanged" && receipt.reasonCode) {
-      fail("reasonCode", "An unchanged handoff has no refusal reason");
-    }
-  });
-
 export const issueCommentMetadataSchema = z
   .object({
     version: z.literal(1),
@@ -1079,18 +1059,11 @@ export const issueCommentMetadataSchema = z
       reason: z.string().trim().min(1).max(160),
       assigneeAgentId: z.string().guid().nullable(),
     }).strict().optional(),
-    handoff: issueCommentHandoffReceiptSchema.optional(),
     sections: z.array(issueCommentMetadataSectionSchema).min(1).max(20),
   })
   .strict();
 
 export type IssueCommentMetadata = z.infer<typeof issueCommentMetadataSchema>;
-
-/**
- * Comment metadata a caller may submit. The handoff receipt is server-authored,
- * so a request that carries one is rejected rather than stored.
- */
-export const issueCommentRequestMetadataSchema = issueCommentMetadataSchema.omit({ handoff: true });
 
 export const addIssueCommentSchema = z.object({
   clientRequestId: z.string().uuid().optional(),
@@ -1099,7 +1072,7 @@ export const addIssueCommentSchema = z.object({
   onBehalfOfUserId: z.string().trim().min(1).optional().nullable(),
   authorType: issueCommentAuthorTypeSchema.optional(),
   presentation: issueCommentPresentationSchema.nullable().optional(),
-  metadata: issueCommentRequestMetadataSchema.nullable().optional(),
+  metadata: issueCommentMetadataSchema.nullable().optional(),
   reopen: z.boolean().optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),
@@ -1322,6 +1295,7 @@ const paperclipQuestionSchema = z
     helpText: z.string().max(4000).optional(),
     required: z.boolean(),
     answerMode: z.enum(["single_select", "multi_select", "text"]),
+    initialText: z.string().refine(value => value.length <= 200000 && Array.from(value).length <= 100000, "initial text exceeds 100000 Unicode code points").optional(),
     options: z.array(paperclipQuestionOptionSchema).max(128).optional(),
     customAnswer: z
       .object({
@@ -1342,6 +1316,9 @@ const paperclipQuestionSchema = z
       .optional(),
   })
   .superRefine((value, ctx) => {
+    if (value.initialText !== undefined && value.answerMode !== "text") {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "only text questions can define initial text", path: ["initialText"] });
+    }
     if (
       value.answerMode === "text" &&
       value.options &&
@@ -1492,8 +1469,9 @@ export const askUserQuestionsPayloadSchema = z
 export const askUserQuestionsAnswerSchema = z.object({
   questionId: z.string().trim().min(1).max(160),
   optionIds: z.array(z.string().trim().min(1).max(160)).max(129),
-  otherText: multilineTextSchema
-    .pipe(z.string().trim().max(100000))
+  // The persisted question determines whether this is exact editor text or a
+  // legacy custom answer; normalize only after that trusted context is known.
+  otherText: z.string().max(100000)
     .nullable()
     .optional(),
 });

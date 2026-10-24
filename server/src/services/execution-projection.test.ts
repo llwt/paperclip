@@ -237,4 +237,22 @@ describe("execution truth projection", () => {
       ).phase,
     ).toBe("recovery_needed");
   });
+  it("shows a repair run cancelled at the dispatch gate as cancelled, not as recovery needed", () => {
+    const suppressed = run({
+      runtimeMode: "legacy", status: "cancelled", errorCode: "legacy_disposition_repair_suppressed",
+    });
+    const staleHold = {
+      status: "resolved",
+      cause: "legacy_execution_requires_reconciliation",
+      nextAction: "Stopped",
+      evidence: { automaticRecovery: { replay: "blocked" } },
+    };
+    for (const hold of [undefined, staleHold]) {
+      const projection = projectExecution(suppressed, undefined, [], hold, now);
+      expect(projection.phase).not.toBe("recovery_needed");
+      expect(projection).toMatchObject({ label: "Cancelled", recoveryOwner: null });
+    }
+    expect(projectExecution(run({ runtimeMode: "legacy", status: "cancelled", errorCode: "cancelled" }),
+      undefined, [], staleHold, now).phase).toBe("recovery_needed");
+  });
 });

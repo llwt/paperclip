@@ -1,3 +1,6 @@
+import { resolveIssueChatHumanAuthor } from "@/lib/issue-chat-human-author";
+import { useWorkspaceBaseRefRecovery } from "./WorkspaceBaseRefRecovery";
+import { WorkspaceBaseRefRecoveryNotice } from "./WorkspaceBaseRefRecoveryNotice";
 import { DispositionRecoveryNotice, useDispositionRecoverySnapshot } from "./DispositionRecoveryNotice";
 import { AgentAvatar } from "@/components/AgentAvatar";
 import type { ComposerRunSettings } from "./task-chat/composer-run-settings";
@@ -169,7 +172,6 @@ import {
   computeComposerHandoffPreview,
   extractAgentMentionIds,
   findPlainAgentNameCandidate,
-  knownComposerHandoffRefusal,
   type ComposerHandoffPreview,
   type HandoffAgentMention,
 } from "../lib/interrupt-handoff";
@@ -212,7 +214,7 @@ import {
   summarizeToolInput,
   summarizeToolResult,
 } from "../lib/transcriptPresentation";
-import { buildAgentMentionHref, parseLeadingAgentMention } from "@paperclipai/shared";
+import { buildAgentMentionHref } from "@paperclipai/shared";
 import { useComposerStop } from "@/hooks/useComposerStop";
 import { cn, formatDateTime, formatShortDate } from "../lib/utils";
 import { liveBlueBadge } from "../lib/status-colors";
@@ -536,8 +538,6 @@ interface IssueChatComposerProps {
   issueStatus?: string;
   issueWorkMode?: IssueWorkMode;
   onWorkModeChange?: (workMode: IssueWorkMode) => Promise<void> | void;
-  /** Whether a leading agent mention hands the task off. Off until the server path is switched on. */
-  commentHandoffAvailable?: boolean;
 }
 
 interface IssueChatThreadProps {
@@ -1166,30 +1166,7 @@ function formatInteractionActorLabel(args: {
   return "System";
 }
 
-export function resolveIssueChatHumanAuthor(args: {
-  authorName?: string | null;
-  authorUserId?: string | null;
-  currentUserId?: string | null;
-  userProfileMap?: ReadonlyMap<string, CompanyUserProfile> | null;
-}) {
-  const { authorName, authorUserId, currentUserId, userProfileMap } = args;
-  const profile = authorUserId
-    ? (userProfileMap?.get(authorUserId) ?? null)
-    : null;
-  const isCurrentUser = Boolean(
-    authorUserId && currentUserId && authorUserId === currentUserId,
-  );
-  const resolvedAuthorName =
-    profile?.label?.trim() ||
-    authorName?.trim() ||
-    (authorUserId === "local-board" ? "Board" : isCurrentUser ? "You" : "User");
-
-  return {
-    isCurrentUser,
-    authorName: resolvedAuthorName,
-    avatarUrl: profile?.image ?? null,
-  };
-}
+export { resolveIssueChatHumanAuthor } from "@/lib/issue-chat-human-author";
 
 function toolCountSummary(toolParts: ToolCallMessagePart[]): string | null {
   if (toolParts.length === 0) return null;
@@ -2510,6 +2487,7 @@ function IssueChatAssistantMessage({
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
+          {custom.origin === "fast_response" && <div className="max-w-xs px-2 py-2 text-xs text-muted-foreground">Platform-generated acknowledgement. The agent’s substantive response follows separately.</div>}
           <DropdownMenuItem
             onClick={() => {
               void copyTextToClipboard(copyText).catch((error) => {
@@ -3521,6 +3499,7 @@ function SystemNoticeCommentContent({
     ? custom.commentMetadata
     : null;
   const recoverySnapshot = useDispositionRecoverySnapshot(commentMetadata);
+  const branchRecovery = useWorkspaceBaseRefRecovery(commentMetadata);
   const runAgentId =
     typeof custom.runAgentId === "string" ? custom.runAgentId : null;
   const runId = typeof custom.runId === "string" ? custom.runId : null;
@@ -3616,6 +3595,8 @@ function SystemNoticeCommentContent({
         });
       });
   };
+
+  if (authorType === "system" && branchRecovery) return <div id={anchorId}><WorkspaceBaseRefRecoveryNotice key={`${branchRecovery.actionId}:${branchRecovery.runId}`} {...branchRecovery.props} /></div>;
 
   if (authorType === "system" && recoverySnapshot) {
     return <div id={anchorId}><DispositionRecoveryNotice snapshot={recoverySnapshot} createdAt={toValidIsoString(message.createdAt)} defaultExpanded={presentation?.detailsDefaultOpen} /></div>;
@@ -4685,7 +4666,6 @@ const IssueChatComposer = forwardRef<
     issueStatus,
     issueWorkMode,
     onWorkModeChange,
-    commentHandoffAvailable = false,
   },
   forwardedRef,
 ) {
@@ -5300,7 +5280,6 @@ const IssueChatComposer = forwardRef<
         : findPlainAgentNameCandidate(body, agentMentionOptions),
     [body, mentionedAgentIds, agentMentionOptions],
   );
-  const leadingMention = useMemo(() => parseLeadingAgentMention(body), [body]);
   const handoffPreview = useMemo(
     () =>
       computeComposerHandoffPreview({
@@ -5310,9 +5289,6 @@ const IssueChatComposer = forwardRef<
         bodyHasAgentMention: mentionedAgentIds.length > 0,
         mentionedAgentId: mentionedAgentIds[0] ?? null,
         plainNameCandidate,
-        leadingMention,
-        handoffAvailable: commentHandoffAvailable,
-        handoffCheck: knownComposerHandoffRefusal({ issueStatus }),
       }),
     [
       reassignTarget,
@@ -5320,9 +5296,6 @@ const IssueChatComposer = forwardRef<
       hasActiveRun,
       mentionedAgentIds,
       plainNameCandidate,
-      leadingMention,
-      commentHandoffAvailable,
-      issueStatus,
     ],
   );
   const coachVisible = Boolean(

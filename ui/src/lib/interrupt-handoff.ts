@@ -1,9 +1,4 @@
-import {
-  describeIssueCommentHandoffReason,
-  parseAgentMentionHref,
-  type IssueCommentHandoffReasonCode,
-  type LeadingAgentMention,
-} from "@paperclipai/shared";
+import { parseAgentMentionHref } from "@paperclipai/shared";
 
 /**
  * Shared logic for the "interrupt handoff" UX clarity surfaces (PAP-10669).
@@ -170,11 +165,7 @@ export type ComposerHandoffPreviewKind =
   | "wake_agent"
   | "user_handoff"
   | "clear_assignee"
-  | "mention_handoff"
-  | "mention_interrupt_handoff"
-  | "mention_handoff_refused"
-  | "mention_handoff_unknown"
-  | "mention_context"
+  | "notify_agent"
   | "plain_text_only"
   | "none";
 
@@ -215,33 +206,6 @@ export interface ComposerHandoffPreviewInput {
   mentionedAgentId?: string | null;
   /** A plain-text agent-name candidate detected in the body, if any. */
   plainNameCandidate?: PlainAgentNameCandidate | null;
-  /** Leading mention of the body, from `parseLeadingAgentMention`. */
-  leadingMention?: LeadingAgentMention | null;
-  /**
-   * Whether the server turns a leading mention into a handoff. Defaults to
-   * false; while it is off every mention previews as context.
-   */
-  handoffAvailable?: boolean;
-  /**
-   * What the client already knows about the server's decision for the leading
-   * mention. Absent means the gates are unknown, so nothing is promised.
-   */
-  handoffCheck?: ComposerHandoffCheck | null;
-}
-
-export type ComposerHandoffCheck =
-  | { kind: "eligible" }
-  | { kind: "refused"; reasonCode: IssueCommentHandoffReasonCode };
-
-/**
- * Refusals the composer can know before sending. Everything else (author,
- * target, gates, permission) is checked by the server when the comment is sent.
- */
-export function knownComposerHandoffRefusal(input: { issueStatus?: string | null }): ComposerHandoffCheck | null {
-  if (input.issueStatus && input.issueStatus !== "todo" && input.issueStatus !== "in_progress") {
-    return { kind: "refused", reasonCode: "status_requires_explicit_action" };
-  }
-  return null;
 }
 
 /**
@@ -288,54 +252,14 @@ export function computeComposerHandoffPreview(
     };
   }
 
-  const leading = input.leadingMention;
-  if (input.handoffAvailable && leading && leading.kind !== "none") {
-    const current = parseReassignValue(input.currentAssigneeValue);
-    const alreadyOwner = leading.kind === "target" && current.kind === "agent" && current.id === leading.agentId;
-    if (!alreadyOwner) {
-      const check = leading.kind === "ambiguous"
-        ? ({ kind: "refused", reasonCode: "ambiguous_prefix" } as const)
-        : input.handoffCheck;
-      if (check?.kind === "refused") {
-        return {
-          kind: "mention_handoff_refused",
-          tone: "warn",
-          text: `Context only: ${describeIssueCommentHandoffReason(check.reasonCode)}`,
-        };
-      }
-      if (leading.kind === "target") {
-        const chip = { kind: "agent", id: leading.agentId } as const;
-        if (check?.kind === "eligible") {
-          return input.hasActiveRun
-            ? { kind: "mention_interrupt_handoff", tone: "neutral", text: "Will stop the current run and hand off to", chip }
-            : { kind: "mention_handoff", tone: "neutral", text: "Will hand off to", chip };
-        }
-        return {
-          kind: "mention_handoff_unknown",
-          tone: "neutral",
-          text: "Handoff to",
-          chip,
-          suffix: "will be checked when sent",
-        };
-      }
-    }
-  }
-
   if (input.bodyHasAgentMention) {
-    // Mentions do not wake or assign anyone; they are context for readers.
-    return input.mentionedAgentId
-      ? {
-          kind: "mention_context",
-          tone: "neutral",
-          text: "Mentions",
-          chip: { kind: "agent", id: input.mentionedAgentId },
-          suffix: "as context only: no handoff, no wake",
-        }
-      : {
-          kind: "mention_context",
-          tone: "neutral",
-          text: "Mentions are context only: no handoff, no wake",
-        };
+    return {
+      kind: "notify_agent",
+      tone: "neutral",
+      text: "Notify",
+      chip: input.mentionedAgentId ? { kind: "agent", id: input.mentionedAgentId } : undefined,
+      suffix: input.mentionedAgentId ? undefined : "the mentioned agent",
+    };
   }
 
   if (input.plainNameCandidate) {

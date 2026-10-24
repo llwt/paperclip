@@ -115,6 +115,11 @@ describe("execution stage fixtures", () => {
     expect(view.confirmations.items[0].resolvers[0].displayName).toBe("missing-user");
   });
 
+  it("tells whether a stage policy was known at all", () => {
+    expect(buildExecutionFlow({ issue: issue(), history: { status: "unavailable" }, interactions: { status: "unavailable" } }).execution.policyKnown).toBe(true);
+    expect(buildExecutionFlow({ issue: {}, history: { status: "unavailable" }, interactions: { status: "unavailable" } }).execution.policyKnown).toBe(false);
+  });
+
   it("makes history/card failures explicit without hiding stages", () => {
     const view = buildExecutionFlow({ issue: issue(), history: { status: "unavailable" }, interactions: { status: "unavailable" } });
     expect(view.execution.stages).toHaveLength(2);

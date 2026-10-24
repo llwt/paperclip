@@ -12,6 +12,14 @@ import {
 } from "./local-process-sandbox.js";
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
+import {
+  RUN_PROCESS_SWEEP_INVOCATION_ENV,
+  RUN_PROCESS_SWEEP_RUN_ID_ENV,
+  formatRunProcessSweepLogLine,
+  sweepRunProcesses,
+  type RunProcessSweepEvidence,
+  type RunProcessSweepOptions,
+} from "./run-process-sweep.js";
 import { spawnRunOutputRelay } from "./run-output-relay.js";
 import { paperclipChatFilePreparationDelivery } from "./chat-file-delivery.js";
 import {
@@ -21,6 +29,7 @@ import {
 } from "./paperclip-runner-permissions.js";
 import type {
   AdapterExecutionContext,
+  AgentRuntimeIdentity,
   AdapterRuntimeToolAccess,
   AdapterSkillEntry,
   AdapterSkillSnapshot,
@@ -65,6 +74,58 @@ export interface RunProcessResult {
   // duplex control channel died before a clean completion.
   errorCode?: string | null;
   terminalResultCleanup?: TerminalResultCleanupEvidence | null;
+  // What the end-of-run sweep stopped; null when no sweep ran (non-Linux, or
+  // the child env does not carry this run's PAPERCLIP_RUN_ID).
+  leftoverProcessSweep?: RunProcessSweepEvidence | null;
+}
+
+export {
+  sweepRunProcesses,
+  formatRunProcessSweepLogLine,
+  type RunProcessSweepEvidence,
+  type RunProcessSweepOptions,
+};
+
+// The resultJson fragment that records an end-of-run sweep that stopped
+// something; empty when nothing was stopped, so ordinary runs stay unchanged.
+export function leftoverProcessSweepResultJson(
+  proc: Pick<RunProcessResult, "leftoverProcessSweep">,
+): { leftoverProcessSweep?: RunProcessSweepEvidence } {
+  const sweep = proc.leftoverProcessSweep;
+  return sweep && sweep.stopped > 0 ? { leftoverProcessSweep: sweep } : {};
+}
+
+type LeftoverProcessSweepSource = Pick<RunProcessResult, "leftoverProcessSweep"> | null | undefined;
+
+// One evidence record for every attempt of a run (initial attempt plus a
+// retry), so a retry does not hide what the first attempt left behind.
+export function mergeLeftoverProcessSweeps(
+  procs: readonly LeftoverProcessSweepSource[],
+): RunProcessSweepEvidence | null {
+  const sweeps = procs
+    .map((proc) => proc?.leftoverProcessSweep)
+    .filter((sweep): sweep is RunProcessSweepEvidence => Boolean(sweep && sweep.stopped > 0));
+  if (sweeps.length === 0) return null;
+  if (sweeps.length === 1) return sweeps[0]!;
+  return {
+    kind: "leftover_process_sweep",
+    stopped: sweeps.reduce((sum, sweep) => sum + sweep.stopped, 0),
+    forceKilled: sweeps.reduce((sum, sweep) => sum + sweep.forceKilled, 0),
+    processes: sweeps.flatMap((sweep) => sweep.processes),
+  };
+}
+
+// Put the sweep evidence of the given attempts on an adapter result's
+// resultJson. Every adapter result path goes through this, so the server
+// records the stopped processes for every adapter that uses runChildProcess.
+export function withLeftoverProcessSweep<T extends object>(
+  result: T,
+  procs: readonly LeftoverProcessSweepSource[],
+): T {
+  const sweep = mergeLeftoverProcessSweeps(procs);
+  if (!sweep) return result;
+  const resultJson = (result as { resultJson?: Record<string, unknown> | null }).resultJson;
+  return { ...result, resultJson: { ...(resultJson ?? {}), leftoverProcessSweep: sweep } };
 }
 
 export interface TerminalResultCleanupOptions {
@@ -184,7 +245,8 @@ export function isPaperclipRuntimeEnvKey(key: string): boolean {
 // Other PAPERCLIP_*-named config keys are allowed as long as Paperclip has
 // not assigned the same key for the run (runtime vars always win).
 export function isForbiddenConfigEnvKey(key: string): boolean {
-  return key === "PAPERCLIP_API_KEY" || key === "PAPERCLIP_WAKE_PAYLOAD_JSON";
+  return key === "PAPERCLIP_API_KEY" || key === "PAPERCLIP_WAKE_PAYLOAD_JSON" ||
+    AGENT_IDENTITY_ENV_KEYS.includes(key.toUpperCase());
 }
 const PAPERCLIP_SKILL_ROOT_RELATIVE_CANDIDATES = [
   "../../skills",
@@ -790,7 +852,7 @@ type PaperclipWakeRecovery = {
 };
 
 export type PaperclipExternalChatProvider =
-  "slack" | "github" | "discord" | "microsoft-teams" | "telegram" | "imessage-photon";
+  "slack" | "github" | "discord" | "microsoft-teams" | "telegram" | "imessage-photon" | "speko";
 
 type PaperclipWakePayload = {
   executionContinuation: ExecutionContinuationEnvelope | null;
@@ -1659,6 +1721,7 @@ const PAPERCLIP_EXTERNAL_CHAT_PROVIDERS =
     "discord",
     "microsoft-teams",
     "telegram",
+    "speko",
     "imessage-photon",
   ]);
 
@@ -2398,13 +2461,18 @@ function renderPaperclipWakePromptBody(
         ...(externalChatReaderTurn
           ? [
               "The inline comment batch is incomplete. Before answering, call `read_current_wake_comments` without a cursor, then pass each returned `nextCursor` until `complete` is true. That closed reader exposes only the exact comments accepted for this run. Attachment entries marked `metadata_only` are not readable bytes; state that limitation instead of inferring their contents.",
-              "After the complete read, answer every accepted comment in order. Make zero other Paperclip API calls: do not fetch broader task history, inbox, status, artifacts, workspace, or provider connections; do not post progress or completion comments; do not write task status; and do not check out the issue again.",
+              "After the complete read, answer every accepted comment in order. For a text answer that does not require structured human input, use the supplied context. Make zero other Paperclip API calls: do not fetch broader task history, inbox, status, artifacts, workspace, or provider connections; do not post progress or completion comments; do not write task status; and do not check out the issue again.",
             ]
           : [
-              "For a self-contained text request, answer directly from the supplied task and wake context. Make zero Paperclip API calls: do not refetch the issue, inbox, status, artifacts, workspace, or provider connections; do not post progress or completion comments; do not write task status; and do not check out the issue again.",
+              "For a self-contained text answer that does not require structured human input, answer directly from the supplied task and wake context. Make zero Paperclip API calls: do not refetch the issue, inbox, status, artifacts, workspace, or provider connections; do not post progress or completion comments; do not write task status; and do not check out the issue again.",
             ]),
         "The harness owns task state and persists your final assistant response. If the runtime offers a semantic completion operation, emit exactly one semantic completion and do not duplicate that response in a Paperclip comment or status update.",
         "The semantic completion summary is the user-visible final answer. Include every requested answer, exact value, description, and any actionable file-access or delivery limitation there; a statement that you read, checked, or prepared something is not a substitute. Private progress commentary is not delivered as the final answer.",
+        ...(normalized.externalChatProvider === "github"
+          ? [
+              "GitHub publication uses the task-scoped bot tools when they are available. Paperclip creates one working comment for this request. You may and should periodically edit that same comment with update_comment during longer work, reporting brief, factual progress or blockers before the final result. Use a distinct stable idempotency key for each update and reuse it for retries. Publish the final answer with comment, or a requested review with begin_review and submit_review; these replace the same working comment. This is the provider reply, not a Paperclip progress or completion comment. Your semantic completion remains internal to Paperclip and does not post another GitHub reply. Never substitute personal credentials or choose another comment, connection, or repository.",
+            ]
+          : []),
         "In a normal successful answer, omit routine file-preparation, unconfirmed-delivery, and waiting-for-next-message status; end after the requested content or a neutral file label. Report a genuine failure or required user action plainly, without claiming a delivery that has not been confirmed.",
         ...(externalChatQuestionResponseTurn
           ? [
@@ -3209,10 +3277,22 @@ export function buildInvocationEnvForLogs(
   return redactEnvForLogs(merged);
 }
 
+export const AGENT_IDENTITY_ENV_KEYS = [
+  "PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY",
+];
+
+export function buildAgentIdentityEnv(identity?: AgentRuntimeIdentity): Record<string, string> {
+  return identity ? {
+    PAPERCLIP_AGENT_KEY_ID: identity.keyId,
+    PAPERCLIP_AGENT_PUBLIC_KEY: identity.publicKeyPem,
+    PAPERCLIP_AGENT_PRIVATE_KEY: identity.privateKeyPem,
+  } : {};
+}
+
 export function buildPaperclipEnv(agent: {
   id: string;
   companyId: string;
-}): Record<string, string> {
+}, identity?: AgentRuntimeIdentity): Record<string, string> {
   const resolveHostForUrl = (rawHost: string): string => {
     const host = rawHost.trim();
     if (!host || host === "0.0.0.0" || host === "::") return "localhost";
@@ -3223,6 +3303,7 @@ export function buildPaperclipEnv(agent: {
   const vars: Record<string, string> = {
     PAPERCLIP_AGENT_ID: agent.id,
     PAPERCLIP_COMPANY_ID: agent.companyId,
+    ...buildAgentIdentityEnv(identity),
   };
   const runtimeHost = resolveHostForUrl(
     process.env.PAPERCLIP_LISTEN_HOST ?? process.env.HOST ?? "localhost",
@@ -3505,12 +3586,26 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
   return shapedWorkspaceEnv;
 }
 
+const INHERITED_SYSTEMD_ENV_KEYS = [
+  "NOTIFY_SOCKET",
+  "WATCHDOG_USEC",
+  "WATCHDOG_PID",
+  "LISTEN_FDS",
+  "LISTEN_PID",
+  "LISTEN_FDNAMES",
+] as const;
+
 export function sanitizeInheritedPaperclipEnv(
   baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.PAPERCLIPAI_CMD;
+  for (const key of INHERITED_SYSTEMD_ENV_KEYS) delete env[key];
   for (const key of Object.keys(env)) {
+    if (AGENT_IDENTITY_ENV_KEYS.includes(key.toUpperCase())) {
+      delete env[key];
+      continue;
+    }
     if (!key.startsWith("PAPERCLIP_")) continue;
     if (key === "PAPERCLIP_RUNTIME_API_URL") continue;
     if (key === "PAPERCLIP_LISTEN_HOST") continue;
@@ -4226,6 +4321,11 @@ export function resolvePaperclipDesiredSkillNames(
 export const PAPERCLIP_OPERATIONAL_SKILL_KEY =
   "paperclipai/paperclip/paperclip";
 
+export const PAPERCLIP_FEEDBACK_SKILL_KEYS = [
+  "paperclipai/paperclip/complain",
+  "paperclipai/paperclip/suggestion-box",
+] as const;
+
 /**
  * Native Paperclip Runner sessions receive the control-plane contract through
  * PRP, so carrying the legacy operational skill into their stored preference
@@ -4255,6 +4355,9 @@ export function normalizePaperclipRunnerAdapterConfig(
 ): Record<string, unknown> {
   if (adapterType !== "paperclip_runner") return config;
   config = normalizeLegacyRunnerProvider(config);
+  if (config.provider === "openai_dot") {
+    return normalizePaperclipOperationalSkillPreference(adapterType, { lifecycleMode: "per_turn", ...config });
+  }
   const next: Record<string, unknown> = {
     provider: "codex",
     codexPermissionMode:
@@ -4286,12 +4389,11 @@ export function resolveLegacyPaperclipDesiredSkillNames(
   );
   if (!operationalEntry) return desiredSkills;
 
-  return [
-    operationalEntry.key,
-    ...desiredSkills.filter(
-      (key) => key.trim().toLowerCase() !== PAPERCLIP_OPERATIONAL_SKILL_KEY,
-    ),
-  ];
+  const feedbackEntries = PAPERCLIP_FEEDBACK_SKILL_KEYS.flatMap((key) => {
+    const entry = availableEntries.find((candidate) => candidate.key.trim().toLowerCase() === key);
+    return entry ? [entry.key] : [];
+  });
+  return Array.from(new Set([operationalEntry.key, ...feedbackEntries, ...desiredSkills]));
 }
 
 export function writePaperclipSkillSyncPreference(
@@ -4691,6 +4793,11 @@ export async function runChildProcess(
       startedAt: string;
     }) => Promise<void>;
     terminalResultCleanup?: TerminalResultCleanupOptions;
+    // Tuning for the end-of-run sweep; tests inject a fake /proc reader here.
+    leftoverProcessSweep?: Pick<
+      RunProcessSweepOptions,
+      "graceMs" | "procReader" | "kill" | "platform" | "selfPid" | "selfUid"
+    >;
     stdin?: string;
     remoteExecution?: RemoteExecutionSpec | null;
     localProcessSandbox?: LocalProcessSandboxOptions | null;
@@ -4734,6 +4841,38 @@ export async function runChildProcess(
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }
+        // Sweep only when the child carries this run's id, so leftovers can be
+        // found by it. The per-spawn invocation id narrows the sweep to this
+        // spawn's own descendants.
+        const sweepInvocationId =
+          childEnv[RUN_PROCESS_SWEEP_RUN_ID_ENV] === runId ? randomUUID() : null;
+        if (sweepInvocationId) {
+          childEnv[RUN_PROCESS_SWEEP_INVOCATION_ENV] = sweepInvocationId;
+        }
+        let leftoverSweep: Promise<RunProcessSweepEvidence | null> | null =
+          null;
+        const runLeftoverSweep = () => {
+          if (!sweepInvocationId) return Promise.resolve(null);
+          leftoverSweep ??= sweepRunProcesses(runId, {
+            ...opts.leftoverProcessSweep,
+            invocationId: sweepInvocationId,
+          })
+            .then(async (evidence) => {
+              if (evidence && evidence.stopped > 0) {
+                await opts
+                  .onLog("stderr", formatRunProcessSweepLogLine(evidence))
+                  .catch((err) =>
+                    onLogError(err, runId, "failed to log leftover process sweep"),
+                  );
+              }
+              return evidence;
+            })
+            .catch((err) => {
+              onLogError(err, runId, "failed to sweep leftover run processes");
+              return null;
+            });
+          return leftoverSweep;
+        };
         const child = spawn(target.command, target.args, {
           cwd: target.cwd ?? opts.cwd,
           env: childEnv,
@@ -4957,12 +5096,18 @@ export async function runChildProcess(
             errno === "ENOENT"
               ? `Failed to start command "${command}" in "${opts.cwd}". Verify adapter command, working directory, and PATH (${pathValue}).`
               : `Failed to start command "${command}" in "${opts.cwd}": ${err.message}`;
-          reject(new Error(msg));
+          void runLeftoverSweep().finally(() => reject(new Error(msg)));
         });
 
         child.on("exit", () => {
           if (outputHandedOff) return;
           maybeArmTerminalResultCleanup();
+          // The adapter process has ended, so whatever still carries this
+          // spawn's ids is a leftover. Sweep now rather than on "close": a
+          // leftover that inherited stdout/stderr keeps the pipes open, and
+          // "close" waits for it. Starting here keeps the whole wait within one
+          // grace time from adapter exit; "close" reuses this sweep.
+          void runLeftoverSweep();
         });
 
         child.on(
@@ -4978,7 +5123,11 @@ export async function runChildProcess(
             void logChain.finally(() => {
               void Promise.resolve()
                 .then(() => target.cleanup?.())
-                .finally(() => {
+                .catch((err) =>
+                  onLogError(err, runId, "failed to clean up spawn target"),
+                )
+                .then(() => runLeftoverSweep())
+                .then((leftoverProcessSweep) => {
                   resolve({
                     exitCode: code,
                     signal,
@@ -4998,6 +5147,7 @@ export async function runChildProcess(
                           forceKilled: terminalCleanupForceKilled,
                         }
                       : null,
+                    ...(leftoverProcessSweep ? { leftoverProcessSweep } : {}),
                   });
                 });
             });

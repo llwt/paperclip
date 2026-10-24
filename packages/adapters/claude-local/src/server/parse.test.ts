@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   claudeModelUsageTotals,
+  classifyClaudeTerminalResult,
   parseClaudeStreamJson,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
@@ -647,5 +648,60 @@ describe("parseClaudeStreamJson usage extraction", () => {
     expect(parsed.usageBasis).toBe("per_run");
     // total_cost_usd is still the session total on --resume.
     expect(parsed.costBasis).toBe("session_cumulative");
+  });
+});
+
+describe("classifyClaudeTerminalResult", () => {
+  it("treats a success subtype as succeeded", () => {
+    expect(classifyClaudeTerminalResult({ type: "result", subtype: "success", is_error: false })).toEqual({
+      verdict: "succeeded",
+    });
+  });
+
+  it.each([
+    "error_max_turns",
+    "error_during_execution",
+    "error_max_budget_usd",
+    "error_max_structured_output_retries",
+  ])("treats %s as a hard failure", (subtype) => {
+    expect(classifyClaudeTerminalResult({ type: "result", subtype })).toEqual({
+      verdict: "failed",
+      refusalOnly: false,
+    });
+  });
+
+  it("treats is_error as a hard failure even on a success subtype", () => {
+    expect(classifyClaudeTerminalResult({ type: "result", subtype: "success", is_error: true })).toEqual({
+      verdict: "failed",
+      refusalOnly: false,
+    });
+  });
+
+  it("marks a clean-exit refusal as refusal only", () => {
+    expect(
+      classifyClaudeTerminalResult({ type: "result", subtype: "success", is_error: false, stop_reason: "refusal" }),
+    ).toEqual({ verdict: "failed", refusalOnly: true });
+  });
+
+  it("does not guess at unknown or missing subtypes", () => {
+    expect(classifyClaudeTerminalResult({ type: "result", subtype: "brand_new" })).toEqual({
+      verdict: "unsupported",
+      subtype: "brand_new",
+    });
+    expect(classifyClaudeTerminalResult({ type: "result" })).toEqual({ verdict: "unsupported", subtype: "" });
+  });
+});
+
+describe("interrupted Claude accounting", () => {
+  it("retains partial usage and replaces repeated message snapshots", () => {
+    const events = [
+      { type: "assistant", message: { id: "m1", usage: { input_tokens: 10, cache_creation_input_tokens: 20, cache_read_input_tokens: 40, output_tokens: 3 } } },
+      { type: "assistant", message: { id: "m1", usage: { input_tokens: 10, cache_creation_input_tokens: 20, cache_read_input_tokens: 40, output_tokens: 7 } } },
+      { type: "assistant", message: { id: "m2", usage: { input_tokens: 5, output_tokens: 2 } } },
+    ];
+    const parsed = parseClaudeStreamJson(events.map((event) => JSON.stringify(event)).join("\n"));
+    expect(parsed.usage).toEqual({ inputTokens: 35, cachedInputTokens: 40, outputTokens: 9 });
+    expect(parsed.usageBasis).toBe("per_run");
+    expect(parsed.costUsd).toBeNull();
   });
 });

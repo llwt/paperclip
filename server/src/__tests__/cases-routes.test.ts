@@ -734,6 +734,9 @@ describeEmbeddedPostgres("cases routes", () => {
       .send({ body: "# v2", baseRevisionId: firstRevision.body.revision.id })
       .expect(200);
 
+    expect(firstRevision.body.document).toMatchObject({ key: "body", body: "# v1", latestBody: "# v1" });
+    expect(secondRevision.body.document).toMatchObject({ key: "body", body: "# v2", latestBody: "# v2" });
+
     const loaded = await http.get(`/api/cases/${created.body.id}/documents/body`).expect(200);
     expect(loaded.body.body).toBe("# v2");
     expect(loaded.body.latestRevisionNumber).toBe(2);

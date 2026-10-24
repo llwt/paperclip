@@ -1,8 +1,10 @@
+import type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
+import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { inferOpenAiCompatibleBiller, resolveManagedOpenAiBilling, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { buildCodexAuthInboundProvision } from "./codex-auth-merge-scripts.js";
 import { copyBackCodexAuth } from "./codex-auth-copyback.js";
 import {
@@ -51,6 +53,8 @@ import {
   isPaperclipRecoveryWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
+  leftoverProcessSweepResultJson,
+  withLeftoverProcessSweep,
   joinPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
@@ -64,7 +68,7 @@ import {
   type LocalProcessSandboxOptions,
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import {
-  parseCodexJsonl,
+  parseCodexJsonl, createCodexJsonlParser,
   classifyCodexAuthRefreshFailure,
   extractCodexRetryNotBefore,
   isCodexHarnessCrash,
@@ -757,7 +761,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     for (const note of preparedRuntimeConfig.notes) {
       await onLog("stdout", `[paperclip] ${note}\n`);
     }
-    const paperclipBaseEnv = buildPaperclipEnv(agent);
+    const paperclipBaseEnv = buildPaperclipEnv(agent, ctx.agentIdentity);
     const runtimeMcpGateways = (ctx.runtimeMcp?.getServers() ?? []).map((server) => ({
       name: server.name,
       endpointPath: server.url,
@@ -996,7 +1000,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
-    const billingType = resolveCodexBillingType(effectiveEnv);
+    const managedBilling = resolveManagedOpenAiBilling(config.managedAiRouting);
+    const billingType = managedBilling?.billingType ?? resolveCodexBillingType(effectiveEnv);
+    const biller = managedBilling?.biller ?? resolveCodexBiller(effectiveEnv, billingType);
     const networkScope = parseLocalProcessNetworkScope(config.networkScope);
     const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
     const localProcessSandbox: LocalProcessSandboxOptions | null =
@@ -1236,6 +1242,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         },
       );
       const args = execArgs.args;
+      const pricingContext = execArgs.fastModeApplied ? { serviceTier: "fast" } : undefined;
+      if (ctx.agentIdentity) {
+        const identityNames = ["PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY"];
+        const shellKeys = [...new Set([
+          "PATH", "HOME", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "TEMP", "TMP", "CODEX_HOME",
+          // Keep Codex's default secret-name exclusions except for the scoped
+          // Paperclip API token used by the agent skill. Never include host env.
+          ...Object.keys(env).filter(key => key === "PAPERCLIP_API_KEY" || !/key|secret|token/i.test(key)),
+          ...identityNames,
+        ])];
+        args.unshift("-c", "features.shell_snapshot=false", "-c", 'shell_environment_policy.inherit="all"', "-c", "shell_environment_policy.ignore_default_excludes=true",
+          "-c", `shell_environment_policy.include_only=${JSON.stringify(shellKeys)}`);
+      }
       const commandNotesWithFastMode =
         execArgs.fastModeIgnoredReason == null
           ? commandNotes
@@ -1254,6 +1273,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           prompt,
           promptMetrics,
           context,
+          recovery: {
+            version: 1,
+            engine: "cli",
+            sessionIdBefore: resumeSessionId,
+            sessionParams: {
+              cwd: effectiveExecutionCwd,
+              ...(executionTargetIsRemote
+                ? {
+                    remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
+                  }
+                : {}),
+              ...(workspaceId ? { workspaceId } : {}),
+              ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
+              ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
+            },
+            accounting: {
+              provider: "openai",
+              biller: resolveCodexBiller(effectiveEnv, billingType),
+              model,
+              billingType,
+            },
+          },
         });
       }
 
@@ -1326,6 +1367,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
       };
 
+      const consumeAccounting = createCodexJsonlParser();
+      const accountingLog = createUsageCheckpointLog(onLog, ctx.onUsage, stdout => {
+        const parsed = consumeAccounting(stdout);
+        // Differs from upstream (fork #31): the counters are session totals.
+        // Name the session so the server can subtract the earlier runs.
+        return { usage: parsed.usageReported ? parsed.usage : undefined, costStatus: parsed.usageComplete ? undefined : "unpriced", usageBasis: parsed.usageBasis, sessionId: parsed.sessionId ?? resumeSessionId, provider: "openai", biller, billingType, model, pricingContext, costUsd: null, complete: parsed.usageComplete };
+      });
       try {
         const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
           onProcessStopped: providerStop.beginInvocation(),
@@ -1339,7 +1387,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           onLog: async (stream, chunk) => {
             monitor?.noteOutputChunk(stream, chunk);
             if (stream === "stdout") {
-              await onLog(stream, chunk);
+              await accountingLog(stream, chunk);
               return;
             }
             const cleaned = stripCodexRolloutNoise(chunk);
@@ -1350,6 +1398,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           settleRunDisposition: paperclipBridge?.settleRunDisposition,
           localProcessSandbox,
         });
+        await accountingLog.flush();
         const cleanedStderr = stripCodexRolloutNoise(proc.stderr);
         return {
           proc: {
@@ -1358,6 +1407,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           },
           rawStderr: proc.stderr,
           parsed: parseCodexJsonl(proc.stdout),
+          pricingContext,
           monitor: monitorFired
             ? {
                 fired: true as const,
@@ -1383,9 +1433,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const toResult = (
       attempt: {
-        proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null };
+        proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null; leftoverProcessSweep?: RunProcessResult["leftoverProcessSweep"] };
         rawStderr: string;
         parsed: ReturnType<typeof parseCodexJsonl>;
+        pricingContext?: AdapterExecutionResult["pricingContext"];
         monitor?:
           | { fired: false }
           | { fired: true; terminationSignal: NodeJS.Signals | null; elapsedMsSinceLastEvent: number; timeoutMs: number };
@@ -1399,19 +1450,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           exitCode: null,
           signal: attempt.monitor.terminationSignal ?? attempt.proc.signal,
           timedOut: false,
+          usageComplete: attempt.parsed.usageComplete,
+          costStatus: attempt.parsed.usageComplete ? undefined : "unpriced",
           errorMessage,
           errorCode: "codex_output_inactivity_monitor",
           errorFamily: null,
-          usage: attempt.parsed.usage,
+          usage: attempt.parsed.usageReported ? attempt.parsed.usage : undefined,
           usageBasis: attempt.parsed.usageBasis,
           sessionId: null,
           sessionParams: null,
           sessionDisplayId: null,
           provider: "openai",
-          biller: resolveCodexBiller(effectiveEnv, billingType),
+          biller,
           model,
           billingType,
           costUsd: null,
+          pricingContext: attempt.pricingContext,
           resultJson: {
             stdout: attempt.proc.stdout,
             stderr: attempt.proc.stderr,
@@ -1421,6 +1475,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               elapsedMsSinceLastEvent: attempt.monitor.elapsedMsSinceLastEvent,
               terminationSignal: attempt.monitor.terminationSignal,
             },
+            ...leftoverProcessSweepResultJson(attempt.proc),
           },
           summary: attempt.parsed.summary,
           clearSession: clearSessionOnMissingSession,
@@ -1431,7 +1486,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           exitCode: attempt.proc.exitCode,
           signal: attempt.proc.signal,
           timedOut: true,
+          usageComplete: attempt.parsed.usageComplete,
+          costStatus: attempt.parsed.usageComplete ? undefined : "unpriced",
+          usage: attempt.parsed.usageReported ? attempt.parsed.usage : undefined,
+          // Differs from upstream (fork #31): a timed-out resume still reports
+          // session totals.
+          usageBasis: attempt.parsed.usageBasis,
+          provider: "openai",
+          biller,
+          model,
+          billingType,
+          costUsd: null,
+          pricingContext: attempt.pricingContext,
           errorMessage: `Timed out after ${timeoutSec}s`,
+          ...(attempt.proc.leftoverProcessSweep?.stopped
+            ? { resultJson: leftoverProcessSweepResultJson(attempt.proc) }
+            : {}),
           clearSession: clearSessionOnMissingSession,
         };
       }
@@ -1510,6 +1580,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: attempt.proc.exitCode,
         signal: attempt.proc.signal,
         timedOut: false,
+        usageComplete: attempt.parsed.usageComplete,
+        costStatus: attempt.parsed.usageComplete ? undefined : "unpriced",
         errorMessage:
           (attempt.proc.exitCode ?? 0) === 0
             ? null
@@ -1531,16 +1603,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             : null,
         errorFamily,
         retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
-        usage: attempt.parsed.usage,
+        usage: attempt.parsed.usageReported ? attempt.parsed.usage : undefined,
         usageBasis: attempt.parsed.usageBasis,
         sessionId: resolvedSessionId,
         sessionParams: resolvedSessionParams,
         sessionDisplayId: resolvedSessionId,
         provider: "openai",
-        biller: resolveCodexBiller(effectiveEnv, billingType),
+        biller,
         model,
         billingType,
         costUsd: null,
+        pricingContext: attempt.pricingContext,
         resultJson: {
           stdout: attempt.proc.stdout,
           stderr: attempt.proc.stderr,
@@ -1548,6 +1621,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
           ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
           ...(providerQuota && transientRetryNotBefore ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
+          ...leftoverProcessSweepResultJson(attempt.proc),
         },
         summary: attempt.parsed.summary,
         clearSession: Boolean((clearSessionOnMissingSession || forceFreshSession) && !resolvedSessionId),
@@ -1572,7 +1646,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           `[paperclip] Codex resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
         );
         const retry = await runAttempt(null);
-        const retryResult = toResult(retry, true, true);
+        const retryResult = withLeftoverProcessSweep(toResult(retry, true, true), [initial.proc, retry.proc]);
         if (retryResult.errorMessage) {
           executionError = new Error(retryResult.errorMessage);
         }
