@@ -1,10 +1,11 @@
-import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { activityLog, heartbeatRuns, issueComments, issueDocuments, issues } from "@paperclipai/db";
 import { createActivityDetailsRedactor } from "./activity-log.js";
 import { badRequest } from "../errors.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { TASK_VERSION_CHANGED_BY_AGENT_ACTION } from "./task-version-attribution.js";
 
 export interface AgentActionAuditFilters {
   companyId: string;
@@ -54,7 +55,11 @@ export function agentActionAuditService(db: Db) {
       const cursor = decodeCursor(filters.cursor);
       if (filters.cursor && !cursor) throw badRequest("Invalid audit cursor");
       const effectiveResponsibleUserId = sql<string | null>`coalesce(${activityLog.responsibleUserId}, ${heartbeatRuns.responsibleUserId})`;
-      const conditions = [eq(activityLog.companyId, filters.companyId)];
+      const conditions = [
+        eq(activityLog.companyId, filters.companyId),
+        // Fork (SX-2550): internal run attribution, not an event for people.
+        ne(activityLog.action, TASK_VERSION_CHANGED_BY_AGENT_ACTION),
+      ];
       // Preserve the historical agent-audit query unless the caller opts into
       // the unified all-actors feed explicitly.
       if (filters.actorScope !== "all") conditions.push(isNotNull(activityLog.agentId));

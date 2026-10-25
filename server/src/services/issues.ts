@@ -203,6 +203,7 @@ import {
   type ActivityPublication,
 } from "./activity-log.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
+import { TASK_VERSION_CHANGED_BY_AGENT_ACTION } from "./task-version-attribution.js";
 import { ensurePersonalPrivateProject } from "./projects.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
@@ -3137,6 +3138,7 @@ const ISSUE_LOCAL_INBOX_ACTIVITY_ACTIONS = [
   "issue.read_unmarked",
   "issue.inbox_archived",
   "issue.inbox_unarchived",
+  TASK_VERSION_CHANGED_BY_AGENT_ACTION, // Fork (SX-2550): internal run attribution.
 ] as const;
 
 function issueLatestCommentAtExpr(companyId: string) {
@@ -11549,6 +11551,38 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+        // Differs from upstream (fork, SX-2550). Every status change (database
+        // trigger) and owner change (above) raises statusVersion. When an agent
+        // changed the status or the owner, record the agent, the new version and
+        // the values before and after in this same transaction; the route writes
+        // its `issue.updated` audit only after commit. A version raised for
+        // another reason (blocker edits, reasserted Blocked) gets no entry. See
+        // task-version-attribution.ts.
+        if (actorAgentId && Number(updated.statusVersion) !== Number(receiptExisting.statusVersion)
+          && (updated.status !== receiptExisting.status
+            || updated.assigneeAgentId !== receiptExisting.assigneeAgentId
+            || updated.assigneeUserId !== receiptExisting.assigneeUserId)) {
+          // Not published: the activity lists leave it out (activity.ts).
+          await persistActivity(tx as unknown as Db, {
+            companyId: updated.companyId,
+            actorType: "agent",
+            actorId: actorAgentId,
+            agentId: actorAgentId,
+            runId: actorRunId ?? null,
+            action: TASK_VERSION_CHANGED_BY_AGENT_ACTION,
+            entityType: "issue",
+            entityId: updated.id,
+            details: {
+              statusVersion: Number(updated.statusVersion),
+              status: updated.status,
+              assigneeAgentId: updated.assigneeAgentId,
+              assigneeUserId: updated.assigneeUserId,
+              previousStatus: receiptExisting.status,
+              previousAssigneeAgentId: receiptExisting.assigneeAgentId,
+              previousAssigneeUserId: receiptExisting.assigneeUserId,
+            },
+          });
+        }
         if (issueData.description !== undefined) await attachOwnedDraftImages(tx, updated, updated.description,
           { userId: actorUserId, agentId: actorAgentId });
         if (changesPrivacy && updated.visibility === "private") {
