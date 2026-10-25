@@ -2812,7 +2812,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         const result = await retryScheduledRetryNow({
           issueId,
           actor: { actorType: "user", actorId },
+          onlyRunId: coalescedRun.id,
+          leaveParkedWhenGateRefuses: true,
         });
+        if (result.outcome === "gate_suppressed" || result.outcome === "no_scheduled_retry") {
+          logger.info(
+            { issueId, runId: coalescedRun.id, commentId: wakeCommentId, outcome: result.outcome, reason: result.message },
+            "board user's comment did not start the parked scheduled retry; leaving it scheduled",
+          );
+          return null;
+        }
         await logActivity(db, {
           companyId: agent.companyId,
           actorType: "user",

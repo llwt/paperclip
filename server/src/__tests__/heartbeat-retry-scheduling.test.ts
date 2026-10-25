@@ -1958,6 +1958,37 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       expect(activity[0]?.details).toMatchObject({ trigger: "human_comment", commentId, outcome: "promoted" });
     });
 
+    it("does not fail the comment wake when starting the retry throws", async () => {
+      const fixture = await seedParkedRetry();
+      const commentId = randomUUID();
+      const realTransaction = db.transaction.bind(db);
+      let thrown = 0;
+      // The retry-now write is the only transaction that sets scheduledRetryAt to "now".
+      const spy = vi.spyOn(db, "transaction").mockImplementation(((fn: never, config: never) => {
+        if (String(fn).includes("scheduledRetryAt: now")) {
+          thrown += 1;
+          return Promise.reject(new Error("retry-now write failed"));
+        }
+        return realTransaction(fn, config);
+      }) as never);
+      try {
+        await expect(
+          heartbeat.wakeup(fixture.agentId, commentWake(fixture, commentId, { type: "user", id: "board-user" })),
+        ).resolves.not.toThrow();
+      } finally {
+        spy.mockRestore();
+      }
+
+      expect(thrown).toBe(1);
+      const run = await readRun(fixture.retryRunId);
+      expect(run.status).toBe("scheduled_retry");
+      expect(run.scheduledRetryAt!.getTime()).toBe(fixture.dueAt.getTime());
+      expect(run.contextSnapshot).toMatchObject({ wakeCommentId: commentId });
+      expect(await db.select().from(activityLog).where(
+        eq(activityLog.action, "issue.scheduled_retry_retry_now"),
+      )).toHaveLength(0);
+    });
+
     it("leaves the retry parked at the same time when an agent comments", async () => {
       const fixture = await seedParkedRetry();
       const commentId = randomUUID();
@@ -1988,11 +2019,13 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         eq(agentWakeupRequests.status, "coalesced"),
       ));
       expect(receipts.some((row) => row.runId === fixture.retryRunId)).toBe(true);
-      const activity = await db.select().from(activityLog).where(
+      const run = await readRun(fixture.retryRunId);
+      expect(run.status).toBe("scheduled_retry");
+      expect(run.scheduledRetryAt!.getTime()).toBe(fixture.dueAt.getTime());
+      expect(run.contextSnapshot).toMatchObject({ wakeCommentId: commentId });
+      expect(await db.select().from(activityLog).where(
         eq(activityLog.action, "issue.scheduled_retry_retry_now"),
-      );
-      expect(activity).toHaveLength(1);
-      expect(activity[0]?.details).toMatchObject({ trigger: "human_comment", outcome: "gate_suppressed" });
+      )).toHaveLength(0);
     });
   });
 
