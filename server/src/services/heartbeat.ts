@@ -5316,8 +5316,9 @@ export function heartbeatService(
       }
       // Fork (SX-2509): a self hand-off recorded while this executor still
       // cleaned up is finalized as `succeeded` only now.
-      await runControl.finalizeSelfHandoffOutcome(run.id).catch(err => {
+      await runControl.finalizeSelfHandoffOutcome(run.id).catch(async err => {
         logger.warn({ err, runId: run.id }, "failed to finalize the self hand-off run outcome");
+        await runControl.announceSelfHandoffStopCancelled(run.id).catch(() => undefined);
       });
       if (
         !nativeSessionResumeScheduled &&
@@ -5535,6 +5536,9 @@ export function heartbeatService(
     // Fork (SX-2509): record `succeeded` for a run stopped by its own task change.
     recordSelfHandoffOutcome: (input: Parameters<typeof runControl.recordSelfHandoffOutcome>[0]) =>
       runControl.recordSelfHandoffOutcome(input),
+    // Fork (SX-2551): announce a self hand-off stop whose change did not complete.
+    announceSelfHandoffStopCancelled: (runId: string) =>
+      runControl.announceSelfHandoffStopCancelled(runId),
 
     /**
      * Pause-only. Emits errorCode "agent_paused" unconditionally; its sole caller is the
