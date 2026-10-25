@@ -2,6 +2,7 @@ import { verifyAppWebhook } from "./app-webhook.js";
 import crypto from "node:crypto";
 import { verifyFirefliesWebhook } from "./fireflies-webhook.js";
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
+import { TASK_VERSION_CHANGED_BY_AGENT_ACTION } from "./task-version-attribution.js";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -95,6 +96,7 @@ const ACTIVITY_GATE_IGNORED_ACTIONS = [
   "issue.inbox_archived",
   "issue.inbox_unarchived",
   "issue.inbox_touched",
+  TASK_VERSION_CHANGED_BY_AGENT_ACTION, // Fork (SX-2550): internal run attribution.
 ];
 const WEEKDAY_INDEX: Record<string, number> = {
   Sun: 0,

@@ -92,7 +92,7 @@ export function isUnexpectedRunCancellation(run: Run): boolean {
 // own task (hand-off, close or cancel) is recorded `succeeded` after the change
 // commits. `selfHandoffStop` keeps the stop it went through, so readers that
 // key on that stop treat both shapes alike.
-export type SelfHandoffKind = "reassignment" | "terminalization" | "cancelled_status";
+export type SelfHandoffKind = "reassignment" | "terminalization" | "cancelled_status" | "stale_continuation";
 export interface SelfHandoffStop {
   kind: SelfHandoffKind;
   errorCode: string;

@@ -320,6 +320,7 @@ import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
+import { staleTaskChangedByAgent } from "./task-version-attribution.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 
 import {
@@ -342,6 +343,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import {
   createHash,
+  randomUUID,
 } from "node:crypto";
 import {
   and,
@@ -5019,11 +5021,31 @@ export function heartbeatService(
         // The queued continuation became obsolete before adapter dispatch.
         // Use cancellation settlement so wakeup, issue ownership, agent state,
         // and notifications agree; do not retry work for the previous owner.
-        await cancelRunInternal(run.id, outerErr.code, {
+        // Fork (SX-2550): when this agent itself made the task change, the
+        // leftover wake ends `succeeded` (nothing left to do), not as a cancel.
+        // A change by anyone else still cancels as before.
+        // The check is bound to the task row the builder rejected
+        // (`outerErr.observed`) and fails closed if the task changed since.
+        const selfChange = await staleTaskChangedByAgent(db, {
+          companyId: run.companyId, agentId: run.agentId, observed: outerErr.observed,
+        }).catch((err: unknown) => {
+          logger.warn({ err, runId: run.id }, "failed to read who changed the stale task");
+          return false;
+        });
+        const issueMutationStopId = selfChange ? randomUUID() : null;
+        const cancelled = await cancelRunInternal(run.id, outerErr.code, {
           errorCode: outerErr.code,
+          ...(issueMutationStopId ? { resultJson: { issueMutationStopId } } : {}),
           eventMessage: "stale execution continuation cancelled before dispatch",
           suppressImmediateRecovery: true,
         });
+        if (issueMutationStopId && cancelled?.status === "cancelled") {
+          await runControl.recordSelfHandoffOutcome({
+            runId: run.id, issueMutationStopId, kind: "stale_continuation",
+          }).catch((err: unknown) => {
+            logger.warn({ err, runId: run.id }, "failed to record the self hand-off run outcome");
+          });
+        }
       } else if (isWorkspaceBusyDeferral(outerErr)) {
         // Expected contention on a shared project workspace, not a
         // failure: park the run as a bounded scheduled retry and leave the
