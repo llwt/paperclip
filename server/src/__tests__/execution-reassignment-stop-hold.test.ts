@@ -266,7 +266,11 @@ describeEmbeddedPostgres("wakes after the author's run is stopped for a stage ha
     expect(await runsFor(ids.reviewerId, "issue_commented")).toHaveLength(1);
   });
 
-  it("reassigning A to B while A runs: B gets exactly one run after A's cleanup, with no comment (SX-2418)", async () => {
+  it.each([
+    { by: "the board", actorType: "user" as const, actor: () => "board-user" },
+    // A hands the task to B in its own last step (SX-2272).
+    { by: "A itself", actorType: "agent" as const, actor: (formerOwnerId: string) => formerOwnerId },
+  ])("reassigning A to B while A runs ($by): B gets exactly one run after A's cleanup, with no comment (SX-2418)", async ({ actorType, actor }) => {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
@@ -331,8 +335,8 @@ describeEmbeddedPostgres("wakes after the author's run is stopped for a stage ha
       triggerDetail: "system",
       reason: "issue_assigned",
       payload: { issueId, mutation: "update", interruptedRunId: runId },
-      requestedByActorType: "user",
-      requestedByActorId: "board-user",
+      requestedByActorType: actorType,
+      requestedByActorId: actor(formerOwnerId),
       contextSnapshot: { issueId, source: "issue.update", interruptedRunId: runId },
     });
 
