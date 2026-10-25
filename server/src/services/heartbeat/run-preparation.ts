@@ -1796,6 +1796,16 @@ export function isExecutionStageHandoffWakeContext(
   );
 }
 
+// Differs from upstream (fork, SX-2418): a committed reassignment hands the
+// task to its new owner exactly once, like a stage decision. Promotion also
+// needs a confirmed reassignment stop of the former owner's run.
+export function isAssignmentHandoffWake(
+  source: string | null | undefined,
+  contextSnapshot: Record<string, unknown> | null | undefined,
+) {
+  return source === "assignment" && contextSnapshot?.wakeReason === "issue_assigned";
+}
+
 function normalizeInteractionContinuationWakeContext(
   contextSnapshot: Record<string, unknown>,
   payload: Record<string, unknown> | null | undefined,
