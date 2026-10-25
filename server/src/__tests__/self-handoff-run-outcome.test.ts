@@ -59,6 +59,7 @@ vi.mock("../adapters/index.ts", async () => {
 import { heartbeatService } from "../services/heartbeat.ts";
 import { agentRunWritesRevoked } from "../agent-run-cancellation.ts";
 import { isConfirmedReassignmentStop } from "../services/run-cancellation.ts";
+import { subscribeCompanyLiveEvents } from "../services/live-events.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -182,14 +183,98 @@ describeEmbeddedPostgres("a run that changes its own task ends succeeded (SX-250
       if (kind === "terminalization") {
         return heartbeat.cancelRun(runId, "Cancelled before issue terminalization", {
           errorCode: "issue_terminalized",
-          resultJson: { terminalizationStopConfirmed: true, ...(issueMutationStopId ? { issueMutationStopId } : {}) },
+          resultJson: {
+            terminalizationStopConfirmed: true,
+            ...(issueMutationStopId ? { issueMutationStopId, selfHandoffRequested: true } : {}),
+          },
           eventMessage: "run cancelled before issue terminalization",
         });
       }
       return issueMutationStopId
-        ? heartbeat.cancelRun(runId, undefined, { resultJson: { issueMutationStopId } })
+        ? heartbeat.cancelRun(runId, undefined, { resultJson: { issueMutationStopId, selfHandoffRequested: true } })
         : heartbeat.cancelRun(runId);
     }
+
+    // Fork (SX-2551): the run status events in the order the live stream
+    // carries them. ui LiveUpdatesProvider.test.ts feeds these shapes to the
+    // toast builder.
+    function captureRunStatusEvents(companyId: string) {
+      const events: Array<Record<string, unknown>> = [];
+      const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
+        if (event.type === "heartbeat.run.status") events.push(event.payload as Record<string, unknown>);
+      });
+      return { events, unsubscribe };
+    }
+    const statusSequence = (events: Array<Record<string, unknown>>) =>
+      events.map(e => ({ status: e.status, errorCode: e.errorCode, selfHandoffRequested: e.selfHandoffRequested }));
+
+    it("itself: publishes a marked stop, then succeeded (SX-2551)", async () => {
+      const ids = await seedRunningRun();
+      const capture = captureRunStatusEvents(ids.companyId);
+      const issueMutationStopId = randomUUID();
+      await stopAsRoute(ids.runId, issueMutationStopId);
+      await db.update(issues).set({ status: "cancelled", checkoutRunId: null, executionRunId: null })
+        .where(eq(issues.id, ids.issueId));
+      await heartbeat.recordSelfHandoffOutcome({ runId: ids.runId, issueMutationStopId, kind });
+      capture.unsubscribe();
+
+      const stopCode = kind === "terminalization" ? "issue_terminalized" : "cancelled";
+      expect(statusSequence(capture.events)).toEqual([
+        { status: "cancelled", errorCode: stopCode, selfHandoffRequested: true },
+        { status: "succeeded", errorCode: null, selfHandoffRequested: undefined },
+      ]);
+    });
+
+    it("by another actor: publishes an unmarked stop (SX-2551)", async () => {
+      const ids = await seedRunningRun();
+      const capture = captureRunStatusEvents(ids.companyId);
+      await stopAsRoute(ids.runId, null);
+      await heartbeat.recordSelfHandoffOutcome({ runId: ids.runId, issueMutationStopId: randomUUID(), kind });
+      capture.unsubscribe();
+
+      expect(statusSequence(capture.events)).toEqual([
+        { status: "cancelled", errorCode: kind === "terminalization" ? "issue_terminalized" : "cancelled", selfHandoffRequested: undefined },
+      ]);
+    });
+
+    it("itself, change not completed: publishes the stop again unmarked (SX-2551)", async () => {
+      const ids = await seedRunningRun();
+      const capture = captureRunStatusEvents(ids.companyId);
+      await stopAsRoute(ids.runId, randomUUID());
+      // The route's fallback when the change failed before the outcome.
+      await heartbeat.announceSelfHandoffStopCancelled(ids.runId);
+      capture.unsubscribe();
+
+      const stopCode = kind === "terminalization" ? "issue_terminalized" : "cancelled";
+      expect(statusSequence(capture.events)).toEqual([
+        { status: "cancelled", errorCode: stopCode, selfHandoffRequested: true },
+        { status: "cancelled", errorCode: stopCode, selfHandoffRequested: undefined },
+      ]);
+      expect(await heartbeat.getRun(ids.runId)).toMatchObject({ status: "cancelled", errorCode: stopCode });
+    });
+
+    it("itself, outcome refused: announces the stop as a cancellation (SX-2551)", async () => {
+      const ids = await seedRunningRun();
+      const capture = captureRunStatusEvents(ids.companyId);
+      await stopAsRoute(ids.runId, randomUUID());
+      // A stop id that does not match leaves the run cancelled.
+      expect(await heartbeat.recordSelfHandoffOutcome({ runId: ids.runId, issueMutationStopId: randomUUID(), kind }))
+        .toBeNull();
+      capture.unsubscribe();
+
+      expect(statusSequence(capture.events).map(e => e.selfHandoffRequested)).toEqual([true, undefined]);
+    });
+
+    it("itself: no announcement once the run is succeeded (SX-2551)", async () => {
+      const ids = await seedRunningRun();
+      const issueMutationStopId = randomUUID();
+      await stopAsRoute(ids.runId, issueMutationStopId);
+      await heartbeat.recordSelfHandoffOutcome({ runId: ids.runId, issueMutationStopId, kind });
+      const capture = captureRunStatusEvents(ids.companyId);
+      await heartbeat.announceSelfHandoffStopCancelled(ids.runId);
+      capture.unsubscribe();
+      expect(capture.events).toEqual([]);
+    });
 
     it("itself: is recorded succeeded after the change commits", async () => {
       const ids = await seedRunningRun();

@@ -1268,6 +1268,81 @@ describe("LiveUpdatesProvider run lifecycle toasts", () => {
     }, () => "Assistant")).toBeNull();
   });
 
+  // Fork (SX-2551): the run status events the server publishes, in order
+  // (server/src/__tests__/self-handoff-run-outcome.test.ts). A run that changes
+  // its own task: a marked stop, then `succeeded`; neither is announced. A
+  // stop by anyone else, or a self stop whose change did not complete (the
+  // server publishes the stop again unmarked), still is.
+  describe("stop of a run that changes its own task", () => {
+    const stop = {
+      runId: "self-run", agentId: "agent-1", status: "cancelled",
+      error: "Cancelled before issue reassignment", errorCode: "issue_reassigned",
+    };
+    const succeeded = { runId: "self-run", agentId: "agent-1", status: "succeeded", error: null, errorCode: null };
+    const toasts = (sequence: Array<Record<string, unknown>>) =>
+      sequence.map(payload => __liveUpdatesTestUtils.buildRunStatusToast(payload, () => "Reviewer"));
+
+    it("itself, change committed: no toast for the stop or the success", () => {
+      expect(toasts([{ ...stop, selfHandoffRequested: true }, succeeded])).toEqual([null, null]);
+    });
+
+    it("by another actor: the stop shows the cancellation toast", () => {
+      expect(toasts([stop])).toEqual([
+        expect.objectContaining({ title: "Reviewer run cancelled", tone: "info" }),
+      ]);
+    });
+
+    it("itself, change not completed: the unmarked stop shows the cancellation toast", () => {
+      expect(toasts([{ ...stop, selfHandoffRequested: true }, stop])).toEqual([
+        null,
+        expect.objectContaining({ title: "Reviewer run cancelled", tone: "info" }),
+      ]);
+    });
+
+    // The same sequences through the live event handler, with its repeat and
+    // age gate (observeRunOutcome) and a fresh gate per page load.
+    const live = (sequence: Array<Record<string, unknown>>) => {
+      const queryClient = new QueryClient();
+      queryClient.setQueryData(queryKeys.agents.list("company-1"), [{ id: "agent-1", name: "Reviewer" }]);
+      const gate = { cooldownHits: new Map(), suppressUntil: 0, observedRunOutcomes: new Set<string>() };
+      const pushed: Array<{ title: string }> = [];
+      const finishedAt = new Date().toISOString();
+      sequence.forEach((payload, index) => __liveUpdatesTestUtils.handleLiveEvent(
+        queryClient,
+        "company-1",
+        "/SX/dashboard",
+        { id: index + 1, companyId: "company-1", type: "heartbeat.run.status", createdAt: new Date().toISOString(), payload: { ...payload, finishedAt } },
+        toast => { pushed.push(toast); return String(pushed.length); },
+        gate,
+        { userId: "user-1", agentId: null },
+      ));
+      return pushed.map(toast => toast.title);
+    };
+
+    it("through the live handler: committed self stop shows nothing", () => {
+      expect(live([{ ...stop, selfHandoffRequested: true }, succeeded])).toEqual([]);
+    });
+
+    it("through the live handler: another actor's stop shows the cancellation", () => {
+      expect(live([stop])).toEqual(["Reviewer run cancelled"]);
+    });
+
+    it("through the live handler: the unmarked fallback after a marked stop is not dropped as a repeat", () => {
+      expect(live([{ ...stop, selfHandoffRequested: true }, stop])).toEqual(["Reviewer run cancelled"]);
+    });
+
+    it("through the live handler: a repeated unmarked stop still shows once", () => {
+      expect(live([stop, stop])).toEqual(["Reviewer run cancelled"]);
+    });
+
+    it("only a cancelled status is muted by the flag", () => {
+      expect(__liveUpdatesTestUtils.buildRunStatusToast(
+        { ...stop, status: "failed", errorCode: "adapter_failed", selfHandoffRequested: true },
+        () => "Reviewer",
+      )).not.toBeNull();
+    });
+  });
+
   it("still builds failure toasts for agent errors and failed runs", () => {
     const queryClient = {
       getQueryData: () => [

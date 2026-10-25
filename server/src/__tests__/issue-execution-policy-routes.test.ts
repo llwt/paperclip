@@ -1,4 +1,6 @@
 import express from "express";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
@@ -25,6 +27,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
   recordSelfHandoffOutcome: vi.fn(async () => null),
+  announceSelfHandoffStopCancelled: vi.fn(async () => undefined),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -748,7 +751,13 @@ describe("issue execution policy routes", () => {
       expect.objectContaining({
         errorCode: "issue_reassigned",
         suppressImmediateRecovery: true,
-        resultJson: { reassignmentStopConfirmed: true, issueMutationStopId: expect.any(String) },
+        // Only the author's own stop is marked, so its transient stop event
+        // announces no cancellation; another actor's stop is unchanged.
+        resultJson: {
+          reassignmentStopConfirmed: true,
+          issueMutationStopId: expect.any(String),
+          ...(who === "self" ? { selfHandoffRequested: true } : {}),
+        },
       }),
     );
     if (who === "self") {
@@ -767,6 +776,177 @@ describe("issue execution policy routes", () => {
     }
     mockHeartbeatService.getRun.mockResolvedValue(null as never);
     mockHeartbeatService.cancelRun.mockResolvedValue(null as never);
+  });
+
+  // Fork (SX-2551): the author's own stop announces no cancellation, so when
+  // the change then fails the stop is announced as an ordinary cancellation.
+  // `cancelRun` publishes the marked stop before its own later writes, so a
+  // throw from it is covered too.
+  it.each([
+    ["the task update", "update"],
+    ["the stop after it published the marked event", "cancelRun"],
+  ] as const)("announces the author's own stop as a cancellation when %s fails", async (_label, failing) => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1006",
+      title: "Execution participant",
+      executionPolicy: null,
+      executionState: null,
+      executionRunId: "55555555-5555-4555-8555-555555555555",
+    };
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          type: "review",
+          participants: [{ type: "agent", agentId: "44444444-4444-4444-8444-444444444444" }],
+        },
+      ],
+    })!;
+    const run = { id: "55555555-5555-4555-8555-555555555555", status: "running", agentId: "33333333-3333-4333-8333-333333333333" };
+    mockIssueService.getById.mockResolvedValue(issue);
+    if (failing === "update") {
+      mockIssueService.update.mockRejectedValue(new Error("update failed after the stop"));
+      mockHeartbeatService.cancelRun.mockResolvedValue({ ...run, status: "cancelled" } as never);
+    } else {
+      mockHeartbeatService.cancelRun.mockRejectedValue(new Error("lease release failed after the stop event"));
+    }
+    mockHeartbeatService.getRun.mockResolvedValue(run as never);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_review", executionPolicy: policy });
+
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    if (failing === "cancelRun") expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.recordSelfHandoffOutcome).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(mockHeartbeatService.announceSelfHandoffStopCancelled)
+      .toHaveBeenCalledWith("55555555-5555-4555-8555-555555555555"));
+    mockIssueService.update.mockReset();
+    mockHeartbeatService.getRun.mockResolvedValue(null as never);
+    mockHeartbeatService.cancelRun.mockResolvedValue(null as never);
+  });
+
+  // Fork (SX-2551): a client that disconnects while the PATCH is still
+  // running proves nothing about the change. The fallback follows the
+  // handler's own outcome: no cancellation when the change then commits, the
+  // cancellation when it then fails.
+  it.each([
+    ["commits", "commit"],
+    ["fails", "fail"],
+  ] as const)("follows the handler, not a client disconnect, when the change then %s", async (_label, outcome) => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1007",
+      title: "Execution participant",
+      executionPolicy: null,
+      executionState: null,
+      executionRunId: "55555555-5555-4555-8555-555555555555",
+    };
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          type: "review",
+          participants: [{ type: "agent", agentId: "44444444-4444-4444-8444-444444444444" }],
+        },
+      ],
+    })!;
+    const run = { id: "55555555-5555-4555-8555-555555555555", status: "running", agentId: "33333333-3333-4333-8333-333333333333" };
+    mockIssueService.getById.mockResolvedValue(issue);
+    let settled = false;
+    if (outcome === "commit") {
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+      mockHeartbeatService.recordSelfHandoffOutcome.mockImplementation(async () => {
+        settled = true;
+        return undefined as never;
+      });
+    } else {
+      mockIssueService.update.mockImplementation(async () => {
+        settled = true;
+        throw new Error("update failed after the client left");
+      });
+    }
+    mockHeartbeatService.getRun.mockResolvedValue(run as never);
+    // The stop has published its marked event and is still doing its later
+    // work when the client goes away.
+    let entered!: () => void;
+    const cancelEntered = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const cancelReleased = new Promise<void>((resolve) => { release = resolve; });
+    mockHeartbeatService.cancelRun.mockImplementation(async () => {
+      entered();
+      await cancelReleased;
+      return { ...run, status: "cancelled" } as never;
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    });
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const body = JSON.stringify({ status: "in_review", executionPolicy: policy });
+      const clientReq = http.request({
+        host: "127.0.0.1",
+        port: (server.address() as AddressInfo).port,
+        method: "PATCH",
+        path: "/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+      });
+      clientReq.on("error", () => undefined);
+      clientReq.end(body);
+      await cancelEntered;
+      clientReq.destroy();
+      // Give the server time to see the disconnect before the stop returns.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(mockHeartbeatService.announceSelfHandoffStopCancelled).not.toHaveBeenCalled();
+      release();
+      await vi.waitFor(() => expect(settled).toBe(true));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      if (outcome === "commit") {
+        expect(mockHeartbeatService.recordSelfHandoffOutcome).toHaveBeenCalledWith(
+          expect.objectContaining({ runId: "55555555-5555-4555-8555-555555555555", kind: "reassignment" }),
+        );
+        expect(mockHeartbeatService.announceSelfHandoffStopCancelled).not.toHaveBeenCalled();
+      } else {
+        expect(mockHeartbeatService.recordSelfHandoffOutcome).not.toHaveBeenCalled();
+        await vi.waitFor(() => expect(mockHeartbeatService.announceSelfHandoffStopCancelled)
+          .toHaveBeenCalledWith("55555555-5555-4555-8555-555555555555"));
+      }
+    } finally {
+      release();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      mockIssueService.update.mockReset();
+      mockHeartbeatService.recordSelfHandoffOutcome.mockReset();
+      mockHeartbeatService.recordSelfHandoffOutcome.mockResolvedValue(null as never);
+      mockHeartbeatService.getRun.mockResolvedValue(null as never);
+      mockHeartbeatService.cancelRun.mockReset();
+      mockHeartbeatService.cancelRun.mockResolvedValue(null as never);
+    }
   });
 
   it("allows an agent-authored in_review transition with a scheduled monitor", async () => {
