@@ -93,7 +93,16 @@ environment, credentials, prompts or output.
   or the process group it leads, after checking the boot id and start time.
   A group is done only when no member still runs, not when the leader exits.
   The group id is signalled only while the verified leader, or a member seen
-  earlier with the same start time, is still in the group.
+  earlier with the same start time, is still in the group. If that proof is
+  lost while members still run, signalling stops and the result is
+  `unconfirmed` (`group_ownership_lost`).
+- If the degraded root has already exited and been reaped (for example after
+  a normal exit), the group id can no longer be tied to the record. Survivors
+  that carry it are never signalled; the result is `unconfirmed`
+  (`group_ownership_unprovable`) and the record stays. A later call removes
+  the record once no process carries the group id. If the root's PID now
+  names another process, the recorded group is gone, because the kernel
+  never reuses a PID that is still a process group id.
 - It never kills by process name, by unit prefix, a whole slice, or an
   unverified PID. When it cannot confirm emptiness it keeps the record and
   returns `unconfirmed`.

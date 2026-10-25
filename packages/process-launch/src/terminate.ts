@@ -140,17 +140,37 @@ async function terminateScope(cgroup: string, options: Required<Omit<TerminateOp
   return { signalled: signalled + (killFile ? 1 : 0), empty };
 }
 
+/** Members of process group `pgid` seen in one listing. */
+interface GroupScan {
+  /** Members that still run (zombies excluded). */
+  running: number;
+  /** Whether the group id still provably names the recorded group. */
+  continuous: boolean;
+}
+
+/** Running (non-zombie) processes whose process group id is `pgid`. */
+function groupMembers(pgid: number, procRoot: string): Map<number, string> {
+  const members = new Map<number, string>();
+  for (const pid of listPids(procRoot)) {
+    const stat = readProcStat(pid, procRoot);
+    if (stat && stat.pgrp === pgid && stat.state !== "Z") members.set(pid, stat.startTime);
+  }
+  return members;
+}
+
 /**
- * The members of process group `pgid` that are provably the recorded
- * group, tracked across polls. A process group exists, and its id cannot be
- * reused, while any member remains. So the group is still ours while the
- * verified leader exists (a zombie leader still reserves its PID) or while a
- * member seen earlier is still in it with the same start time. Once neither
- * holds, the recorded group has been empty at some point, and any process
- * now carrying that group id belongs to someone else.
+ * The members of process group `pgid`, tracked across polls to prove the
+ * group id still names the recorded group. A process group exists, and its
+ * id cannot be reused, while any member remains. So the group is still ours
+ * while the verified leader exists (a zombie leader still reserves its PID)
+ * or while a member seen earlier is still in it with the same start time.
+ * Once neither holds, continuity is lost for good: the members now carrying
+ * that id may be ours (a member forked and then exited between polls) or a
+ * later group that reused the id, and neither can be proved.
  */
 class TrackedGroup {
   private readonly known = new Map<number, string>();
+  private lost = false;
 
   constructor(
     private readonly pgid: number,
@@ -158,40 +178,36 @@ class TrackedGroup {
     private readonly procRoot: string,
   ) {}
 
-  /** Refresh the members; returns how many still run, or null once the group is no longer provably ours. */
-  live(): number | null {
-    const current = new Map<number, { startTime: string; state: string }>();
-    for (const pid of listPids(this.procRoot)) {
-      const stat = readProcStat(pid, this.procRoot);
-      if (stat && stat.pgrp === this.pgid) current.set(pid, stat);
+  scan(): GroupScan {
+    const current = groupMembers(this.pgid, this.procRoot);
+    if (!this.lost) {
+      const continuous =
+        this.leaderAlive() || [...this.known].some(([pid, startTime]) => current.get(pid) === startTime);
+      if (continuous) {
+        this.known.clear();
+        for (const [pid, startTime] of current) this.known.set(pid, startTime);
+      } else {
+        this.lost = true;
+        this.known.clear();
+      }
     }
-    const continuous =
-      this.leaderAlive() ||
-      [...this.known].some(([pid, startTime]) => current.get(pid)?.startTime === startTime);
-    if (!continuous) {
-      this.known.clear();
-      return null;
-    }
-    this.known.clear();
-    let running = 0;
-    for (const [pid, stat] of current) {
-      this.known.set(pid, stat.startTime);
-      if (stat.state !== "Z") running += 1;
-    }
-    return running;
+    return { running: current.size, continuous: !this.lost };
   }
 }
+
+type DegradedPhase = Phase & { containment: "process_group" | "process" | "none"; reason?: string };
 
 /**
  * The degraded path has no scope: only the recorded root process, verified
  * by boot id and start time, and the process group it leads, if any. The
  * group is done only when none of its members still runs, not when the
- * leader alone has exited.
+ * leader alone has exited. A group whose ownership cannot be proved while
+ * members still run is never signalled and is reported as not empty.
  */
 async function terminateVerifiedProcess(
   record: ScopeRecord,
   options: Required<Omit<TerminateOptions, "instanceId">>,
-): Promise<Phase & { containment: "process_group" | "process" | "none" }> {
+): Promise<DegradedPhase> {
   const pid = record.manifest.pid ?? record.status?.pid ?? null;
   const startTime = record.manifest.pidStartTime ?? record.status?.pidStartTime ?? null;
   const bootId = record.manifest.bootId ?? record.status?.bootId ?? null;
@@ -204,14 +220,24 @@ async function terminateVerifiedProcess(
     return stat !== null && stat.startTime === startTime ? stat : null;
   };
   const initial = verified();
-  // Not running, or the PID now belongs to another process: never signal it.
-  if (!initial || initial.state === "Z") return { signalled: 0, empty: true, containment: "none" };
-  const leaderGone = () => {
-    const stat = verified();
-    return stat === null || stat.state === "Z";
-  };
+
+  if (!initial) {
+    // The PID now names another process: the kernel never reuses a PID while
+    // it is still a process group id, so the recorded group is gone.
+    if (readProcStat(pid, options.procRoot) !== null) return { signalled: 0, empty: true, containment: "none" };
+    // The root was reaped. Survivors that carry its group id may be ours
+    // (for example after a normal exit) or a later group that reused the id;
+    // this cannot be proved, so they are never signalled and the record stays.
+    if (groupMembers(pid, options.procRoot).size === 0) return { signalled: 0, empty: true, containment: "none" };
+    return { signalled: 0, empty: false, containment: "process_group", reason: "group_ownership_unprovable" };
+  }
 
   if (initial.pgrp !== pid) {
+    if (initial.state === "Z") return { signalled: 0, empty: true, containment: "none" };
+    const leaderGone = () => {
+      const stat = verified();
+      return stat === null || stat.state === "Z";
+    };
     const signalRoot = (signal: NodeJS.Signals) => (leaderGone() ? 0 : sendSignal(pid, signal) ? 1 : 0);
     let signalled = signalRoot(options.signal);
     if (await waitFor(leaderGone, options.graceMs, options.pollMs)) return { signalled, empty: true, containment: "process" };
@@ -220,20 +246,31 @@ async function terminateVerifiedProcess(
     return { signalled, empty, containment: "process" };
   }
 
+  // The verified leader (running or a zombie) still reserves the group id.
   const group = new TrackedGroup(pid, () => verified() !== null, options.procRoot);
-  // Learn the members while the leader is verified, before any signal.
-  if (!group.live()) return { signalled: 0, empty: true, containment: "none" };
-  const groupDone = () => !group.live();
+  let last = group.scan();
+  // Done when nothing runs, or when ownership can no longer be proved.
+  const settled = () => {
+    last = group.scan();
+    return last.running === 0 || !last.continuous;
+  };
+  const result = (signalled: number): DegradedPhase =>
+    last.running === 0
+      ? { signalled, empty: true, containment: "process_group" }
+      : last.continuous
+        ? { signalled, empty: false, containment: "process_group" }
+        : { signalled, empty: false, containment: "process_group", reason: "group_ownership_lost" };
   const signalGroup = (signal: NodeJS.Signals) => {
     // Re-check right before each signal that the group id is still ours.
-    if (groupDone()) return 0;
+    if (settled()) return 0;
     return sendSignal(-pid, signal) ? 1 : 0;
   };
+  if (last.running === 0) return result(0);
   let signalled = signalGroup(options.signal);
-  if (await waitFor(groupDone, options.graceMs, options.pollMs)) return { signalled, empty: true, containment: "process_group" };
+  if (await waitFor(settled, options.graceMs, options.pollMs)) return result(signalled);
   signalled += signalGroup("SIGKILL");
-  const empty = await waitFor(groupDone, options.killWaitMs, options.pollMs);
-  return { signalled, empty, containment: "process_group" };
+  await waitFor(settled, options.killWaitMs, options.pollMs);
+  return result(signalled);
 }
 
 function recordBelongsTo(record: ScopeRecord, instanceId: string): boolean {
@@ -256,8 +293,10 @@ function recordBelongsTo(record: ScopeRecord, instanceId: string): boolean {
  * scope, SIGKILL the scope after the grace period, and wait until it is
  * empty. Without one (degraded launch): signal only the recorded root
  * process (or the group it leads) after checking its boot id and start
- * time. It never kills by process name, by unit prefix, a whole slice, or a
- * PID it cannot verify. When emptiness cannot be confirmed the record stays.
+ * time. A group whose ownership cannot be proved (its leader was already
+ * reaped, or continuity was lost) is never signalled while members run. It
+ * never kills by process name, by unit prefix, a whole slice, or a PID it
+ * cannot verify. When emptiness cannot be confirmed the record stays.
  */
 export async function terminateOwnedProcessTree(
   ref: ScopeRecordRef,
@@ -295,7 +334,9 @@ export async function terminateOwnedProcessTree(
     const phase = await terminateVerifiedProcess(record, settings);
     signalled += phase.signalled;
     if (containment === "none") containment = phase.containment;
-    if (!phase.empty) return { outcome: "unconfirmed", containment, signalled, reason: "process_still_running" };
+    if (!phase.empty) {
+      return { outcome: "unconfirmed", containment, signalled, reason: phase.reason ?? "process_still_running" };
+    }
   }
 
   removeScopeRecord(ref);

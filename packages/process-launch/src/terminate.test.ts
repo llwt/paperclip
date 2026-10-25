@@ -128,6 +128,74 @@ describe("terminate without a scope (degraded launch)", () => {
     expect(readScopeRecord(record(handle))).toBeNull();
   });
 
+  it("keeps the record and signals nothing when a group member outlives a leader that already exited", async () => {
+    const policy = degradedPolicy();
+    const pidFile = path.join(temp.make(), "member.pid");
+    // The leader exits 0 at once; the member stays in its process group.
+    const { child, launch: handle } = launch(policy, `(exec sleep 300) & echo $! > ${pidFile}`);
+    const member = await readPid(pidFile);
+    strays.push(member);
+    await exited(child);
+    expect(child.exitCode).toBe(0);
+    expect(readProcStat(member)?.pgrp).toBe(child.pid);
+
+    const result = await terminateOwnedProcessTree(record(handle), {
+      instanceId: policy.instanceId,
+      graceMs: 100,
+      killWaitMs: 500,
+    });
+    expect(result).toEqual({
+      outcome: "unconfirmed",
+      containment: "process_group",
+      signalled: 0,
+      reason: "group_ownership_unprovable",
+    });
+    expect(isAlive(member)).toBe(true);
+    expect(readScopeRecord(record(handle))).not.toBeNull();
+
+    // Once the group is empty, a repeat confirms it and removes the record.
+    process.kill(member, "SIGKILL");
+    expect(await waitUntil(() => readProcStat(member) === null || readProcStat(member)?.state === "Z")).toBe(true);
+    expect(await terminateOwnedProcessTree(record(handle), { instanceId: policy.instanceId })).toMatchObject({
+      outcome: "already_empty",
+      signalled: 0,
+    });
+    expect(readScopeRecord(record(handle))).toBeNull();
+  });
+
+  it("stops signalling and keeps the record when group continuity is lost while members still run", async () => {
+    const policy = degradedPolicy();
+    const dir = temp.make();
+    const ready = path.join(dir, "ready");
+    const lateFile = path.join(dir, "late.pid");
+    // Between two polls the leader dies on TERM and the only known member
+    // starts a new member and exits, so no process seen before remains.
+    const { child, launch: handle } = launch(
+      policy,
+      `(trap "" TERM; echo ok > ${ready}; sleep 0.4; (exec sleep 300) & echo $! > ${lateFile}) & wait`,
+    );
+    expect(await waitUntil(() => existsSync(ready))).toBe(true);
+    const result = await terminateOwnedProcessTree(record(handle), {
+      instanceId: policy.instanceId,
+      pollMs: 1_000,
+      graceMs: 1_500,
+      killWaitMs: 1_000,
+    });
+    const late = await readPid(lateFile);
+    strays.push(late);
+    await exited(child);
+    expect(child.signalCode).toBe("SIGTERM");
+    expect(result).toEqual({
+      outcome: "unconfirmed",
+      containment: "process_group",
+      signalled: 1,
+      reason: "group_ownership_lost",
+    });
+    expect(readProcStat(late)?.pgrp).toBe(child.pid);
+    expect(isAlive(late)).toBe(true);
+    expect(readScopeRecord(record(handle))).not.toBeNull();
+  });
+
   it("never signals a PID whose start time does not match the record", async () => {
     const policy = degradedPolicy();
     const { child, launch: handle } = launch(policy, "sleep 300");
