@@ -1634,6 +1634,10 @@ function observeRunOutcome(gate: ToastGate, event: LiveEvent): boolean {
   const runId = readString(payload.runId);
   const status = readString(payload.status);
   if (!runId || !status || !TERMINAL_RUN_STATUSES.has(status)) return false;
+  // Fork (SX-2551): the marked stop of a self hand-off announces nothing; do
+  // not remember it, or the unmarked fallback stop for a failed change (same
+  // run and status) would be dropped as a repeat.
+  if (status === "cancelled" && payload.selfHandoffRequested === true) return false;
   const key = `${event.companyId}:${runId}:${status}`;
   const observed = gate.observedRunOutcomes.has(key);
   // Refresh insertion order so repeated deliveries stay remembered even in a
@@ -1865,6 +1869,7 @@ function closeSocketQuietly(
 
 export const __liveUpdatesTestUtils = {
   buildActivityToast,
+  handleLiveEvent,
   applyRunLifecycleToCompanyLiveRuns,
   buildAgentStatusToast,
   buildRunStatusToast,

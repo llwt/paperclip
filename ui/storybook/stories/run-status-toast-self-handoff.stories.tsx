@@ -1,14 +1,16 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
+import { QueryClient } from "@tanstack/react-query";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, waitFor, within } from "storybook/test";
 import { __liveUpdatesTestUtils } from "@/context/LiveUpdatesProvider";
 import { useToastActions } from "@/context/ToastContext";
 import { ToastViewport } from "@/components/ToastViewport";
 import { Button } from "@/components/ui/button";
+import { queryKeys } from "@/lib/queryKeys";
 
 // Fork (SX-2551): replays the `heartbeat.run.status` events the server
-// publishes for a stop, in order, through the real toast builder. Synthetic
-// data only.
+// publishes for a stop, in order, through the real live event handler (its
+// repeat gate and the toast builder). Synthetic data only.
 
 type Scenario = "self" | "other" | "failed";
 
@@ -48,12 +50,27 @@ function RunStatusToastSequence({ scenario }: { scenario: Scenario }) {
   const { title, events } = sequences[scenario];
   const [sent, setSent] = useState<Array<{ label: string; toast: boolean }>>([]);
   const next = events[sent.length];
+  const queryClient = useRef<QueryClient | null>(null);
+  if (!queryClient.current) {
+    queryClient.current = new QueryClient();
+    queryClient.current.setQueryData(queryKeys.agents.list("company-1"), [{ id: stop.agentId, name: "Sr. Engineer Reviewer" }]);
+  }
+  const gate = useRef({ cooldownHits: new Map<string, number[]>(), suppressUntil: 0, observedRunOutcomes: new Set<string>() });
 
   function publishNext() {
     if (!next) return;
-    const toast = __liveUpdatesTestUtils.buildRunStatusToast(next.payload, () => "Sr. Engineer Reviewer");
-    if (toast) pushToast(toast);
-    setSent([...sent, { label: next.label, toast: Boolean(toast) }]);
+    let toast = false;
+    const now = new Date().toISOString();
+    __liveUpdatesTestUtils.handleLiveEvent(
+      queryClient.current!,
+      "company-1",
+      "/SX/dashboard",
+      { id: sent.length + 1, companyId: "company-1", type: "heartbeat.run.status", createdAt: now, payload: { ...next.payload, finishedAt: now } },
+      input => { toast = true; return pushToast(input); },
+      gate.current,
+      { userId: "user-1", agentId: null },
+    );
+    setSent([...sent, { label: next.label, toast }]);
   }
 
   return (

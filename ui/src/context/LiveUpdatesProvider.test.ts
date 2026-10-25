@@ -1299,6 +1299,42 @@ describe("LiveUpdatesProvider run lifecycle toasts", () => {
       ]);
     });
 
+    // The same sequences through the live event handler, with its repeat and
+    // age gate (observeRunOutcome) and a fresh gate per page load.
+    const live = (sequence: Array<Record<string, unknown>>) => {
+      const queryClient = new QueryClient();
+      queryClient.setQueryData(queryKeys.agents.list("company-1"), [{ id: "agent-1", name: "Reviewer" }]);
+      const gate = { cooldownHits: new Map(), suppressUntil: 0, observedRunOutcomes: new Set<string>() };
+      const pushed: Array<{ title: string }> = [];
+      const finishedAt = new Date().toISOString();
+      sequence.forEach((payload, index) => __liveUpdatesTestUtils.handleLiveEvent(
+        queryClient,
+        "company-1",
+        "/SX/dashboard",
+        { id: index + 1, companyId: "company-1", type: "heartbeat.run.status", createdAt: new Date().toISOString(), payload: { ...payload, finishedAt } },
+        toast => { pushed.push(toast); return String(pushed.length); },
+        gate,
+        { userId: "user-1", agentId: null },
+      ));
+      return pushed.map(toast => toast.title);
+    };
+
+    it("through the live handler: committed self stop shows nothing", () => {
+      expect(live([{ ...stop, selfHandoffRequested: true }, succeeded])).toEqual([]);
+    });
+
+    it("through the live handler: another actor's stop shows the cancellation", () => {
+      expect(live([stop])).toEqual(["Reviewer run cancelled"]);
+    });
+
+    it("through the live handler: the unmarked fallback after a marked stop is not dropped as a repeat", () => {
+      expect(live([{ ...stop, selfHandoffRequested: true }, stop])).toEqual(["Reviewer run cancelled"]);
+    });
+
+    it("through the live handler: a repeated unmarked stop still shows once", () => {
+      expect(live([stop, stop])).toEqual(["Reviewer run cancelled"]);
+    });
+
     it("only a cancelled status is muted by the flag", () => {
       expect(__liveUpdatesTestUtils.buildRunStatusToast(
         { ...stop, status: "failed", errorCode: "adapter_failed", selfHandoffRequested: true },
