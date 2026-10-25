@@ -4,8 +4,8 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { heartbeatService } from "./heartbeat.js";
-import { hasLiveLegacyController, legacyControllerBootId, legacyControllerClaim,
-  renewLegacyControllerLease, revokeExpiredLegacyController, watchLegacyControllerLease } from "./legacy-controller-lease.js";
+import { hasLiveLegacyController, LEGACY_CONTROLLER_DEADLINE_RENEW_MS, legacyControllerBootId, legacyControllerClaim,
+  LegacyControllerLeaseLostError, renewLegacyControllerLease, revokeExpiredLegacyController, watchLegacyControllerLease } from "./legacy-controller-lease.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("durable legacy controller ownership", () => {
@@ -59,16 +59,55 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(saved.executionStage).toBe("dispatching");
     expect(await revokeExpiredLegacyController(db, run)).toBe(false);
   });
-  it("an expired controller cannot renew or dispatch even before a reaper claims it", async () => {
+  it("a late renewal with the same boot id succeeds: an expired lease is not a lost lease", async () => {
     const run = await seed();
     await expire(run.id);
+    expect(await renewLegacyControllerLease(db, run, "dispatching")).toBe(true);
+    const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    expect(saved.controllerLeaseExpiresAt!.getTime()).toBeGreaterThan(Date.now());
+    expect(await revokeExpiredLegacyController(db, saved)).toBe(false);
+  });
+  it("after revocation the controller cannot renew or dispatch and the run aborts", async () => {
+    const run = await seed();
+    await expire(run.id);
+    expect(await revokeExpiredLegacyController(db, run)).toBe(true);
     expect(await renewLegacyControllerLease(db, run, "dispatching")).toBe(false);
     const controller = new AbortController();
     const watch = watchLegacyControllerLease(db, run, controller);
     try {
       await expect(watch.assertOwned("dispatching")).rejects.toThrow("lease lost");
       expect(controller.signal.aborted).toBe(true);
+      expect(controller.signal.reason).toBeInstanceOf(LegacyControllerLeaseLostError);
     } finally { watch.stop(); }
+  });
+  it("a deadline that fires late renews instead of aborting while the row is still ours", async () => {
+    const run = await seed();
+    await expire(run.id);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const controller = new AbortController();
+    const watch = watchLegacyControllerLease(db, { ...run, controllerLeaseExpiresAt: new Date(Date.now() - 1_000) }, controller);
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.waitFor(async () => {
+        const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+        expect(saved.controllerLeaseExpiresAt!.getTime()).toBeGreaterThan(Date.now());
+      });
+      await vi.advanceTimersByTimeAsync(LEGACY_CONTROLLER_DEADLINE_RENEW_MS + 1);
+      expect(controller.signal.aborted).toBe(false);
+    } finally { watch.stop(); vi.useRealTimers(); }
+  });
+  it("a deadline that fires after revocation aborts the run", async () => {
+    const run = await seed();
+    await expire(run.id);
+    expect(await revokeExpiredLegacyController(db, run)).toBe(true);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const controller = new AbortController();
+    const watch = watchLegacyControllerLease(db, { ...run, controllerLeaseExpiresAt: new Date(Date.now() - 1_000) }, controller);
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.waitFor(() => expect(controller.signal.aborted).toBe(true));
+      expect(controller.signal.reason).toBeInstanceOf(LegacyControllerLeaseLostError);
+    } finally { watch.stop(); vi.useRealTimers(); }
   });
   it("only one competing recovery revokes the observed expired owner", async () => {
     const run = await seed();
@@ -109,6 +148,8 @@ const support = await getEmbeddedPostgresTestSupport();
     try {
       const checked = expect(watch.assertOwned("dispatching")).rejects.toThrow("lease lost");
       await vi.advanceTimersByTimeAsync(101);
+      expect(controller.signal.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(LEGACY_CONTROLLER_DEADLINE_RENEW_MS);
       await checked;
       expect(controller.signal.aborted).toBe(true);
     } finally { watch.stop(); vi.useRealTimers(); }

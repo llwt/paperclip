@@ -31,4 +31,16 @@ describe("cancellation provenance", () => {
       executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
     } })).toBe(false);
   });
+  it("labels a lease-lost cancel control_plane with its own description, never unknown", () => {
+    const resultJson = cancellationResultJson({ ...run, error: "Legacy controller lease lost" }, "cancelled", {}, "legacy_controller_lease_lost");
+    expect(resultJson?.cancellation).toMatchObject({ source: "control_plane", expected: false, initiator: { type: "system" },
+      reason: "Legacy controller lease lost" });
+    expect(isUnexpectedRunCancellation({ ...run, resultJson })).toBe(true);
+    expect(canContinueCancelledRun({ ...run, resultJson })).toBe(false);
+    // An ACP provider that honoured the abort does not turn it into a provider cancel.
+    const honoured = cancellationResultJson(run, "cancelled", { status: "cancelled" }, "legacy_controller_lease_lost");
+    expect(honoured?.cancellation).toMatchObject({ source: "control_plane", initiator: { type: "system" } });
+    expect(canContinueCancelledRun({ ...run, resultJson: { ...honoured,
+      acpToolInventoryComplete: true, acpPendingToolCount: 0 } })).toBe(false);
+  });
 });

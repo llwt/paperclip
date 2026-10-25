@@ -7,6 +7,7 @@ import { CONFIGURATION_INCOMPLETE_FAILURE_CODE, ConfigurationIncompleteFailure }
 import { isWorkspaceValidationFailedRun, isWorkspaceValidationFailure, attachPaperclipSessionMetadataToSessionParams } from "./workspaces.js";
 import { preserveWorkspaceRestoreRecoveryMetadataSql } from "../legacy-workspace-restore-recovery.js";
 import { cancellationResultJson, readRunCancellation } from "../run-cancellation.js";
+import { isLegacyControllerLeaseLost, LEGACY_CONTROLLER_LEASE_LOST_CODE, legacyControllerBootId } from "../legacy-controller-lease.js";
 import { accountRunCost } from "../run-cost-accounting.js";
 import { isConversation, settleConversationTurn } from "../agent-conversations.js";
 import { legacyExecutionNeedsReconciliationWithEvidence } from "../legacy-execution-recovery.js";
@@ -367,9 +368,33 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     await processCancellation?.settled;
     let outcome: RunSessionOutcome;
     const latestRun = await getRun(run.id);
+    // A lease-lost abort on a row this controller still owns had no effect when
+    // the provider finished cleanly (a CLI adapter may ignore the signal), so
+    // the normal outcome stands. A revoked row keeps the cancel. Differs from
+    // upstream (master `50797ea03`), where any abort wins (SX-2390).
+    // A Stop saved after the lease-lost abort keeps the first abort reason on the
+    // signal, so its durable record on the row decides: the Stop stands.
+    const stopRecorded = Boolean(latestRun?.errorCode) || readRunCancellation(latestRun?.resultJson) !== null ||
+      parseObject(latestRun?.resultJson?.executionCancellation).state !== undefined;
+    const leaseLostAbort = signal.aborted && isLegacyControllerLeaseLost(signal.reason) && !stopRecorded;
+    const leaseLostWithoutEffect = leaseLostAbort &&
+      latestRun?.status === "running" &&
+      latestRun.controllerBootId === legacyControllerBootId &&
+      !adapterResult.nativeFinalization &&
+      !adapterResult.timedOut &&
+      adapterResult.resultJson?.status !== "cancelled" &&
+      (adapterResult.exitCode ?? 0) === 0 &&
+      !adapterResult.errorMessage &&
+      !adapterResult.signal &&
+      !processCancellation?.failed;
+    if (leaseLostWithoutEffect) {
+      logger.warn({ runId: run.id }, "legacy controller lease-lost abort ignored: row still owned and provider finished cleanly");
+    }
+    const leaseLostCancel = leaseLostAbort && !leaseLostWithoutEffect &&
+      !isHeartbeatRunTerminalStatus(latestRun?.status);
     if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
       outcome = latestRun.status;
-    } else if (signal.aborted) {
+    } else if (signal.aborted && !leaseLostWithoutEffect) {
       outcome = "cancelled";
     } else if (adapterResult.nativeFinalization) {
       const nativeTerminal =
@@ -449,7 +474,8 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     }
     const runErrorMessage =
       outcome === "cancelled"
-        ? redactCurrentUserText(latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled", currentUserRedactionOptions)
+        ? redactCurrentUserText(latestRun?.error ?? adapterResult.errorMessage ??
+            (leaseLostCancel ? signal.reason.message : "Cancelled"), currentUserRedactionOptions)
         : outcome === "succeeded"
           ? null
           : redactCurrentUserText(
@@ -463,7 +489,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       outcome === "timed_out"
         ? "timeout"
         : outcome === "cancelled"
-          ? (latestRun?.errorCode ?? "cancelled")
+          ? (latestRun?.errorCode ?? (leaseLostCancel ? LEGACY_CONTROLLER_LEASE_LOST_CODE : "cancelled"))
           : outcome === "failed"
             ? (adapterResult.errorCode ??
               recordedResponsibleUserDenialCode ??
