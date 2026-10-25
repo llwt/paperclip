@@ -159,7 +159,7 @@ import { retryChatControlAdmission } from "../chat-control-admission-retry.js";
 import type { HeartbeatServiceOptions } from "../heartbeat.js";
 import type { createHeartbeatRunState } from "./run-state.js";
 import type { createHeartbeatRunPreparation } from "./run-preparation.js";
-import type { HeartbeatRetryDependencies } from "./retries.js";
+import type { HeartbeatRetryDependencies, createHeartbeatRetries } from "./retries.js";
 import type { HeartbeatRecoveryDependencies, createHeartbeatRecovery } from "./recovery.js";
 import type { issueService } from "../issues.js";
 import type { issueTreeControlService } from "../issue-tree-control.js";
@@ -209,6 +209,8 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   resumeQueuedCommentInterrupt: (companyId: string, queueId: string) => Promise<unknown>;
   resumeSavedLegacyComments: (companyId: string, queueId: string) => Promise<unknown>;
   formatIssueIdentifierLink: (identifier: string | null, fallback: string) => string;
+  // Fork (SX-2526): a board user's reply starts a parked scheduled retry.
+  retryScheduledRetryNow: ReturnType<typeof createHeartbeatRetries>["retryScheduledRetryNow"];
   // Fork (SX-1386, SX-1537): saved stage hand-offs, owned by run control.
   resumeDeferredExecutionStageWakes: (companyId: string, issueId: string) => Promise<"none" | "blocked" | "attempted">;
   scheduleOwnerExitRecheck: (companyId: string, issueId: string, waitingSince?: Date) => void;
@@ -470,6 +472,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     filterZombieCoalesceTarget,
     resumeDeferredExecutionStageWakes,
     scheduleOwnerExitRecheck,
+    retryScheduledRetryNow,
   } = dependencies;
 
   function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
@@ -2788,6 +2791,55 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       }
     }
 
+    // Fork (SX-2526): never throws; a refused promotion leaves the run parked.
+    const promoteParkedRetryForHumanReply = async (
+      coalescedRun: typeof heartbeatRuns.$inferSelect,
+    ): Promise<typeof heartbeatRuns.$inferSelect | null> => {
+      const actorId = readNonEmptyString(opts.requestedByActorId);
+      if (
+        !issueId ||
+        coalescedRun.status !== "scheduled_retry" ||
+        opts.requestedByActorType !== "user" ||
+        !actorId ||
+        !wakeCommentId ||
+        (reason ?? readNonEmptyString(enrichedContextSnapshot.wakeReason)) !== "issue_commented" ||
+        enrichedContextSnapshot.interactionId ||
+        payload?.interactionId
+      ) {
+        return null;
+      }
+      try {
+        const result = await retryScheduledRetryNow({
+          issueId,
+          actor: { actorType: "user", actorId },
+        });
+        await logActivity(db, {
+          companyId: agent.companyId,
+          actorType: "user",
+          actorId,
+          action: "issue.scheduled_retry_retry_now",
+          entityType: "issue",
+          entityId: issueId,
+          agentId: result.scheduledRetry?.agentId ?? agentId,
+          runId: result.scheduledRetry?.runId ?? coalescedRun.id,
+          details: {
+            trigger: "human_comment",
+            commentId: wakeCommentId,
+            outcome: result.outcome,
+            message: result.message,
+            scheduledRetry: result.scheduledRetry,
+          },
+        });
+        return await getRun(coalescedRun.id) ?? null;
+      } catch (err) {
+        logger.warn(
+          { err, issueId, runId: coalescedRun.id, commentId: wakeCommentId },
+          "failed to start the parked scheduled retry for a board user's comment; leaving it scheduled",
+        );
+        return null;
+      }
+    };
+
     if (issueId) {
       // Mention-triggered wakes can request input from another agent, but they must
       // still respect the issue execution lock so a second agent cannot start on the
@@ -4385,8 +4437,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         return null;
       }
       if (outcome.kind === "coalesced") {
+        // Fork (SX-2526): the comment is already merged into the parked
+        // retry's context above; a board user's reply also starts it now.
+        const promotedRun = await promoteParkedRetryForHumanReply(outcome.run);
         await startNextQueuedRunForAgent(agent.id);
-        return outcome.run;
+        return promotedRun ?? outcome.run;
       }
       if (outcome.kind === "replayed") {
         if (outcome.run.status === "queued")

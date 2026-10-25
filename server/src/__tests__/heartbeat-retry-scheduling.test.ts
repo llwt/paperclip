@@ -1877,6 +1877,125 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     });
   });
 
+  describe("a reply on an issue with a parked scheduled retry", () => {
+    async function seedParkedRetry(input?: { issueStatus?: string }) {
+      const fixture = await seedMaxTurnFixture({ now: new Date(), issueStatus: input?.issueStatus });
+      const scheduled = await heartbeat.scheduleBoundedRetry(fixture.runId, {
+        now: new Date(),
+        retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
+        wakeReason: MAX_TURN_CONTINUATION_WAKE_REASON,
+        maxAttempts: 2,
+        delayMs: 24 * 60 * 60 * 1_000,
+      });
+      if (scheduled.outcome !== "scheduled") throw new Error(`retry was not scheduled: ${scheduled.outcome}`);
+      // Fill the agent's slots so a promoted run stays queued instead of executing.
+      await db.insert(heartbeatRuns).values(
+        Array.from({ length: 5 }, () => ({
+          id: randomUUID(),
+          companyId: fixture.companyId,
+          agentId: fixture.agentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: "running",
+          contextSnapshot: { wakeReason: "test_busy_slot" },
+          startedAt: new Date(),
+        })),
+      );
+      return { ...fixture, retryRunId: scheduled.run.id, dueAt: scheduled.dueAt };
+    }
+
+    function commentWake(
+      fixture: { issueId: string },
+      commentId: string,
+      actor: { type: "user" | "agent"; id: string },
+    ) {
+      return {
+        source: "automation" as const,
+        triggerDetail: "system" as const,
+        reason: "issue_commented",
+        payload: { issueId: fixture.issueId, commentId, mutation: "comment" },
+        requestedByActorType: actor.type,
+        requestedByActorId: actor.id,
+        contextSnapshot: {
+          issueId: fixture.issueId,
+          taskId: fixture.issueId,
+          commentId,
+          wakeCommentId: commentId,
+          source: "issue.comment",
+          wakeReason: "issue_commented",
+        },
+      };
+    }
+
+    const readRun = (runId: string) =>
+      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]!);
+
+    it("starts the same run now when a board user comments, with the comment in its context", async () => {
+      const fixture = await seedParkedRetry();
+      const commentId = randomUUID();
+
+      await heartbeat.wakeup(fixture.agentId, commentWake(fixture, commentId, { type: "user", id: "board-user" }));
+
+      const run = await readRun(fixture.retryRunId);
+      expect(run.status).toBe("queued");
+      expect(run.scheduledRetryAt!.getTime()).toBeLessThan(fixture.dueAt.getTime());
+      expect(run.contextSnapshot).toMatchObject({
+        wakeCommentId: commentId,
+        retryNowRequestedByActorType: "user",
+        retryNowRequestedByActorId: "board-user",
+      });
+      expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.issueId, fixture.issueId),
+        inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+      ))).toEqual([{ id: fixture.retryRunId }]);
+
+      const activity = await db.select().from(activityLog).where(and(
+        eq(activityLog.entityId, fixture.issueId),
+        eq(activityLog.action, "issue.scheduled_retry_retry_now"),
+      ));
+      expect(activity).toHaveLength(1);
+      expect(activity[0]).toMatchObject({ actorType: "user", actorId: "board-user", runId: fixture.retryRunId });
+      expect(activity[0]?.details).toMatchObject({ trigger: "human_comment", commentId, outcome: "promoted" });
+    });
+
+    it("leaves the retry parked at the same time when an agent comments", async () => {
+      const fixture = await seedParkedRetry();
+      const commentId = randomUUID();
+
+      await heartbeat.wakeup(fixture.agentId, commentWake(fixture, commentId, { type: "agent", id: fixture.agentId }));
+
+      const run = await readRun(fixture.retryRunId);
+      expect(run.status).toBe("scheduled_retry");
+      expect(run.scheduledRetryAt!.getTime()).toBe(fixture.dueAt.getTime());
+      expect(run.contextSnapshot).toMatchObject({ wakeCommentId: commentId });
+      expect(await db.select().from(activityLog).where(
+        eq(activityLog.action, "issue.scheduled_retry_retry_now"),
+      )).toHaveLength(0);
+    });
+
+    it("keeps the comment wake when promotion is refused", async () => {
+      const fixture = await seedParkedRetry();
+      // A max-turn continuation only runs while the issue is in_progress.
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, fixture.issueId));
+      const commentId = randomUUID();
+
+      await expect(
+        heartbeat.wakeup(fixture.agentId, commentWake(fixture, commentId, { type: "user", id: "board-user" })),
+      ).resolves.not.toThrow();
+
+      const receipts = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.agentId, fixture.agentId),
+        eq(agentWakeupRequests.status, "coalesced"),
+      ));
+      expect(receipts.some((row) => row.runId === fixture.retryRunId)).toBe(true);
+      const activity = await db.select().from(activityLog).where(
+        eq(activityLog.action, "issue.scheduled_retry_retry_now"),
+      );
+      expect(activity).toHaveLength(1);
+      expect(activity[0]?.details).toMatchObject({ trigger: "human_comment", outcome: "gate_suppressed" });
+    });
+  });
+
   it("exhausts bounded retries after the hard cap", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
