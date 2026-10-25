@@ -475,7 +475,7 @@ describeEmbeddedPostgres("execution stage hand-off wake when the deciding run is
   async function seedReassignment(input: {
     leaseHeld: boolean;
     withComment?: boolean;
-    stop?: "reassignment" | "operator";
+    stop?: "reassignment" | "operator" | "self_handoff";
     newOwner?: "other" | "self";
   }) {
     const companyId = randomUUID();
@@ -492,20 +492,30 @@ describeEmbeddedPostgres("execution stage hand-off wake when the deciding run is
     const stoppedRunId = randomUUID();
     const finishedAt = new Date();
     const operatorStop = input.stop === "operator";
+    // Fork (SX-2509): the former owner's own run made the change and was
+    // recorded `succeeded` after the commit.
+    const selfHandoff = input.stop === "self_handoff";
     await db.insert(heartbeatRuns).values({
       id: stoppedRunId,
       companyId,
       agentId: formerOwnerId,
-      status: "cancelled",
+      status: selfHandoff ? "succeeded" : "cancelled",
       invocationSource: "assignment",
       createdAt: new Date(finishedAt.getTime() - 60_000),
       startedAt: new Date(finishedAt.getTime() - 60_000),
       finishedAt,
-      error: operatorStop ? "Cancelled by operator" : "Cancelled before issue reassignment",
-      errorCode: operatorStop ? "cancelled" : "issue_reassigned",
+      error: selfHandoff ? null : operatorStop ? "Cancelled by operator" : "Cancelled before issue reassignment",
+      errorCode: selfHandoff ? null : operatorStop ? "cancelled" : "issue_reassigned",
       contextSnapshot: { issueId },
       resultJson: {
         ...(operatorStop ? {} : { reassignmentStopConfirmed: true }),
+        ...(selfHandoff ? {
+          selfHandoff: true,
+          selfHandoffStop: {
+            kind: "reassignment", errorCode: "issue_reassigned",
+            error: "Cancelled before issue reassignment", recordedAt: finishedAt.toISOString(),
+          },
+        } : {}),
         executionCancellation: { state: "acknowledged", acknowledgedAt: finishedAt.toISOString() },
       },
       runnerProfileJson: { adapterDispatch: { adapterType: "claude_local" } },
@@ -591,10 +601,12 @@ describeEmbeddedPostgres("execution stage hand-off wake when the deciding run is
 
   describe("assignment hand-off after a confirmed reassignment stop (SX-2418)", () => {
     it.each([
-      ["without a comment", false],
-      ["with a hand-off comment", true],
-    ] as const)("%s: the new owner's wake waits for the stopped run's cleanup, then starts exactly one run", async (_name, withComment) => {
-      const ids = await seedReassignment({ leaseHeld: true, withComment });
+      ["without a comment", false, "reassignment"],
+      ["with a hand-off comment", true, "reassignment"],
+      ["self hand-off recorded as succeeded (SX-2509), without a comment", false, "self_handoff"],
+      ["self hand-off recorded as succeeded (SX-2509), with a hand-off comment", true, "self_handoff"],
+    ] as const)("%s: the new owner's wake waits for the stopped run's cleanup, then starts exactly one run", async (_name, withComment, stop) => {
+      const ids = await seedReassignment({ leaseHeld: true, withComment, stop });
       expect(await getConversationOwnershipBlocker(db, ids.companyId, ids.issueId)).toMatchObject({
         runId: ids.stoppedRunId,
         cause: "execution_owner_active",

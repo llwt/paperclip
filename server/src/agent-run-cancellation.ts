@@ -8,7 +8,9 @@ export function agentRunWritesRevoked(run: {
   resultJson?: Record<string, unknown> | null;
 } | null | undefined): boolean {
   const cancellation = run?.resultJson?.executionCancellation;
-  return run?.status === "cancelled" || Boolean(cancellation && typeof cancellation === "object"
+  // A self hand-off (SX-2509) ends `succeeded` but was stopped like a cancel.
+  return run?.status === "cancelled" || run?.resultJson?.selfHandoff === true ||
+    Boolean(cancellation && typeof cancellation === "object"
     && "state" in cancellation && cancellation.state === "requested");
 }
 
@@ -23,7 +25,7 @@ export async function assertAgentRunWriteAllowed(tx: Db, companyId: string, acto
     .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, actor.runId),
       eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, actor.agentId)))
     .for("share");
-  const stoppedForThisMutation = run?.status === "cancelled" && actor.stopId &&
+  const stoppedForThisMutation = (run?.status === "cancelled" || run?.resultJson?.selfHandoff === true) && actor.stopId &&
     run.resultJson?.issueMutationStopId === actor.stopId;
   if (agentRunWritesRevoked(run) && !stoppedForThisMutation) {
     throw forbidden("This run was cancelled", { code: "agent_run_cancelled" });

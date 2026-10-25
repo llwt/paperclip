@@ -24,6 +24,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getRun: vi.fn(async () => null),
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
+  recordSelfHandoffOutcome: vi.fn(async () => null),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -692,7 +693,11 @@ describe("issue execution policy routes", () => {
     );
   });
 
-  it("stops the author's run for the review hand-off without queuing its own recovery", async () => {
+  // Fork (SX-2509): the twin is the same hand-off submitted by a board user.
+  it.each([
+    ["the author's own run", "self"],
+    ["a board user", "board"],
+  ] as const)("stops the author's run for the review hand-off without queuing its own recovery: %s", async (_name, who) => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",
@@ -715,7 +720,7 @@ describe("issue execution policy routes", () => {
         },
       ],
     })!;
-    const run = { id: "55555555-5555-4555-8555-555555555555", status: "running" };
+    const run = { id: "55555555-5555-4555-8555-555555555555", status: "running", agentId: "33333333-3333-4333-8333-333333333333" };
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...issue,
@@ -725,12 +730,12 @@ describe("issue execution policy routes", () => {
     mockHeartbeatService.getRun.mockResolvedValue(run as never);
     mockHeartbeatService.cancelRun.mockResolvedValue({ ...run, status: "cancelled" } as never);
 
-    const res = await request(await createApp({
+    const res = await request(await createApp(who === "self" ? {
       type: "agent",
       agentId: "33333333-3333-4333-8333-333333333333",
       companyId: "company-1",
       runId: "55555555-5555-4555-8555-555555555555",
-    }))
+    } : undefined))
       .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
       .send({ status: "in_review", executionPolicy: policy });
 
@@ -740,8 +745,26 @@ describe("issue execution policy routes", () => {
     expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
       "55555555-5555-4555-8555-555555555555",
       "Cancelled before issue reassignment",
-      expect.objectContaining({ errorCode: "issue_reassigned", suppressImmediateRecovery: true }),
+      expect.objectContaining({
+        errorCode: "issue_reassigned",
+        suppressImmediateRecovery: true,
+        resultJson: { reassignmentStopConfirmed: true, issueMutationStopId: expect.any(String) },
+      }),
     );
+    if (who === "self") {
+      // After the change commits, the author's run is recorded as a self
+      // hand-off under the same stop id.
+      const stopId = (mockHeartbeatService.cancelRun.mock.calls[0] as unknown as [string, string, {
+        resultJson: { issueMutationStopId: string };
+      }])[2].resultJson.issueMutationStopId;
+      expect(mockHeartbeatService.recordSelfHandoffOutcome).toHaveBeenCalledWith({
+        runId: "55555555-5555-4555-8555-555555555555",
+        issueMutationStopId: stopId,
+        kind: "reassignment",
+      });
+    } else {
+      expect(mockHeartbeatService.recordSelfHandoffOutcome).not.toHaveBeenCalled();
+    }
     mockHeartbeatService.getRun.mockResolvedValue(null as never);
     mockHeartbeatService.cancelRun.mockResolvedValue(null as never);
   });
