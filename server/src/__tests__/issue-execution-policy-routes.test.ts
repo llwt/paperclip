@@ -25,6 +25,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
   recordSelfHandoffOutcome: vi.fn(async () => null),
+  announceSelfHandoffStopCancelled: vi.fn(async () => undefined),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -748,7 +749,13 @@ describe("issue execution policy routes", () => {
       expect.objectContaining({
         errorCode: "issue_reassigned",
         suppressImmediateRecovery: true,
-        resultJson: { reassignmentStopConfirmed: true, issueMutationStopId: expect.any(String) },
+        // Only the author's own stop is marked, so its transient stop event
+        // announces no cancellation; another actor's stop is unchanged.
+        resultJson: {
+          reassignmentStopConfirmed: true,
+          issueMutationStopId: expect.any(String),
+          ...(who === "self" ? { selfHandoffRequested: true } : {}),
+        },
       }),
     );
     if (who === "self") {
@@ -765,6 +772,55 @@ describe("issue execution policy routes", () => {
     } else {
       expect(mockHeartbeatService.recordSelfHandoffOutcome).not.toHaveBeenCalled();
     }
+    mockHeartbeatService.getRun.mockResolvedValue(null as never);
+    mockHeartbeatService.cancelRun.mockResolvedValue(null as never);
+  });
+
+  // Fork (SX-2551): the author's own stop announces no cancellation, so when
+  // the change then fails the stop is announced as an ordinary cancellation.
+  it("announces the author's own stop as a cancellation when the hand-off change fails", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1006",
+      title: "Execution participant",
+      executionPolicy: null,
+      executionState: null,
+      executionRunId: "55555555-5555-4555-8555-555555555555",
+    };
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          type: "review",
+          participants: [{ type: "agent", agentId: "44444444-4444-4444-8444-444444444444" }],
+        },
+      ],
+    })!;
+    const run = { id: "55555555-5555-4555-8555-555555555555", status: "running", agentId: "33333333-3333-4333-8333-333333333333" };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockRejectedValue(new Error("update failed after the stop"));
+    mockHeartbeatService.getRun.mockResolvedValue(run as never);
+    mockHeartbeatService.cancelRun.mockResolvedValue({ ...run, status: "cancelled" } as never);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_review", executionPolicy: policy });
+
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(mockHeartbeatService.recordSelfHandoffOutcome).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(mockHeartbeatService.announceSelfHandoffStopCancelled)
+      .toHaveBeenCalledWith("55555555-5555-4555-8555-555555555555"));
+    mockIssueService.update.mockReset();
     mockHeartbeatService.getRun.mockResolvedValue(null as never);
     mockHeartbeatService.cancelRun.mockResolvedValue(null as never);
   });
