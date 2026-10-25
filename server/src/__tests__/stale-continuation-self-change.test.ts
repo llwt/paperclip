@@ -63,6 +63,7 @@ const realBuildExecutionContinuation = executionContinuation.buildExecutionConti
 import { heartbeatService } from "../services/heartbeat.ts";
 import { issueService } from "../services/issues.ts";
 import { activityService } from "../services/activity.ts";
+import { agentActionAuditService } from "../services/agent-action-audit.ts";
 import {
   staleTaskChangedByAgent,
   TASK_VERSION_CHANGED_BY_AGENT_ACTION,
@@ -80,7 +81,11 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 type Actor = "self" | "board";
-type Change = { status?: "done" | "cancelled"; assigneeAgentId?: string | null };
+type Change = {
+  status?: "done" | "cancelled" | "in_progress" | "in_review";
+  assigneeAgentId?: string | null;
+  blockedByIssueIds?: string[];
+};
 
 describeEmbeddedPostgres("a leftover queued wake after the task changed (SX-2550)", () => {
   let db!: ReturnType<typeof createDb>;
@@ -120,7 +125,7 @@ describeEmbeddedPostgres("a leftover queued wake after the task changed (SX-2550
     return agentId;
   }
 
-  async function seed() {
+  async function seed(initialStatus: "in_progress" | "blocked" = "in_progress") {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
@@ -142,7 +147,7 @@ describeEmbeddedPostgres("a leftover queued wake after the task changed (SX-2550
     });
     // The agent's own earlier change and checkout: its entries are the latest
     // in the audit when a later change by someone else has no audit yet.
-    await issueService(db).update(issueId, { status: "in_progress", actorAgentId: agentId });
+    await issueService(db).update(issueId, { status: initialStatus, actorAgentId: agentId });
     await audit({ companyId, agentId, issueId }, "self", "issue.checked_out", {});
     return { companyId, agentId, otherAgentId, issueId };
   }
@@ -275,8 +280,19 @@ describeEmbeddedPostgres("a leftover queued wake after the task changed (SX-2550
   });
 
   describe("attribution read (staleTaskChangedByAgent)", () => {
-    const attributed = (ids: Awaited<ReturnType<typeof seed>>) =>
-      staleTaskChangedByAgent(db, { companyId: ids.companyId, issueId: ids.issueId, agentId: ids.agentId });
+    type Ids = Awaited<ReturnType<typeof seed>>;
+    // The task row the real continuation builder rejects, as dispatch gets it.
+    async function staleDecision(ids: Ids, agentId = ids.agentId) {
+      const err = await realBuildExecutionContinuation({
+        db, companyId: ids.companyId, issueId: ids.issueId, agentId,
+        context: { issueId: ids.issueId, wakeReason: "issue_children_completed" },
+        summary: null, exposeLowTrustRaw: false,
+      }).then(() => null, (e: unknown) => e);
+      expect(err).toBeInstanceOf(executionContinuation.StaleExecutionContinuationError);
+      return (err as InstanceType<typeof executionContinuation.StaleExecutionContinuationError>).observed;
+    }
+    const attributed = async (ids: Ids, agentId = ids.agentId) =>
+      staleTaskChangedByAgent(db, { companyId: ids.companyId, agentId, observed: await staleDecision(ids, agentId) });
 
     it("is written in the change's transaction for agents only", async () => {
       const ids = await seed();
@@ -298,6 +314,13 @@ describeEmbeddedPostgres("a leftover queued wake after the task changed (SX-2550
       ].map(row => row.action);
       expect(shown).toContain("issue.checked_out");
       expect(shown).not.toContain(TASK_VERSION_CHANGED_BY_AGENT_ACTION);
+      // Nor the audit feed and its CSV export (both read this service).
+      for (const actorScope of ["agents", "all"] as const) {
+        const feed = await agentActionAuditService(db).list({ companyId: ids.companyId, actorScope, limit: 100 });
+        const actions = feed.items.map(item => item.action);
+        expect(actions).toContain("issue.checked_out");
+        expect(actions).not.toContain(TASK_VERSION_CHANGED_BY_AGENT_ACTION);
+      }
     });
 
     it("follows the change that made the current version", async () => {
@@ -311,8 +334,9 @@ describeEmbeddedPostgres("a leftover queued wake after the task changed (SX-2550
       await changeTask(ids, "board", { status: "done" }, false);
       expect(await attributed(ids)).toBe(false);
       // Another agent's change is not this agent's.
-      expect(await staleTaskChangedByAgent(db, { companyId: ids.companyId, issueId: ids.issueId, agentId: ids.otherAgentId }))
-        .toBe(false);
+      expect(await staleTaskChangedByAgent(db, {
+        companyId: ids.companyId, agentId: ids.otherAgentId, observed: await staleDecision(ids),
+      })).toBe(false);
     });
 
     it("is false when a later change kept the version but moved the owner", async () => {
@@ -323,6 +347,72 @@ describeEmbeddedPostgres("a leftover queued wake after the task changed (SX-2550
       // raising statusVersion (status unchanged).
       await db.update(issues).set({ assigneeAgentId: null, assigneeUserId: "board-user" }).where(eq(issues.id, ids.issueId));
       expect(await attributed(ids)).toBe(false);
+    });
+
+    it("is false when the agent only edited blockers after a board reassignment", async () => {
+      const ids = await seed("blocked");
+      await changeTask(ids, "board", { assigneeAgentId: ids.otherAgentId }, false);
+      // Raises statusVersion (blocker edit on a Blocked task) without changing
+      // the status or the owner: no attribution entry for this version.
+      await changeTask(ids, "self", { blockedByIssueIds: [] }, false);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, ids.issueId));
+      expect(issue).toMatchObject({ status: "blocked", assigneeAgentId: ids.otherAgentId });
+      expect(await attributed(ids)).toBe(false);
+    });
+
+    it("is false when the agent changed the status after a board reassignment", async () => {
+      const ids = await seed();
+      await changeTask(ids, "board", { assigneeAgentId: ids.otherAgentId }, false);
+      // The wake was already stale (owner moved by the board); the agent's
+      // later status change did not cause it.
+      await changeTask(ids, "self", { status: "in_review" }, false);
+      expect(await attributed(ids)).toBe(false);
+    });
+
+    it("is false when the agent reassigned a task the board had already closed", async () => {
+      const ids = await seed();
+      await changeTask(ids, "board", { status: "cancelled" }, false);
+      await changeTask(ids, "self", { assigneeAgentId: ids.otherAgentId }, false);
+      expect(await attributed(ids)).toBe(false);
+    });
+
+    it("is bound to the version the builder rejected, not a later one", async () => {
+      const ids = await seed();
+      await changeTask(ids, "board", { status: "cancelled" }, false);
+      const observed = await staleDecision(ids);
+      // Between the stale decision and the attribution read, the agent reopens
+      // the task: its entry is for a newer version, so the old decision stays
+      // a board cancel.
+      await changeTask(ids, "self", { status: "in_progress" }, false);
+      expect(await staleTaskChangedByAgent(db, { companyId: ids.companyId, agentId: ids.agentId, observed }))
+        .toBe(false);
+      // The reverse: the agent's close was the decision, then a board change.
+      await changeTask(ids, "self", { status: "done" }, false);
+      const ownClose = await staleDecision(ids);
+      expect(await staleTaskChangedByAgent(db, { companyId: ids.companyId, agentId: ids.agentId, observed: ownClose }))
+        .toBe(true);
+      await changeTask(ids, "board", { assigneeAgentId: ids.otherAgentId }, false);
+      expect(await staleTaskChangedByAgent(db, { companyId: ids.companyId, agentId: ids.agentId, observed: ownClose }))
+        .toBe(false);
+      expect(await staleTaskChangedByAgent(db, { companyId: ids.companyId, agentId: ids.agentId, observed: null }))
+        .toBe(false);
+    });
+  });
+
+  describe("blocker edit after a board reassignment, full dispatch", () => {
+    it("cancels with today's code", async () => {
+      const ids = await seed("blocked");
+      const wake = await queueWake(ids);
+      const build = vi.spyOn(executionContinuation, "buildExecutionContinuation")
+        .mockImplementationOnce(async (input) => {
+          await changeTask(ids, "board", { assigneeAgentId: ids.otherAgentId }, false);
+          await changeTask(ids, "self", { blockedByIssueIds: [] }, false);
+          return realBuildExecutionContinuation(input);
+        });
+      await heartbeat.resumeQueuedRuns();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      expect(build).toHaveBeenCalled();
+      await expectCancelledAsToday({ ...wake, run: await heartbeat.getRun(wake.runId) });
     });
   });
 });

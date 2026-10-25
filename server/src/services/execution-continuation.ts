@@ -17,8 +17,20 @@ import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js
 import { childReviewOutcomes } from "./native-runtime/child-review-outcomes.js";
 import { isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 
+// Fork (SX-2550): `observed` is the task row this decision read (null when the
+// task is gone), so a later caller can tell whether the task changed since.
+export interface StaleContinuationObservedTask {
+  issueId: string;
+  statusVersion: number;
+  status: string;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
+}
 export class StaleExecutionContinuationError extends Error {
-  constructor(readonly code: "continuation_task_ownership_changed") {
+  constructor(
+    readonly code: "continuation_task_ownership_changed",
+    readonly observed: StaleContinuationObservedTask | null = null,
+  ) {
     super(code);
     this.name = "StaleExecutionContinuationError";
   }
@@ -167,7 +179,10 @@ export async function buildExecutionContinuation(input: {
       reason: string(input.context.wakeReason), contextSnapshot: input.context,
     }))
   )
-    throw new StaleExecutionContinuationError("continuation_task_ownership_changed");
+    throw new StaleExecutionContinuationError("continuation_task_ownership_changed", issue ? {
+      issueId: issue.id, statusVersion: Number(issue.statusVersion), status: issue.status,
+      assigneeAgentId: issue.assigneeAgentId, assigneeUserId: issue.assigneeUserId,
+    } : null);
   const rows = await db
     .select()
     .from(issueComments)

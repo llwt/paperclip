@@ -289,7 +289,9 @@ export function activityService(db: Db) {
           latestAt: sql<Date | null>`max(${activityLog.createdAt})`,
         })
         .from(activityLog)
-        .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, run.id)));
+        // Fork (SX-2550): internal run attribution is not run activity.
+        .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, run.id),
+          ne(activityLog.action, TASK_VERSION_CHANGED_BY_AGENT_ACTION)));
 
       const [eventStats] = await db
         .select({

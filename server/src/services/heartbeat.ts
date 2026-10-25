@@ -4998,14 +4998,14 @@ export function heartbeatService(
         // Fork (SX-2550): when this agent itself made the task change, the
         // leftover wake ends `succeeded` (nothing left to do), not as a cancel.
         // A change by anyone else still cancels as before.
-        const staleIssueId = readNonEmptyString(run.contextSnapshot?.issueId);
-        const selfChange = staleIssueId
-          ? await staleTaskChangedByAgent(db, { companyId: run.companyId, issueId: staleIssueId, agentId: run.agentId })
-              .catch((err: unknown) => {
-                logger.warn({ err, runId: run.id }, "failed to read who changed the stale task");
-                return false;
-              })
-          : false;
+        // The check is bound to the task row the builder rejected
+        // (`outerErr.observed`) and fails closed if the task changed since.
+        const selfChange = await staleTaskChangedByAgent(db, {
+          companyId: run.companyId, agentId: run.agentId, observed: outerErr.observed,
+        }).catch((err: unknown) => {
+          logger.warn({ err, runId: run.id }, "failed to read who changed the stale task");
+          return false;
+        });
         const issueMutationStopId = selfChange ? randomUUID() : null;
         const cancelled = await cancelRunInternal(run.id, outerErr.code, {
           errorCode: outerErr.code,

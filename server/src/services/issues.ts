@@ -3138,6 +3138,7 @@ const ISSUE_LOCAL_INBOX_ACTIVITY_ACTIONS = [
   "issue.read_unmarked",
   "issue.inbox_archived",
   "issue.inbox_unarchived",
+  TASK_VERSION_CHANGED_BY_AGENT_ACTION, // Fork (SX-2550): internal run attribution.
 ] as const;
 
 function issueLatestCommentAtExpr(companyId: string) {
@@ -11552,10 +11553,15 @@ export function issueService(db: Db) {
         if (!updated) return null;
         // Differs from upstream (fork, SX-2550). Every status change (database
         // trigger) and owner change (above) raises statusVersion. When an agent
-        // made it, record the agent against the new version in this same
-        // transaction; the route writes its `issue.updated` audit only after
-        // commit. See task-version-attribution.ts.
-        if (actorAgentId && Number(updated.statusVersion) !== Number(receiptExisting.statusVersion)) {
+        // changed the status or the owner, record the agent, the new version and
+        // the values before and after in this same transaction; the route writes
+        // its `issue.updated` audit only after commit. A version raised for
+        // another reason (blocker edits, reasserted Blocked) gets no entry. See
+        // task-version-attribution.ts.
+        if (actorAgentId && Number(updated.statusVersion) !== Number(receiptExisting.statusVersion)
+          && (updated.status !== receiptExisting.status
+            || updated.assigneeAgentId !== receiptExisting.assigneeAgentId
+            || updated.assigneeUserId !== receiptExisting.assigneeUserId)) {
           // Not published: the activity lists leave it out (activity.ts).
           await persistActivity(tx as unknown as Db, {
             companyId: updated.companyId,
@@ -11571,6 +11577,9 @@ export function issueService(db: Db) {
               status: updated.status,
               assigneeAgentId: updated.assigneeAgentId,
               assigneeUserId: updated.assigneeUserId,
+              previousStatus: receiptExisting.status,
+              previousAssigneeAgentId: receiptExisting.assigneeAgentId,
+              previousAssigneeUserId: receiptExisting.assigneeUserId,
             },
           });
         }
