@@ -11,7 +11,7 @@ import { createHeartbeatRunPreparation, ConfigurationIncompleteFailure } from ".
 import { createHeartbeatRunState, getAdapterSessionCodec } from "./run-state.js";
 import { buildEffectiveRunSessionConfigMetadata } from "./workspaces.js";
 import { legacyControllerBootId, LegacyControllerLeaseLostError } from "../legacy-controller-lease.js";
-import { isUnexpectedRunCancellation } from "../run-cancellation.js";
+import { isUnexpectedRunCancellation, requestedRunCancellation } from "../run-cancellation.js";
 import { createHeartbeatRunCompletion, type CompleteHeartbeatRunInput, type FailHeartbeatRunInput, type HeartbeatRunCompletionDependencies } from "./run-completion.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
@@ -184,6 +184,22 @@ describe.skipIf(!support.supported)("heartbeat run completion boundary", () => {
     await db.update(heartbeatRuns).set({ error: "Stop requested", resultJson: { cancelledByUserId: "board", cancelledByActorType: "user" } })
       .where(eq(heartbeatRuns.id, f.run.id));
     f.controller.abort();
+    await f.completion.completeRun(f.input);
+    const run = await read(f.run.id);
+    expect(run).toMatchObject({ status: "cancelled", errorCode: "cancelled", error: "Stop requested",
+      resultJson: { cancellation: { source: "operator", expected: true, initiator: { type: "user", id: "board" } } } });
+  });
+
+  it("keeps an operator Stop saved after a lease-lost abort cancelled, even on exit 0", async () => {
+    const f = await fixture({ controllerBootId: legacyControllerBootId, startedAt: new Date() });
+    f.input.adapterResult.resultJson = { type: "result", subtype: "success", stop_reason: "end_turn" };
+    f.controller.abort(new LegacyControllerLeaseLostError());
+    // The Stop path saves its intent on the running row, then aborts again; the signal keeps the first reason.
+    const cancellation = requestedRunCancellation({ cancelledByUserId: "board", cancelledByActorType: "user" }, "Stop requested");
+    await db.update(heartbeatRuns).set({ error: "Stop requested", errorCode: "cancelled",
+      resultJson: { cancelledByUserId: "board", cancelledByActorType: "user", cancellation } })
+      .where(eq(heartbeatRuns.id, f.run.id));
+    f.controller.abort(new Error("Stop requested"));
     await f.completion.completeRun(f.input);
     const run = await read(f.run.id);
     expect(run).toMatchObject({ status: "cancelled", errorCode: "cancelled", error: "Stop requested",

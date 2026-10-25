@@ -54,10 +54,10 @@ export function cancellationResultJson(run: Run, status: string, patch?: Run["re
       cancellation = requestedRunCancellation(result, error ?? run.error ?? "Execution stopped");
     } else {
       const leaseLost = code === "legacy_controller_lease_lost";
-      // Provider evidence keeps precedence: an ACP run that honoured a lease-lost
-      // abort stays eligible for continuation, as before.
-      const source = code === "duplex_channel_lost" ? "transport" : result.status === "cancelled" ? "provider"
-        : leaseLost ? "control_plane" : "unknown";
+      // A lease-lost cancel that stands is the control plane's, even when the
+      // provider reports the cancel it was told to make (SX-2385 section 4).
+      const source = code === "duplex_channel_lost" ? "transport" : leaseLost ? "control_plane"
+        : result.status === "cancelled" ? "provider" : "unknown";
       const description = source === "provider" ? "Provider cancelled execution"
         : source === "transport" ? "Connection to the execution provider was lost"
         : leaseLost ? "Legacy controller lease lost"

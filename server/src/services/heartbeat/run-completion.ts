@@ -372,7 +372,11 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     // the provider finished cleanly (a CLI adapter may ignore the signal), so
     // the normal outcome stands. A revoked row keeps the cancel. Differs from
     // upstream (master `50797ea03`), where any abort wins (SX-2390).
-    const leaseLostAbort = signal.aborted && isLegacyControllerLeaseLost(signal.reason);
+    // A Stop saved after the lease-lost abort keeps the first abort reason on the
+    // signal, so its durable record on the row decides: the Stop stands.
+    const stopRecorded = Boolean(latestRun?.errorCode) || readRunCancellation(latestRun?.resultJson) !== null ||
+      parseObject(latestRun?.resultJson?.executionCancellation).state !== undefined;
+    const leaseLostAbort = signal.aborted && isLegacyControllerLeaseLost(signal.reason) && !stopRecorded;
     const leaseLostWithoutEffect = leaseLostAbort &&
       latestRun?.status === "running" &&
       latestRun.controllerBootId === legacyControllerBootId &&

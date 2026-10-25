@@ -37,8 +37,10 @@ describe("cancellation provenance", () => {
       reason: "Legacy controller lease lost" });
     expect(isUnexpectedRunCancellation({ ...run, resultJson })).toBe(true);
     expect(canContinueCancelledRun({ ...run, resultJson })).toBe(false);
-    // An ACP provider that honoured the abort keeps its provider evidence.
-    expect(cancellationResultJson(run, "cancelled", { status: "cancelled" }, "legacy_controller_lease_lost")?.cancellation)
-      .toMatchObject({ source: "provider" });
+    // An ACP provider that honoured the abort does not turn it into a provider cancel.
+    const honoured = cancellationResultJson(run, "cancelled", { status: "cancelled" }, "legacy_controller_lease_lost");
+    expect(honoured?.cancellation).toMatchObject({ source: "control_plane", initiator: { type: "system" } });
+    expect(canContinueCancelledRun({ ...run, resultJson: { ...honoured,
+      acpToolInventoryComplete: true, acpPendingToolCount: 0 } })).toBe(false);
   });
 });
