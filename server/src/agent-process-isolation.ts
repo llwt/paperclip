@@ -16,7 +16,7 @@ import { resolvePaperclipInstanceId, resolvePaperclipInstanceRoot } from "./home
  * Build the host's agent process isolation policy from trusted server
  * configuration and publish it once for the common process runner. Nothing
  * from provider or agent configuration reaches this policy. When isolation is
- * on, the capability check runs here but never blocks startup: if it fails,
+ * on, the capability check runs here (a few seconds at most) but never fails startup: if it fails,
  * the server warns once and runs agents normally, then retries in the
  * background with a bounded backoff.
  */

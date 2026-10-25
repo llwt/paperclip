@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -66,13 +66,28 @@ export async function prepareLiveIsolation(): Promise<LiveIsolation> {
     slice,
     skip: null,
     cleanup() {
-      try {
-        execFileSync("systemctl", ["--user", "stop", slice], { stdio: "ignore", timeout: 15_000 });
-      } catch {
-        // Already gone.
-      }
+      stopUserSlice(slice);
     },
   };
+}
+
+function userManagerEnv(): NodeJS.ProcessEnv {
+  const runtimeDir = process.env.XDG_RUNTIME_DIR ?? `/run/user/${process.getuid?.()}`;
+  return { ...process.env, XDG_RUNTIME_DIR: runtimeDir, DBUS_SESSION_BUS_ADDRESS: userBusAddress() };
+}
+
+function sliceIsActive(slice: string, env: NodeJS.ProcessEnv): boolean {
+  return spawnSync("systemctl", ["--user", "is-active", "--quiet", slice], { env, timeout: 15_000 }).status === 0;
+}
+
+/** Stops a test slice and throws if it is still active, so a leaked unit fails the run instead of piling up. */
+function stopUserSlice(slice: string): void {
+  const env = userManagerEnv();
+  if (!sliceIsActive(slice, env)) return;
+  const stop = spawnSync("systemctl", ["--user", "stop", slice], { env, timeout: 15_000, encoding: "utf8" });
+  if (sliceIsActive(slice, env)) {
+    throw new Error(`test slice ${slice} is still active after stop (exit ${stop.status}): ${stop.stderr?.trim() ?? ""}`);
+  }
 }
 
 export interface RecordedLogger extends IsolationLogger {
