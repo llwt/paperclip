@@ -2859,6 +2859,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       // Set when a stage or assignment hand-off wake is saved behind a run
       // that still owns execution (fork, SX-1386, SX-2418).
       let handoffDeferred = false;
+      // Fork (SX-2537): set when admission defers a wake behind a parked
+      // scheduled retry of this agent (conversation issues never coalesce).
+      let parkedRetryDeferredBehind: typeof heartbeatRuns.$inferSelect | null = null;
       // Differs from upstream (fork, SX-1386): resuming a saved stage hand-off.
       // Its saved row is settled in the same transaction as the admission
       // result, so it is never finished without a successor run or a decision.
@@ -2910,6 +2913,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const outcome = await db
         .transaction(async (tx) => settleStageHandoffResume(tx, await (async () => {
           handoffDeferred = false;
+          parkedRetryDeferredBehind = null;
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
@@ -4061,6 +4065,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               };
             }
             if (admission.kind === "deferred") {
+              if (
+                isConversation(issue) &&
+                activeExecutionRun.status === "scheduled_retry" &&
+                activeExecutionRun.agentId === agentId
+              ) {
+                parkedRetryDeferredBehind = activeExecutionRun;
+              }
               return { kind: "deferred" as const };
             }
             // admission.kind === "proceed": no active run absorbed this wake,
@@ -4440,6 +4451,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         if (await resumeDeferredExecutionStageWakes(agent.companyId, issueId) === "blocked") {
           // Fork (SX-1537): a process exit has no release hook; recheck it.
           scheduleOwnerExitRecheck(agent.companyId, issueId);
+        }
+      }
+      if (outcome.kind === "deferred" && parkedRetryDeferredBehind) {
+        // Fork (SX-2537): the reply stays a deferred wake; a board user's
+        // reply still starts the parked retry now (the chat banner says so).
+        if (await promoteParkedRetryForHumanReply(parkedRetryDeferredBehind)) {
+          await startNextQueuedRunForAgent(agent.id);
         }
       }
       if (outcome.kind === "deferred" || outcome.kind === "skipped") {
