@@ -72,6 +72,22 @@ export async function legacyExecutionNeedsReconciliationWithEvidence(db: Db, run
     (legacyExecutionNeedsReconciliation(run) && !(await isPreDispatchReviewWaitVerified(db, run)));
 }
 
+/** The adopted-run leftover sweep can record evidence after the orphan reaper read the run; keep it on the process_lost result. */
+export function preserveLeftoverProcessSweep(
+  current: Record<string, unknown> | null | undefined,
+  patch: Partial<typeof heartbeatRuns.$inferInsert> | undefined,
+  status: string,
+): Partial<typeof heartbeatRuns.$inferInsert> | undefined {
+  if (
+    status !== "failed" ||
+    patch?.errorCode !== "process_lost" ||
+    !patch.resultJson ||
+    current?.leftoverProcessSweep === undefined ||
+    (patch.resultJson as Record<string, unknown>).leftoverProcessSweep !== undefined
+  ) return patch;
+  return { ...patch, resultJson: { ...patch.resultJson, leftoverProcessSweep: current.leftoverProcessSweep } };
+}
+
 /** Persist the failed legacy run, owned lock release and operator decision together. */
 export async function terminalizeLegacyExecution(input: {
   db: Db;
@@ -114,6 +130,7 @@ export async function terminalizeLegacyExecution(input: {
       resultJson: preserveWorkspaceRestoreRecoveryMetadata(current.resultJson,
         input.recordRestoreFailureOnly ? { ...current.resultJson, ...patch.resultJson } : patch.resultJson),
     };
+    patch = preserveLeftoverProcessSweep(current.resultJson, patch, status);
     let [updated] = await tx
       .update(heartbeatRuns)
       .set({
