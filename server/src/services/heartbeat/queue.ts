@@ -1,5 +1,6 @@
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
 import { normalizeAgentNameKey } from "./retries.js";
+import { isUniqueViolation } from "../../db-errors.js";
 import { publishActiveDotComment } from "../dot-assignment-follow-up.js";
 import {
   type WakeupOptions,
@@ -95,7 +96,6 @@ import {
   notFound,
 } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
-import { ISSUES_OPEN_ROUTINE_EXECUTION_CONSTRAINT, isUniqueViolation } from "../../db-errors.js";
 import { publishLiveEvent } from "../live-events.js";
 import { allocateHeartbeatRunEventSeq } from "../heartbeat-run-events.js";
 import {
@@ -301,6 +301,8 @@ export async function readAssignmentHandoffPredecessor(
   }
   return { state: "ready", runId: latest.id };
 }
+
+const OPEN_ROUTINE_EXECUTION_CONSTRAINT = "issues_open_routine_execution_uq";
 
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
 
@@ -1270,7 +1272,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     // The claim transaction rolls back, so the run stays queued; the periodic
     // resumeQueuedRuns pass and the other task's lock release start it later.
     const deferOnOpenRoutineExecutionClash = <T>(fallback: T) => (error: unknown): T => {
-      if (!isUniqueViolation(error, ISSUES_OPEN_ROUTINE_EXECUTION_CONSTRAINT)) throw error;
+      if (!isUniqueViolation(error, OPEN_ROUTINE_EXECUTION_CONSTRAINT)) throw error;
       logger.warn(
         {
           err: error,
@@ -1278,9 +1280,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           runId: run.id,
           agentId: run.agentId,
           companyId: run.companyId,
-          constraint: ISSUES_OPEN_ROUTINE_EXECUTION_CONSTRAINT,
+          constraint: OPEN_ROUTINE_EXECUTION_CONSTRAINT,
         },
-        "queued heartbeat run not claimed: another open task of the same routine holds the execution lock; leaving it queued",
+        "queued heartbeat run claim hit the open routine execution constraint; leaving the run queued and the issue unchanged",
       );
       return fallback;
     };

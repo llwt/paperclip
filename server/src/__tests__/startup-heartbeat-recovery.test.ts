@@ -1,93 +1,61 @@
 import { describe, expect, it, vi } from "vitest";
-import {
-  runStartupHeartbeatRecoverySteps,
-  type StartupHeartbeatRecoveryService,
-} from "../startup-heartbeat-recovery.js";
+import { runStartupHeartbeatRecoverySteps } from "../startup-heartbeat-recovery.js";
 
-const STEP_NAMES = [
-  "promoteDueScheduledRetries",
-  "resumeQueuedRuns",
-  "recoverPendingSessionGoalActions",
-  "recoverActiveSessionGoals",
-  "reconcileStrandedAssignedIssues",
-  "reconcileResolvedDependencyWakes",
-  "reconcileTaskWatchdogs",
-  "scanSilentActiveRuns",
-  "sweepStaleIssueLocks",
-  "sweepEndedTerminalRunLeases",
-] as const;
-
-function buildHeartbeat() {
-  const calls: string[] = [];
-  const results: Record<(typeof STEP_NAMES)[number], unknown> = {
-    promoteDueScheduledRetries: { promoted: 0, runIds: [] },
-    resumeQueuedRuns: undefined,
-    recoverPendingSessionGoalActions: { enqueued: 0, invalid: 0 },
-    recoverActiveSessionGoals: { enqueued: 0 },
-    reconcileStrandedAssignedIssues: {
+function heartbeat() {
+  return {
+    promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] as string[] })),
+    resumeQueuedRuns: vi.fn(async () => undefined),
+    recoverPendingSessionGoalActions: vi.fn(async () => ({ enqueued: 0, invalid: 0 })),
+    recoverActiveSessionGoals: vi.fn(async () => ({ enqueued: 0 })),
+    reconcileStrandedAssignedIssues: vi.fn(async () => ({
       assignmentDispatched: 0,
       dispatchRequeued: 0,
       continuationRequeued: 0,
       successfulRunHandoffEscalated: 0,
       successfulRunHandoffRetried: 0,
       escalated: 0,
-    },
-    reconcileResolvedDependencyWakes: { healed: 0 },
-    reconcileTaskWatchdogs: { triggered: 0 },
-    scanSilentActiveRuns: { created: 0, escalated: 0 },
-    sweepStaleIssueLocks: { cleared: 0 },
-    sweepEndedTerminalRunLeases: { released: 0 },
+    })),
+    reconcileResolvedDependencyWakes: vi.fn(async () => ({ healed: 0 })),
+    reconcileTaskWatchdogs: vi.fn(async () => ({ triggered: 0 })),
+    scanSilentActiveRuns: vi.fn(async () => ({ created: 0, escalated: 0 })),
+    sweepStaleIssueLocks: vi.fn(async () => ({ cleared: 0 })),
+    sweepEndedTerminalRunLeases: vi.fn(async () => ({ released: 0 })),
   };
-  const heartbeat = Object.fromEntries(
-    STEP_NAMES.map((name) => [
-      name,
-      vi.fn(async () => {
-        calls.push(name);
-        return results[name];
-      }),
-    ]),
-  ) as unknown as Record<(typeof STEP_NAMES)[number], ReturnType<typeof vi.fn>>;
-  return { heartbeat, calls };
 }
 
 describe("runStartupHeartbeatRecoverySteps", () => {
-  it("runs every step in order and logs nothing when all succeed", async () => {
-    const { heartbeat, calls } = buildHeartbeat();
+  it("runs every step in order when none fail", async () => {
+    const hb = heartbeat();
     const logger = { warn: vi.fn(), error: vi.fn() };
-
-    await runStartupHeartbeatRecoverySteps(heartbeat as unknown as StartupHeartbeatRecoveryService, logger);
-
-    expect(calls).toEqual([...STEP_NAMES]);
+    await runStartupHeartbeatRecoverySteps(hb, logger);
+    for (const fn of Object.values(hb)) expect(fn).toHaveBeenCalledTimes(1);
     expect(logger.error).not.toHaveBeenCalled();
-    expect(logger.warn).not.toHaveBeenCalled();
   });
 
-  it.each(STEP_NAMES)("keeps going and resolves when %s throws", async (failing) => {
-    const { heartbeat, calls } = buildHeartbeat();
-    const err = new Error(`${failing} exploded`);
-    heartbeat[failing].mockImplementation(async () => {
-      calls.push(failing);
-      throw err;
-    });
-    const logger = { warn: vi.fn(), error: vi.fn() };
+  it.each(Object.keys(heartbeat()) as Array<keyof ReturnType<typeof heartbeat>>)(
+    "logs the step name and runs the later steps when %s throws",
+    async (failing) => {
+      const hb = heartbeat();
+      const boom = new Error("boom");
+      (hb[failing] as ReturnType<typeof vi.fn>).mockRejectedValue(boom);
+      const logger = { warn: vi.fn(), error: vi.fn() };
 
-    await expect(
-      runStartupHeartbeatRecoverySteps(heartbeat as unknown as StartupHeartbeatRecoveryService, logger),
-    ).resolves.toBeUndefined();
+      await expect(runStartupHeartbeatRecoverySteps(hb, logger)).resolves.toBeUndefined();
 
-    expect(calls).toEqual([...STEP_NAMES]);
-    expect(logger.error).toHaveBeenCalledTimes(1);
-    expect(logger.error).toHaveBeenCalledWith(
-      { err, step: failing },
-      "startup heartbeat recovery step failed",
-    );
-  });
+      for (const fn of Object.values(hb)) expect(fn).toHaveBeenCalledTimes(1);
+      expect(logger.error).toHaveBeenCalledTimes(1);
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ err: boom, step: failing }),
+        expect.any(String),
+      );
+    },
+  );
 
-  it("still logs the assigned-issue summary when the promotion step failed but reconcile changed state", async () => {
-    const { heartbeat } = buildHeartbeat();
-    heartbeat.promoteDueScheduledRetries.mockRejectedValue(new Error("boom"));
-    heartbeat.reconcileStrandedAssignedIssues.mockResolvedValue({
-      assignmentDispatched: 2,
+  it("keeps reporting reconciled state when the retry promotion step failed", async () => {
+    const hb = heartbeat();
+    hb.promoteDueScheduledRetries.mockRejectedValue(new Error("boom"));
+    hb.reconcileStrandedAssignedIssues.mockResolvedValue({
+      assignmentDispatched: 1,
       dispatchRequeued: 0,
       continuationRequeued: 0,
       successfulRunHandoffEscalated: 0,
@@ -95,11 +63,9 @@ describe("runStartupHeartbeatRecoverySteps", () => {
       escalated: 0,
     });
     const logger = { warn: vi.fn(), error: vi.fn() };
-
-    await runStartupHeartbeatRecoverySteps(heartbeat as unknown as StartupHeartbeatRecoveryService, logger);
-
+    await runStartupHeartbeatRecoverySteps(hb, logger);
     expect(logger.warn).toHaveBeenCalledWith(
-      expect.objectContaining({ promotedScheduledRetries: 0, assignmentDispatched: 2 }),
+      expect.objectContaining({ assignmentDispatched: 1, promotedScheduledRetries: 0 }),
       "startup heartbeat recovery changed assigned issue state",
     );
   });

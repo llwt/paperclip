@@ -176,7 +176,7 @@ describeEmbeddedPostgres("queued run claim against issues_open_routine_execution
         runId: seed.queuedRunId,
         constraint: "issues_open_routine_execution_uq",
       }),
-      expect.stringContaining("leaving it queued"),
+      expect.stringContaining("leaving the run queued"),
     );
   });
 
