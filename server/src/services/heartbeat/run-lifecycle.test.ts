@@ -145,6 +145,20 @@ describe.skipIf(!support.supported)("heartbeat lifecycle database wiring", () =>
     expect(vi.mocked(publishLiveEvent).mock.calls.filter(([event]) => event.type === "heartbeat.run.status")).toHaveLength(1);
   });
 
+  it("keeps the leftover sweep evidence recorded after the reaper read the run when it writes process_lost", async () => {
+    const sweep = { kind: "leftover_process_sweep", stopped: 1, processes: [{ pid: 4242, command: "sleep 300" }] };
+    const { run } = await fixture({ resultJson: { hotRestart: { adopted: true }, leftoverProcessSweep: sweep } });
+    const lifecycle = createHeartbeatLifecycle(db, callbacks(db));
+    const staleResult = { hotRestart: { adopted: true }, processLossDiagnostic: { retryEligible: false } };
+    const write = await lifecycle.setRunStatusFromLive(run.id, "failed", ["running"], {
+      errorCode: "process_lost", finishedAt: new Date(), resultJson: staleResult,
+    });
+    expect(write.updated).toBe(true);
+    const [persisted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    expect(persisted.status).toBe("failed");
+    expect(persisted.resultJson).toMatchObject({ leftoverProcessSweep: sweep, processLossDiagnostic: { retryEligible: false } });
+  });
+
   it("rechecks native ownership atomically before a terminal write", async () => {
     const { run } = await fixture({ errorCode: "native_execution_ownership_unverified", nativePhase: "terminal_failure" });
     const deps = callbacks(db);

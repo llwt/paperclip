@@ -1110,6 +1110,22 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       resultJson: preserveWorkspaceRestoreRecoveryMetadata(previousStatus.resultJson, patch.resultJson),
     };
 
+    // The orphan reaper builds its result from the row it read earlier. The
+    // adopted-run leftover sweep can record its evidence in between; the xmin
+    // fence below makes this read the row the write replaces.
+    if (
+      status === "failed" &&
+      patch?.errorCode === "process_lost" &&
+      patch.resultJson &&
+      previousStatus?.resultJson?.leftoverProcessSweep !== undefined &&
+      (patch.resultJson as Record<string, unknown>).leftoverProcessSweep === undefined
+    ) {
+      patch = { ...patch, resultJson: {
+        ...patch.resultJson,
+        leftoverProcessSweep: previousStatus.resultJson.leftoverProcessSweep,
+      } };
+    }
+
     // Preserve the receipt-source fence when finalization enriches usage. A
     // late spool replay must still be able to complete an unfinished receipt.
     if (patch?.usageJson && previousStatus?.usageJson) patch = { ...patch, usageJson: { ...previousStatus.usageJson, ...patch.usageJson } };
