@@ -99,6 +99,7 @@ import {
 import { queryKeys } from "../lib/queryKeys";
 import { keepPreviousDataForSameQueryTail } from "../lib/query-placeholder-data";
 import { useIssueWorkProducts } from "../hooks/useIssueWorkProducts";
+import { useRetryNowMutation } from "../hooks/useRetryNowMutation";
 import {
   mergePendingIssueQueuedComments,
   normalizeIssueQueuedCommentQueue,
@@ -4598,6 +4599,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     },
   });
 
+  const retryScheduledRetryNow = useRetryNowMutation(issueId);
+
   const checkIssueMonitorNow = useMutation({
     mutationKey: ["check-issue-monitor-now", issueId],
     mutationFn: () => issuesApi.checkMonitorNow(issueId!),
@@ -7531,9 +7534,11 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         onCancelMonitor={() => cancelIssueMonitor.mutateAsync()}
         issue={issue}
         workProducts={workProducts}
-        checkError={checkIssueMonitorNow.error?.message}
+        checkError={checkIssueMonitorNow.error?.message ?? retryScheduledRetryNow.lastError?.message}
         onCheckNow={() => checkIssueMonitorNow.mutate()}
         checkingNow={checkIssueMonitorNow.isPending}
+        onRetryNow={() => retryScheduledRetryNow.mutate()}
+        retryingNow={retryScheduledRetryNow.isPending}
       />
 
       {taskChatShellEnabled ? null : (
@@ -8099,9 +8104,11 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                       <IssueMonitorComposerStrip
                         issue={issue}
                         workProducts={workProducts}
-                        checkError={checkIssueMonitorNow.error?.message}
+                        checkError={checkIssueMonitorNow.error?.message ?? retryScheduledRetryNow.lastError?.message}
                         onCheckNow={() => checkIssueMonitorNow.mutate()}
                         checkingNow={checkIssueMonitorNow.isPending}
+                        onRetryNow={() => retryScheduledRetryNow.mutate()}
+                        retryingNow={retryScheduledRetryNow.isPending}
                       />
                     ) : null
                   }
