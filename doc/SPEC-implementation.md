@@ -1511,11 +1511,14 @@ Required UX behaviors:
 - no silent background failures; every failed run visible in UI
 
 Regular task chats and Agent Chat keep unanswered questions as compact,
-reopenable entries at their original position in the feed. Dismissing a question
-or sending a newer message clears its form from the composer without resolving
-the saved question. Questions do not contribute to composer pending counts.
-Dismissal persists locally for the person and task across reloads; reopening
-restores the original form and draft. Approval and permission gates are unchanged.
+reopenable entries at their original position in the feed. In the Somnex fork
+(SX-1603), a pending question also stays in the composer dock until it is
+answered, expired or withdrawn, like a confirmation. Sending a newer message does
+not take it out of the dock. Questions count in the composer pending-input badge.
+Dismissing the dock moves the question to the badge for the current page view
+only, without resolving it; a reload docks it again, and no dismissal is stored.
+Reopening from the badge or the feed entry restores the original form and draft.
+Approval and permission gates are unchanged.
 
 ## 15. Operational Requirements
 

@@ -147,8 +147,10 @@ the bottom navigation. The normal message composer remains usable below the
 pending card.
 
 Use **Chat & Comments → Task Chat Unanswered Questions → Test Drive** to
-try a regular task question: dismiss it, reload, reopen its compact feed entry,
-and submit the preserved draft. The composer has no question pending badge.
+try a regular task question: dismiss it, see it counted in the pending-input
+badge, reopen it from the badge (or its compact feed entry), and submit the
+preserved draft. In the fork (SX-1603) the question stays docked after a newer
+message, and a reload docks a dismissed question again.
 The demo uses real thread/form components with fixture response callbacks.
 The Agent Chat stories share the same component fixture.
 
