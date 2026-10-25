@@ -10,6 +10,8 @@ import { createHeartbeatLifecycle, type HeartbeatLifecycleDependencies } from ".
 import { createHeartbeatRunPreparation, ConfigurationIncompleteFailure } from "./run-preparation.js";
 import { createHeartbeatRunState, getAdapterSessionCodec } from "./run-state.js";
 import { buildEffectiveRunSessionConfigMetadata } from "./workspaces.js";
+import { legacyControllerBootId, LegacyControllerLeaseLostError } from "../legacy-controller-lease.js";
+import { isUnexpectedRunCancellation } from "../run-cancellation.js";
 import { createHeartbeatRunCompletion, type CompleteHeartbeatRunInput, type FailHeartbeatRunInput, type HeartbeatRunCompletionDependencies } from "./run-completion.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
@@ -153,6 +155,39 @@ describe.skipIf(!support.supported)("heartbeat run completion boundary", () => {
       expect((await read(f.run.id)).sessionIdAfter).toBe("provider-session");
       expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(f.agent.id, "cancelled", expect.any(String), expect.any(Object));
     } else expect(f.deps.finalizeAgentStatus).not.toHaveBeenCalled();
+  });
+
+  it("finalizes a clean run as succeeded when a late lease-lost abort fired on a row it still owns", async () => {
+    const f = await fixture({ controllerBootId: legacyControllerBootId });
+    f.input.adapterResult.resultJson = { type: "result", subtype: "success", stop_reason: "end_turn" };
+    f.controller.abort(new LegacyControllerLeaseLostError());
+    await f.completion.completeRun(f.input);
+    const run = await read(f.run.id);
+    expect(run).toMatchObject({ status: "succeeded", errorCode: null, error: null, exitCode: 0 });
+    expect(run.resultJson?.cancellation).toBeUndefined();
+    expect(isUnexpectedRunCancellation(run)).toBe(false);
+    expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(f.agent.id, "succeeded", null, expect.any(Object));
+  });
+
+  it("keeps a lease-lost cancel after revocation and labels it control_plane", async () => {
+    const f = await fixture({ controllerBootId: legacyControllerBootId, startedAt: new Date() });
+    await db.update(heartbeatRuns).set({ controllerBootId: crypto.randomUUID() }).where(eq(heartbeatRuns.id, f.run.id));
+    f.controller.abort(new LegacyControllerLeaseLostError());
+    await f.completion.completeRun(f.input);
+    const run = await read(f.run.id);
+    expect(run).toMatchObject({ status: "cancelled", errorCode: "legacy_controller_lease_lost", error: "Legacy controller lease lost",
+      resultJson: { cancellation: { source: "control_plane", expected: false, initiator: { type: "system" }, reason: "Legacy controller lease lost" } } });
+  });
+
+  it("keeps an operator Stop plus exit 0 cancelled with its operator source", async () => {
+    const f = await fixture({ controllerBootId: legacyControllerBootId, startedAt: new Date() });
+    await db.update(heartbeatRuns).set({ error: "Stop requested", resultJson: { cancelledByUserId: "board", cancelledByActorType: "user" } })
+      .where(eq(heartbeatRuns.id, f.run.id));
+    f.controller.abort();
+    await f.completion.completeRun(f.input);
+    const run = await read(f.run.id);
+    expect(run).toMatchObject({ status: "cancelled", errorCode: "cancelled", error: "Stop requested",
+      resultJson: { cancellation: { source: "operator", expected: true, initiator: { type: "user", id: "board" } } } });
   });
 
   it("does not publish or overwrite a conflicting terminal transition that wins the compare-and-set", async () => {
