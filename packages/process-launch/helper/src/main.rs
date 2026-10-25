@@ -223,9 +223,36 @@ fn search_path() -> Vec<u8> {
         .unwrap_or_else(|| b"/usr/bin:/bin".to_vec())
 }
 
-/// Execute `file` the way libuv's spawn does: a name with a slash is used
-/// as is; otherwise each PATH entry is tried, an empty entry meaning the
-/// current directory. Returns only on failure, with the errno to report.
+/// The shell glibc's `execvp` falls back to for a file the kernel will not
+/// execute (ENOEXEC), such as a script without a `#!` line.
+const FALLBACK_SHELL: &[u8] = b"/bin/sh\0";
+
+/// One `execv` with glibc's ENOEXEC fallback: on ENOEXEC the file runs as
+/// `/bin/sh <path> args...` (argv[0] replaced, as glibc does). Nothing has
+/// run when ENOEXEC is returned, so this is still exactly one exec of the
+/// target. Returns only on failure, with the errno of the first attempt
+/// unless the shell itself could not run.
+fn exec_path(path: &CStr, argv: &[*const libc::c_char]) -> i32 {
+    unsafe { libc::execv(path.as_ptr(), argv.as_ptr()) };
+    let errno = last_errno();
+    if errno != libc::ENOEXEC {
+        return errno;
+    }
+    let shell = FALLBACK_SHELL.as_ptr().cast::<libc::c_char>();
+    let mut script: Vec<*const libc::c_char> = Vec::with_capacity(argv.len() + 1);
+    script.push(shell);
+    script.push(path.as_ptr());
+    // argv ends with its null terminator; skip the original argv[0].
+    script.extend_from_slice(argv.get(1..).unwrap_or(&[std::ptr::null()]));
+    unsafe { libc::execv(shell, script.as_ptr()) };
+    errno
+}
+
+/// Execute `file` the way libuv's spawn does on Linux (glibc `execvp`): a
+/// name with a slash is used as is; otherwise each PATH entry is tried, an
+/// empty entry meaning the current directory. A file without a valid
+/// executable format runs through `/bin/sh`. Returns only on failure, with
+/// the errno to report.
 fn exec_target(file: &OsStr, argv: &[CString]) -> i32 {
     let mut pointers: Vec<*const libc::c_char> = argv.iter().map(|arg| arg.as_ptr()).collect();
     pointers.push(std::ptr::null());
@@ -234,8 +261,7 @@ fn exec_target(file: &OsStr, argv: &[CString]) -> i32 {
         let Ok(path) = CString::new(bytes) else {
             return libc::ENOENT;
         };
-        unsafe { libc::execv(path.as_ptr(), pointers.as_ptr()) };
-        return last_errno();
+        return exec_path(&path, &pointers);
     }
     let mut saw_eacces = false;
     let mut result = libc::ENOENT;
@@ -250,10 +276,10 @@ fn exec_target(file: &OsStr, argv: &[CString]) -> i32 {
         let Ok(path) = CString::new(candidate) else {
             continue;
         };
-        unsafe { libc::execv(path.as_ptr(), pointers.as_ptr()) };
-        match last_errno() {
+        match exec_path(&path, &pointers) {
             libc::EACCES => saw_eacces = true,
-            libc::ENOENT | libc::ENOTDIR => {}
+            // glibc's execvp moves on to the next PATH entry for these.
+            libc::ENOENT | libc::ENOTDIR | libc::ESTALE | libc::ENODEV | libc::ETIMEDOUT => {}
             other => {
                 result = other;
                 break;

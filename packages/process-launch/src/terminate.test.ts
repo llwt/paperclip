@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, inject, it } from "vitest";
 import { spawnIsolated, type LaunchHandle } from "./launch.js";
 import type { SystemdIsolationPolicy } from "./policy.js";
-import { readProcCgroup } from "./proc.js";
+import { readProcCgroup, readProcStat } from "./proc.js";
 import {
   listScopeRecordRefs,
   readScopeRecord,
@@ -104,6 +104,28 @@ describe("terminate without a scope (degraded launch)", () => {
     expect(Date.now() - started).toBeGreaterThanOrEqual(300);
     await exited(child);
     expect(child.signalCode).toBe("SIGKILL");
+  });
+
+  it("kills a group member that ignores SIGTERM after the leader exits on it", async () => {
+    const policy = degradedPolicy();
+    const pidFile = path.join(temp.make(), "member.pid");
+    // The leader keeps the default TERM action; the member ignores TERM.
+    const { child, launch: handle } = launch(
+      policy,
+      `(trap "" TERM; while :; do sleep 0.05; done) & echo $! > ${pidFile}; wait`,
+    );
+    const member = await readPid(pidFile);
+    strays.push(member);
+    const result = await terminateOwnedProcessTree(record(handle), {
+      instanceId: policy.instanceId,
+      graceMs: 150,
+      killWaitMs: 2_000,
+    });
+    await exited(child);
+    expect(child.signalCode).toBe("SIGTERM");
+    expect(result).toMatchObject({ outcome: "terminated", containment: "process_group", signalled: 2 });
+    expect(readProcStat(member) === null || readProcStat(member)?.state === "Z").toBe(true);
+    expect(readScopeRecord(record(handle))).toBeNull();
   });
 
   it("never signals a PID whose start time does not match the record", async () => {

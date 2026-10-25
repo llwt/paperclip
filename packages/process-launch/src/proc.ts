@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 
 /** Small, synchronous Linux /proc readers. Each returns null when the fact is unavailable. */
 
@@ -52,4 +52,15 @@ export function userManagerCgroup(ownCgroup: string, uid: number): string | null
   const end = index + marker.length;
   if (end < ownCgroup.length && ownCgroup[end] !== "/") return null;
   return ownCgroup.slice(0, end);
+}
+
+/** Every PID currently listed in /proc. */
+export function listPids(procRoot = "/proc"): number[] {
+  try {
+    return readdirSync(procRoot)
+      .filter((name) => /^\d+$/.test(name))
+      .map(Number);
+  } catch {
+    return [];
+  }
 }

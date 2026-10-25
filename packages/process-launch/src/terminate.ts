@@ -1,6 +1,6 @@
 import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
-import { readBootId, readProcCgroup, readProcStat } from "./proc.js";
+import { listPids, readBootId, readProcCgroup, readProcStat } from "./proc.js";
 import { readScopeRecord, removeScopeRecord, type ScopeRecord, type ScopeRecordRef } from "./registry.js";
 import { scopeUnitNamespace, sliceCgroupPath } from "./unit-names.js";
 
@@ -141,8 +141,52 @@ async function terminateScope(cgroup: string, options: Required<Omit<TerminateOp
 }
 
 /**
+ * The members of process group `pgid` that are provably the recorded
+ * group, tracked across polls. A process group exists, and its id cannot be
+ * reused, while any member remains. So the group is still ours while the
+ * verified leader exists (a zombie leader still reserves its PID) or while a
+ * member seen earlier is still in it with the same start time. Once neither
+ * holds, the recorded group has been empty at some point, and any process
+ * now carrying that group id belongs to someone else.
+ */
+class TrackedGroup {
+  private readonly known = new Map<number, string>();
+
+  constructor(
+    private readonly pgid: number,
+    private readonly leaderAlive: () => boolean,
+    private readonly procRoot: string,
+  ) {}
+
+  /** Refresh the members; returns how many still run, or null once the group is no longer provably ours. */
+  live(): number | null {
+    const current = new Map<number, { startTime: string; state: string }>();
+    for (const pid of listPids(this.procRoot)) {
+      const stat = readProcStat(pid, this.procRoot);
+      if (stat && stat.pgrp === this.pgid) current.set(pid, stat);
+    }
+    const continuous =
+      this.leaderAlive() ||
+      [...this.known].some(([pid, startTime]) => current.get(pid)?.startTime === startTime);
+    if (!continuous) {
+      this.known.clear();
+      return null;
+    }
+    this.known.clear();
+    let running = 0;
+    for (const [pid, stat] of current) {
+      this.known.set(pid, stat.startTime);
+      if (stat.state !== "Z") running += 1;
+    }
+    return running;
+  }
+}
+
+/**
  * The degraded path has no scope: only the recorded root process, verified
- * by boot id and start time, and its process group when it leads one.
+ * by boot id and start time, and the process group it leads, if any. The
+ * group is done only when none of its members still runs, not when the
+ * leader alone has exited.
  */
 async function terminateVerifiedProcess(
   record: ScopeRecord,
@@ -162,25 +206,34 @@ async function terminateVerifiedProcess(
   const initial = verified();
   // Not running, or the PID now belongs to another process: never signal it.
   if (!initial || initial.state === "Z") return { signalled: 0, empty: true, containment: "none" };
-  const group = initial.pgrp === pid;
-  const containment = group ? "process_group" : "process";
-  const gone = () => {
+  const leaderGone = () => {
     const stat = verified();
     return stat === null || stat.state === "Z";
   };
-  const signalRoot = (signal: NodeJS.Signals) => {
-    // Re-verify right before each signal. A zombie leader still reserves
-    // its PID, so its group id cannot have been reused.
-    const stat = verified();
-    if (!stat) return 0;
-    if (group) return sendSignal(-pid, signal) ? 1 : 0;
-    return stat.state === "Z" ? 0 : sendSignal(pid, signal) ? 1 : 0;
+
+  if (initial.pgrp !== pid) {
+    const signalRoot = (signal: NodeJS.Signals) => (leaderGone() ? 0 : sendSignal(pid, signal) ? 1 : 0);
+    let signalled = signalRoot(options.signal);
+    if (await waitFor(leaderGone, options.graceMs, options.pollMs)) return { signalled, empty: true, containment: "process" };
+    signalled += signalRoot("SIGKILL");
+    const empty = await waitFor(leaderGone, options.killWaitMs, options.pollMs);
+    return { signalled, empty, containment: "process" };
+  }
+
+  const group = new TrackedGroup(pid, () => verified() !== null, options.procRoot);
+  // Learn the members while the leader is verified, before any signal.
+  if (!group.live()) return { signalled: 0, empty: true, containment: "none" };
+  const groupDone = () => !group.live();
+  const signalGroup = (signal: NodeJS.Signals) => {
+    // Re-check right before each signal that the group id is still ours.
+    if (groupDone()) return 0;
+    return sendSignal(-pid, signal) ? 1 : 0;
   };
-  let signalled = signalRoot(options.signal);
-  if (await waitFor(gone, options.graceMs, options.pollMs)) return { signalled, empty: true, containment };
-  signalled += signalRoot("SIGKILL");
-  const empty = await waitFor(gone, options.killWaitMs, options.pollMs);
-  return { signalled, empty, containment };
+  let signalled = signalGroup(options.signal);
+  if (await waitFor(groupDone, options.graceMs, options.pollMs)) return { signalled, empty: true, containment: "process_group" };
+  signalled += signalGroup("SIGKILL");
+  const empty = await waitFor(groupDone, options.killWaitMs, options.pollMs);
+  return { signalled, empty, containment: "process_group" };
 }
 
 function recordBelongsTo(record: ScopeRecord, instanceId: string): boolean {

@@ -1,6 +1,6 @@
 import { spawn, type SpawnOptions, type StdioOptions } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import { afterEach, describe, expect, inject, it } from "vitest";
@@ -256,6 +256,29 @@ for (const mode of modes) {
       const result = await collect(wrapped.child);
       expect(result.stdout.toString()).toBe(direct.stdout.toString());
       expect(result.stdout.toString()).toBe("x y /bin/sh\n");
+    });
+
+    it("runs an executable script without a #! line like an unwrapped spawn", async () => {
+      const registryDir = temp.make();
+      registries.push(registryDir);
+      const bin = temp.make();
+      const script = path.join(bin, "no-shebang-target");
+      writeFileSync(script, 'printf "%s|" "$0" "$@"; echo target-ran\n', { mode: 0o700 });
+      const policy = mode.policy(registryDir);
+      const forms: LaunchTarget[] = [
+        { command: script, args: ["a b", "$x"], options: { argv0: "custom0" } },
+        { command: "no-shebang-target", args: ["a b"], options: { env: { PATH: `/nonexistent:${bin}` } } },
+      ];
+      for (const target of forms) {
+        const direct = await collect(spawn(target.command, target.args ?? [], target.options ?? {}));
+        expect(direct.code).toBe(0);
+        const wrapped = spawnIsolated(target, { policy, owner });
+        const result = await collect(wrapped.child);
+        expect(result.stdout.toString()).toBe(direct.stdout.toString());
+        expect(result.stdout.toString()).toBe(`${script}|${(target.args ?? []).join("|")}|target-ran\n`);
+        expect(result.stderr.toString()).toBe(direct.stderr.toString());
+        expect(wrapped.launch.classifyExit(result.code, result.signal)).toEqual({ kind: "target", code: 0, signal: null });
+      }
     });
 
     it("writes a versioned status with identity only", async () => {
