@@ -41,7 +41,9 @@ keeps its counters unchanged.
 If a counter decreases after a reset, the service uses that counter's current
 value. The reset rule applies to each counter separately. Mixed resets can
 produce a cached-input delta greater than the input delta; this existing behavior
-is unchanged. Cached input is included in input and is not added to input.
+is unchanged. Since upstream v2026.1023.0 the adapter subtracts cached input
+from input before it reports the counters, so input and cached input are
+separate counts.
 
 This behavior was verified against fresh and resumed rollout records from Codex
 CLI 0.160.1. Other CLI versions were not verified. The ACP lane reports per-turn

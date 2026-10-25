@@ -1,4 +1,5 @@
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
+import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -52,6 +53,8 @@ import {
   shapePaperclipWorkspaceEnvForExecution,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
+  leftoverProcessSweepResultJson,
+  withLeftoverProcessSweep,
 } from "@paperclipai/adapter-utils/server-utils";
 import { buildSkillLibraryManifestMarkdown } from "@paperclipai/adapter-utils/skill-library-manifest";
 import {
@@ -60,11 +63,15 @@ import {
   parseLocalProcessNetworkAllowlist,
   parseLocalProcessNetworkScope,
   managedAiSessionStateMounts,
+  miseToolInstallMounts,
+  sharedToolCacheMounts,
   type LocalProcessSandboxOptions,
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import {
   claudeModelUsageTotals,
-  parseClaudeStreamJson,
+  claudeModelReceipts,
+  claudeResultUsageTotals,
+  parseClaudeStreamJson, createClaudeStreamParser,
   describeClaudeFailure,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
@@ -106,6 +113,7 @@ const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const executeClaudeAcp = createClaudeAcpExecutor();
 
 interface ClaudeExecutionInput {
+  agentIdentity?: AdapterExecutionContext["agentIdentity"];
   runId: string;
   agent: AdapterExecutionContext["agent"];
   config: Record<string, unknown>;
@@ -218,7 +226,7 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
 
   const envConfig = parseObject(config.env);
-  const env: Record<string, string> = { ...buildPaperclipEnv(agent) };
+  const env: Record<string, string> = { ...buildPaperclipEnv(agent, input.agentIdentity) };
   env.PAPERCLIP_RUN_ID = runId;
 
   const wakeTaskId =
@@ -457,6 +465,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     typeof configEnv.CLAUDE_CONFIG_DIR === "string" && configEnv.CLAUDE_CONFIG_DIR.trim().length > 0;
   const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
   const runtimeConfig = await buildClaudeRuntimeConfig({
+    agentIdentity: ctx.agentIdentity,
     runId,
     agent,
     config,
@@ -578,6 +587,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             { path: promptBundle.addDir, access: "ro" },
             { path: localMcpConfigDir, access: "ro" },
             ...(config.managedAiConnection ? await managedAiSessionStateMounts(sharedClaudeConfigDir) : []),
+            ...(await miseToolInstallMounts(effectiveEnv)),
+            ...sharedToolCacheMounts(effectiveEnv),
           ],
           extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
           homeDir: filesystemScope ? path.dirname(sharedClaudeConfigDir) : null,
@@ -1001,9 +1012,47 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         prompt,
         promptMetrics,
         context,
+        recovery: {
+          version: 1,
+          engine: "cli",
+          sessionIdBefore: resumeSessionId,
+          sessionParams: {
+            cwd,
+            promptBundleKey: promptBundle.bundleKey,
+            mcpServerIdentity: runtimeMcpIdentity,
+            ...(executionTargetIsRemote
+              ? {
+                  remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
+                }
+              : {}),
+            ...(workspaceId ? { workspaceId } : {}),
+            ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
+            ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
+          },
+          accounting: {
+            provider: "anthropic",
+            biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
+            model,
+            billingType,
+          },
+        },
       });
     }
 
+    const consumeAccounting = createClaudeStreamParser();
+    const accountingLog = createUsageCheckpointLog(onLog, ctx.onUsage, stdout => {
+      const parsed = consumeAccounting(stdout);
+      // Differs from upstream (fork, SX-1378): on --resume the result's
+      // modelUsage and total_cost_usd are session totals. Keep the parser's
+      // bases and name the session, so the server records only this run's part.
+      return { usage: parsed.usage ?? undefined, usageBasis: parsed.usageBasis, costUsd: parsed.costUsd,
+        ...(parsed.costBasis ? { costBasis: parsed.costBasis } : {}),
+        ...(parsed.invocationUsage ? { invocationUsage: parsed.invocationUsage } : {}),
+        sessionId: parsed.sessionId ?? resumeSessionId,
+        provider: "anthropic", biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
+        billingType, model: Object.keys(parseObject(parsed.resultJson?.modelUsage)).length > 1 ? "mixed" : parsed.model || model,
+          usageByModel: claudeModelReceipts(parsed.resultJson?.modelUsage), complete: parsed.resultJson !== null };
+    });
     const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
       onProcessStopped: providerStop.beginInvocation(),
       cwd,
@@ -1013,7 +1062,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       graceSec,
       onSpawn,
       onRuntimeProgress: ctx.onRuntimeProgress,
-      onLog,
+      onLog: accountingLog,
       runLogTail: paperclipBridge?.runLogTail,
       settleRunDisposition: paperclipBridge?.settleRunDisposition,
       terminalResultCleanup: {
@@ -1022,6 +1071,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       },
       localProcessSandbox,
     });
+    await accountingLog.flush();
 
     const parsedStream = parseClaudeStreamJson(proc.stdout);
     const parsed = parsedStream.resultJson ?? parseJson(proc.stdout);
@@ -1054,9 +1104,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: proc.exitCode,
         signal: proc.signal,
         timedOut: true,
+        usageComplete: parsedStream.resultJson !== null,
+        usage: parsedStream.usage ?? undefined,
+        // Differs from upstream (fork, SX-1378): a timed-out resume that got
+        // its result still reports session totals.
+        usageBasis: parsedStream.usageBasis,
+        ...(parsedStream.costBasis ? { costBasis: parsedStream.costBasis } : {}),
+        ...(parsedStream.invocationUsage ? { invocationUsage: parsedStream.invocationUsage } : {}),
+        provider: "anthropic",
+        biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
+        model: Object.keys(parseObject(parsedStream.resultJson?.modelUsage)).length > 1 ? "mixed" : parsedStream.model || model,
+        usageByModel: claudeModelReceipts(parsedStream.resultJson?.modelUsage),
+        billingType,
+        costUsd: parsedStream.costUsd,
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: "timeout",
         errorMeta,
+        ...(proc.leftoverProcessSweep?.stopped ? { resultJson: leftoverProcessSweepResultJson(proc) } : {}),
         clearSession: Boolean(opts.clearSessionOnMissingSession),
       };
     }
@@ -1115,6 +1179,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: proc.exitCode,
         signal: proc.signal,
         timedOut: false,
+        usageComplete: parsedStream.resultJson !== null,
+        usage: parsedStream.usage ?? undefined,
+        usageBasis: "per_run",
+        provider: "anthropic",
+        biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
+        model: Object.keys(parseObject(parsedStream.resultJson?.modelUsage)).length > 1 ? "mixed" : parsedStream.model || model,
+        usageByModel: claudeModelReceipts(parsedStream.resultJson?.modelUsage),
+        billingType,
+        costUsd: parsedStream.costUsd,
         errorMessage: fallbackErrorMessage,
         errorCode,
         errorFamily,
@@ -1134,6 +1207,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() }
             : {}),
           ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
+          ...leftoverProcessSweepResultJson(proc),
         },
         clearSession: Boolean(opts.clearSessionOnMissingSession),
       };
@@ -1143,18 +1217,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const usage =
       parsedStream.usage ??
       fallbackModelUsageTotals ??
-      (() => {
-        const usageObj = parseObject(parsed.usage);
-        return {
-          inputTokens: asNumber(usageObj.input_tokens, 0),
-          cachedInputTokens: asNumber(usageObj.cache_read_input_tokens, 0),
-          outputTokens: asNumber(usageObj.output_tokens, 0),
-        };
-      })();
+      claudeResultUsageTotals(parsed.usage);
     const usageBasis = parsedStream.usage
       ? parsedStream.usageBasis
       : fallbackModelUsageTotals
-      ? ("per_run" as const)
+      ? ("session_cumulative" as const)
+      : null;
+    const invocationUsage = parsedStream.usage
+      ? parsedStream.invocationUsage
+      : fallbackModelUsageTotals
+      ? claudeResultUsageTotals(parsed.usage)
       : null;
 
     const rawResolvedSessionId =
@@ -1271,25 +1343,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(providerQuota && transientRetryNotBefore ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
+      ...leftoverProcessSweepResultJson(proc),
     };
 
     return {
       exitCode: proc.exitCode,
       signal: proc.signal,
       timedOut: false,
+      usageComplete: parsedStream.resultJson !== null || parsed.type === "result",
       errorMessage,
       errorCode: resolvedErrorCode,
       errorFamily,
       retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
       errorMeta,
       usage,
+      usageByModel: claudeModelReceipts(parsed.modelUsage),
       ...(usageBasis ? { usageBasis } : {}),
+      ...(parsedStream.costBasis ? { costBasis: parsedStream.costBasis } : {}),
+      ...(invocationUsage ? { invocationUsage } : {}),
       sessionId: resolvedSessionId,
       sessionParams: resolvedSessionParams,
       sessionDisplayId: resolvedSessionId,
       provider: "anthropic",
       biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
-      model: parsedStream.model || asString(parsed.model, model),
+      model: Object.keys(parseObject(parsed.modelUsage)).length > 1 ? "mixed" : parsedStream.model || asString(parsed.model, model),
       billingType,
       costUsd: parsedStream.costUsd,
       resultJson: mergedResultJson,
@@ -1395,7 +1472,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
       }
       const retry = await runAttempt(null);
-      return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
+      return withLeftoverProcessSweep(
+        toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true }),
+        [initial.proc, retry.proc],
+      );
     }
 
     return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });

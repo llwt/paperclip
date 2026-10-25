@@ -75,6 +75,8 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
 
 import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixtures/prompt-context";
 import { execute } from "./execute.js";
+import type { AdapterInvocationMeta } from "@paperclipai/adapter-utils";
+import { recoverCodexResultFromOutput } from "./recover-result.js";
 
 describe("codex remote execution", () => {
   const cleanupDirs: string[] = [];
@@ -693,6 +695,76 @@ describe("codex remote execution", () => {
     expect(retry).not.toContain("## Compact assignment");
     expect(retry.indexOf("comment-first")).toBeLessThan(retry.indexOf("comment-second"));
     expect(retry.split("Append the same ledger entry.")).toHaveLength(3);
+  });
+
+  it("gives a recovered result the same remoteExecution as the normal result, without credentials", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-remote-recovery-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    const codexHomeDir = path.join(rootDir, "codex-home");
+    await mkdir(workspaceDir, { recursive: true });
+    await mkdir(codexHomeDir, { recursive: true });
+    await writeFile(path.join(codexHomeDir, "auth.json"), "{}", "utf8");
+    const stdout = [
+      JSON.stringify({ type: "thread.started", thread_id: "thread-remote-1" }),
+      JSON.stringify({ type: "turn.started" }),
+      JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "done" } }),
+      JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 } }),
+    ].join("\n");
+    runChildProcess.mockResolvedValueOnce({
+      exitCode: 0, signal: null, timedOut: false, stdout, stderr: "", pid: 123, startedAt: new Date().toISOString(),
+    });
+    const metas: AdapterInvocationMeta[] = [];
+
+    const result = await execute({
+      runId: "run-recovery",
+      agent: { id: "agent-1", companyId: "company-1", name: "CodexCoder", adapterType: "codex_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { engine: "cli", command: "codex", env: { CODEX_HOME: codexHomeDir } },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      executionTarget: {
+        kind: "remote",
+        transport: "ssh",
+        remoteCwd: "/remote/workspace",
+        spec: {
+          host: "127.0.0.1",
+          port: 2222,
+          username: "fixture",
+          remoteWorkspacePath: "/remote/workspace",
+          remoteCwd: "/remote/workspace",
+          privateKey: "PRIVATE KEY",
+          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+          strictHostKeyChecking: true,
+        },
+      },
+      onLog: async () => {},
+      onMeta: async (meta) => {
+        metas.push(meta);
+      },
+    });
+
+    const normalParams = result.sessionParams as Record<string, unknown>;
+    expect(normalParams.remoteExecution).toMatchObject({ transport: "ssh", host: "127.0.0.1", port: 2222, username: "fixture" });
+    const recovery = metas.at(-1)?.recovery;
+    expect(recovery?.sessionParams?.remoteExecution).toEqual(normalParams.remoteExecution);
+    expect(JSON.stringify(recovery)).not.toContain("PRIVATE KEY");
+    expect(JSON.stringify(recovery)).not.toContain("ssh-ed25519");
+
+    const outcome = await recoverCodexResultFromOutput({
+      output: (async function* () {
+        yield { stream: "stdout" as const, chunk: stdout, seq: 1 };
+      })(),
+      context: {
+        version: 1,
+        adapterType: "codex_local",
+        engine: "cli",
+        invocation: { firstSeq: null, sessionIdBefore: recovery!.sessionIdBefore, sessionParams: recovery!.sessionParams },
+        accounting: recovery!.accounting,
+        runStart: { sessionIdBefore: null, sessionDisplayId: null, sessionParams: null },
+      },
+    });
+    if (outcome.kind !== "complete") throw new Error(`expected complete, got ${JSON.stringify(outcome)}`);
+    expect(outcome.result.sessionParams).toEqual(normalParams);
   });
 
 });

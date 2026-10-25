@@ -605,6 +605,35 @@ describeEmbeddedPostgres("tool access policy service", () => {
     expect(remainingTrustRules.map((policy) => policy.id)).toEqual([trustRule.id]);
   });
 
+  it("lets a board user toggle a managed policy without re-validating its stored config", async () => {
+    const company = await createCompany(db);
+    const { connection, catalogEntry } = await createTool(db, company.id);
+    const svc = toolAccessPolicyService(db);
+    const config = { source: "connection_intent", connectionId: connection.id, catalogEntryId: catalogEntry.id };
+    const [managed] = await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Managed ask first",
+      policyType: "require_approval",
+      selectors: { toolName: "send_email" },
+      config,
+    }).returning();
+
+    const updated = await svc.updatePolicy({
+      companyId: company.id,
+      policyId: managed!.id,
+      body: { enabled: false },
+    });
+    expect(updated).toMatchObject({ id: managed!.id, enabled: false, config });
+    const [row] = await db.select().from(toolPolicies).where(eq(toolPolicies.id, managed!.id));
+    expect(row).toMatchObject({ enabled: false, config });
+
+    await expect(svc.updatePolicy({
+      companyId: company.id,
+      policyId: managed!.id,
+      body: { config: { source: "x" } },
+    })).rejects.toMatchObject({ status: 422 });
+  });
+
   it("treats glob-looking action-name selectors as exact names", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);

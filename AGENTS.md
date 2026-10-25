@@ -183,6 +183,10 @@ pnpm build
 
 If anything cannot be run, explicitly report what was not run and why.
 
+### Screenshots and evidence
+
+For Storybook screenshots use `pnpm storybook:with <port> -- <cmd>` (or `build-storybook` with the `tests/storybook-visual` Playwright `webServer`). Never start `storybook dev` in the background with `&`.
+
 ## 8. API and Auth Expectations
 
 - Base path: `/api`

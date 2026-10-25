@@ -53,13 +53,18 @@ export function cancellationResultJson(run: Run, status: string, patch?: Run["re
     } else if (result.cancelledByActorType || result.cancelledByUserId || result.interruptedByActorType || result.queuedCommentInterruptQueueId) {
       cancellation = requestedRunCancellation(result, error ?? run.error ?? "Execution stopped");
     } else {
-      const source = code === "duplex_channel_lost" ? "transport" : result.status === "cancelled" ? "provider" : "unknown";
+      const leaseLost = code === "legacy_controller_lease_lost";
+      // A lease-lost cancel that stands is the control plane's, even when the
+      // provider reports the cancel it was told to make (SX-2385 section 4).
+      const source = code === "duplex_channel_lost" ? "transport" : leaseLost ? "control_plane"
+        : result.status === "cancelled" ? "provider" : "unknown";
       const description = source === "provider" ? "Provider cancelled execution"
         : source === "transport" ? "Connection to the execution provider was lost"
+        : leaseLost ? "Legacy controller lease lost"
         : "Execution stopped without a recorded cancellation request";
       const detail = error ?? run.error;
       cancellation = { source, expected: false, initiator: { type: source === "provider" ? "provider" : "system" },
-        reason: (!detail || /^cancelled\.?$/i.test(detail) ? description : `${description}: ${detail}`).slice(0, 512),
+        reason: (!detail || /^cancelled\.?$/i.test(detail) || detail === description ? description : `${description}: ${detail}`).slice(0, 512),
         recordedAt: new Date().toISOString() };
     }
   }
@@ -81,4 +86,11 @@ export function isUnexpectedRunCancellation(run: Run): boolean {
   return run.status === "cancelled" && Boolean(run.startedAt) &&
     !(bootstrap?.kind === "bootstrap" && bootstrap.providerWorkStarted === false) &&
     readRunCancellation(run.resultJson)?.expected !== true;
+}
+
+// Differs from upstream (fork, SX-1735, SX-2419). The issue route stopped this
+// run on purpose to hand the task over and the stop was acknowledged.
+export function isConfirmedReassignmentStop(run: Pick<Run, "status" | "errorCode" | "resultJson">): boolean {
+  return run.status === "cancelled" && run.errorCode === "issue_reassigned" &&
+    run.resultJson?.reassignmentStopConfirmed === true;
 }

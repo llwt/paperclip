@@ -471,6 +471,7 @@ export async function resolveManagedGitHubCredential(
     responsibleUserId?: string | null;
     agentId?: string | null;
     allowStandingDelegation?: boolean;
+    auditDedupeWindowMs?: number;
   },
 ): Promise<{ configured: boolean; identitySource?: "personal" | "dedicated"; credential?: GitCredential; error?: string }> {
   const selection = await resolveManagedGitHubIdentitySelection(db, companyId, context);
@@ -519,6 +520,7 @@ export async function resolveManagedGitHubCredential(
       issueId: context.issueId ?? null,
       heartbeatRunId: context.heartbeatRunId ?? null,
       responsibleUserId: context.responsibleUserId ?? null,
+      auditDedupeWindowMs: context.auditDedupeWindowMs,
     };
     let token: string;
     if (grant.kind === "user") {

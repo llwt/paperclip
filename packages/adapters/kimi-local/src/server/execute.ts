@@ -45,6 +45,7 @@ import {
   isPaperclipRecoveryWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
+  withLeftoverProcessSweep,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   SANDBOX_INSTALL_COMMAND,
@@ -246,7 +247,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const hasExplicitApiKey =
     typeof envConfig.PAPERCLIP_API_KEY === "string" && envConfig.PAPERCLIP_API_KEY.trim().length > 0;
   const env: Record<string, string> = {
-    ...buildPaperclipEnv(agent),
+    ...buildPaperclipEnv(agent, ctx.agentIdentity),
     ...buildRuntimeToolsEnv(ctx.runtimeTools),
   };
   env.PAPERCLIP_RUN_ID = runId;
@@ -648,6 +649,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: attempt.proc.exitCode,
         signal: attempt.proc.signal,
         timedOut: true,
+        // This stream protocol has no usage receipt to recover after exit.
+        // Close collection with an explicitly unknown price, never a free run.
+        usageComplete: true,
+        costStatus: "unpriced",
+        usageBasis: "per_run",
+        provider: "moonshot",
+        biller: "moonshot",
+        model: model || null,
+        billingType,
+        costUsd: null,
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: authMeta.requiresAuth
           ? "kimi_auth_required"
@@ -704,6 +715,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       exitCode: attempt.proc.exitCode,
       signal: attempt.proc.signal,
       timedOut: false,
+      usageComplete: true,
+      costStatus: "unpriced",
+      usageBasis: "per_run",
       errorMessage: failed ? fallbackErrorMessage : null,
       // Forward the transport-level error code from the run-disposition seam
       // first. A lost duplex control channel surfaces the typed
@@ -741,10 +755,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[paperclip] Kimi resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
       );
       const retry = await runAttempt(null);
-      return toResult(retry, true, true);
+      return withLeftoverProcessSweep(toResult(retry, true, true), [initial.proc, retry.proc]);
     }
 
-    return toResult(initial);
+    return withLeftoverProcessSweep(toResult(initial), [initial.proc]);
   } finally {
     try {
       await providerStop.collectBeforeRestore();

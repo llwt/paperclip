@@ -16,6 +16,7 @@ import type {
 } from "@paperclipai/shared";
 import { heartbeatsApi } from "@/api/heartbeats";
 import { nativeRunEventsToTranscript } from "./transcript/native-run-events";
+import { pendingConnectionIntentInteraction } from "@/fixtures/issueThreadInteractionFixtures";
 import type { HeartbeatRunEvent } from "@paperclipai/shared";
 
 const transcriptState = vi.hoisted(() => ({
@@ -42,7 +43,10 @@ const DIRECT_ADAPTER_TYPES = [
   "http",
   "custom_plugin",
 ] as const;
-const editorCallbacks = vi.hoisted(() => ({ change: (_value: string) => {} }));
+const editorCallbacks = vi.hoisted(() => ({
+  change: (_value: string) => {},
+  byNode: new WeakMap<Element, (value: string) => void>(),
+}));
 const streamlinedState = vi.hoisted(() => ({ enabled: true }));
 
 vi.mock("@/components/transcript/useLiveRunTranscripts", () => ({
@@ -101,7 +105,11 @@ vi.mock("@/components/MarkdownEditor", () => ({
       focus: () => {},
     }));
     editorCallbacks.change = onChange;
-    return <div data-testid="mock-editor">{value}</div>;
+    return (
+      <div data-testid="mock-editor" ref={node => { if (node) editorCallbacks.byNode.set(node, onChange); }}>
+        {value}
+      </div>
+    );
   }),
 }));
 
@@ -1008,6 +1016,54 @@ describe("TaskChatThread runtime transcript selection", () => {
     expect(container.textContent).toContain("The run failed");
     expect(container.textContent).not.toContain("before returning an answer");
     expect(container.textContent).not.toContain("Workspace restore failed");
+  });
+
+  it("directs a missing starting branch to repair instead of offering an unchanged retry", () => {
+    render(<TaskChatThread comments={[]} onAdd={async () => {}} issueStatus="blocked" onRetryFailedRun={vi.fn()} linkedRuns={[{
+      runId: "missing-branch-run", runtimeMode: "legacy", status: "failed", errorCode: "configuration_incomplete",
+      agentId: "agent-1", agentName: "Worker", adapterType: "claude_local",
+      createdAt: "2026-08-25T18:00:00.000Z", startedAt: null, finishedAt: "2026-08-25T18:00:02.000Z",
+      resultJson: { configurationIncomplete: { reason: "workspace_base_ref_unresolved", requestedRef: "main" } },
+    }]} />);
+    expect(container.textContent).toContain("Starting branch unavailable");
+    expect(container.textContent).toContain("Repair the starting branch below before retrying.");
+    expect(container.querySelector('[data-testid="task-chat-run-failed-try-again"]')).toBeNull();
+  });
+
+  it.each(["legacy", "native"] as const)("keeps a %s credential denial expanded and replaces it after a successful attempt", (runtimeMode) => {
+    const denied = {
+      runId: "credential-run", runtimeMode, status: "failed", errorCode: "configuration_incomplete",
+      agentId: "agent-1", agentName: "Codie", adapterType: runtimeMode === "native" ? "paperclip_runner" : "codex_local",
+      responsibleUserId: "nicky", createdAt: "2026-08-25T18:00:00Z", startedAt: null, finishedAt: "2026-08-25T18:00:02Z",
+      resultJson: { configurationIncomplete: { selectionFailure: "ai_connection_credential_not_shared", credentialAccess: { connectionName: "Dotta’s API Key" } } },
+    };
+    const props = { comments: [], onAdd: async () => {}, issueStatus: "blocked", currentUserId: "nicky", onRetryFailedRun: vi.fn() };
+    render(<TaskChatThread {...props} linkedRuns={[denied]} />);
+    const alert = container.querySelector('[data-testid="task-chat-credential-access-notice"]');
+    expect(alert?.getAttribute("role")).toBe("alert");
+    expect(alert?.textContent).toContain("Codie is configured to use Dotta’s API Key, but you don’t have access");
+    expect(alert?.querySelector('a[href="/agents/agent-1/runtime"]')).not.toBeNull();
+    expect(alert?.querySelector('a[href*="/runs/credential-run"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-run-failed-try-again"]')).toBeNull();
+    render(<TaskChatThread {...props} linkedRuns={[denied, { ...denied, runId: "new-run", status: "succeeded",
+      resultJson: null, errorCode: null, createdAt: "2026-08-25T18:01:00Z", startedAt: "2026-08-25T18:01:00Z", finishedAt: "2026-08-25T18:01:02Z" }]} />);
+    expect(container.querySelector('[data-testid="task-chat-credential-access-notice"]')).toBeNull();
+  });
+
+  it("directs a missing personal AI credential to its card without offering a premature retry", () => {
+    render(<TaskChatThread comments={[]} onAdd={async () => {}} issueStatus="blocked"
+      onRetryFailedRun={vi.fn()} interactions={[{
+        ...pendingConnectionIntentInteraction, sourceRunId: "missing-ai-run",
+        payload: { ...pendingConnectionIntentInteraction.payload, purpose: "ai" },
+      }]} linkedRuns={[{
+        runId: "missing-ai-run", runtimeMode: "legacy", status: "failed", errorCode: "configuration_incomplete",
+        agentId: "agent-1", agentName: "Chief of Staff", adapterType: "claude_local",
+        createdAt: "2026-08-25T18:00:00.000Z", startedAt: null, finishedAt: "2026-08-25T18:00:02.000Z",
+      }]} />);
+    expect(container.textContent).toContain("AI connection needed");
+    expect(container.textContent).toContain("Use the connection card below to continue.");
+    expect(container.textContent).not.toContain("The selected AI account is unavailable");
+    expect(container.querySelector('[data-testid="task-chat-run-failed-try-again"]')).toBeNull();
   });
 
   it("projects the saved Plan inline at its native write_document boundary", () => {
@@ -2169,6 +2225,35 @@ describe("TaskChatThread runtime transcript selection", () => {
     );
   });
 
+  it("keeps a pending native permission answerable after same-turn steering", async () => {
+    const runId = "native-pending-steered";
+    nativeTranscriptState.transcriptByRun.set(runId, [
+      { kind: "runtime_request", ts: "2026-08-25T18:00:01.000Z", requestId: "permission-1",
+        requestKind: "permission_approval", turnId: "provider-turn-1", requestType: "permission", status: "pending",
+        prompt: "Pi write", choices: [{ key: "decline", label: "Deny" }], fields: [] },
+      { kind: "assistant", ts: "2026-08-25T18:00:03.000Z", text: "Steering acknowledged.", channel: "progress" },
+    ]);
+    const resolve = vi.spyOn(heartbeatsApi, "resolveRuntimeRequest").mockResolvedValue({} as never);
+    render(<TaskChatThread comments={[{
+      id: "pending-steering-comment", companyId: "company-1", issueId: "issue-1", authorType: "user",
+      authorAgentId: null, authorUserId: "user-1", body: "Change course.", presentation: null, metadata: null,
+      runId: null, consumedByRunId: runId, steeredIntoRunId: runId,
+      conversationAnchorAt: new Date("2026-08-25T18:00:02.000Z"),
+      createdAt: new Date("2026-08-25T18:00:02.000Z"), updatedAt: new Date("2026-08-25T18:00:02.000Z"),
+    }]} onAdd={async () => {}} issueStatus="in_progress" activeRun={{
+      id: runId, runtimeMode: "native", status: "running", invocationSource: "issue", triggerDetail: null,
+      startedAt: "2026-08-25T18:00:00.000Z", finishedAt: null, createdAt: "2026-08-25T18:00:00.000Z",
+      agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner",
+    }} />);
+    const deny = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).filter(button => button.textContent === "Deny");
+    expect(deny).toHaveLength(1);
+    expect(deny[0].disabled).toBe(false);
+    expect(container.textContent).not.toContain("Cancelled");
+    await act(async () => deny[0].click());
+    expect(resolve).toHaveBeenCalledWith({ runId, requestId: "permission-1", turnId: "provider-turn-1",
+      requestKind: "permission_approval", resolution: { action: "decline" } });
+  });
+
   it("labels the live tail as a continuation after the steering bubble", () => {
     nativeTranscriptState.transcriptByRun.set("native-live-steered", [
       {
@@ -3314,6 +3399,82 @@ describe.each([true, false])("Pending question dock (conversationMode=%s)", conv
       expect(pendingIndicator()).toBeNull();
       expect(historyRows()).toHaveLength(0);
     }
+  });
+
+  it("does not count answered, cancelled, expired or degenerate questions", async () => {
+    const resolved = (["answered", "cancelled", "expired"] as const).map(status =>
+      ({ ...questionInteraction(`q-${status}`, `Question ${status}?`, "2026-08-15T12:10:00Z"), status }) as IssueThreadInteraction);
+    const degenerate = { ...questionInteraction("q-degenerate", "Blank?", "2026-08-15T12:11:00Z"), payload: { version: 1, questions: [] } } as IssueThreadInteraction;
+    render(<TaskChatThread {...props} comments={[]} interactions={[...resolved, degenerate, old]} />);
+    expect(takeover()?.textContent).toContain("Which color?");
+    expect(takeover()?.textContent).not.toContain("pending");
+    await dismiss();
+    expect(pendingIndicator()?.textContent).toContain("1 pending input");
+  });
+
+  it("reaches and answers a confirmation and a question posted by the same run (SX-1460 shape)", async () => {
+    const confirmation = {
+      ...planReviewInteraction("pending", "revision-2", "run-same"),
+      id: "confirm-same",
+      title: "Approve the route?",
+      createdAt: new Date("2026-08-15T12:10:00.000Z"),
+      payload: { version: 1, prompt: "Approve the route?", acceptLabel: "Approve", rejectLabel: "Request changes" },
+    } as IssueThreadInteraction;
+    const question = {
+      ...questionInteraction("question-same", "Which route?", "2026-08-15T12:10:00.100Z"),
+      sourceRunId: "run-same",
+      title: "Copy of the set",
+      payload: {
+        version: 1,
+        supersedeOnUserComment: false,
+        questions: [
+          {
+            id: "route",
+            prompt: "Which route?",
+            selectionMode: "single",
+            required: true,
+            allowOther: true,
+            options: [{ id: "a", label: "Route A" }, { id: "b", label: "Route B" }],
+          },
+          {
+            id: "directory",
+            prompt: "Which folder?",
+            selectionMode: "single",
+            required: true,
+            options: [{ id: "path", label: "I'll type the path", freeText: true }],
+          },
+        ],
+      },
+    } as IssueThreadInteraction;
+    const onAcceptInteraction = vi.fn(async () => {});
+    const onSubmitInteractionAnswers = vi.fn(async () => {});
+    const shown = { ...props, onAcceptInteraction, onRejectInteraction: async () => {}, onSubmitInteractionAnswers };
+    render(<TaskChatThread {...shown} comments={[]} interactions={[confirmation, question]} />);
+    expect(takeover()?.textContent).toContain("Which route?");
+    expect(takeover()?.textContent).toContain("2 pending");
+    await dismiss();
+    expect(pendingIndicator()?.textContent).toContain("2 pending inputs");
+    await act(async () => pendingIndicator()!.click());
+    expect(takeover()?.textContent).toContain("Which route?");
+    await click("2 pending");
+    expect(takeover()?.textContent).toContain("Approve the route?");
+    await click("Approve");
+    expect(onAcceptInteraction).toHaveBeenCalledWith(confirmation);
+    await act(async () => render(<TaskChatThread {...shown} comments={movedOn} interactions={[{ ...confirmation, status: "accepted" }, question]} />));
+    expect(takeover()?.textContent).toContain("Which route?");
+    expect(pendingIndicator()).toBeNull();
+    await click("Route B");
+    await click("Next");
+    expect(takeover()?.textContent).toContain("Which folder?");
+    await click("I'll type the path");
+    const pathEditor = takeover()!.querySelector('[data-testid="question-other-answer-composer"] [data-testid="mock-editor"]');
+    expect(pathEditor).toBeTruthy();
+    await act(async () => editorCallbacks.byNode.get(pathEditor!)!("My Drive/Taxes/2025"));
+    await click("Submit answers");
+    expect(onSubmitInteractionAnswers).toHaveBeenCalledWith(question, [
+      { questionId: "route", optionIds: ["b"] },
+      { questionId: "directory", optionIds: [], otherText: "My Drive/Taxes/2025" },
+    ]);
   });
 });
 

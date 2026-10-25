@@ -1,6 +1,4 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { useEffect } from "react";
-import { buildAgentMentionHref, parseLeadingAgentMention } from "@paperclipai/shared";
 import { ArrowRight, User } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -18,12 +16,7 @@ import {
   computeComposerHandoffPreview,
   computePauseAffectsSummary,
   describeReassignInterrupt,
-  extractAgentMentionIds,
-  type ComposerHandoffPreviewInput,
 } from "@/lib/interrupt-handoff";
-import { ToastViewport } from "@/components/ToastViewport";
-import { recommendationRequestToast } from "@/components/DecisionTriageStrip";
-import { useToastActions } from "@/context/ToastContext";
 
 /**
  * Visual states for the interrupt-handoff UX clarity work (PAP-10669). Each card
@@ -31,15 +24,10 @@ import { useToastActions } from "@/context/ToastContext";
  * interrupted → waiting on user, and no agent selected.
  */
 
-const MENTION_OWNER_ID = "11111111-1111-4111-8111-111111111111";
-const MENTION_QA_ID = "22222222-2222-4222-8222-222222222222";
-
 const resolvers: HandoffChipResolvers = {
   agentMap: new Map([
     ["agent-claude", { name: "ClaudeCoder", icon: null }],
     ["agent-qa", { name: "QA", icon: null }],
-    [MENTION_OWNER_ID, { name: "ClaudeCoder", icon: null }],
-    [MENTION_QA_ID, { name: "QA", icon: null }],
   ]),
   currentUserId: "user-board",
   resolveUserLabel: (id) => (id === "user-board" ? "Riley Board" : null),
@@ -244,95 +232,4 @@ export const PauseAffects: Story = {
       </div>
     );
   },
-};
-
-const qaMention = `[@QA](${buildAgentMentionHref(MENTION_QA_ID)})`;
-const devMention = `[@Dev](${buildAgentMentionHref("33333333-3333-4333-8333-333333333333")})`;
-
-function LeadingMentionRow({
-  title,
-  body,
-  input,
-}: {
-  title: string;
-  body: string;
-  input?: Partial<ComposerHandoffPreviewInput>;
-}) {
-  const mentionedAgentIds = extractAgentMentionIds(body);
-  const preview = computeComposerHandoffPreview({
-    reassignTarget: `agent:${MENTION_OWNER_ID}`,
-    currentAssigneeValue: `agent:${MENTION_OWNER_ID}`,
-    hasActiveRun: false,
-    bodyHasAgentMention: mentionedAgentIds.length > 0,
-    mentionedAgentId: mentionedAgentIds[0] ?? null,
-    plainNameCandidate: null,
-    leadingMention: parseLeadingAgentMention(body),
-    ...input,
-  });
-  return (
-    <div className="space-y-1 rounded-md border border-dashed border-border/70 p-2">
-      <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{title}</div>
-      <div className="font-mono text-[11px] text-muted-foreground">{body.replace(/\(agent:\/\/[^)]+\)/g, "(agent://…)")}</div>
-      <ComposerHandoffPreviewRow preview={preview} resolvers={resolvers} />
-    </div>
-  );
-}
-
-/** Leading-mention handoff preview (SX-1178). Availability is off in the app until the server path ships. */
-export const LeadingMentionPreview: Story = {
-  render: () => (
-    <div className="flex max-w-xl flex-col gap-3 p-4" data-testid="leading-mention-preview">
-      <div className="text-xs font-medium">Availability off (current default)</div>
-      <LeadingMentionRow title="Leading mention" body={`${qaMention} please take this`} />
-      <LeadingMentionRow title="Later mention" body={`Context first, ${qaMention} please look`} />
-      <div className="pt-2 text-xs font-medium">Availability on (PR 3)</div>
-      <LeadingMentionRow
-        title="Later mention"
-        body={`Context first, ${qaMention} please look`}
-        input={{ handoffAvailable: true }}
-      />
-      <LeadingMentionRow
-        title="Unknown gates"
-        body={`${qaMention} please take this`}
-        input={{ handoffAvailable: true }}
-      />
-      <LeadingMentionRow
-        title="Refused: confirmation pending"
-        body={`${qaMention} please take this`}
-        input={{ handoffAvailable: true, handoffCheck: { kind: "refused", reasonCode: "confirmation_pending" } }}
-      />
-      <LeadingMentionRow
-        title="Refused: two recipients"
-        body={`${qaMention} ${devMention} take this`}
-        input={{ handoffAvailable: true }}
-      />
-      <LeadingMentionRow
-        title="Eligible, agent running"
-        body={`${qaMention} please take this`}
-        input={{ handoffAvailable: true, hasActiveRun: true, handoffCheck: { kind: "eligible" } }}
-      />
-      <LeadingMentionRow
-        title="Explicit picker wins"
-        body={`${qaMention} please take this`}
-        input={{ handoffAvailable: true, reassignTarget: "user:user-board", handoffCheck: { kind: "eligible" } }}
-      />
-    </div>
-  ),
-};
-
-function RecommendationToastDemo() {
-  const { pushToast } = useToastActions();
-  useEffect(() => {
-    pushToast({ ...recommendationRequestToast("Planner"), ttlMs: 600_000 });
-  }, [pushToast]);
-  return <ToastViewport />;
-}
-
-/** Decisions desk "Ask agent for recommendation" success toast. */
-export const DecisionsDeskRecommendationToast: Story = {
-  render: () => (
-    <div className="min-h-[200px] p-4" data-testid="decisions-desk-toast">
-      <RecommendationToastDemo />
-    </div>
-  ),
 };

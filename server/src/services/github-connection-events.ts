@@ -1,3 +1,5 @@
+import { dispatchGitHubBotCloudEvent } from "./chat-github-cloud-ingress.js";
+import { chatEndpoints } from "@paperclipai/db";
 import { randomUUID } from "node:crypto";
 import {
   connectionEventDeliveries,
@@ -110,6 +112,7 @@ function normalizeLeasedPayload(event: LeasedEvent): Record<string, unknown> {
       url: githubUrl(payload.url),
       state: boundedString(payload.state, 40),
       merged: payload.merged === true,
+      draft: payload.draft === true,
       mergedAt: isoDate(payload.mergedAt),
       updatedAt: isoDate(payload.updatedAt),
       headRef: boundedString(payload.headRef, 300),
@@ -174,6 +177,8 @@ function githubSnapshotUpdate(payload: Record<string, unknown>) {
   if (!repository || !number) return null;
   const state = stringValue(payload.state) ?? "unknown";
   const merged = payload.merged === true;
+  // Mirrors the poller's pull request snapshot: only an open pull request shows Draft.
+  const draft = state === "open" && payload.draft === true;
   const [owner, repo, ...extra] = repository.split("/");
   if (!owner || !repo || extra.length > 0) return null;
   return {
@@ -184,11 +189,11 @@ function githubSnapshotUpdate(payload: Record<string, unknown>) {
     externalId: `${repository}#pull/${number}`,
     state,
     merged,
-    statusKey: merged ? "merged" : state === "closed" ? "closed" : "open",
-    statusLabel: merged ? "Merged" : state === "closed" ? "Closed" : "Open",
-    statusCategory: merged ? "succeeded" : state === "closed" ? "closed" : "open",
-    statusTone: merged ? "success" : state === "closed" ? "muted" : "info",
-    statusIconKey: merged ? "git-merge" : state === "closed" ? "x-circle" : "git-pull-request",
+    statusKey: merged ? "merged" : state === "closed" ? "closed" : draft ? "draft" : "open",
+    statusLabel: merged ? "Merged" : state === "closed" ? "Closed" : draft ? "Draft" : "Open",
+    statusCategory: merged ? "succeeded" : state === "closed" ? "closed" : draft ? "waiting" : "open",
+    statusTone: merged ? "success" : state === "closed" ? "muted" : draft ? "warning" : "info",
+    statusIconKey: merged ? "git-merge" : state === "closed" ? "x-circle" : draft ? "clock" : "git-pull-request",
     data: {
       provider: "github",
       owner,
@@ -196,6 +201,7 @@ function githubSnapshotUpdate(payload: Record<string, unknown>) {
       number,
       state,
       merged,
+      draft,
       ...(stringValue(payload.url) ? { url: stringValue(payload.url) } : {}),
       ...(stringValue(payload.mergedAt) ? { mergedAt: stringValue(payload.mergedAt) } : {}),
       ...(stringValue(payload.headRef) ? { headRef: stringValue(payload.headRef) } : {}),
@@ -246,8 +252,14 @@ export function githubConnectionEventService(
       statusTone: snapshot.statusTone,
       statusIconKey: snapshot.statusIconKey,
       isTerminal: snapshot.merged || snapshot.state === "closed",
-      data: sql`${externalObjects.data} || ${JSON.stringify(snapshot.data)}::jsonb`,
+      // A webhook carries the real state, so an earlier "Not found" verdict from the poller
+      // (notFound/probeVerified) and its auth or reachability error no longer apply.
+      data: sql`(${externalObjects.data} - 'notFound' - 'probeVerified') || ${JSON.stringify(snapshot.data)}::jsonb`,
       remoteVersion: snapshot.remoteVersion,
+      liveness: "fresh",
+      lastErrorAt: null,
+      lastErrorCode: null,
+      lastErrorMessage: null,
       lastResolvedAt: appliedAt,
       lastChangedAt: appliedAt,
       nextRefreshAt: appliedAt,
@@ -462,8 +474,9 @@ export function githubConnectionEventService(
         return { leased: 0, processed: 0, duplicate: 0, ignored: 0, failed: 0 };
       }
       const bindings = await activeBindings();
-      if (bindings.length === 0) {
-        nextPollAt = now().getTime() + 5 * 60_000;
+      const bots = await db.select().from(chatEndpoints).where(and(eq(chatEndpoints.provider, "github"), sql`${chatEndpoints.setup}->'github'->>'cloudRegistrationId' is not null`, sql`${chatEndpoints.status} <> 'archived'`));
+      if (bindings.length === 0 && bots.length === 0) {
+        nextPollAt = now().getTime() + 5_000;
         return { leased: 0, processed: 0, duplicate: 0, ignored: 0, failed: 0 };
       }
       const config = options.connector ? null : paperclipCloudConnectorConfigFromEnv(options.env);
@@ -472,11 +485,11 @@ export function githubConnectionEventService(
         nextPollAt = now().getTime() + 5 * 60_000;
         return { leased: 0, processed: 0, duplicate: 0, ignored: 0, failed: 0 };
       }
-      const first = bindings[0]!;
+      const first = bindings[0] ?? { subject: "github-bot-events", companyId: bots[0]!.companyId };
       const lease = await connector.leaseEvents({ subject: first.subject, companyId: first.companyId });
       if (!lease) {
         emptyPolls += 1;
-        nextPollAt = now().getTime() + Math.min(5 * 60_000, 5_000 * (2 ** Math.min(emptyPolls, 6)));
+        nextPollAt = now().getTime() + Math.min(bots.length ? 15_000 : 5 * 60_000, 5_000 * (2 ** Math.min(emptyPolls, 6)));
         return { leased: 0, processed: 0, duplicate: 0, ignored: 0, failed: 0 };
       }
       emptyPolls = 0;
@@ -490,6 +503,11 @@ export function githubConnectionEventService(
       };
       const acknowledge: string[] = [];
       for (const event of lease.events) {
+        if (event.payload.githubApp !== undefined) {
+          try { await dispatchGitHubBotCloudEvent(db, event); acknowledge.push(event.id); result.processed += 1; }
+          catch { result.failed += 1; }
+          continue;
+        }
         const matched = bindings.filter((binding) => event.bindingIds.includes(binding.id));
         if (matched.length === 0) {
           result.ignored += 1;

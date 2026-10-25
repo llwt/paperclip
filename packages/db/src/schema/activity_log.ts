@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import { pgTable, uuid, text, timestamp, jsonb, index } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
@@ -33,5 +34,9 @@ export const activityLog = pgTable(
     ),
     runIdIdx: index("activity_log_run_id_idx").on(table.runId),
     entityIdx: index("activity_log_entity_type_id_idx").on(table.entityType, table.entityId),
+    // Fork (SX-1597): the source-issue branch of activity forIssue scanned the whole table without this.
+    companySourceIssueIdx: index("activity_log_company_source_issue_idx")
+      .on(table.companyId, sql`(${table.details} ->> 'sourceIssueId')`)
+      .where(sql`${table.action} IN ('project.created', 'company.skill_created')`),
   }),
 );

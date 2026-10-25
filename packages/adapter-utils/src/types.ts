@@ -31,9 +31,52 @@ export interface AdapterRuntime {
 // ---------------------------------------------------------------------------
 
 export interface UsageSummary {
+  /** Uncached input plus cache writes; excludes cache reads. Total tokens are input + cachedInput + output. */
   inputTokens: number;
   outputTokens: number;
   cachedInputTokens?: number;
+  /** Subset of inputTokens, not an additional token count. */
+  cacheWriteTokens?: number;
+}
+
+/** Accounting-only snapshot. Never include prompt, response, or credentials. */
+export interface AdapterUsageCheckpoint {
+  attemptId?: string;
+  usage?: UsageSummary;
+  usageByModel?: Array<{ model: string; usage: UsageSummary; costUsd: number }>;
+  usageBasis?: "per_run" | "session_cumulative" | null;
+  /**
+   * Differs from upstream (fork #31): the provider session whose running
+   * totals a "session_cumulative" usage reports. The server subtracts that
+   * session's earlier runs before pricing.
+   */
+  sessionId?: string | null;
+  /** Set by the server: the session totals behind a subtracted usage. */
+  sessionUsage?: UsageSummary;
+  /**
+   * Differs from upstream (fork, SX-1378): "session_cumulative" when costUsd is
+   * the session's running total (the Claude CLI's total_cost_usd on --resume),
+   * also when the tokens are per run.
+   */
+  costBasis?: "per_run" | "session_cumulative" | null;
+  /** This invocation's own tokens, when usage reports session totals. */
+  invocationUsage?: UsageSummary;
+  /** Set by the server: the session-total cost behind a subtracted costUsd. */
+  rawCostUsd?: number | null;
+  /** Set by the server: sessionUsage is a lower bound (Claude without modelUsage). */
+  sessionUsageIncomplete?: boolean;
+  provider?: string | null;
+  biller?: string | null;
+  model?: string | null;
+  billingType?: AdapterBillingType | null;
+  costUsd?: number | null;
+  costUsdExact?: string | null;
+  costStatus?: "reported" | "estimated" | "unpriced";
+  pricingContext?: { serviceTier?: string; contextTier?: "short" | "long" };
+  pricingProvenance?: { source: "provider_reported" | "provider_invoice" | "operator" | "rate_card" | "unknown"; version?: string; evidence?: string; inputCentsPerMillion?: string; cachedInputCentsPerMillion?: string; cacheWriteCentsPerMillion?: string; outputCentsPerMillion?: string; serviceTier?: string; contextTier?: "short" | "long" };
+  cacheAdjustedCostUsd?: number | null;
+  providerRequestId?: string | null;
+  complete: boolean;
 }
 
 export type AdapterBillingType =
@@ -93,13 +136,28 @@ export interface AdapterExecutionResult {
   retryNotBefore?: string | null;
   errorMeta?: Record<string, unknown>;
   usage?: UsageSummary;
+  /** Complete per-model receipts, when supplied by the runtime. Their sums must match the run totals. */
+  usageByModel?: Array<{ model: string; usage: UsageSummary; costUsd: number }>;
   /**
    * How `usage` totals are scoped. "per_run" means the tokens cover only this
    * execution; "session_cumulative" means they are running totals for the
    * persisted session, and the server must delta consecutive runs. Absent
-   * means unknown — the server applies its legacy session-delta heuristic.
+   * defaults to per-run; the server must never infer cumulative usage from a
+   * reused session ID.
    */
   usageBasis?: "per_run" | "session_cumulative" | null;
+  /**
+   * How `costUsd` is scoped, when it differs from `usageBasis`. The Claude CLI
+   * reports `total_cost_usd` as a session total even when its tokens cover
+   * only this invocation. Absent means the cost follows `usageBasis`.
+   */
+  costBasis?: "per_run" | "session_cumulative" | null;
+  /**
+   * This invocation's own tokens, when `usage` holds session totals. The
+   * server stores these instead of a delta when the previous run's counters
+   * are only a lower bound (Claude CLI runs without modelUsage).
+   */
+  invocationUsage?: UsageSummary | null;
   /**
    * Legacy single session id output. Prefer `sessionParams` + `sessionDisplayId`.
    */
@@ -111,6 +169,12 @@ export interface AdapterExecutionResult {
   model?: string | null;
   billingType?: AdapterBillingType | null;
   costUsd?: number | null;
+  costUsdExact?: string | null;
+  costStatus?: "reported" | "estimated" | "unpriced";
+  pricingContext?: { serviceTier?: string; contextTier?: "short" | "long" };
+  pricingProvenance?: { source: "provider_reported" | "provider_invoice" | "operator" | "rate_card" | "unknown"; version?: string; evidence?: string; inputCentsPerMillion?: string; cachedInputCentsPerMillion?: string; cacheWriteCentsPerMillion?: string; outputCentsPerMillion?: string; serviceTier?: string; contextTier?: "short" | "long" };
+  providerRequestId?: string | null;
+  usageComplete?: boolean;
   /**
    * Provider-billed cost after prompt-cache discounts. Adapters should set
    * this when they expose it separately; otherwise the server treats a
@@ -158,6 +222,28 @@ export interface AdapterInvocationMeta {
   prompt?: string;
   promptMetrics?: Record<string, number>;
   context?: Record<string, unknown>;
+  /**
+   * Allowlisted facts about this CLI invocation, sent before its process starts
+   * so a later output-recovery hook can rebuild the final result. Never carries
+   * credentials, env, prompts or tool access.
+   */
+  recovery?: AdapterInvocationRecoveryMeta;
+}
+
+export interface AdapterInvocationRecoveryMeta {
+  version: 1;
+  /** Engine that runs this invocation's child, for example "cli". */
+  engine: string;
+  /** Session this invocation resumes, or null for a fresh session. */
+  sessionIdBefore: string | null;
+  /** Safe local session fields (no session id) that a result's session params extend. */
+  sessionParams: Record<string, unknown> | null;
+  accounting: {
+    provider: string | null;
+    biller: string | null;
+    model: string | null;
+    billingType: AdapterBillingType | null;
+  };
 }
 
 export interface AdapterRuntimeMcpServer {
@@ -196,7 +282,15 @@ export interface AdapterRuntimeEvent {
   payload?: Record<string, unknown>;
 }
 
+export interface AgentRuntimeIdentity {
+  keyId: string;
+  publicKeyPem: string;
+  privateKeyPem: string;
+}
+
 export interface AdapterExecutionContext {
+  /** Server-owned credentials. Never persist this object or merge it into config. */
+  agentIdentity?: AgentRuntimeIdentity;
   /** Synchronous, content-free diagnostic scope; never stop or collection authority. */
   onExecutionPhase?: AdapterExecutionPhaseSink;
   /** Run-scoped operator cancellation; adapters must settle before returning. */
@@ -232,6 +326,7 @@ export interface AdapterExecutionContext {
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
   onEvent?: (event: AdapterRuntimeEvent) => Promise<void>;
+  onUsage?: (receipt: AdapterUsageCheckpoint) => Promise<void>;
   onRuntimeProgress?: RuntimeStatusSink;
   /**
    * Reports that execution has crossed the adapter's dispatch boundary.
@@ -459,6 +554,65 @@ export interface AcpTargetDescriptor {
   };
 }
 
+/** One ordered piece of a run's persisted output, kept separate per stream. */
+export interface AdapterOutputRecoveryRecord {
+  stream: "stdout" | "stderr";
+  chunk: string;
+  seq: number;
+}
+
+export interface AdapterOutputRecoveryInput {
+  output: AsyncIterable<AdapterOutputRecoveryRecord>;
+  context: AdapterOutputRecoveryContext;
+}
+
+/**
+ * Allowlisted snapshot of the latest CLI invocation of a run, taken before it
+ * started. Deliberately not an AdapterExecutionContext: no env, credentials,
+ * prompt, tools or paths, so a recovery hook is a parser and nothing more.
+ */
+export interface AdapterOutputRecoveryContext {
+  version: 1;
+  /** Adapter type the run was started with, not today's agent setting. */
+  adapterType: string;
+  /** Engine that actually ran the child, for example "cli". */
+  engine: string;
+  /** Where the latest invocation begins in the run's output. */
+  invocation: {
+    /** First output seq that belongs to the latest invocation, when known. */
+    firstSeq: number | null;
+    sessionIdBefore: string | null;
+    /** Safe local session fields only. */
+    sessionParams: Record<string, unknown> | null;
+  };
+  accounting: {
+    provider: string | null;
+    biller: string | null;
+    model: string | null;
+    billingType: AdapterBillingType | null;
+  };
+  runStart: {
+    sessionIdBefore: string | null;
+    sessionDisplayId: string | null;
+    sessionParams: Record<string, unknown> | null;
+  };
+}
+
+export type AdapterOutputRecoveryResult =
+  | {
+      kind: "complete";
+      outcome: "succeeded" | "failed";
+      /** Always exitCode null, signal null, timedOut false. */
+      result: AdapterExecutionResult;
+      /** The provider event that ended the run, for provenance. */
+      terminalEvent: string;
+    }
+  | {
+      kind: "inconclusive";
+      reason: string;
+      observedSessionId?: string;
+    };
+
 export interface ServerAdapterModule {
   type: string;
   execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult>;
@@ -468,6 +622,12 @@ export interface ServerAdapterModule {
   syncSkills?: (ctx: AdapterSkillContext, desiredSkills: string[]) => Promise<AdapterSkillSnapshot>;
   sessionCodec?: AdapterSessionCodec;
   sessionManagement?: import("./session-compaction.js").AdapterSessionManagement;
+  /**
+   * Optional: read the final provider result from the persisted output of a
+   * local child whose parent process was lost. A parser only; the server
+   * establishes that the output is complete and owned before calling it.
+   */
+  recoverResultFromOutput?: (input: AdapterOutputRecoveryInput) => Promise<AdapterOutputRecoveryResult>;
   /** Selected harness can resume its conversation with this run's tool bindings. */
   supportsToolRefreshOnResume?: boolean | ((config: Record<string, unknown>) => boolean);
   supportsLocalAgentJwt?: boolean;
@@ -619,6 +779,8 @@ export interface PaperclipQuestion {
   helpText?: string;
   required: boolean;
   answerMode: "single_select" | "multi_select" | "text";
+  /** Editable starting text, never an implicit or submitted answer. Text mode only. */
+  initialText?: string;
   options?: PaperclipQuestionOption[];
   customAnswer?: { enabled: true; label?: string; placeholder?: string };
   textValidation?: {

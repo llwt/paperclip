@@ -1,0 +1,35 @@
+{
+  "name": "@somnex/paperclip-plugin-execution-flow",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Read-only execution stages and retained decisions",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": {
+    "prebuild": "pnpm --filter @paperclipai/plugin-sdk ensure-build-deps",
+    "build": "node ./esbuild.config.mjs",
+    "test": "vitest run --config ./vitest.config.ts",
+    "typecheck": "pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && tsc --noEmit"
+  },
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js",
+    "ui": "./dist/ui/"
+  },
+  "dependencies": { "@paperclipai/plugin-sdk": "workspace:*" },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "esbuild": "^0.28.2",
+    "jsdom": "^30.0.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  },
+  "author": "Somnex",
+  "license": "MIT",
+  "engines": { "node": ">=24.11.0" },
+  "peerDependencies": { "react": ">=18" }
+}

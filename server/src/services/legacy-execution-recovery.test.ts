@@ -107,3 +107,32 @@ it("recognizes only an unclaimed pre-dispatch review wait receipt", () => {
     { resultJson: { ...run.resultJson, workspaceRestoreFailure: "restore_unsafe_archive" } },
   ]) expect(isPreDispatchReviewWait({ ...run, ...patch })).toBe(false);
 });
+
+it("does not hold a run the issue route stopped on purpose for a reassignment", () => {
+  const reassigned = {
+    runtimeMode: "legacy", status: "cancelled", errorCode: "issue_reassigned",
+    resultJson: { reassignmentStopConfirmed: true },
+  };
+  expect(legacyExecutionNeedsReconciliation(reassigned)).toBe(false);
+  expect(legacyExecutionNeedsReconciliation({ ...reassigned, resultJson: {} })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...reassigned, status: "failed" })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...reassigned, errorCode: "cancelled" })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({
+    ...reassigned,
+    resultJson: { reassignmentStopConfirmed: true, workspaceRestoreFailure: "restore_unsafe_archive" },
+  })).toBe(true);
+});
+
+it("does not hold a disposition repair run the dispatch gate cancelled before the provider was called", () => {
+  const suppressed = {
+    runtimeMode: "legacy", status: "cancelled", errorCode: "legacy_disposition_repair_suppressed",
+    resultJson: {},
+  };
+  expect(legacyExecutionNeedsReconciliation(suppressed)).toBe(false);
+  expect(legacyExecutionNeedsReconciliation({ ...suppressed, status: "failed" })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...suppressed, errorCode: "cancelled" })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({
+    ...suppressed,
+    resultJson: { workspaceRestoreFailure: "restore_unsafe_archive" },
+  })).toBe(true);
+});

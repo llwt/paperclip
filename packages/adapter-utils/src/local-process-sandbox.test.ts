@@ -6,6 +6,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   buildLocalProcessSandboxSpawnTarget,
+  miseToolInstallMounts,
+  sharedToolCacheMounts,
   parseLocalProcessFilesystemScope,
   parseLocalProcessNetworkAllowlist,
   parseLocalProcessNetworkScope,
@@ -101,6 +103,98 @@ describe("local process sandbox", () => {
     expect(target.args).toContain(workspace);
     expect(target.args).toContain(managedHome);
     expect(target.args.slice(-3)).toEqual([process.execPath, "-e", "console.log('ok')"]);
+  });
+
+  it("mounts the mise tool dirs, shims and executable of a run env read-only", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-mise-mounts-"));
+    cleanup.push(root);
+    const binDir = path.join(root, "bin");
+    await fs.mkdir(binDir);
+    await fs.writeFile(path.join(binDir, "mise"), "#!/bin/sh\n", { mode: 0o755 });
+
+    expect(await miseToolInstallMounts({
+      MISE_DATA_DIR: "/srv/paperclip/runtime/mise/data",
+      MISE_CACHE_DIR: "/srv/paperclip/runtime/mise/cache/",
+      MISE_SHARED_INSTALL_DIRS: ["/home/user/.local/share/mise/installs", "relative/installs", "", "/srv/paperclip/runtime/mise/data"].join(path.delimiter),
+      PATH: ["relative/bin", path.join(root, "missing"), binDir, "/usr/bin"].join(path.delimiter),
+    })).toEqual([
+      { path: "/srv/paperclip/runtime/mise/data", access: "ro" },
+      { path: "/srv/paperclip/runtime/mise/cache", access: "ro" },
+      { path: "/home/user/.local/share/mise/installs", access: "ro" },
+      { path: "/srv/paperclip/runtime/mise/data/shims", access: "ro" },
+      { path: "/home/user/.local/share/mise/shims", access: "ro" },
+      { path: "/srv/paperclip/runtime/mise/shims", access: "ro" },
+      { path: path.join(binDir, "mise"), access: "ro" },
+    ]);
+    expect(await miseToolInstallMounts({ HOME: "/home/user" })).toEqual([]);
+  });
+
+  it.runIf(process.platform === "linux")("binds the mise tool dirs read-only into a workspace sandbox", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-mise-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const dataDir = path.join(root, "mise", "data");
+    const hostInstalls = path.join(root, "host", "installs");
+    await Promise.all([workspace, dataDir, hostInstalls].map((dir) => fs.mkdir(dir, { recursive: true })));
+
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        filesystemScope: "workspace",
+        managedPaths: await miseToolInstallMounts({
+          MISE_DATA_DIR: dataDir,
+          MISE_CACHE_DIR: path.join(root, "mise", "missing-cache"),
+          MISE_SHARED_INSTALL_DIRS: hostInstalls,
+        }),
+      },
+    });
+
+    const flagFor = (dir: string) => target.args[target.args.indexOf(dir) - 1];
+    expect(flagFor(dataDir)).toBe("--ro-bind");
+    expect(flagFor(hostInstalls)).toBe("--ro-bind");
+    expect(target.args.filter((arg) => arg === dataDir)).toHaveLength(2);
+    expect(target.args).not.toContain(path.join(root, "mise", "missing-cache"));
+  });
+
+  it("selects the pnpm store and Rust paths read-only without mounting relative paths", () => {
+    expect(sharedToolCacheMounts({
+      npm_config_store_dir: "/agent/pnpm/store/",
+      pnpm_config_store_dir: "/agent/pnpm11/store",
+      RUSTUP_HOME: "/agent/rustup",
+      CARGO_HOME: "/agent/cargo",
+    })).toEqual([
+      { path: "/agent/pnpm/store", access: "ro" },
+      { path: "/agent/pnpm11/store", access: "ro" },
+      { path: "/agent/rustup", access: "ro" },
+      { path: "/agent/cargo", access: "ro" },
+    ]);
+    expect(sharedToolCacheMounts({ npm_config_store_dir: "relative", pnpm_config_store_dir: "also/relative", RUSTUP_HOME: "", CARGO_HOME: "/agent/rust" })).toEqual([
+      { path: "/agent/rust", access: "ro" },
+    ]);
+    expect(sharedToolCacheMounts({ RUSTUP_HOME: "/agent/rust", CARGO_HOME: "/agent/rust/" })).toHaveLength(1);
+    expect(sharedToolCacheMounts({})).toEqual([]);
+  });
+
+  it.runIf(process.platform === "linux")("binds the pnpm store and Rust directories read-only into a workspace sandbox", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-tool-caches-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const dirs = ["pnpm/store", "rustup", "cargo"].map(dir => path.join(root, "runtime", dir));
+    await Promise.all([workspace, ...dirs].map(dir => fs.mkdir(dir, { recursive: true })));
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath, args: ["-e", "process.exit(0)"], cwd: workspace,
+      options: {
+        workspaceDir: workspace, filesystemScope: "workspace",
+        managedPaths: sharedToolCacheMounts({ npm_config_store_dir: dirs[0], RUSTUP_HOME: dirs[1], CARGO_HOME: dirs[2] }),
+      },
+    });
+    for (const dir of dirs) {
+      expect(target.args[target.args.indexOf(dir) - 1]).toBe("--ro-bind");
+      expect(target.args.filter(arg => arg === dir)).toHaveLength(2);
+    }
   });
 
   it.runIf(process.platform === "linux")("binds a confined absolute alias to the synchronized workspace", async () => {
@@ -332,6 +426,94 @@ describe("local process sandbox", () => {
 
       expect(result.exitCode, result.stderr).toBe(0);
       await expect(fs.readFile(path.join(workspace, "workspace-ok.txt"), "utf8")).resolves.toBe("ok");
+    },
+  );
+
+  it.runIf(Boolean(process.env.PAPERCLIP_TEST_BWRAP))(
+    "reads shared tool caches in the sandbox and rejects writes to each directory",
+    async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-tool-caches-integration-"));
+      cleanup.push(root);
+      const workspace = path.join(root, "workspace");
+      const dirs = ["pnpm/store", "rustup", "cargo"].map(dir => path.join(root, "runtime", dir));
+      await Promise.all([workspace, ...dirs].map(dir => fs.mkdir(dir, { recursive: true })));
+      for (const dir of dirs) await fs.writeFile(path.join(dir, "canary"), "shared-tool-data");
+      const result = await runChildProcess("filesystem-sandbox-tool-caches-test", process.execPath, ["-e", [
+        "const fs = require('node:fs');",
+        `for (const dir of ${JSON.stringify(dirs)}) {`,
+        "  if (fs.readFileSync(dir + '/canary', 'utf8') !== 'shared-tool-data') process.exit(8);",
+        "  try { fs.writeFileSync(dir + '/written', 'bad'); process.exit(9); } catch (error) {",
+        "    if (!['EROFS', 'EACCES'].includes(error.code)) throw error;",
+        "  }",
+        "}",
+      ].join("\n")], {
+        cwd: workspace, env: {}, timeoutSec: 10, graceSec: 1, onLog: async () => {},
+        localProcessSandbox: {
+          workspaceDir: workspace, filesystemScope: "workspace",
+          managedPaths: sharedToolCacheMounts({ npm_config_store_dir: dirs[0], RUSTUP_HOME: dirs[1], CARGO_HOME: dirs[2] }),
+          command: process.env.PAPERCLIP_TEST_BWRAP,
+        },
+      });
+      expect(result.exitCode, result.stderr).toBe(0);
+      for (const dir of dirs) await expect(fs.access(path.join(dir, "written"))).rejects.toThrow();
+    },
+  );
+
+  it.runIf(Boolean(process.env.PAPERCLIP_TEST_BWRAP))(
+    "runs a mise shim from PATH inside the workspace sandbox without writing the installs",
+    async () => {
+      // Host layout as on the agent box: the shims link to a `mise` binary in
+      // a bin dir on PATH, and the tool lives under the host's mise installs.
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fs-mise-shim-"));
+      cleanup.push(root);
+      const workspace = path.join(root, "workspace");
+      const binDir = path.join(root, "home", ".local", "bin");
+      const hostData = path.join(root, "home", ".local", "share", "mise");
+      const sharedData = path.join(root, "instance", "runtime", "mise", "data");
+      const toolDir = path.join(hostData, "installs", "demo", "1.0.0", "bin");
+      await Promise.all([workspace, binDir, path.join(hostData, "shims"), sharedData, toolDir]
+        .map((dir) => fs.mkdir(dir, { recursive: true })));
+      // Stand-in for mise's shim mode: run the tool the shim is named after
+      // from the installs dir, and fail when it cannot write there.
+      await fs.writeFile(path.join(binDir, "mise"), [
+        "#!/bin/sh",
+        "tool=$(basename \"$0\")",
+        "if [ \"$tool\" = mise ]; then echo mise-ok; exit 0; fi",
+        "if touch \"$MISE_SHARED_INSTALL_DIRS/written\" 2>/dev/null; then exit 7; fi",
+        "exec \"$MISE_SHARED_INSTALL_DIRS/$tool/1.0.0/bin/$tool\" \"$@\"",
+        "",
+      ].join("\n"), { mode: 0o755 });
+      await fs.writeFile(path.join(toolDir, "demo"), "#!/bin/sh\necho demo-ok \"$@\"\n", { mode: 0o755 });
+      await fs.symlink(path.join(binDir, "mise"), path.join(hostData, "shims", "demo"));
+      const env = {
+        PATH: [path.join(hostData, "shims"), binDir, "/usr/bin", "/bin"].join(path.delimiter),
+        MISE_DATA_DIR: sharedData,
+        MISE_CACHE_DIR: path.join(root, "instance", "runtime", "mise", "cache"),
+        MISE_SHARED_INSTALL_DIRS: path.join(hostData, "installs"),
+      };
+
+      const result = await runChildProcess(
+        "filesystem-sandbox-mise-shim-test",
+        "/bin/sh",
+        ["-c", "mise && demo arg"],
+        {
+          cwd: workspace,
+          env,
+          timeoutSec: 10,
+          graceSec: 1,
+          onLog: async () => {},
+          localProcessSandbox: {
+            workspaceDir: workspace,
+            filesystemScope: "workspace",
+            managedPaths: await miseToolInstallMounts(env),
+            command: process.env.PAPERCLIP_TEST_BWRAP,
+          },
+        },
+      );
+
+      expect(result.exitCode, result.stderr).toBe(0);
+      expect(result.stdout).toBe("mise-ok\ndemo-ok arg\n");
+      await expect(fs.access(path.join(hostData, "installs", "written"))).rejects.toThrow();
     },
   );
 

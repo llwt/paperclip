@@ -7,6 +7,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { parseCodexJsonl } from "../../../packages/adapters/codex-local/src/server/parse.js";
+import { parseClaudeStreamJson } from "../../../packages/adapters/claude-local/src/server/parse.js";
 import cliSessionUsage from "../../../packages/adapters/codex-local/src/server/__fixtures__/cli-session-usage.json" with { type: "json" };
 import { getLatestSessionUsageJson, resolveNormalizedUsageForSession } from "../services/heartbeat.js";
 
@@ -17,9 +18,11 @@ function parseTurn(turn: "fresh" | "resumed") {
   ].join("\n"));
 }
 
+// Since upstream v2026.1023.0 the Codex adapter reports input without cache
+// hits (Paperclip stores them separately), so the request totals do the same.
 function requestTotals(turn: "fresh" | "resumed") {
   return cliSessionUsage[turn].requests.reduce((totals, usage) => ({
-    inputTokens: totals.inputTokens + usage.input_tokens,
+    inputTokens: totals.inputTokens + usage.input_tokens - usage.cached_input_tokens,
     cachedInputTokens: totals.cachedInputTokens + usage.cached_input_tokens,
     outputTokens: totals.outputTokens + usage.output_tokens,
   }), { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 });
@@ -54,12 +57,11 @@ describe("resolveNormalizedUsageForSession", () => {
 
     expect(cliSessionUsage.resumed.requests).toHaveLength(9);
     expect(result.normalizedUsage).toEqual({
-      inputTokens: 1_108_431,
+      inputTokens: 22_607,
       cachedInputTokens: 1_085_824,
       outputTokens: 3_402,
     });
     expect(result.normalizedUsage).toEqual(requestTotals("resumed"));
-    expect(result.normalizedUsage!.cachedInputTokens).toBeLessThanOrEqual(result.normalizedUsage!.inputTokens);
     expect(result.derivedFromSessionTotals).toBe(true);
   });
 
@@ -127,6 +129,390 @@ describe("resolveNormalizedUsageForSession", () => {
     });
     expect(result.normalizedUsage).toEqual(input.rawUsage);
     expect(getPreviousUsageJson).not.toHaveBeenCalled();
+  });
+});
+
+// Claude CLI result events on --resume: modelUsage and total_cost_usd are the
+// session totals so far, while result.usage covers only this invocation.
+// Figures are synthetic but follow that shape (SX-1378).
+const claudeTurns = {
+  first: { input: 200_000, cacheRead: 9_000_000, output: 34_000, costUsd: 4.75, invocationOutput: 34_000 },
+  resumed: { input: 213_000, cacheRead: 10_000_000, output: 37_500, costUsd: 5.25, invocationOutput: 3_500 },
+};
+
+function parseClaudeTurn(turn: keyof typeof claudeTurns, sessionId = "claude-session") {
+  const figures = claudeTurns[turn];
+  return parseClaudeStreamJson(JSON.stringify({
+    type: "result",
+    subtype: "success",
+    session_id: sessionId,
+    result: "done",
+    total_cost_usd: figures.costUsd,
+    usage: { input_tokens: 2, output_tokens: figures.invocationOutput, cache_read_input_tokens: 0 },
+    modelUsage: {
+      "claude-opus-5-5": {
+        inputTokens: 100,
+        cacheCreationInputTokens: figures.input - 100,
+        cacheReadInputTokens: figures.cacheRead,
+        outputTokens: figures.output,
+        costUSD: figures.costUsd,
+      },
+    },
+  }));
+}
+
+/** usage_json as the server stored it for a Claude run before SX-1378. */
+function preFixClaudeUsageJson(turn: keyof typeof claudeTurns) {
+  const parsed = parseClaudeTurn(turn);
+  return {
+    ...parsed.usage,
+    rawInputTokens: parsed.usage!.inputTokens,
+    rawCachedInputTokens: parsed.usage!.cachedInputTokens,
+    rawOutputTokens: parsed.usage!.outputTokens,
+    usageSource: "per_run",
+    costUsd: parsed.costUsd,
+  };
+}
+
+function resolveClaudeTurn(
+  turn: keyof typeof claudeTurns,
+  getPreviousUsageJson: (sessionId: string) => Promise<unknown>,
+) {
+  const parsed = parseClaudeTurn(turn);
+  return resolveNormalizedUsageForSession({
+    sessionId: parsed.sessionId,
+    rawUsage: parsed.usage,
+    usageBasis: parsed.usageBasis,
+    costBasis: parsed.costBasis,
+    rawCostUsd: parsed.costUsd,
+    getPreviousUsageJson,
+  });
+}
+
+/** A Claude result event without modelUsage: invocation tokens, session cost. */
+function parseClaudeFallbackTurn(input: {
+  inputTokens: number;
+  costUsd: number;
+  cacheCreationInputTokens?: number;
+  outputTokens?: number;
+}) {
+  return parseClaudeStreamJson(JSON.stringify({
+    type: "result",
+    subtype: "success",
+    session_id: "claude-session",
+    result: "done",
+    total_cost_usd: input.costUsd,
+    usage: {
+      input_tokens: input.inputTokens,
+      output_tokens: input.outputTokens ?? 0,
+      cache_read_input_tokens: 0,
+      ...(input.cacheCreationInputTokens !== undefined
+        ? { cache_creation_input_tokens: input.cacheCreationInputTokens }
+        : {}),
+    },
+  }));
+}
+
+/** The usage_json fields the heartbeat stores from a resolution. */
+function storedUsageJson(
+  result: Awaited<ReturnType<typeof resolveNormalizedUsageForSession>>,
+  rawCostUsd: number,
+) {
+  return {
+    ...result.normalizedUsage,
+    rawInputTokens: result.sessionRawUsage!.inputTokens,
+    rawCachedInputTokens: result.sessionRawUsage!.cachedInputTokens,
+    rawOutputTokens: result.sessionRawUsage!.outputTokens,
+    ...(result.sessionRawUsageIncomplete ? { rawUsageIncomplete: true } : {}),
+    costUsd: result.normalizedCostUsd,
+    rawCostUsd,
+  };
+}
+
+/** Resolve a parsed Claude result against a stored previous row. */
+function resolveParsedClaude(
+  parsed: ReturnType<typeof parseClaudeStreamJson>,
+  previous: unknown,
+) {
+  return resolveNormalizedUsageForSession({
+    sessionId: "claude-session",
+    rawUsage: parsed.usage,
+    usageBasis: parsed.usageBasis,
+    costBasis: parsed.costBasis,
+    rawCostUsd: parsed.costUsd,
+    invocationUsage: parsed.invocationUsage,
+    getPreviousUsageJson: async () => previous,
+  });
+}
+
+/** A Claude result event with session-total modelUsage. */
+function parseClaudeModelUsageTurn(input: {
+  sessionInput: number;
+  sessionCacheWrites: number;
+  sessionOutput: number;
+  costUsd: number;
+  invocation: { input_tokens: number; output_tokens: number };
+  failed?: boolean;
+}) {
+  return parseClaudeStreamJson(JSON.stringify({
+    type: "result",
+    subtype: input.failed ? "error_during_execution" : "success",
+    is_error: Boolean(input.failed),
+    session_id: "claude-session",
+    total_cost_usd: input.costUsd,
+    usage: { ...input.invocation, cache_read_input_tokens: 0 },
+    modelUsage: {
+      "claude-fable-5": {
+        inputTokens: input.sessionInput,
+        outputTokens: input.sessionOutput,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: input.sessionCacheWrites,
+      },
+    },
+  }));
+}
+
+describe("resolveNormalizedUsageForSession for Claude CLI session totals", () => {
+  it("labels modelUsage figures as session totals", () => {
+    expect(parseClaudeTurn("resumed").usageBasis).toBe("session_cumulative");
+  });
+
+  it("stores a fresh session's full tokens and cost", async () => {
+    const result = await resolveClaudeTurn("first", async () => null);
+    expect(result.normalizedUsage).toEqual(parseClaudeTurn("first").usage);
+    expect(result.normalizedCostUsd).toBe(4.75);
+    expect(result.derivedFromSessionTotals).toBe(false);
+  });
+
+  it("stores only a resumed run's own tokens and cost against a pre-fix row", async () => {
+    const result = await resolveClaudeTurn("resumed", async () => preFixClaudeUsageJson("first"));
+    expect(result.normalizedUsage).toEqual({
+      inputTokens: 13_000,
+      cachedInputTokens: 1_000_000,
+      outputTokens: 3_500,
+    });
+    // The output delta matches the invocation's own result.usage block.
+    expect(result.normalizedUsage!.outputTokens).toBe(claudeTurns.resumed.invocationOutput);
+    expect(result.normalizedCostUsd).toBe(0.5);
+    expect(result.previousRawCostUsd).toBe(4.75);
+    expect(result.derivedFromSessionTotals).toBe(true);
+  });
+
+  it("subtracts the saved raw cost, not the previous run's delta cost", async () => {
+    const result = await resolveClaudeTurn("resumed", async () => ({
+      ...preFixClaudeUsageJson("first"),
+      inputTokens: 1,
+      costUsd: 0.25,
+      rawCostUsd: 4.75,
+      usageSource: "session_delta",
+    }));
+    expect(result.normalizedCostUsd).toBe(0.5);
+  });
+
+  it("stores zero for a failed run that repeats the previous session snapshot", async () => {
+    const result = await resolveClaudeTurn("resumed", async () => preFixClaudeUsageJson("resumed"));
+    expect(result.normalizedUsage).toEqual({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 });
+    expect(result.normalizedCostUsd).toBe(0);
+  });
+
+  it("keeps the current cost if the session cost went down", async () => {
+    const result = await resolveClaudeTurn("first", async () => preFixClaudeUsageJson("resumed"));
+    expect(result.normalizedCostUsd).toBe(4.75);
+  });
+
+  it("deltas the session cost of a run without modelUsage and keeps the token baseline", async () => {
+    const previous = {
+      inputTokens: 1_000, cachedInputTokens: 0, outputTokens: 0,
+      rawInputTokens: 1_000, rawCachedInputTokens: 0, rawOutputTokens: 0,
+      costUsd: 4.75, rawCostUsd: 4.75,
+    };
+    const fallback = parseClaudeFallbackTurn({ inputTokens: 10, costUsd: 5.25 });
+    expect(fallback.usageBasis).toBe("per_run");
+    const fallbackResult = await resolveNormalizedUsageForSession({
+      sessionId: "claude-session",
+      rawUsage: fallback.usage,
+      usageBasis: fallback.usageBasis,
+      costBasis: fallback.costBasis,
+      rawCostUsd: fallback.costUsd,
+      getPreviousUsageJson: async () => previous,
+    });
+    expect(fallbackResult.normalizedUsage).toEqual({ inputTokens: 10, cachedInputTokens: 0, outputTokens: 0 });
+    expect(fallbackResult.normalizedCostUsd).toBe(0.5);
+    // Stored raw counters stay a session total: 1000 before plus 10 now.
+    expect(fallbackResult.sessionRawUsage).toEqual({ inputTokens: 1_010, cachedInputTokens: 0, outputTokens: 0 });
+
+    // The next run reports session totals again: input 1200, cost 5.50.
+    const next = await resolveNormalizedUsageForSession({
+      sessionId: "claude-session",
+      rawUsage: { inputTokens: 1_200, cachedInputTokens: 0, outputTokens: 0 },
+      usageBasis: "session_cumulative",
+      costBasis: "session_cumulative",
+      rawCostUsd: 5.5,
+      getPreviousUsageJson: async () => storedUsageJson(fallbackResult, 5.25),
+    });
+    expect(next.normalizedUsage!.inputTokens).toBe(190);
+    expect(next.normalizedCostUsd).toBe(0.25);
+    // Both resumes together add up to the session's real increment.
+    expect(next.normalizedUsage!.inputTokens + fallbackResult.normalizedUsage!.inputTokens).toBe(200);
+  });
+
+  it("counts cache writes of a run without modelUsage like modelUsage does", async () => {
+    const previous = {
+      inputTokens: 1_000, cachedInputTokens: 0, outputTokens: 0,
+      rawInputTokens: 1_000, rawCachedInputTokens: 0, rawOutputTokens: 0,
+      costUsd: 4.75, rawCostUsd: 4.75,
+    };
+    const fallback = parseClaudeFallbackTurn({ inputTokens: 10, cacheCreationInputTokens: 100, costUsd: 5.25 });
+    const fallbackResult = await resolveNormalizedUsageForSession({
+      sessionId: "claude-session",
+      rawUsage: fallback.usage,
+      usageBasis: fallback.usageBasis,
+      costBasis: fallback.costBasis,
+      rawCostUsd: fallback.costUsd,
+      getPreviousUsageJson: async () => previous,
+    });
+    expect(fallbackResult.normalizedUsage).toEqual({ inputTokens: 110, cachedInputTokens: 0, outputTokens: 0 });
+    expect(fallbackResult.sessionRawUsage).toEqual({ inputTokens: 1_110, cachedInputTokens: 0, outputTokens: 0 });
+
+    // A failed run then reports the unchanged session snapshot through
+    // modelUsage (1010 input plus 100 cache writes) and the same cost.
+    const failed = parseClaudeStreamJson(JSON.stringify({
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      session_id: "claude-session",
+      total_cost_usd: 5.25,
+      usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 },
+      modelUsage: {
+        "claude-fable-5": {
+          inputTokens: 1_010,
+          outputTokens: 0,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 100,
+        },
+      },
+    }));
+    const next = await resolveNormalizedUsageForSession({
+      sessionId: "claude-session",
+      rawUsage: failed.usage,
+      usageBasis: failed.usageBasis,
+      costBasis: failed.costBasis,
+      rawCostUsd: failed.costUsd,
+      getPreviousUsageJson: async () => storedUsageJson(fallbackResult, 5.25),
+    });
+    expect(next.normalizedUsage).toEqual({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 });
+    expect(next.normalizedCostUsd).toBe(0);
+  });
+
+  it("does not book a fallback run's subagent tokens to the next zero-work run", async () => {
+    const previous = {
+      inputTokens: 1_000, cachedInputTokens: 0, outputTokens: 100,
+      rawInputTokens: 1_000, rawCachedInputTokens: 0, rawOutputTokens: 100,
+      costUsd: 4.75, rawCostUsd: 4.75,
+    };
+    // Without modelUsage: 5 main-loop output tokens are visible; its subagent
+    // wrote another 100 that result.usage does not show.
+    const fallback = parseClaudeFallbackTurn({
+      inputTokens: 10, cacheCreationInputTokens: 100, outputTokens: 5, costUsd: 5.25,
+    });
+    const fallbackResult = await resolveParsedClaude(fallback, previous);
+    expect(fallbackResult.normalizedUsage).toEqual({ inputTokens: 110, cachedInputTokens: 0, outputTokens: 5 });
+    expect(fallbackResult.sessionRawUsage).toEqual({ inputTokens: 1_110, cachedInputTokens: 0, outputTokens: 105 });
+    expect(fallbackResult.sessionRawUsageIncomplete).toBe(true);
+
+    // A failed run does no work and reports the complete session snapshot,
+    // which includes the subagent's 100 output tokens.
+    const failed = parseClaudeModelUsageTurn({
+      sessionInput: 1_010, sessionCacheWrites: 100, sessionOutput: 205, costUsd: 5.25,
+      invocation: { input_tokens: 0, output_tokens: 0 }, failed: true,
+    });
+    const failedResult = await resolveParsedClaude(failed, storedUsageJson(fallbackResult, 5.25));
+    expect(failedResult.normalizedUsage).toEqual({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 });
+    expect(failedResult.normalizedCostUsd).toBe(0);
+    expect(failedResult.usageFromInvocation).toBe(true);
+    // The complete snapshot is the next baseline again.
+    expect(failedResult.sessionRawUsage).toEqual({ inputTokens: 1_110, cachedInputTokens: 0, outputTokens: 205 });
+    expect(failedResult.sessionRawUsageIncomplete).toBe(false);
+
+    // The run after that deltas against the complete snapshot as usual.
+    const later = parseClaudeModelUsageTurn({
+      sessionInput: 1_030, sessionCacheWrites: 100, sessionOutput: 245, costUsd: 5.5,
+      invocation: { input_tokens: 20, output_tokens: 40 },
+    });
+    const laterResult = await resolveParsedClaude(later, storedUsageJson(failedResult, 5.25));
+    expect(laterResult.normalizedUsage).toEqual({ inputTokens: 20, cachedInputTokens: 0, outputTokens: 40 });
+    expect(laterResult.normalizedCostUsd).toBe(0.25);
+    expect(laterResult.derivedFromSessionTotals).toBe(true);
+  });
+
+  it("stores a working run's own tokens after a baseline without modelUsage", async () => {
+    const fallbackRow = {
+      inputTokens: 10, cachedInputTokens: 0, outputTokens: 5,
+      rawInputTokens: 1_010, rawCachedInputTokens: 0, rawOutputTokens: 105,
+      rawUsageIncomplete: true, costUsd: 0.5, rawCostUsd: 5.25,
+    };
+    // Session output went from 105 known (+100 unseen subagent) to 255: this
+    // run wrote 50, of which a delta would wrongly claim 150.
+    const next = parseClaudeModelUsageTurn({
+      sessionInput: 1_030, sessionCacheWrites: 0, sessionOutput: 255, costUsd: 5.5,
+      invocation: { input_tokens: 20, output_tokens: 50 },
+    });
+    const result = await resolveParsedClaude(next, fallbackRow);
+    expect(result.normalizedUsage).toEqual({ inputTokens: 20, cachedInputTokens: 0, outputTokens: 50 });
+    expect(result.normalizedCostUsd).toBe(0.25);
+  });
+
+  it("keeps the incomplete mark across consecutive runs without modelUsage", async () => {
+    const fallbackRow = {
+      inputTokens: 10, cachedInputTokens: 0, outputTokens: 5,
+      rawInputTokens: 1_010, rawCachedInputTokens: 0, rawOutputTokens: 105,
+      rawUsageIncomplete: true, costUsd: 0.5, rawCostUsd: 5.25,
+    };
+    const again = parseClaudeFallbackTurn({ inputTokens: 4, outputTokens: 1, costUsd: 5.3 });
+    const result = await resolveParsedClaude(again, fallbackRow);
+    expect(result.normalizedUsage).toEqual({ inputTokens: 4, cachedInputTokens: 0, outputTokens: 1 });
+    expect(result.sessionRawUsageIncomplete).toBe(true);
+  });
+
+  it("stores zero for a failed run without modelUsage that did no work", async () => {
+    const failed = parseClaudeFallbackTurn({ inputTokens: 0, costUsd: 5.25 });
+    const result = await resolveNormalizedUsageForSession({
+      sessionId: "claude-session",
+      rawUsage: failed.usage,
+      usageBasis: failed.usageBasis,
+      costBasis: failed.costBasis,
+      rawCostUsd: failed.costUsd,
+      getPreviousUsageJson: async () => preFixClaudeUsageJson("resumed"),
+    });
+    expect(result.normalizedUsage).toEqual({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 });
+    expect(result.normalizedCostUsd).toBe(0);
+    expect(result.sessionRawUsage).toEqual(parseClaudeTurn("resumed").usage);
+  });
+
+  it("stores a fresh session's full cost when modelUsage is absent", async () => {
+    const fresh = parseClaudeFallbackTurn({ inputTokens: 10, costUsd: 0.4 });
+    const result = await resolveNormalizedUsageForSession({
+      sessionId: "claude-session",
+      rawUsage: fresh.usage,
+      usageBasis: fresh.usageBasis,
+      costBasis: fresh.costBasis,
+      rawCostUsd: fresh.costUsd,
+      getPreviousUsageJson: async () => null,
+    });
+    expect(result.normalizedCostUsd).toBe(0.4);
+    expect(result.sessionRawUsage).toEqual(fresh.usage);
+  });
+
+  it.each(["per_run", null] as const)("does not subtract cost for usage basis %s", async (usageBasis) => {
+    const result = await resolveNormalizedUsageForSession({
+      sessionId: "claude-session",
+      rawUsage: parseClaudeTurn("resumed").usage,
+      usageBasis,
+      rawCostUsd: 5.25,
+      getPreviousUsageJson: async () => preFixClaudeUsageJson("first"),
+    });
+    expect(result.normalizedCostUsd).toBe(5.25);
+    expect(result.previousRawCostUsd).toBeNull();
   });
 });
 
@@ -258,6 +644,35 @@ describePostgres("session usage baseline lookup", () => {
       },
     ]);
     expect((await resolve()).normalizedUsage).toEqual(requestTotals("resumed"));
+  });
+
+  it("uses the stored baseline for a cold Claude resume after a restart", async () => {
+    // A new process has no in-memory state: the baseline comes only from the
+    // stored rows, including one written before SX-1378.
+    const { run, lookup } = await fixture();
+    await db.update(heartbeatRuns).set({ usageJson: null }).where(eq(heartbeatRuns.id, lookup.excludeRunId));
+    await db.insert(heartbeatRuns).values([
+      { ...run, usageJson: preFixClaudeUsageJson("first") },
+      // A failed run that repeated the snapshot: stored as zero, raw kept.
+      {
+        ...run,
+        status: "failed",
+        createdAt: new Date("2026-10-12T12:00:01Z"),
+        usageJson: {
+          inputTokens: 0, cachedInputTokens: 0, outputTokens: 0,
+          rawInputTokens: parseClaudeTurn("first").usage!.inputTokens,
+          rawCachedInputTokens: parseClaudeTurn("first").usage!.cachedInputTokens,
+          rawOutputTokens: parseClaudeTurn("first").usage!.outputTokens,
+          costUsd: 0,
+          rawCostUsd: 4.75,
+          usageSource: "session_delta",
+        },
+      },
+    ]);
+    // The parsed fixture names its own session; look up the fixture's rows.
+    const result = await resolveClaudeTurn("resumed", () => getLatestSessionUsageJson(db, lookup));
+    expect(result.normalizedUsage).toEqual({ inputTokens: 13_000, cachedInputTokens: 1_000_000, outputTokens: 3_500 });
+    expect(result.normalizedCostUsd).toBe(0.5);
   });
 
   it("excludes other agents, sessions, later runs, and the current run", async () => {

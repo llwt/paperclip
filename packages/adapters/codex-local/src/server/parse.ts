@@ -1,6 +1,6 @@
 import {
-  asString,
   asNumber,
+  asString,
   parseObject,
   parseJson,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -28,74 +28,91 @@ export type CodexAuthRefreshFailureClass =
   | "refresh_token_invalidated";
 
 export function parseCodexJsonl(stdout: string) {
+  return createCodexJsonlParser()(stdout);
+}
+
+/** Consume complete JSONL records once, retaining protocol accounting state. */
+export function createCodexJsonlParser() {
   let sessionId: string | null = null;
   let finalMessage: string | null = null;
   let errorMessage: string | null = null;
   let sawProtocolEvent = false;
   let sawProtocolTerminalEvent = false;
+  let usageReported = false;
+  let usageComplete = false;
   const usage = {
     inputTokens: 0,
     cachedInputTokens: 0,
     outputTokens: 0,
   };
 
-  for (const rawLine of stdout.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line) continue;
+  return (stdout: string) => {
+    for (const rawLine of stdout.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line) continue;
 
-    const event = parseJson(line);
-    if (!event) continue;
+      const event = parseJson(line);
+      if (!event) continue;
 
-    const type = asString(event.type, "");
-    if (type) sawProtocolEvent = true;
-    if (type === "error" || type === "turn.completed" || type === "turn.failed") {
-      sawProtocolTerminalEvent = true;
-    }
-    if (type === "thread.started") {
-      sessionId = asString(event.thread_id, sessionId ?? "") || sessionId;
-      continue;
-    }
-
-    if (type === "error") {
-      const msg = asString(event.message, "").trim();
-      if (msg) errorMessage = msg;
-      continue;
-    }
-
-    if (type === "item.completed") {
-      const item = parseObject(event.item);
-      if (asString(item.type, "") === "agent_message") {
-        const text = asString(item.text, "");
-        if (text) finalMessage = text;
+      const type = asString(event.type, "");
+      if (type) sawProtocolEvent = true;
+      if (type === "error" || type === "turn.completed" || type === "turn.failed") {
+        sawProtocolTerminalEvent = true;
+        const reported = parseObject(event.usage);
+        const validCount = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+        const cached = reported.cached_input_tokens ?? 0;
+        usageComplete = validCount(reported.input_tokens) && validCount(reported.output_tokens)
+          && validCount(cached) && cached <= reported.input_tokens;
+        if (usageComplete) {
+          usage.inputTokens = reported.input_tokens as number;
+          usage.cachedInputTokens = cached as number;
+          usage.outputTokens = reported.output_tokens as number;
+          usageReported = true;
+        }
       }
-      continue;
+      if (type === "turn.started") usageComplete = false;
+      if (type === "thread.started") {
+        sessionId = asString(event.thread_id, sessionId ?? "") || sessionId;
+        continue;
+      }
+
+      if (type === "error") {
+        const msg = asString(event.message, "").trim();
+        if (msg) errorMessage = msg;
+        continue;
+      }
+
+      if (type === "item.completed") {
+        const item = parseObject(event.item);
+        if (asString(item.type, "") === "agent_message") {
+          const text = asString(item.text, "");
+          if (text) finalMessage = text;
+        }
+        continue;
+      }
+
+      if (type === "turn.failed") {
+        const err = parseObject(event.error);
+        const msg = asString(err.message, "").trim();
+        if (msg) errorMessage = msg;
+      }
     }
 
-    if (type === "turn.completed") {
-      const usageObj = parseObject(event.usage);
-      usage.inputTokens = asNumber(usageObj.input_tokens, usage.inputTokens);
-      usage.cachedInputTokens = asNumber(usageObj.cached_input_tokens, usage.cachedInputTokens);
-      usage.outputTokens = asNumber(usageObj.output_tokens, usage.outputTokens);
-      continue;
-    }
-
-    if (type === "turn.failed") {
-      const err = parseObject(event.error);
-      const msg = asString(err.message, "").trim();
-      if (msg) errorMessage = msg;
-    }
-  }
-
-  return {
-    sessionId,
-    summary: finalMessage?.trim() ?? "",
-    usage,
-    // Codex CLI turn.completed carries session totals, including resumed turns.
-    // Let the heartbeat service subtract the previous run's raw counters.
-    usageBasis: "session_cumulative" as const,
-    errorMessage,
-    sawProtocolEvent,
-    sawProtocolTerminalEvent,
+    return {
+      sessionId,
+      summary: finalMessage?.trim() ?? "",
+      // Codex includes cache hits in input_tokens; Paperclip stores them separately.
+      usage: { ...usage, inputTokens: Math.max(0, usage.inputTokens - usage.cachedInputTokens) },
+      // Differs from upstream (fork #31): Codex CLI turn.completed carries
+      // session totals, including resumed turns. Let the heartbeat service
+      // subtract the previous run's raw counters.
+      usageBasis: "session_cumulative" as const,
+      errorMessage,
+      sawProtocolEvent,
+      sawProtocolTerminalEvent,
+      usageReported,
+      usageComplete,
+    };
   };
 }
 
@@ -327,4 +344,34 @@ export function isCodexProviderQuotaError(input: {
 }): boolean {
   const haystack = buildCodexErrorHaystack(input);
   return CODEX_PROVIDER_QUOTA_RE.test(haystack) || extractCodexRetryNotBefore(input) != null;
+}
+
+const CODEX_RECONNECT_NOTICE_RE = /^\s*reconnecting\b/i;
+
+/**
+ * Codex prints "Reconnecting... 2/5" as a top-level `error` event while it
+ * retries a dropped stream. It is progress, not the end of the run.
+ */
+export function isCodexReconnectNotice(message: string): boolean {
+  return CODEX_RECONNECT_NOTICE_RE.test(message);
+}
+
+/**
+ * Token totals of a `turn.completed` event, or null when the event carries no
+ * usage numbers at all, so recovery reports unknown usage instead of zero.
+ */
+export function readCodexTurnUsage(
+  event: Record<string, unknown>,
+): { inputTokens: number; cachedInputTokens: number; outputTokens: number } | null {
+  const usageObj = parseObject(event.usage);
+  const input = usageObj.input_tokens;
+  const cached = usageObj.cached_input_tokens;
+  const output = usageObj.output_tokens;
+  const isCount = (value: unknown) => typeof value === "number" && Number.isFinite(value);
+  if (!isCount(input) && !isCount(cached) && !isCount(output)) return null;
+  return {
+    inputTokens: asNumber(input, 0),
+    cachedInputTokens: asNumber(cached, 0),
+    outputTokens: asNumber(output, 0),
+  };
 }
