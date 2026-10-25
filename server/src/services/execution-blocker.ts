@@ -1,8 +1,9 @@
 import { isPreDispatchReviewWait } from "./pre-dispatch-review-wait.js";
-import { and, desc, eq, gt, inArray, not, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, not, or, sql, type SQL } from "drizzle-orm";
 import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
 import { z } from "zod";
 import { agentWakeupRequests, chatConversations, chatEndpoints, heartbeatRuns, issueComments, issues, issueRecoveryActions, toolConnections, type Db } from "@paperclipai/db";
+import { adapterExecutionControls } from "./adapter-execution-control.js";
 import { canContinueCancelledRun, readRunCancellation } from "./run-cancellation.js";
 import { canRetryStoppedRun } from "./cancelled-native-startup.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
@@ -20,6 +21,47 @@ export function executionBlockerPredicate() {
     or(inArray(issueRecoveryActions.status, ["active", "escalated"]),
       sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`),
   );
+}
+
+const TERMINAL_RUN_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
+
+function runIdOf(action: typeof issueRecoveryActions.$inferSelect) {
+  const parsed = z.string().guid().safeParse(action.evidence.runId ?? action.evidence.sourceRunId);
+  return parsed.success ? parsed.data : null;
+}
+
+// Differs from upstream (fork, SX-2384). A resolved no-replay hold means "do not
+// replay that agent's uncertain work". Once the stopped run has fully ended and
+// the task belongs to someone else, a fresh run by the new owner is not a
+// replay, so the hold must not save that owner's stage and comment wakes.
+function isHoldForFormerOwner(
+  action: typeof issueRecoveryActions.$inferSelect,
+  run: typeof heartbeatRuns.$inferSelect | undefined,
+  assigneeAgentId: string | null,
+) {
+  if (action.status !== "resolved") return false;
+  const automaticRecovery = action.evidence.automaticRecovery as Record<string, unknown> | undefined;
+  if (automaticRecovery?.replay !== "blocked") return false;
+  if (!run || !TERMINAL_RUN_STATUSES.has(run.status) || !run.finishedAt || adapterExecutionControls.has(run.id)) return false;
+  return run.agentId !== assigneeAgentId && action.returnOwnerAgentId !== assigneeAgentId;
+}
+
+async function firstBlockingAction(db: Db, companyId: string, issueId: string, assigneeAgentId: string | null, afterBoundary: SQL | undefined) {
+  const actions = await db.select().from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, companyId),
+    eq(issueRecoveryActions.sourceIssueId, issueId),
+    executionBlockerPredicate(),
+    afterBoundary,
+  )).orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id));
+  const runIds = [...new Set(actions.map(runIdOf).filter((id): id is string => id !== null))];
+  const runs = runIds.length ? await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, runIds),
+  )) : [];
+  const runsById = new Map(runs.map((run) => [run.id, run]));
+  return actions.find((action) => {
+    const runId = runIdOf(action);
+    return !isHoldForFormerOwner(action, runId ? runsById.get(runId) : undefined, assigneeAgentId);
+  });
 }
 
 export async function getExecutionBlocker(db: Db, companyId: string, issueId: string, options?: { conversationResetCommentId?: string | null }): Promise<ExecutionBlocker | null> {
@@ -68,15 +110,10 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
       : ownership.nextAction;
     return { ...ownership, nextAction, recoveryActionId: null };
   }
-  const [action] = restoreHold ? [restoreHold] : await db.select().from(issueRecoveryActions).where(and(
-    eq(issueRecoveryActions.companyId, companyId),
-    eq(issueRecoveryActions.sourceIssueId, issueId),
-    executionBlockerPredicate(),
-    boundary ? gt(issueRecoveryActions.createdAt, boundary.createdAt) : undefined,
-  )).orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id)).limit(1);
+  const action = restoreHold ? restoreHold : await firstBlockingAction(db, companyId, issueId, conversation?.assigneeAgentId ?? null,
+    boundary ? gt(issueRecoveryActions.createdAt, boundary.createdAt) : undefined);
   if (!action) return null;
-  const parsedRunId = z.string().guid().safeParse(action.evidence.runId ?? action.evidence.sourceRunId);
-  const runId = parsedRunId.success ? parsedRunId.data : null;
+  const runId = runIdOf(action);
   const [run] = runId ? await db.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId),
   )).limit(1) : [];

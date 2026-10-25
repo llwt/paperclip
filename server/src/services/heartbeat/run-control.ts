@@ -479,12 +479,17 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     if (state !== "blocked") return "done";
     if (now.getTime() - waitingSince.getTime() < OWNER_EXIT_RECHECK_TIMEOUT_MS) return "waiting";
     const blocker = await getExecutionBlocker(db, companyId, issueId);
+    // Fork, SX-2384: a run that has already ended is not "not exited"; say what
+    // the blocker needs instead.
+    const runEnded = blocker?.recoveryActionId != null && blocker.runStatus != null && !["queued", "running"].includes(blocker.runStatus);
     const marked = await db.update(agentWakeupRequests).set({
       payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}',
         coalesce(${agentWakeupRequests.payload}->'executionWait', '{}'::jsonb) || ${JSON.stringify({
           ownerExitTimedOutAt: now.toISOString(),
           blockingRunId: blocker?.runId ?? null,
-          message: "The stopped run has not exited. The hand-off is saved and starts when it exits.",
+          message: runEnded && blocker?.nextAction
+            ? blocker.nextAction
+            : "The stopped run has not exited. The hand-off is saved and starts when it exits.",
         })}::jsonb)`,
       updatedAt: now,
     }).where(and(
