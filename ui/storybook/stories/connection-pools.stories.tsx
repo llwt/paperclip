@@ -44,7 +44,7 @@ function PoolWait({ checking = false }: { checking?: boolean }) {
   const [issue] = useState<Issue>(() => ({ ...storybookIssues[0]!, status: "in_progress", executionState: null,
     scheduledRetry: { status: "scheduled_retry", scheduledRetryReason: "ai_connection_pool_wait", scheduledRetryAt: new Date(Date.now() + 60_000).toISOString(), scheduledRetryAttempt: 1 } as Issue["scheduledRetry"],
   }));
-  return <div className="space-y-4"><IssueMonitorBanner issue={issue} onCheckNow={() => undefined} checkingNow={checking} /><IssueMonitorComposerStrip issue={issue} onCheckNow={() => undefined} checkingNow={checking} /></div>;
+  return <div className="space-y-4"><IssueMonitorBanner issue={issue} onRetryNow={() => undefined} retryingNow={checking} /><IssueMonitorComposerStrip issue={issue} onRetryNow={() => undefined} retryingNow={checking} /></div>;
 }
 function PoolRun({ scenario }: { scenario: Scenario }) {
   const claude = scenario === "run-claude", member = pool.members[claude ? 1 : 0]!;
