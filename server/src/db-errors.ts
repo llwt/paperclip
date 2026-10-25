@@ -2,6 +2,8 @@ const UNIQUE_VIOLATION = "23505";
 const FOREIGN_KEY_VIOLATION = "23503";
 const MAX_CAUSE_DEPTH = 4;
 
+export const ISSUES_OPEN_ROUTINE_EXECUTION_CONSTRAINT = "issues_open_routine_execution_uq";
+
 /**
  * Recognizes a Postgres unique-constraint violation (SQLSTATE 23505).
  *
