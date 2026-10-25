@@ -1,5 +1,6 @@
 import { parseObject } from "../adapters/utils.js";
 import { enqueueFastResponse } from "../services/fast-responses.js";
+import type { SelfHandoffKind } from "../services/run-cancellation.js";
 import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "../services/workspace-restore-recovery-state.js";
 import { monitorPoliciesEqual, applyActorMonitorScheduledBy, assertCanManageIssueMonitor, summarizeIssueMonitor } from "../services/issue-monitors.js";
 import type { IssuePrivacyConstraints } from "@paperclipai/shared";
@@ -14289,6 +14290,13 @@ export function issueRoutes(
       // Only this request may finish a mutation that intentionally stops its
       // own run (for example handing work to a signoff reviewer).
       const issueMutationStopId = randomUUID();
+      // Fork (SX-2509): a stop of the requesting agent's own run on this task
+      // is a self hand-off. The stop below is unchanged; after the change
+      // commits the run is recorded `succeeded` (recordSelfHandoffOutcome).
+      const isActorOwnRun = (run: { id: string; agentId?: string | null }) =>
+        actor.actorType === "agent" && Boolean(actor.agentId) &&
+        (actor.runId ? run.id === actor.runId : run.agentId === actor.agentId);
+      let selfHandoffStop: { runId: string; kind: SelfHandoffKind } | null = null;
       if (req.actor.source !== "mcp_oauth" && assigneeWillChange && existing.assigneeAgentId) {
         await stopRunnerGoalForOwnershipChange({
           companyId: existing.companyId,
@@ -14318,6 +14326,9 @@ export function issueRoutes(
             );
           }
           interruptedRunId = cancelled.id;
+          if (isActorOwnRun(runToStopForReassignment)) {
+            selfHandoffStop = { runId: cancelled.id, kind: "reassignment" };
+          }
         }
       }
 
@@ -14362,6 +14373,9 @@ export function issueRoutes(
             );
           }
           interruptedRunId = cancelled.id;
+          if (isActorOwnRun(runToStopForTerminalization)) {
+            selfHandoffStop = { runId: cancelled.id, kind: "terminalization" };
+          }
         }
       }
 
@@ -14685,11 +14699,17 @@ export function issueRoutes(
         runToCancelForCancelledStatus.id !== interruptedRunId
       ) {
         try {
-          const cancelled = await heartbeat.cancelRun(
-            runToCancelForCancelledStatus.id,
-          );
+          const ownRun = isActorOwnRun(runToCancelForCancelledStatus);
+          const cancelled = ownRun
+            ? await heartbeat.cancelRun(runToCancelForCancelledStatus.id, undefined, {
+                resultJson: { issueMutationStopId },
+              })
+            : await heartbeat.cancelRun(runToCancelForCancelledStatus.id);
           if (cancelled) {
             cancelledStatusRunId = cancelled.id;
+            if (ownRun && cancelled.status === "cancelled") {
+              selfHandoffStop = { runId: cancelled.id, kind: "cancelled_status" };
+            }
             await logActivity(db, {
               companyId: cancelled.companyId,
               actorType: actor.actorType,
@@ -14730,6 +14750,22 @@ export function issueRoutes(
             issueId: existing.id,
             details: { source: "issue_status_cancelled", issueId: existing.id },
           });
+        }
+      }
+
+      if (selfHandoffStop) {
+        try {
+          await heartbeat.recordSelfHandoffOutcome({
+            runId: selfHandoffStop.runId,
+            issueMutationStopId,
+            kind: selfHandoffStop.kind,
+          });
+        } catch (err) {
+          // The change has committed; the run then keeps its cancelled record.
+          logger.warn(
+            { err, issueId: existing.id, runId: selfHandoffStop.runId },
+            "failed to record the self hand-off run outcome",
+          );
         }
       }
 

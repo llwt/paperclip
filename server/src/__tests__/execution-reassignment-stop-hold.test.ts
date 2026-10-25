@@ -121,7 +121,7 @@ describeEmbeddedPostgres("wakes after the author's run is stopped for a stage ha
    * author. The route's reassignment stop cancels it before the PATCH commits
    * the move to in_review with the reviewer as the stage participant.
    */
-  async function stopAuthorRunThenHandOff() {
+  async function stopAuthorRunThenHandOff(options: { selfHandoff?: boolean } = {}) {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
@@ -191,6 +191,12 @@ describeEmbeddedPostgres("wakes after the author's run is stopped for a stage ha
       checkoutRunId: null,
       executionState: reviewPending as unknown as Record<string, unknown>,
     }).where(eq(issues.id, issueId));
+    if (options.selfHandoff) {
+      // Fork (SX-2509): the author's run made the hand-off itself, so after
+      // the commit the route records its real result.
+      const recorded = await heartbeat.recordSelfHandoffOutcome({ runId, issueMutationStopId, kind: "reassignment" });
+      expect(recorded).toMatchObject({ status: "succeeded", errorCode: null, error: null });
+    }
 
     const stageWakeup = buildExecutionStageWakeup({
       issueId,
@@ -226,15 +232,21 @@ describeEmbeddedPostgres("wakes after the author's run is stopped for a stage ha
       ));
   }
 
-  it("leaves no execution hold behind the reassignment stop", async () => {
-    const ids = await stopAuthorRunThenHandOff();
+  it.each([
+    ["stopped by the hand-off", false],
+    ["recorded as a self hand-off (SX-2509)", true],
+  ])("leaves no execution hold behind the reassignment stop: %s", async (_name, selfHandoff) => {
+    const ids = await stopAuthorRunThenHandOff({ selfHandoff });
     expect(await getExecutionBlocker(db, ids.companyId, ids.issueId)).toBeNull();
     expect(await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, ids.issueId))).toEqual([]);
   });
 
-  it("starts a run for the stage participant after the move to in_review", async () => {
-    const ids = await stopAuthorRunThenHandOff();
+  it.each([
+    ["stopped by the hand-off", false],
+    ["recorded as a self hand-off (SX-2509)", true],
+  ])("starts a run for the stage participant after the move to in_review: %s", async (_name, selfHandoff) => {
+    const ids = await stopAuthorRunThenHandOff({ selfHandoff });
     const reason = ids.stageWakeup.wakeup.reason!;
     expect(reason).toBe("execution_review_requested");
 
@@ -488,7 +500,11 @@ describeEmbeddedPostgres("wakes after the author's run is stopped for a stage ha
     { by: "the board", actorType: "user" as const, actor: () => "board-user" },
     // A hands the task to B in its own last step (SX-2272).
     { by: "A itself", actorType: "agent" as const, actor: (formerOwnerId: string) => formerOwnerId },
-  ])("reassigning A to B while A runs ($by): B gets exactly one run after A's cleanup, with no comment (SX-2418)", async ({ actorType, actor }) => {
+    // Fork (SX-2509): A's own run made the change, so the route records it
+    // `succeeded` after the commit. The board case above is its twin.
+    { by: "A's own run, recorded as a self hand-off", actorType: "agent" as const,
+      actor: (formerOwnerId: string) => formerOwnerId, selfHandoff: true },
+  ])("reassigning A to B while A runs ($by): B gets exactly one run after A's cleanup, with no comment (SX-2418)", async ({ actorType, actor, selfHandoff }) => {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
@@ -537,15 +553,28 @@ describeEmbeddedPostgres("wakes after the author's run is stopped for a stage ha
     });
 
     // The exact stop the issue PATCH route makes before it commits B.
+    const issueMutationStopId = randomUUID();
     const cancelled = await heartbeat.cancelRun(runId, "Cancelled before issue reassignment", {
       errorCode: "issue_reassigned",
-      resultJson: { reassignmentStopConfirmed: true, issueMutationStopId: randomUUID() },
+      resultJson: { reassignmentStopConfirmed: true, issueMutationStopId },
       eventMessage: "run cancelled before issue reassignment",
       eventPayload: { issueId },
       suppressImmediateRecovery: true,
     });
     expect(cancelled?.status).toBe("cancelled");
     await db.update(issues).set({ assigneeAgentId: newOwnerId, checkoutRunId: null }).where(eq(issues.id, issueId));
+    if (selfHandoff) {
+      await heartbeat.recordSelfHandoffOutcome({ runId, issueMutationStopId, kind: "reassignment" });
+    }
+    expect(await heartbeat.getRun(runId)).toMatchObject(selfHandoff
+      ? {
+          status: "succeeded", errorCode: null, error: null,
+          resultJson: expect.objectContaining({
+            selfHandoff: true, reassignmentStopConfirmed: true, issueMutationStopId,
+            selfHandoffStop: expect.objectContaining({ kind: "reassignment", errorCode: "issue_reassigned" }),
+          }),
+        }
+      : { status: "cancelled", errorCode: "issue_reassigned" });
 
     // The route's wake for the new assignee, with no comment.
     await heartbeat.wakeup(newOwnerId, {
@@ -564,7 +593,7 @@ describeEmbeddedPostgres("wakes after the author's run is stopped for a stage ha
     // A's executor finishes its cleanup (the release at the end of its run),
     // then a late scheduler sweep.
     await heartbeat.releaseEnvironmentLeasesForRun({
-      runId, companyId, agentId: formerOwnerId, status: "cancelled",
+      runId, companyId, agentId: formerOwnerId, status: selfHandoff ? "succeeded" : "cancelled",
     });
     await db.update(agentWakeupRequests).set({ requestedAt: new Date(Date.now() - 60_000) })
       .where(eq(agentWakeupRequests.agentId, newOwnerId));

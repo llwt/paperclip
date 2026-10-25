@@ -88,9 +88,37 @@ export function isUnexpectedRunCancellation(run: Run): boolean {
     readRunCancellation(run.resultJson)?.expected !== true;
 }
 
-// Differs from upstream (fork, SX-1735, SX-2419). The issue route stopped this
-// run on purpose to hand the task over and the stop was acknowledged.
+// Differs from upstream (fork, SX-2509). A run stopped because it changed its
+// own task (hand-off, close or cancel) is recorded `succeeded` after the change
+// commits. `selfHandoffStop` keeps the stop it went through, so readers that
+// key on that stop treat both shapes alike.
+export type SelfHandoffKind = "reassignment" | "terminalization" | "cancelled_status";
+export interface SelfHandoffStop {
+  kind: SelfHandoffKind;
+  errorCode: string;
+  error: string | null;
+  recordedAt: string;
+}
+
+export function readSelfHandoffStop(result: Run["resultJson"] | undefined): SelfHandoffStop | null {
+  if (result?.selfHandoff !== true) return null;
+  const value = result.selfHandoffStop;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const entry = value as Record<string, unknown>;
+  if (typeof entry.kind !== "string" || typeof entry.errorCode !== "string" || typeof entry.recordedAt !== "string") return null;
+  return { kind: entry.kind as SelfHandoffKind, errorCode: entry.errorCode,
+    error: typeof entry.error === "string" ? entry.error : null, recordedAt: entry.recordedAt };
+}
+
+export function isSelfHandoffRun(run: Pick<Run, "status" | "resultJson"> | null | undefined): boolean {
+  return run?.status === "succeeded" && readSelfHandoffStop(run.resultJson) !== null;
+}
+
+// Differs from upstream (fork, SX-1735, SX-2419, SX-2509). The issue route
+// stopped this run on purpose to hand the task over and the stop was
+// acknowledged. A self hand-off keeps that stop under `selfHandoffStop`.
 export function isConfirmedReassignmentStop(run: Pick<Run, "status" | "errorCode" | "resultJson">): boolean {
-  return run.status === "cancelled" && run.errorCode === "issue_reassigned" &&
-    run.resultJson?.reassignmentStopConfirmed === true;
+  if (run.resultJson?.reassignmentStopConfirmed !== true) return false;
+  if (run.status === "cancelled") return run.errorCode === "issue_reassigned";
+  return run.status === "succeeded" && readSelfHandoffStop(run.resultJson)?.errorCode === "issue_reassigned";
 }
