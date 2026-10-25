@@ -778,7 +778,12 @@ describe("issue execution policy routes", () => {
 
   // Fork (SX-2551): the author's own stop announces no cancellation, so when
   // the change then fails the stop is announced as an ordinary cancellation.
-  it("announces the author's own stop as a cancellation when the hand-off change fails", async () => {
+  // `cancelRun` publishes the marked stop before its own later writes, so a
+  // throw from it is covered too.
+  it.each([
+    ["the task update", "update"],
+    ["the stop after it published the marked event", "cancelRun"],
+  ] as const)("announces the author's own stop as a cancellation when %s fails", async (_label, failing) => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",
@@ -803,9 +808,13 @@ describe("issue execution policy routes", () => {
     })!;
     const run = { id: "55555555-5555-4555-8555-555555555555", status: "running", agentId: "33333333-3333-4333-8333-333333333333" };
     mockIssueService.getById.mockResolvedValue(issue);
-    mockIssueService.update.mockRejectedValue(new Error("update failed after the stop"));
+    if (failing === "update") {
+      mockIssueService.update.mockRejectedValue(new Error("update failed after the stop"));
+      mockHeartbeatService.cancelRun.mockResolvedValue({ ...run, status: "cancelled" } as never);
+    } else {
+      mockHeartbeatService.cancelRun.mockRejectedValue(new Error("lease release failed after the stop event"));
+    }
     mockHeartbeatService.getRun.mockResolvedValue(run as never);
-    mockHeartbeatService.cancelRun.mockResolvedValue({ ...run, status: "cancelled" } as never);
 
     const res = await request(await createApp({
       type: "agent",
@@ -817,6 +826,7 @@ describe("issue execution policy routes", () => {
       .send({ status: "in_review", executionPolicy: policy });
 
     expect(res.status).toBeGreaterThanOrEqual(400);
+    if (failing === "cancelRun") expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockHeartbeatService.recordSelfHandoffOutcome).not.toHaveBeenCalled();
     await vi.waitFor(() => expect(mockHeartbeatService.announceSelfHandoffStopCancelled)
       .toHaveBeenCalledWith("55555555-5555-4555-8555-555555555555"));

@@ -14299,21 +14299,27 @@ export function issueRoutes(
       let selfHandoffStop = null as { runId: string; kind: SelfHandoffKind } | null;
       // Fork (SX-2551): the stop of the actor's own run is marked
       // `selfHandoffRequested`, so its `cancelled` status event announces
-      // nothing. If this request answers before the outcome is recorded (the
-      // change failed), announce the stop as an ordinary cancellation after all.
+      // nothing. If this request ends before the outcome is recorded (the
+      // change failed, or the stop itself threw after it published the marked
+      // event), announce the stop as an ordinary cancellation after all. Armed
+      // before cancelRun so a throw inside it is covered too.
       let selfHandoffOutcomeAttempted = false;
+      const armedSelfHandoffStops = new Set<string>();
+      const armSelfHandoffStopFallback = (runId: string) => {
+        if (armedSelfHandoffStops.has(runId)) return;
+        armedSelfHandoffStops.add(runId);
+        res.once("close", () => {
+          if (selfHandoffOutcomeAttempted) return;
+          void Promise.resolve()
+            .then(() => heartbeat.announceSelfHandoffStopCancelled(runId))
+            .catch((err: unknown) => logger.warn(
+              { err, issueId: existing.id, runId },
+              "failed to announce the unfinished self hand-off stop",
+            ));
+        });
+      };
       const markSelfHandoffStop = (stop: { runId: string; kind: SelfHandoffKind }) => {
-        if (!selfHandoffStop) {
-          res.once("finish", () => {
-            if (selfHandoffOutcomeAttempted) return;
-            void Promise.resolve()
-              .then(() => heartbeat.announceSelfHandoffStopCancelled(stop.runId))
-              .catch((err: unknown) => logger.warn(
-                { err, issueId: existing.id, runId: stop.runId },
-                "failed to announce the unfinished self hand-off stop",
-              ));
-          });
-        }
+        armSelfHandoffStopFallback(stop.runId);
         selfHandoffStop = stop;
       };
       if (req.actor.source !== "mcp_oauth" && assigneeWillChange && existing.assigneeAgentId) {
@@ -14325,6 +14331,7 @@ export function issueRoutes(
         const runToStopForReassignment = await resolveActiveIssueRun(existing);
         if (runToStopForReassignment) {
           const ownRun = isActorOwnRun(runToStopForReassignment);
+          if (ownRun) armSelfHandoffStopFallback(runToStopForReassignment.id);
           const cancelled = await heartbeat.cancelRun(
             runToStopForReassignment.id,
             "Cancelled before issue reassignment",
@@ -14375,6 +14382,7 @@ export function issueRoutes(
           : null;
         if (goalStopAction && runToStopForTerminalization) {
           const ownRun = isActorOwnRun(runToStopForTerminalization);
+          if (ownRun) armSelfHandoffStopFallback(runToStopForTerminalization.id);
           const cancelled = await heartbeat.cancelRun(
             runToStopForTerminalization.id,
             "Cancelled before issue terminalization",
@@ -14729,6 +14737,7 @@ export function issueRoutes(
       ) {
         try {
           const ownRun = isActorOwnRun(runToCancelForCancelledStatus);
+          if (ownRun) armSelfHandoffStopFallback(runToCancelForCancelledStatus.id);
           const cancelled = ownRun
             ? await heartbeat.cancelRun(runToCancelForCancelledStatus.id, undefined, {
                 resultJson: { issueMutationStopId, selfHandoffRequested: true },
