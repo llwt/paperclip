@@ -7,6 +7,7 @@ export default defineConfig({
       "packages/skills-catalog",
       "packages/db",
       "packages/adapter-utils",
+      "packages/process-launch",
       "packages/adapters/claude-local",
       "packages/adapters/codex-local",
       "packages/adapters/cursor-cloud",
