@@ -2027,6 +2027,57 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         eq(activityLog.action, "issue.scheduled_retry_retry_now"),
       )).toHaveLength(0);
     });
+    it("leaves the retry parked when the agent is paused and a board user comments", async () => {
+      const fixture = await seedParkedRetry();
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, fixture.agentId));
+      const commentId = randomUUID();
+
+      // A paused agent is refused at admission, before the comment can coalesce.
+      await expect(
+        heartbeat.wakeup(fixture.agentId, commentWake(fixture, commentId, { type: "user", id: "board-user" })),
+      ).rejects.toThrow(/not invokable/);
+
+      const run = await readRun(fixture.retryRunId);
+      expect(run.status).toBe("scheduled_retry");
+      expect(run.scheduledRetryAt!.getTime()).toBe(fixture.dueAt.getTime());
+      expect(await db.select().from(activityLog).where(
+        eq(activityLog.action, "issue.scheduled_retry_retry_now"),
+      )).toHaveLength(0);
+    });
+
+    it("refuses the retry-now request without touching the run when the agent is paused", async () => {
+      const fixture = await seedParkedRetry();
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, fixture.agentId));
+
+      const result = await heartbeat.retryScheduledRetryNow({
+        issueId: fixture.issueId,
+        actor: { actorType: "user", actorId: "board-user" },
+        onlyRunId: fixture.retryRunId,
+        leaveParkedWhenGateRefuses: true,
+      });
+
+      expect(result.outcome).toBe("gate_suppressed");
+      const run = await readRun(fixture.retryRunId);
+      expect(run.status).toBe("scheduled_retry");
+      expect(run.scheduledRetryAt!.getTime()).toBe(fixture.dueAt.getTime());
+      expect(run.contextSnapshot).not.toHaveProperty("retryNowRequestedAt");
+    });
+
+    it("does not start a different run than the one the comment coalesced into", async () => {
+      const fixture = await seedParkedRetry();
+
+      const result = await heartbeat.retryScheduledRetryNow({
+        issueId: fixture.issueId,
+        actor: { actorType: "user", actorId: "board-user" },
+        onlyRunId: randomUUID(),
+        leaveParkedWhenGateRefuses: true,
+      });
+
+      expect(result.outcome).toBe("no_scheduled_retry");
+      const run = await readRun(fixture.retryRunId);
+      expect(run.status).toBe("scheduled_retry");
+      expect(run.scheduledRetryAt!.getTime()).toBe(fixture.dueAt.getTime());
+    });
   });
 
   it("exhausts bounded retries after the hard cap", async () => {
