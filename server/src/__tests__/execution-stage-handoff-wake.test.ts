@@ -8,8 +8,14 @@ import {
   createDb,
   environmentLeases,
   environments,
+  budgetPolicies,
+  costEvents,
   heartbeatRuns,
+  issueComments,
+  issueRecoveryActions,
+  issueRelations,
   issues,
+  issueTreeHolds,
 } from "@paperclipai/db";
 import type { IssueExecutionState } from "@paperclipai/shared";
 import {
@@ -22,6 +28,8 @@ import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.j
 // environment lease is released only when its executor finishes cleanup, so
 // the stage hand-off wake meets the execution owner blocker. The wake must
 // wait for the lease and then start exactly one run for the next participant.
+// Fork test (SX-2418): the same for the new owner's assignment wake after a
+// reassignment stopped the former owner's run.
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 
@@ -454,5 +462,350 @@ describeEmbeddedPostgres("execution stage hand-off wake when the deciding run is
     expect(await wakesFor(ids.nextAgentId, ids.issueId, ids.stageWakeup.wakeup.reason!)).toEqual([
       expect.objectContaining({ status: "cancelled", runId: null }),
     ]);
+  });
+
+  /**
+   * Fork (SX-2418). The issue PATCH route stopped the former owner's run
+   * (`issue_reassigned`, `reassignmentStopConfirmed`) and committed the new
+   * owner, then queues the new owner's `issue_assigned` wake: the exact wake
+   * the route builds. With `leaseHeld` the stopped run still holds its lease.
+   * `stop: "operator"` is a genuine Stop before a plain reassignment, and
+   * `newOwner: "self"` hands the task back to the stopped run's own agent.
+   */
+  async function seedReassignment(input: {
+    leaseHeld: boolean;
+    withComment?: boolean;
+    stop?: "reassignment" | "operator";
+    newOwner?: "other" | "self";
+  }) {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const formerOwnerId = await insertAgent(companyId, "Former owner");
+    const otherAgentId = await insertAgent(companyId, "New owner");
+    const newOwnerId = input.newOwner === "self" ? formerOwnerId : otherAgentId;
+    const issueId = randomUUID();
+    const stoppedRunId = randomUUID();
+    const finishedAt = new Date();
+    const operatorStop = input.stop === "operator";
+    await db.insert(heartbeatRuns).values({
+      id: stoppedRunId,
+      companyId,
+      agentId: formerOwnerId,
+      status: "cancelled",
+      invocationSource: "assignment",
+      createdAt: new Date(finishedAt.getTime() - 60_000),
+      startedAt: new Date(finishedAt.getTime() - 60_000),
+      finishedAt,
+      error: operatorStop ? "Cancelled by operator" : "Cancelled before issue reassignment",
+      errorCode: operatorStop ? "cancelled" : "issue_reassigned",
+      contextSnapshot: { issueId },
+      resultJson: {
+        ...(operatorStop ? {} : { reassignmentStopConfirmed: true }),
+        executionCancellation: { state: "acknowledged", acknowledgedAt: finishedAt.toISOString() },
+      },
+      runnerProfileJson: { adapterDispatch: { adapterType: "claude_local" } },
+      processPid: DEAD_ID,
+      processGroupId: DEAD_ID,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Reassigned task",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: newOwnerId,
+      responsibleUserId: "responsible-user",
+    });
+    const leaseId = randomUUID();
+    await db.insert(environmentLeases).values({
+      id: leaseId,
+      companyId,
+      environmentId: await localEnvironmentId(),
+      issueId,
+      heartbeatRunId: stoppedRunId,
+      status: input.leaseHeld ? "active" : "released",
+      releasedAt: input.leaseHeld ? null : finishedAt,
+      leasePolicy: "ephemeral",
+      provider: "local",
+      metadata: { driver: "local" },
+    });
+    const commentId = input.withComment ? randomUUID() : null;
+    if (commentId) {
+      await db.insert(issueComments).values({
+        id: commentId, companyId, issueId, authorUserId: "board-user", body: "Please take this over.",
+      });
+    }
+    return {
+      companyId, issueId, stoppedRunId, formerOwnerId, newOwnerId, otherAgentId, leaseId,
+      wakeup: assignmentWakeup(issueId, operatorStop ? null : stoppedRunId, commentId),
+    };
+  }
+
+  // The wake the issue PATCH route queues for a new assignee (routes/issues.ts).
+  function assignmentWakeup(issueId: string, interruptedRunId: string | null, commentId: string | null = null) {
+    return {
+      source: "assignment" as const,
+      triggerDetail: "system" as const,
+      reason: "issue_assigned",
+      payload: {
+        issueId,
+        ...(commentId ? { commentId } : {}),
+        mutation: "update",
+        ...(interruptedRunId ? { interruptedRunId } : {}),
+      },
+      requestedByActorType: "user" as const,
+      requestedByActorId: "board-user",
+      contextSnapshot: {
+        issueId,
+        ...(commentId ? { taskId: issueId, commentId, wakeCommentId: commentId } : {}),
+        source: "issue.update",
+        ...(interruptedRunId ? { interruptedRunId } : {}),
+      },
+    };
+  }
+
+  async function issueRunsOf(agentId: string, issueId: string) {
+    return db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status, contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.agentId, agentId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+      ));
+  }
+
+  async function ageWakes(issueId: string) {
+    await db.update(agentWakeupRequests).set({ requestedAt: new Date(Date.now() - 60_000) })
+      .where(sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`);
+  }
+
+  async function releaseLeaseWithoutHook(leaseId: string) {
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date() })
+      .where(eq(environmentLeases.id, leaseId));
+  }
+
+  describe("assignment hand-off after a confirmed reassignment stop (SX-2418)", () => {
+    it.each([
+      ["without a comment", false],
+      ["with a hand-off comment", true],
+    ] as const)("%s: the new owner's wake waits for the stopped run's cleanup, then starts exactly one run", async (_name, withComment) => {
+      const ids = await seedReassignment({ leaseHeld: true, withComment });
+      expect(await getConversationOwnershipBlocker(db, ids.companyId, ids.issueId)).toMatchObject({
+        runId: ids.stoppedRunId,
+        cause: "execution_owner_active",
+      });
+
+      expect(await heartbeat.wakeup(ids.newOwnerId, ids.wakeup)).toBeNull();
+      // Before the fix a wake without a comment was written as `skipped`.
+      expect(await wakesFor(ids.newOwnerId, ids.issueId, "issue_assigned")).toEqual([
+        expect.objectContaining({ status: "deferred_issue_execution", runId: null }),
+      ]);
+      expect(await issueRunsOf(ids.newOwnerId, ids.issueId)).toHaveLength(0);
+
+      expect(await heartbeat.sweepEndedTerminalRunLeases()).toMatchObject({ released: 1 });
+
+      const runs = await issueRunsOf(ids.newOwnerId, ids.issueId);
+      expect(runs).toHaveLength(1);
+      expect(runs[0]!.contextSnapshot).toMatchObject({
+        issueId: ids.issueId,
+        wakeReason: "issue_assigned",
+        interruptedRunId: ids.stoppedRunId,
+      });
+      const wakes = await wakesFor(ids.newOwnerId, ids.issueId, "issue_assigned");
+      expect(wakes.filter((wake) => wake.status === "deferred_issue_execution")).toHaveLength(0);
+      expect(wakes.every((wake) => wake.runId === runs[0]!.id)).toBe(true);
+
+      // Later release passes and sweeps start nothing more.
+      expect(await heartbeat.sweepEndedTerminalRunLeases()).toMatchObject({ released: 0 });
+      await ageWakes(ids.issueId);
+      await heartbeat.resumeQueuedRuns();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      expect((await issueRunsOf(ids.newOwnerId, ids.issueId))
+        .filter((run) => run.contextSnapshot?.wakeReason === "issue_assigned")).toHaveLength(1);
+    });
+
+    it("late cleanup: a sweep before the stopped run's cleanup starts nothing, the next sweep starts one run", async () => {
+      const ids = await seedReassignment({ leaseHeld: true });
+      expect(await heartbeat.wakeup(ids.newOwnerId, ids.wakeup)).toBeNull();
+      await ageWakes(ids.issueId);
+
+      await heartbeat.resumeQueuedRuns();
+      expect(await issueRunsOf(ids.newOwnerId, ids.issueId)).toHaveLength(0);
+      expect(await wakesFor(ids.newOwnerId, ids.issueId, "issue_assigned")).toEqual([
+        expect.objectContaining({ status: "deferred_issue_execution" }),
+      ]);
+
+      // The stopped run's cleanup finishes on another controller: no release
+      // hook runs in this server.
+      await releaseLeaseWithoutHook(ids.leaseId);
+      await heartbeat.resumeQueuedRuns();
+      expect(await issueRunsOf(ids.newOwnerId, ids.issueId)).toHaveLength(1);
+    });
+
+    it("server restart between the stop and the promotion: the sweep of a new server starts one run, with no earlier run of the new owner", async () => {
+      const ids = await seedReassignment({ leaseHeld: true });
+      expect(await heartbeat.wakeup(ids.newOwnerId, ids.wakeup)).toBeNull();
+      expect(await issueRunsOf(ids.newOwnerId, ids.issueId)).toHaveLength(0);
+
+      await releaseLeaseWithoutHook(ids.leaseId);
+      const restarted = heartbeatService(db);
+      await restarted.resumeQueuedRuns();
+      // Too recent: the release hook still owns it.
+      expect(await issueRunsOf(ids.newOwnerId, ids.issueId)).toHaveLength(0);
+
+      await ageWakes(ids.issueId);
+      await restarted.resumeQueuedRuns();
+      await restarted.resumeQueuedRuns();
+      expect(await issueRunsOf(ids.newOwnerId, ids.issueId)).toHaveLength(1);
+      await drainHeartbeatRunsToQuiescence(db, restarted);
+    });
+
+    it("concurrent sweeps start exactly one run", async () => {
+      const ids = await seedReassignment({ leaseHeld: true });
+      expect(await heartbeat.wakeup(ids.newOwnerId, ids.wakeup)).toBeNull();
+      await releaseLeaseWithoutHook(ids.leaseId);
+      await ageWakes(ids.issueId);
+
+      await Promise.all([
+        heartbeat.resumeQueuedRuns(),
+        heartbeat.resumeQueuedRuns(),
+        heartbeatService(db).resumeQueuedRuns(),
+      ]);
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+      const runs = (await issueRunsOf(ids.newOwnerId, ids.issueId))
+        .filter((run) => run.contextSnapshot?.wakeReason === "issue_assigned");
+      expect(runs).toHaveLength(1);
+      const wakes = await wakesFor(ids.newOwnerId, ids.issueId, "issue_assigned");
+      expect(wakes.filter((wake) => wake.status === "deferred_issue_execution")).toHaveLength(0);
+      expect(wakes.every((wake) => wake.runId === runs[0]!.id)).toBe(true);
+    });
+
+    it("stale reassignment: the task moved on to a third agent before promotion, so only that agent runs", async () => {
+      const ids = await seedReassignment({ leaseHeld: true });
+      expect(await heartbeat.wakeup(ids.newOwnerId, ids.wakeup)).toBeNull();
+
+      // Reassigned again while the first new owner had no run: nothing was
+      // stopped, so its wake names no stopped run.
+      const thirdId = await insertAgent(ids.companyId, "Third owner");
+      await db.update(issues).set({ assigneeAgentId: thirdId }).where(eq(issues.id, ids.issueId));
+      expect(await heartbeat.wakeup(thirdId, assignmentWakeup(ids.issueId, null))).toBeNull();
+
+      expect(await heartbeat.sweepEndedTerminalRunLeases()).toMatchObject({ released: 1 });
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+      expect(await issueRunsOf(ids.newOwnerId, ids.issueId)).toHaveLength(0);
+      expect(await wakesFor(ids.newOwnerId, ids.issueId, "issue_assigned")).toEqual([
+        expect.objectContaining({ status: "cancelled", runId: null }),
+      ]);
+      expect((await issueRunsOf(thirdId, ids.issueId))
+        .filter((run) => run.contextSnapshot?.wakeReason === "issue_assigned")).toHaveLength(1);
+    });
+
+    it("an older saved assignment wake of the same owner is settled with the one run", async () => {
+      const ids = await seedReassignment({ leaseHeld: true });
+      expect(await heartbeat.wakeup(ids.newOwnerId, ids.wakeup)).toBeNull();
+      expect(await heartbeat.wakeup(ids.newOwnerId, ids.wakeup)).toBeNull();
+      expect(await wakesFor(ids.newOwnerId, ids.issueId, "issue_assigned")).toHaveLength(2);
+
+      expect(await heartbeat.sweepEndedTerminalRunLeases()).toMatchObject({ released: 1 });
+      await ageWakes(ids.issueId);
+      await heartbeat.resumeQueuedRuns();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+      const runs = (await issueRunsOf(ids.newOwnerId, ids.issueId))
+        .filter((run) => run.contextSnapshot?.wakeReason === "issue_assigned");
+      expect(runs).toHaveLength(1);
+      expect((await wakesFor(ids.newOwnerId, ids.issueId, "issue_assigned"))
+        .every((wake) => wake.runId === runs[0]!.id)).toBe(true);
+    });
+
+    it("self-reassignment: a task handed back to the stopped run's own agent starts no run on this path", async () => {
+      const ids = await seedReassignment({ leaseHeld: true, newOwner: "self" });
+      expect(await heartbeat.wakeup(ids.newOwnerId, ids.wakeup)).toBeNull();
+
+      expect(await heartbeat.sweepEndedTerminalRunLeases()).toMatchObject({ released: 1 });
+      await ageWakes(ids.issueId);
+      await heartbeat.resumeQueuedRuns();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      expect((await issueRunsOf(ids.newOwnerId, ids.issueId)).map((run) => run.id)).toEqual([ids.stoppedRunId]);
+    });
+
+    it("a genuine operator Stop before a plain reassignment does not promote the saved wake", async () => {
+      const ids = await seedReassignment({ leaseHeld: true, stop: "operator" });
+      expect(await heartbeat.wakeup(ids.newOwnerId, ids.wakeup)).toBeNull();
+      expect(await wakesFor(ids.newOwnerId, ids.issueId, "issue_assigned")).toEqual([
+        expect.objectContaining({ status: "deferred_issue_execution" }),
+      ]);
+
+      expect(await heartbeat.sweepEndedTerminalRunLeases()).toMatchObject({ released: 1 });
+      await ageWakes(ids.issueId);
+      await heartbeat.resumeQueuedRuns();
+      expect(await issueRunsOf(ids.newOwnerId, ids.issueId)).toHaveLength(0);
+      expect(await wakesFor(ids.newOwnerId, ids.issueId, "issue_assigned")).toEqual([
+        expect.objectContaining({ status: "deferred_issue_execution" }),
+      ]);
+    });
+
+    it.each([
+      ["a pause hold on the task", "pause"],
+      ["an open dependency", "dependency"],
+      ["a budget hard stop", "budget"],
+      ["a workspace restore hold", "restore"],
+      ["an active execution recovery hold", "recovery"],
+    ] as const)("%s keeps the saved wake and starts no run", async (_name, gate) => {
+      const ids = await seedReassignment({ leaseHeld: true });
+      expect(await heartbeat.wakeup(ids.newOwnerId, ids.wakeup)).toBeNull();
+
+      if (gate === "pause") {
+        await db.insert(issueTreeHolds).values({
+          companyId: ids.companyId, rootIssueId: ids.issueId, mode: "pause", status: "active",
+          reason: "operator pause", releasePolicy: { strategy: "manual" },
+        });
+      } else if (gate === "dependency") {
+        const blockerId = randomUUID();
+        await db.insert(issues).values({
+          id: blockerId, companyId: ids.companyId, title: "Open blocker", status: "todo", priority: "high",
+        });
+        await db.insert(issueRelations).values({
+          companyId: ids.companyId, issueId: blockerId, relatedIssueId: ids.issueId, type: "blocks",
+        });
+      } else if (gate === "budget") {
+        await db.insert(budgetPolicies).values({
+          companyId: ids.companyId, scopeType: "agent", scopeId: ids.newOwnerId, metric: "billed_cents",
+          windowKind: "calendar_month_utc", amount: 1, hardStopEnabled: true, isActive: true,
+        });
+        await db.insert(costEvents).values({
+          companyId: ids.companyId, agentId: ids.newOwnerId, issueId: ids.issueId, provider: "test", biller: "test",
+          billingType: "tokens", model: "test-model", costCents: 1, occurredAt: new Date(),
+        });
+      } else {
+        if (gate === "restore") {
+          // The stopped run itself recorded the unsafe workspace restore.
+          await db.update(heartbeatRuns).set({
+            resultJson: sql`${heartbeatRuns.resultJson} || '{"workspaceRestoreFailure":"restore_unsafe_archive"}'::jsonb`,
+          }).where(eq(heartbeatRuns.id, ids.stoppedRunId));
+        }
+        await db.insert(issueRecoveryActions).values({
+          companyId: ids.companyId, sourceIssueId: ids.issueId, kind: "active_run_watchdog", ownerType: "board",
+          cause: "legacy_execution_requires_reconciliation", fingerprint: randomUUID(),
+          evidence: gate === "restore"
+            ? { runId: ids.stoppedRunId, workspaceRestoreFailure: "restore_unsafe_archive" }
+            : { runId: randomUUID() },
+          nextAction: "Reconcile the stopped work.",
+        });
+      }
+
+      expect(await heartbeat.sweepEndedTerminalRunLeases()).toMatchObject({ released: 1 });
+      await ageWakes(ids.issueId);
+      await heartbeat.resumeQueuedRuns();
+      expect(await issueRunsOf(ids.newOwnerId, ids.issueId)).toHaveLength(0);
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+    });
   });
 });
