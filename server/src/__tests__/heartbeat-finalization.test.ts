@@ -9,6 +9,7 @@ import {
   agentTaskSessions,
   agentWakeupRequests,
   authUsers,
+  budgetReservations,
   companies,
   costEvents,
   createDb,
@@ -26,7 +27,9 @@ import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.j
 // effects, accounting, task session) so the fork's source, provenance and
 // late-write changes to completeRun cannot change it (SX-1745).
 
-const { adapterExecute, runningProcesses, terminateLocalService } = vi.hoisted(() => ({
+const { accountRunCostCalls, adapterExecute, deliverBudgetEnforcementCalls, runningProcesses, terminateLocalService } = vi.hoisted(() => ({
+  accountRunCostCalls: vi.fn<(runId: string) => void>(),
+  deliverBudgetEnforcementCalls: vi.fn<(companyId: string | undefined) => void>(),
   adapterExecute: vi.fn<(ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>>(),
   runningProcesses: new Map<string, { child: ChildProcess; graceSec: number; processGroupId: number | null }>(),
   terminateLocalService: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {}),
@@ -34,6 +37,21 @@ const { adapterExecute, runningProcesses, terminateLocalService } = vi.hoisted((
 vi.mock("../adapters/index.js", () => {
   const adapterFor = (type: string) => ({ type, execute: adapterExecute, testEnvironment: vi.fn(), supportsLocalAgentJwt: false });
   return { getServerAdapter: adapterFor, findActiveServerAdapter: adapterFor, runningProcesses };
+});
+// Pass-through spies: record which finalizer reaches accounting and budget enforcement.
+vi.mock("../services/run-cost-accounting.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/run-cost-accounting.js")>("../services/run-cost-accounting.js");
+  return { ...actual, accountRunCost: (...args: Parameters<typeof actual.accountRunCost>) => {
+    accountRunCostCalls(args[1]);
+    return actual.accountRunCost(...args);
+  } };
+});
+vi.mock("../services/budgets.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/budgets.js")>("../services/budgets.js");
+  return { ...actual, deliverBudgetEnforcement: (...args: Parameters<typeof actual.deliverBudgetEnforcement>) => {
+    deliverBudgetEnforcementCalls(args[2]);
+    return actual.deliverBudgetEnforcement(...args);
+  } };
 });
 vi.mock("../services/local-service-supervisor.js", async () => ({
   ...await vi.importActual<typeof import("../services/local-service-supervisor.js")>("../services/local-service-supervisor.js"),
@@ -677,6 +695,62 @@ describeSupported("heartbeat run finalization", () => {
         const costs = await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, row.run.id));
         expect(costs).toEqual([expect.objectContaining({ costCents: 50, inputTokens: 1_000 })]);
         if (source.source === "execute") expect(costs).toEqual(costsAfterLoser);
+      }
+    });
+
+    it("has no effects at all when an adopted finalizer loses to a run that is already terminal", async () => {
+      const receipt = { ...usage, costUsd: 0.5, provider: "openai", model: "gpt-x", usageBasis: "per_run", accountingReceiptReady: true };
+      const adapterResult: AdapterExecutionResult = { ...nullExit, summary: "Adopted late.", usage, usageBasis: "per_run",
+        costUsd: 0.5, provider: "openai", model: "gpt-x", sessionId: "adopted-session", sessionParams: { sessionId: "adopted-session" } };
+      const winners = {
+        // Stop won; the receipt the adapter checkpointed is still pending.
+        stop: async (row: Awaited<ReturnType<typeof runningRun>>) => {
+          await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(), error: "Stopped", errorCode: "cancelled",
+            costAccountingPending: true, usageJson: receipt }).where(eq(heartbeatRuns.id, row.run.id));
+        },
+        // The live executor wrote the terminal status and has not settled the receipt yet.
+        executeSettling: async (row: Awaited<ReturnType<typeof runningRun>>) => {
+          await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(), exitCode: 0,
+            costAccountingPending: true, usageJson: receipt, resultJson: { summary: "Live result." } }).where(eq(heartbeatRuns.id, row.run.id));
+        },
+        // The live executor finished, accounting included.
+        executeFinished: async (row: Awaited<ReturnType<typeof runningRun>>) => {
+          const won = await heartbeat.completeRunForTests(finalizeInput(row, { ...adapterResult, summary: "Live result." }, { source: "execute" }));
+          expect(won).toMatchObject({ won: true });
+        },
+      };
+      for (const [winner, win] of Object.entries(winners)) {
+        const ids = await seed();
+        const row = await runningRun(ids);
+        await db.insert(budgetReservations).values({ companyId: ids.companyId, runId: row.run.id, agentId: ids.agentId,
+          amountCents: "25", providerStartedAt: new Date() });
+        await win(row);
+        const snapshot = async () => ({
+          run: (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, row.run.id)))[0],
+          costs: await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, row.run.id)),
+          runtime: (await db.select().from(agentRuntimeState).where(eq(agentRuntimeState.agentId, ids.agentId)))[0] ?? null,
+          reservations: await db.select().from(budgetReservations).where(eq(budgetReservations.runId, row.run.id)),
+          events: await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, row.run.id)),
+          sessions: await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, ids.agentId)),
+          agent: (await db.select().from(agents).where(eq(agents.id, ids.agentId)))[0],
+          issue: (await db.select().from(issues).where(eq(issues.id, ids.issueId)))[0],
+          comments: await db.select().from(issueComments).where(eq(issueComments.issueId, ids.issueId)),
+        });
+        const before = await snapshot();
+        if (winner !== "executeFinished") {
+          expect(before.run.costAccountingPending, winner).toBe(true);
+          expect(before.reservations.map((reservation) => reservation.state), winner).toEqual(["held"]);
+        }
+        accountRunCostCalls.mockClear();
+        deliverBudgetEnforcementCalls.mockClear();
+
+        const result = await heartbeat.completeRunForTests(
+          finalizeInput(row, adapterResult, { source: "adopted_output", recoveredOutcome: "succeeded" }));
+
+        expect(result, winner).toMatchObject({ won: false, lateWrite: false, run: null });
+        expect(await snapshot(), winner).toEqual(before);
+        expect(accountRunCostCalls, winner).not.toHaveBeenCalled();
+        expect(deliverBudgetEnforcementCalls, winner).not.toHaveBeenCalled();
       }
     });
 
