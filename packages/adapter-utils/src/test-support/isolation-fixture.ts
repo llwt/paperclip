@@ -3,7 +3,6 @@ import { randomBytes } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 import {
   createSystemdIsolationPolicy,
   IsolationHealth,
@@ -27,36 +26,38 @@ export interface LiveIsolation {
   cleanup(): void;
 }
 
-/** Builds the helper if needed, probes the real user manager, and owns a unique test slice. */
+const SYSTEMCTL_PROBE_TIMEOUT_MS = 2_000;
+const HELPER_PROBE_TIMEOUT_MS = 4_000;
+
+/** Probes the real user manager with short timeouts and owns a unique test slice. Never builds the helper; a missing one skips the live cases. */
 export async function prepareLiveIsolation(): Promise<LiveIsolation> {
   const slice = `app-pcltest${randomBytes(4).toString("hex")}.slice`;
   const none = (skip: string): LiveIsolation => ({ helper: null, slice, skip, cleanup: () => {} });
   if (process.platform !== "linux" || !process.getuid) return none("not linux");
-  let helper = path.join(processLaunchRoot, "dist", "bin", "paperclip-scope-exec");
-  if (!existsSync(helper)) {
-    try {
-      process.env.CARGO_BUILD_JOBS ??= "2";
-      const script = path.join(processLaunchRoot, "scripts", "build-helper.mjs");
-      const mod = (await import(pathToFileURL(script).href)) as { buildHelper(o: { stdio: string }): Promise<string | null> };
-      const built = await mod.buildHelper({ stdio: "pipe" });
-      if (!built) return none("helper not built");
-      helper = built;
-    } catch (error) {
-      return none(`helper build failed: ${String((error as Error).message).split("\n")[0]}`);
-    }
-  }
+  const helper = path.join(processLaunchRoot, "dist", "bin", "paperclip-scope-exec");
+  if (!existsSync(helper)) return none("helper binary not built (run the process-launch build)");
+  const busPath = userBusAddress().replace(/^unix:path=/, "");
+  if (!existsSync(busPath)) return none(`no systemd user bus at ${busPath}`);
+  const systemctl = spawnSync("systemctl", ["--version"], { timeout: SYSTEMCTL_PROBE_TIMEOUT_MS, stdio: "ignore" });
+  if (systemctl.error || systemctl.status !== 0) return none("systemctl not available");
   const dir = mkdtempSync(path.join(tmpdir(), "au-probe-"));
+  let probeRan = false;
   try {
     const status = path.join(dir, "status.json");
     const unit = `pcltest-probe-${randomBytes(8).toString("hex")}.scope`;
+    probeRan = true;
     const result = spawnSync(
       helper,
       ["--unit", unit, "--slice", slice, "--user-bus", userBusAddress(), "--status-file", status, "--", "true"],
-      { timeout: 10_000 },
+      { timeout: HELPER_PROBE_TIMEOUT_MS },
     );
     const parsed = result.status === 0 ? (JSON.parse(readFileSync(status, "utf8")) as { outcome: string; reason?: string }) : null;
-    if (parsed?.outcome !== "enrolled") return none(`user manager unavailable (${parsed?.reason ?? `exit ${result.status}`})`);
+    if (parsed?.outcome !== "enrolled") {
+      stopUserSlice(slice);
+      return none(`user manager unavailable (${parsed?.reason ?? (result.error ? result.error.message : `exit ${result.status}`)})`);
+    }
   } catch (error) {
+    if (probeRan) stopUserSlice(slice);
     return none(`probe failed: ${(error as Error).message}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -77,14 +78,14 @@ function userManagerEnv(): NodeJS.ProcessEnv {
 }
 
 function sliceIsActive(slice: string, env: NodeJS.ProcessEnv): boolean {
-  return spawnSync("systemctl", ["--user", "is-active", "--quiet", slice], { env, timeout: 15_000 }).status === 0;
+  return spawnSync("systemctl", ["--user", "is-active", "--quiet", slice], { env, timeout: SYSTEMCTL_PROBE_TIMEOUT_MS }).status === 0;
 }
 
 /** Stops a test slice and throws if it is still active, so a leaked unit fails the run instead of piling up. */
 function stopUserSlice(slice: string): void {
   const env = userManagerEnv();
   if (!sliceIsActive(slice, env)) return;
-  const stop = spawnSync("systemctl", ["--user", "stop", slice], { env, timeout: 15_000, encoding: "utf8" });
+  const stop = spawnSync("systemctl", ["--user", "stop", slice], { env, timeout: 5_000, encoding: "utf8" });
   if (sliceIsActive(slice, env)) {
     throw new Error(`test slice ${slice} is still active after stop (exit ${stop.status}): ${stop.stderr?.trim() ?? ""}`);
   }
