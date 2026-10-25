@@ -947,7 +947,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : `Claude exited with code ${proc.exitCode ?? -1}`;
   };
 
-  const runAttempt = async (resumeSessionId: string | null) => {
+  const runAttempt = async (resumeSessionId: string | null, freshSessionRetry = false) => {
     await hydrateFreshSessionHandoff(ctx, { resumedSession: Boolean(resumeSessionId) });
     const renderedBootstrapPrompt =
       !resumeSessionId && bootstrapPromptTemplate.trim().length > 0
@@ -1016,6 +1016,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           version: 1,
           engine: "cli",
           sessionIdBefore: resumeSessionId,
+          freshSessionRetry,
           sessionParams: {
             cwd,
             promptBundleKey: promptBundle.bundleKey,
@@ -1471,7 +1472,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           }
         }
       }
-      const retry = await runAttempt(null);
+      const retry = await runAttempt(null, true);
       return withLeftoverProcessSweep(
         toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true }),
         [initial.proc, retry.proc],

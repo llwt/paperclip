@@ -108,6 +108,7 @@ import type { environmentRuntimeService, ProviderResourceDisposition } from "../
 import type { agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
 import type { createHeartbeatRunState } from "./run-state.js";
 import type { HeartbeatRetryDependencies, createHeartbeatRetries } from "./retries.js";
+import type { AdoptedResultRecoveryOutcome } from "./adopted-result-recovery.js";
 
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
 type HeartbeatRetries = ReturnType<typeof createHeartbeatRetries>;
@@ -172,6 +173,9 @@ export interface HeartbeatRecoveryDependencies extends Pick<HeartbeatRetryDepend
   dispatchPendingNativeStatusWakeups: () => Promise<unknown>;
   cancelRunInternal: (runId: string, reason?: string, options?: { resultJson?: Record<string, unknown> }) => Promise<unknown>;
   startNextQueuedRunForAgent: (agentId: string) => Promise<unknown>;
+  // Fork (SX-1746): finalizes an adopted run from its persisted output. Late
+  // bound by the service, which creates the finalizer after this module.
+  recoverAdoptedRunResult: (run: HeartbeatRun) => Promise<AdoptedResultRecoveryOutcome>;
   // Fork (SX-1600, SX-1851): recording the output of children adopted after a
   // hot restart, and sweeping their leftover processes.
   runLogStore: ReturnType<typeof getRunLogStore>;
@@ -436,6 +440,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     getAgent,
     scheduleInteractionContinuationInfrastructureRetryIfEligible,
     startNextQueuedRunForAgent,
+    recoverAdoptedRunResult,
     runLogStore,
     getCurrentUserRedactionOptions,
     options,
@@ -2934,6 +2939,41 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           (!!run.processPid || !!run.processGroupId)) ||
           monitorDispatchLostWithoutFutureWake);
       if (!(await revokeExpiredLegacyController(db, run))) continue;
+
+      // Fork (SX-1746): the child and its group are gone and no tail is
+      // writing, so an adopted local CLI run may have a result in its output.
+      // Recovery finalizes it through the shared finalizer, or says why not
+      // and the run is lost as before, with the same one retry.
+      let adoptedResultFallback: Record<string, unknown> | null = null;
+      if (run.runtimeMode !== "native" && readHotRestartAdoptionMetadata(parseObject(run.resultJson))) {
+        const recovered = await recoverAdoptedRunResult(run);
+        if (recovered.kind === "lost") continue;
+        if (recovered.kind === "fallback") {
+          adoptedResultFallback = recovered.resultRecovery;
+        } else {
+          // Stop, a second sweep or the backstop never reach this branch: only
+          // the caller that wrote the terminal state cleans up after it.
+          try {
+            await releaseEnvironmentLeasesForRun({
+              runId: recovered.run.id,
+              companyId: recovered.run.companyId,
+              agentId: recovered.run.agentId,
+              status: recovered.run.status,
+              failureReason: recovered.run.error ?? undefined,
+            });
+            void sweepAdoptedRunLeftovers(recovered.run);
+            await startNextQueuedRunForAgent(run.agentId);
+          } catch (err) {
+            logger.error(
+              { err, runId: run.id },
+              "cleanup after finalizing an adopted run from its output failed",
+            );
+          }
+          runningProcesses.delete(run.id);
+          reaped.push(run.id);
+          continue;
+        }
+      }
       const baseMessage = buildProcessLossMessage(run);
       const processLossDiagnostic = buildProcessLossDiagnostic({
         run,
@@ -2958,7 +2998,18 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
               "failed",
               {
                 conversationContinuationEligible,
-                resultJson: { ...parseObject(run.resultJson), processLossDiagnostic },
+                resultJson: {
+                  ...parseObject(run.resultJson),
+                  processLossDiagnostic,
+                  ...(adoptedResultFallback
+                    ? {
+                        hotRestart: {
+                          ...parseObject(parseObject(run.resultJson).hotRestart),
+                          resultRecovery: adoptedResultFallback,
+                        },
+                      }
+                    : {}),
+                },
                 errorCode: "process_lost",
                 errorMessage: shouldRetry
                   ? `${baseMessage}; retrying once`
@@ -3111,5 +3162,6 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     stopAdoptedRunOutputTails,
     waitForAdoptedRunOutputTails,
     waitForAdoptedRunSweeps,
+    hasAdoptedOutputTail: (runId: string) => adoptedOutputTails.has(runId),
   };
 }

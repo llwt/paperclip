@@ -3,6 +3,7 @@ import { prepareHeartbeatWorkspace } from "./heartbeat/workspace-preparation.js"
 import { executeHeartbeatRuntime, NativeSessionResumeScheduledError, NativeWorkspaceFinalizeScheduledError } from "./heartbeat/runtime-execution.js";
 import { selectHeartbeatRuntime } from "./heartbeat/runtime-selection.js";
 import { createHeartbeatRunCompletion } from "./heartbeat/run-completion.js";
+import { createAdoptedResultRecovery } from "./heartbeat/adopted-result-recovery.js";
 import { buildLocalResultRecoverySnapshot, LOCAL_RESULT_RECOVERY_CONTEXT_KEY } from "./heartbeat/local-result-recovery.js";
 export {
   adapterOutputRecoveryContextFromSnapshot,
@@ -419,7 +420,7 @@ import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import {
   providerTraceStore,
 } from "./provider-trace-store.js";
-import { getServerAdapter, runningProcesses } from "../adapters/index.js";
+import { findActiveServerAdapter, getServerAdapter, runningProcesses } from "../adapters/index.js";
 import type {
   AdapterInvocationMeta,
   AdapterRuntimeEvent,
@@ -1114,9 +1115,19 @@ export function heartbeatService(
     cancelWorkForScope: cancelBudgetScopeWork,
   };
   const budgets = budgetService(db, budgetHooks);
+  // Fork (SX-1746): adopted runs whose result is being read back from their
+  // output, or whose output tail is still writing. The recovery service's
+  // process-gone backstop leaves them to the orphan reaper.
+  const adoptedResultsPending = new Set<string>();
+  const adoptedResultPending = {
+    has(id: string) {
+      return adoptedResultsPending.has(id) || hasAdoptedOutputTail(id);
+    },
+  };
   const recovery = recoveryService(db, {
     enqueueWakeup,
     liveRunExecutions,
+    adoptedResultPending,
     releaseLeasesForEndedTerminalRun: (run) =>
       releaseEnvironmentLeasesForEndedTerminalRun({
         runId: run.id,
@@ -1182,6 +1193,7 @@ export function heartbeatService(
     stopAdoptedRunOutputTails,
     waitForAdoptedRunOutputTails,
     waitForAdoptedRunSweeps,
+    hasAdoptedOutputTail,
   } = createHeartbeatRecovery(db, {
     enterShutdown: () => { shutdownInProgress = true; },
     scheduleBoundedRetryForRun,
@@ -1214,6 +1226,7 @@ export function heartbeatService(
     getAgent,
     scheduleInteractionContinuationInfrastructureRetryIfEligible,
     startNextQueuedRunForAgent,
+    recoverAdoptedRunResult: (run) => adoptedResultRecovery.recover(run),
     runLogStore,
     getCurrentUserRedactionOptions,
     options,
@@ -2032,6 +2045,19 @@ export function heartbeatService(
     traceStore,
     processRunCancellationSettlements,
     failedProcessRunCancellations,
+  });
+
+  const adoptedResultRecovery = createAdoptedResultRecovery(db, {
+    pending: adoptedResultsPending,
+    runLogStore,
+    getRun,
+    getAgent,
+    getIssueExecutionContext,
+    getCurrentUserRedactionOptions,
+    resolveLedgerScopeForRun,
+    getSessionCodec: getAdapterSessionCodec,
+    findAdapter: findActiveServerAdapter,
+    completeRun: (input) => runCompletion.completeRun(input),
   });
 
   async function executeRun(

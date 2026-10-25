@@ -236,6 +236,13 @@ export interface AdapterInvocationRecoveryMeta {
   engine: string;
   /** Session this invocation resumes, or null for a fresh session. */
   sessionIdBefore: string | null;
+  /**
+   * True only for the invocation an adapter starts after its resume session
+   * proved unusable. A first invocation that merely did not resume a stored
+   * session (for example a different cwd) is false, so recovery can tell a
+   * real fresh-session retry from a session that was never resumable.
+   */
+  freshSessionRetry: boolean;
   /** Safe local session fields (no session id) that a result's session params extend. */
   sessionParams: Record<string, unknown> | null;
   accounting: {
@@ -582,6 +589,8 @@ export interface AdapterOutputRecoveryContext {
     /** First output seq that belongs to the latest invocation, when known. */
     firstSeq: number | null;
     sessionIdBefore: string | null;
+    /** The latest invocation is the retry after a resume session proved unusable. */
+    freshSessionRetry: boolean;
     /** Safe local session fields only. */
     sessionParams: Record<string, unknown> | null;
   };

@@ -167,9 +167,9 @@ export async function recoverCodexResultFromOutput(
 
   const sessionId = state.sessionId ?? context.invocation.sessionIdBefore;
   const sessionParams = sessionId ? { ...(context.invocation.sessionParams ?? {}), sessionId } : null;
-  // Same as execute(): a fresh-session retry that never produced a session id leaves the old session stale.
-  const clearSession =
-    !sessionId && context.invocation.sessionIdBefore === null && context.runStart.sessionIdBefore !== null;
+  // Same as execute(): only a real fresh-session retry that never produced a session id leaves the old
+  // session stale. A first invocation that just could not resume the stored session leaves it alone.
+  const clearSession = !sessionId && context.invocation.freshSessionRetry;
   const base = {
     exitCode: null,
     signal: null,

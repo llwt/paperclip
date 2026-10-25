@@ -762,7 +762,7 @@ describe("claude remote execution", () => {
         version: 1,
         adapterType: "claude_local",
         engine: "cli",
-        invocation: { firstSeq: null, sessionIdBefore: recovery!.sessionIdBefore, sessionParams: recovery!.sessionParams },
+        invocation: { firstSeq: null, sessionIdBefore: recovery!.sessionIdBefore, freshSessionRetry: recovery!.freshSessionRetry, sessionParams: recovery!.sessionParams },
         accounting: recovery!.accounting,
         runStart: { sessionIdBefore: null, sessionDisplayId: null, sessionParams: null },
       },
