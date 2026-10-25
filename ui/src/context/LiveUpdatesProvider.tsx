@@ -1104,6 +1104,9 @@ function buildRunStatusToast(
   if (errorCode === "operator_interrupted") return null;
   // Workspace contention is ordinary scheduling, not a failed user action.
   if (errorCode === "workspace_busy") return null;
+  // Fork (SX-2509): a run stopped while it changes its own task is recorded
+  // `succeeded` right after; its transient stop is not a cancellation.
+  if (status === "cancelled" && payload.selfHandoffPending === true) return null;
   const contextSource = readString(payload.contextSource);
   const triggerDetail = readString(payload.triggerDetail);
   const name = nameOf(agentId) ?? "Agent";

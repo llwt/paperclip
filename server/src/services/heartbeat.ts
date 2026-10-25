@@ -4966,13 +4966,16 @@ export function heartbeatService(
         const issueMutationStopId = selfChange ? randomUUID() : null;
         const cancelled = await cancelRunInternal(run.id, outerErr.code, {
           errorCode: outerErr.code,
-          ...(issueMutationStopId ? { resultJson: { issueMutationStopId } } : {}),
+          ...(issueMutationStopId ? { resultJson: { issueMutationStopId, selfHandoffRequested: true } } : {}),
           eventMessage: "stale execution continuation cancelled before dispatch",
           suppressImmediateRecovery: true,
         });
         if (issueMutationStopId && cancelled?.status === "cancelled") {
           await runControl.recordSelfHandoffOutcome({
             runId: run.id, issueMutationStopId, kind: "stale_continuation",
+          }).catch(async (err: unknown) => {
+            logger.warn({ err, runId: run.id }, "failed to record the self hand-off run outcome");
+            await runControl.announceSelfHandoffStopCancelled(run.id).catch(() => undefined);
           });
         }
       } else if (isWorkspaceBusyDeferral(outerErr)) {
@@ -5462,6 +5465,8 @@ export function heartbeatService(
     // Fork (SX-2509): record `succeeded` for a run stopped by its own task change.
     recordSelfHandoffOutcome: (input: Parameters<typeof runControl.recordSelfHandoffOutcome>[0]) =>
       runControl.recordSelfHandoffOutcome(input),
+    announceSelfHandoffStopCancelled: (runId: string) =>
+      runControl.announceSelfHandoffStopCancelled(runId),
 
     /**
      * Pause-only. Emits errorCode "agent_paused" unconditionally; its sole caller is the

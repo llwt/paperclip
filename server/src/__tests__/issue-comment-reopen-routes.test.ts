@@ -2891,7 +2891,7 @@ describe("issue comment reopen routes", () => {
         return;
       }
       expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("run-1", undefined, {
-        resultJson: { issueMutationStopId: expect.any(String) },
+        resultJson: { issueMutationStopId: expect.any(String), selfHandoffRequested: true },
       });
       const stopId = (mockHeartbeatService.cancelRun.mock.calls[0] as unknown as [string, undefined, {
         resultJson: { issueMutationStopId: string };
