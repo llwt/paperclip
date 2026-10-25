@@ -23,8 +23,8 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
 // Pins the post-run handling after adapter.execute() (outcome, terminal write,
-// effects, accounting, task session) so moving it into finalizeAdapterRun
-// cannot change it (SX-1745).
+// effects, accounting, task session) so the fork's source, provenance and
+// late-write changes to completeRun cannot change it (SX-1745).
 
 const { adapterExecute, runningProcesses, terminateLocalService } = vi.hoisted(() => ({
   adapterExecute: vi.fn<(ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>>(),
@@ -175,7 +175,8 @@ describeSupported("heartbeat run finalization", () => {
     const runId = await runToEnd(ids);
     const seen = await observe(runId, ids);
     expect(seen.run).toMatchObject({ status: "succeeded", exitCode: null, error: null, errorCode: null });
-    expect(seen.costs).toHaveLength(0);
+    // Durable accounting (upstream #14997) records an unpriced receipt for a run without usage.
+    expect(seen.costs).toEqual([expect.objectContaining({ costCents: 0, inputTokens: 0, costStatus: "unpriced" })]);
     expect(seen.runtime).toMatchObject({ lastRunStatus: "succeeded", totalInputTokens: 0, totalCostCents: 0 });
   });
 
@@ -236,11 +237,15 @@ describeSupported("heartbeat run finalization", () => {
     }));
     const runId = await runToEnd(ids);
     const seen = await observe(runId, ids);
-    expect(seen.run).toMatchObject({ status: "cancelled", error: "Stopped elsewhere", sessionIdAfter: null, usageJson: null });
+    expect(seen.run).toMatchObject({ status: "cancelled", error: "Stopped elsewhere", sessionIdAfter: null });
     expect(seen.run.resultJson ?? {}).not.toHaveProperty("summary");
+    // The finalizer's usage record is not written; only the receipt the adapter checkpointed is.
+    expect(seen.run.usageJson).not.toHaveProperty("persistedSessionId");
+    expect(seen.run.usageJson).not.toHaveProperty("freshSession");
     expect(seen.lifecycle).toEqual(["run started", "run scratch cleaned"]);
-    expect(seen.costs).toHaveLength(0);
-    expect(seen.runtime ?? { totalInputTokens: 0, lastRunId: null }).toMatchObject({ totalInputTokens: 0 });
+    // Durable accounting (upstream #14997) still settles that receipt once, through the loser.
+    expect(seen.costs).toEqual([expect.objectContaining({ costCents: 50, inputTokens: 1_000 })]);
+    expect(seen.run.costAccountingPending).toBe(false);
     expect(seen.runtime?.lastRunId ?? null).not.toBe(runId);
     expect(seen.sessions).toHaveLength(0);
     expect(seen.comments).toHaveLength(0);
@@ -479,12 +484,15 @@ describeSupported("heartbeat run finalization", () => {
         sessionId: "session-8", sessionParams: { sessionId: "session-8" } })));
       const runId = await runToEnd(ids);
       const seen = await observe(runId, ids);
-      expect(seen.run).toMatchObject({ status: "failed", errorCode: "adapter_failed", usageJson: null, sessionIdAfter: null });
+      expect(seen.run).toMatchObject({ status: "failed", errorCode: "adapter_failed", sessionIdAfter: null });
+      expect(seen.run.usageJson).not.toHaveProperty("persistedSessionId");
       // The executor's catch records the failed query.
       expect(seen.run.error).toMatch(/^Failed query: update "heartbeat_runs"/);
       expect(seen.run.logBytes).toBeGreaterThan(0);
       expect(seen.wakeup.status).toBe("failed");
-      expect(seen.costs).toHaveLength(0);
+      // Durable accounting (upstream #14997) settles the checkpointed receipt on the failure path.
+      expect(seen.costs).toEqual([expect.objectContaining({ costCents: 50, inputTokens: 1_000 })]);
+      expect(seen.runtime).toMatchObject({ lastRunStatus: "failed", totalInputTokens: 1_000 });
       expect(seen.sessions).toHaveLength(0);
       expect(seen.comments).toHaveLength(0);
       expect(seen.agent.status).toBe("error");
@@ -504,12 +512,14 @@ describeSupported("heartbeat run finalization", () => {
       const seen = await observe(runId, ids);
       expect(seen.run).toMatchObject({ status: "succeeded", error: null, sessionIdAfter: "session-9" });
       expect(seen.run.usageJson).toMatchObject({ inputTokens: 1_000 });
+      // Accounting stays queued for recovery; the run's effects go on.
+      expect(seen.run.costAccountingPending).toBe(true);
       expect(seen.costs).toHaveLength(0);
-      // Effects before the cost insert stay; the task session and agent status after it are not written.
       expect(seen.lifecycle).toEqual(["run started", "run succeeded", "run presentation resolved", "run scratch cleaned"]);
       expect(seen.comments.map((comment) => comment.body)).toEqual(["Done."]);
       expect(seen.wakeup.status).toBe("completed");
-      expect(seen.runtime).toMatchObject({ lastRunStatus: "succeeded", totalInputTokens: 1_000 });
+      // The runtime counters, task session and agent status after it are not written.
+      expect(seen.runtime).toMatchObject({ lastRunStatus: null, totalInputTokens: 0 });
       expect(seen.sessions).toHaveLength(0);
       expect(seen.agent.status).toBe("running");
     } finally {
@@ -517,7 +527,7 @@ describeSupported("heartbeat run finalization", () => {
     }
   });
 
-  describe("finalizeAdapterRun", () => {
+  describe("completeRun", () => {
     const sessionConfig = {
       version: 1, fingerprint: "fp", categories: [], categoryFingerprints: {}, fingerprints: {},
     } as unknown as Parameters<typeof buildLocalResultRecoverySnapshot>[0]["sessionConfig"];
@@ -539,24 +549,34 @@ describeSupported("heartbeat run finalization", () => {
       source:
         | { source: "execute" }
         | { source: "adopted_output"; recoveredOutcome: "succeeded" | "failed"; resultRecovery?: Record<string, unknown> },
-    ): Parameters<typeof heartbeat.finalizeAdapterRunForTests>[0] {
+    ): Parameters<typeof heartbeat.completeRunForTests>[0] {
       return {
         ...source,
         run: row.run,
         agent: row.agent,
-        adapterResult,
-        session: {
-          codec: { deserialize: (raw) => raw as Record<string, unknown> | null, serialize: (params) => params },
-          taskKey: null, previousParams: null, dispatched: { sessionId: null, sessionDisplayId: null },
-          taskSessionReused: false, rotated: false, rotationReason: null, configuredModel: null,
-          configMetadata: sessionConfig, configFreshness: {},
+        issueId: null,
+        issueRef: null,
+        signal: new AbortController().signal,
+        output: {
+          handle: null, outputProgressState: { pending: null }, flushOutputProgress: async () => {},
+          stdoutExcerpt: "", stderrExcerpt: "",
         },
-        issue: { id: null, ref: null, context: null },
-        redaction: { enabled: false },
-        isAborted: () => false,
-        secretValues: () => [],
+        session: {
+          runtimeForAdapter: { sessionId: null, sessionDisplayId: null },
+          previousSessionParams: null, taskKey: null, configuredModel: null, sessionConfigMetadata: sessionConfig,
+        },
+        readFailureReportSecrets: () => [],
+        adapterResult,
+        sessionCodec: { deserialize: (raw) => raw as Record<string, unknown> | null, serialize: (params) => params },
+        taskSessionForRun: null,
+        sessionCompaction: { rotate: false, reason: null },
+        configFreshnessResultMetadata: {},
+        runLedgerScope: {},
+        currentUserRedactionOptions: { enabled: false },
+        providerTraceCapture: false,
+        onProviderTraceFinalized: () => {},
+        issueContext: null,
         onLog: async () => {},
-        finalizeLog: async () => ({ summary: null, stdoutExcerpt: "", stderrExcerpt: "" }),
       };
     }
 
@@ -565,7 +585,7 @@ describeSupported("heartbeat run finalization", () => {
     it("uses the recovered verdict of adopted output, not the null-exit rule", async () => {
       const ids = await seed();
       const row = await runningRun(ids);
-      const result = await heartbeat.finalizeAdapterRunForTests(
+      const result = await heartbeat.completeRunForTests(
         finalizeInput(row, { ...nullExit }, { source: "adopted_output", recoveredOutcome: "failed" }));
       expect(result).toMatchObject({ won: true, lateWrite: false, outcome: "failed" });
       expect(result.run).toMatchObject({ status: "failed", exitCode: null, errorCode: "adapter_failed", error: "Adapter failed" });
@@ -584,7 +604,7 @@ describeSupported("heartbeat run finalization", () => {
         const ids = await seed();
         const row = await runningRun(ids);
         await db.update(heartbeatRuns).set({ resultJson: { hotRestart, leftoverProcessSweep } }).where(eq(heartbeatRuns.id, row.run.id));
-        const result = await heartbeat.finalizeAdapterRunForTests(finalizeInput(row, {
+        const result = await heartbeat.completeRunForTests(finalizeInput(row, {
           ...nullExit, summary: "Recovered.",
           // Adapter JSON cannot replace the server-owned record.
           resultJson: { result: "parsed", hotRestart: { adopted: false, outputCapture: null }, leftoverProcessSweep: null },
@@ -602,7 +622,7 @@ describeSupported("heartbeat run finalization", () => {
       for (const source of [{ source: "execute" }, { source: "adopted_output", recoveredOutcome: "succeeded" }] as const) {
         const ids = await seed();
         const row = await runningRun(ids);
-        await heartbeat.finalizeAdapterRunForTests(finalizeInput(row, { ...nullExit, resultJson: { result: "parsed" } }, source));
+        await heartbeat.completeRunForTests(finalizeInput(row, { ...nullExit, resultJson: { result: "parsed" } }, source));
         const [stored] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, row.run.id));
         expect(stored.resultJson).toMatchObject({ result: "parsed" });
         expect(stored.resultJson).not.toHaveProperty("hotRestart");
@@ -614,8 +634,8 @@ describeSupported("heartbeat run finalization", () => {
       const row = await runningRun(ids);
       const result: AdapterExecutionResult = { ...nullExit, usage, usageBasis: "per_run", costUsd: 0.5, provider: "openai", model: "gpt-x" };
       const outcomes = await Promise.all([
-        heartbeat.finalizeAdapterRunForTests(finalizeInput(row, result, { source: "adopted_output", recoveredOutcome: "succeeded" })),
-        heartbeat.finalizeAdapterRunForTests(finalizeInput(row, result, { source: "adopted_output", recoveredOutcome: "succeeded" })),
+        heartbeat.completeRunForTests(finalizeInput(row, result, { source: "adopted_output", recoveredOutcome: "succeeded" })),
+        heartbeat.completeRunForTests(finalizeInput(row, result, { source: "adopted_output", recoveredOutcome: "succeeded" })),
       ]);
       expect(outcomes.map((outcome) => outcome.won).sort()).toEqual([false, true]);
       expect(outcomes.find((outcome) => !outcome.won)).toMatchObject({ lateWrite: false, run: null });
@@ -630,7 +650,7 @@ describeSupported("heartbeat run finalization", () => {
         const row = await runningRun(ids);
         // Native reconciliation committed the same terminal status first.
         await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, row.run.id));
-        const result = await heartbeat.finalizeAdapterRunForTests(finalizeInput(row, {
+        const result = await heartbeat.completeRunForTests(finalizeInput(row, {
           ...nullExit, usage, usageBasis: "per_run", provider: "openai", model: "gpt-x",
           nativeFinalization: { terminal: { runTerminalState: "succeeded" } } as AdapterExecutionResult["nativeFinalization"],
         }, source));

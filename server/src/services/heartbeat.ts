@@ -3,6 +3,13 @@ import { prepareHeartbeatWorkspace } from "./heartbeat/workspace-preparation.js"
 import { executeHeartbeatRuntime, NativeSessionResumeScheduledError, NativeWorkspaceFinalizeScheduledError } from "./heartbeat/runtime-execution.js";
 import { selectHeartbeatRuntime } from "./heartbeat/runtime-selection.js";
 import { createHeartbeatRunCompletion } from "./heartbeat/run-completion.js";
+import { buildLocalResultRecoverySnapshot, LOCAL_RESULT_RECOVERY_CONTEXT_KEY } from "./heartbeat/local-result-recovery.js";
+export {
+  adapterOutputRecoveryContextFromSnapshot,
+  buildLocalResultRecoverySnapshot,
+  LOCAL_RESULT_RECOVERY_CONTEXT_KEY,
+  type LocalResultRecoverySnapshot,
+} from "./heartbeat/local-result-recovery.js";
 export {
   MAX_TURN_CONTINUATION_WAKE_REASON,
   parseSandboxProviderPluginNotReadyFailureMessage,
@@ -4363,6 +4370,7 @@ export function heartbeatService(
             );
           }
         }
+        let adapterInvocationCount = 0;
         const onAdapterMeta = async (meta: AdapterInvocationMeta) => {
           meta = identityRedactor.redact(meta);
           if (meta.env && secretKeys.size > 0) {
@@ -4370,6 +4378,35 @@ export function heartbeatService(
               if (key in meta.env) meta.env[key] = "***REDACTED***";
             }
           }
+          // Fork (SX-1745): recorded before each CLI invocation, a fresh-session
+          // retry included, so a run whose parent is lost can still be finalized
+          // from the output of its latest invocation alone.
+          adapterInvocationCount += 1;
+          const localResultRecovery = buildLocalResultRecoverySnapshot({
+            adapterType: agent.adapterType,
+            codec: getServerAdapter(agent.adapterType).sessionCodec ?? null,
+            taskKey,
+            configuredModel,
+            previousSessionParams,
+            dispatched: runtimeForAdapter,
+            taskSessionReused: taskSessionForRun != null,
+            rotated: sessionCompaction.rotate,
+            rotationReason: sessionCompaction.reason,
+            sessionConfig: sessionConfigMetadata,
+            configFreshness: configFreshnessResultMetadata,
+            invocationNumber: adapterInvocationCount,
+            firstSeq: outputSeq + 1,
+            startedAt: new Date(),
+            recovery: meta.recovery,
+          });
+          context[LOCAL_RESULT_RECOVERY_CONTEXT_KEY] = localResultRecovery;
+          await db
+            .update(heartbeatRuns)
+            .set({
+              contextSnapshot: sql`jsonb_set(coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb), ${`{${LOCAL_RESULT_RECOVERY_CONTEXT_KEY}}`}::text[], ${JSON.stringify(localResultRecovery)}::jsonb)`,
+              updatedAt: new Date(),
+            })
+            .where(eq(heartbeatRuns.id, run.id));
           await appendRunEvent(currentRun, {
             eventType: "adapter.invoke",
             stream: "system",
@@ -4789,6 +4826,7 @@ export function heartbeatService(
           }
         }
         await runCompletion.completeRun({
+          source: "execute",
           run, agent, issueId, issueRef, signal: executionControl.controller.signal,
           output: {
             handle, outputProgressState, flushOutputProgress,
@@ -5271,6 +5309,8 @@ export function heartbeatService(
 
   return {
     stopInvocationsForAgents,
+    // Fork (SX-1745): direct access to the shared finalizer for the adopted_output tests.
+    completeRunForTests: runCompletion.completeRun,
     waitForRunExecutionDrain: async (
       runId: string,
       options: { timeoutMs?: number; intervalMs?: number } = {},
