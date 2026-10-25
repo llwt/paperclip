@@ -5,3 +5,5 @@ export * from "./helper-path.js";
 export * from "./launch.js";
 export * from "./terminate.js";
 export { readBootId, readProcCgroup, readProcStat, userManagerCgroup } from "./proc.js";
+export * from "./capability.js";
+export * from "./health.js";
