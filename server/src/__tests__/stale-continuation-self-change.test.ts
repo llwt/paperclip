@@ -397,6 +397,20 @@ describeEmbeddedPostgres("a leftover queued wake after the task changed (SX-2550
       expect(await staleTaskChangedByAgent(db, { companyId: ids.companyId, agentId: ids.agentId, observed: null }))
         .toBe(false);
     });
+
+    it("is false when a later own change would explain a newer version only", async () => {
+      const ids = await seed();
+      await changeTask(ids, "board", { assigneeAgentId: ids.otherAgentId }, false);
+      const observed = await staleDecision(ids);
+      // Later the board gives the task back and the agent closes it. That
+      // close is the agent's own and would make a fresh decision stale, but it
+      // is not the change the old decision saw.
+      await changeTask(ids, "board", { assigneeAgentId: ids.agentId }, false);
+      await changeTask(ids, "self", { status: "done" }, false);
+      expect(await staleTaskChangedByAgent(db, { companyId: ids.companyId, agentId: ids.agentId, observed }))
+        .toBe(false);
+      expect(await attributed(ids)).toBe(true);
+    });
   });
 
   describe("blocker edit after a board reassignment, full dispatch", () => {
