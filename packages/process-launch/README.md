@@ -57,7 +57,10 @@ paperclip-scope-exec --unit <name.scope> --slice <name.slice>
 3. Confirms enrollment by reading its own `/proc/self/cgroup`, within one
    combined deadline (default 2 s). A lost or late reply is resolved by that
    membership check, never by a second attempt.
-4. Writes its status file, then executes the target once, in place.
+4. Writes its status file, then executes the target once, in place, the way
+   Node's spawn does on Linux (glibc `execvp`): PATH from the target's
+   environment, and a file the kernel refuses with ENOEXEC (a script without
+   `#!`) runs as `/bin/sh <path> args...`.
 
 The process keeps its PID, process group, session, cwd, environment, signal
 dispositions and every inherited descriptor. The helper never writes to
@@ -88,6 +91,9 @@ environment, credentials, prompts or output.
   the scope is empty.
 - Without one (degraded launch), it signals only the recorded root process,
   or the process group it leads, after checking the boot id and start time.
+  A group is done only when no member still runs, not when the leader exits.
+  The group id is signalled only while the verified leader, or a member seen
+  earlier with the same start time, is still in the group.
 - It never kills by process name, by unit prefix, a whole slice, or an
   unverified PID. When it cannot confirm emptiness it keeps the record and
   returns `unconfirmed`.
