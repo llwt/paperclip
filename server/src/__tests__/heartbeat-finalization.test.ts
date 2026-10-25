@@ -346,10 +346,10 @@ describeSupported("heartbeat run finalization", () => {
       return (row?.context as Record<string, unknown> | null)?.[LOCAL_RESULT_RECOVERY_CONTEXT_KEY] as LocalResultRecoverySnapshot | undefined;
     };
     adapterExecute.mockImplementation(closingIssue(async (ctx) => {
-      const invoke = async (sessionId: string | null) => {
+      const invoke = async (sessionId: string | null, freshSessionRetry = false) => {
         await ctx.onMeta!({
           adapterType: "process", command: "cli", env: { OPENAI_API_KEY: "sk-meta-secret" }, prompt: "secret prompt text",
-          recovery: { version: 1, engine: "cli", sessionIdBefore: sessionId,
+          recovery: { version: 1, engine: "cli", sessionIdBefore: sessionId, freshSessionRetry,
             sessionParams: sessionId ? { sessionId, token: "nested-secret", nested: { a: 1 } } : null,
             accounting: { provider: "openai", biller: "openai", model: "gpt-x", billingType: "subscription" } },
         });
@@ -359,7 +359,7 @@ describeSupported("heartbeat run finalization", () => {
       await invoke("old-session");
       await ctx.onLog("stdout", "first child output\n");
       await ctx.onLog("stdout", "first child final\n");
-      await invoke(null);
+      await invoke(null, true);
       await ctx.onLog("stdout", "second child output\n");
       return { exitCode: 0, signal: null, timedOut: false, sessionId: "new-session", sessionParams: { sessionId: "new-session" } };
     }));
@@ -370,7 +370,8 @@ describeSupported("heartbeat run finalization", () => {
     expect(first).toMatchObject({ version: 1, adapterType: "process", taskKey: ids.issueId, configuredModel: "model-at-start",
       invocation: { number: 1, engine: "cli", sessionIdBefore: "old-session", sessionParams: { sessionId: "old-session" },
         accounting: { provider: "openai", biller: "openai", model: "gpt-x", billingType: "subscription" } } });
-    expect(second).toMatchObject({ invocation: { number: 2, sessionIdBefore: null, sessionParams: null } });
+    expect(first!.invocation.freshSessionRetry).toBe(false);
+    expect(second).toMatchObject({ invocation: { number: 2, sessionIdBefore: null, freshSessionRetry: true, sessionParams: null } });
     // The retry starts after the first child's two output records.
     expect(second!.invocation.firstSeq).toBe(first!.invocation.firstSeq + 2);
     // Without an adapter session codec only the session id is kept.
@@ -815,7 +816,7 @@ describeSupported("heartbeat run finalization", () => {
         accounting: { provider: "anthropic", biller: null, model: "opus", billingType: "bogus" as never } });
       expect(adapterOutputRecoveryContextFromSnapshot(snapshot)).toEqual({
         version: 1, adapterType: "claude_local", engine: "cli",
-        invocation: { firstSeq: 7, sessionIdBefore: "s-0", sessionParams: null },
+        invocation: { firstSeq: 7, sessionIdBefore: "s-0", freshSessionRetry: false, sessionParams: null },
         accounting: { provider: "anthropic", biller: null, model: "opus", billingType: null },
         runStart: { sessionIdBefore: "s-0", sessionDisplayId: "s-0", sessionParams: { sessionId: "s-0", cwd: "/w" } },
       });
@@ -836,7 +837,7 @@ describeSupported("heartbeat run finalization", () => {
           accounting: { provider: null, biller: null, model: null, billingType: null } });
         expect(adapterOutputRecoveryContextFromSnapshot(snapshot)).toBeNull();
       }
-      expect(build(valid).invocation).toMatchObject({ engine: "cli", sessionIdBefore: "s-0" });
+      expect(build(valid).invocation).toMatchObject({ engine: "cli", sessionIdBefore: "s-0", freshSessionRetry: false });
     });
 
     // The id-less templates the Claude and Codex adapters send with each
@@ -872,14 +873,18 @@ describeSupported("heartbeat run finalization", () => {
             sessionConfig, configFreshness: { version: 1 },
             invocationNumber: entry.invocationNumber, firstSeq: 3, startedAt: new Date("2026-10-23T00:00:00.000Z"),
             recovery: { version: 1, engine: "cli", sessionIdBefore: entry.sessionIdBefore,
+              freshSessionRetry: entry.name === "fresh-session retry",
               sessionParams: { ...template, apiKey: "template-secret" },
               accounting: { provider, biller: provider, model: "m", billingType: "subscription" } },
           });
           expect(snapshot.invocation.sessionParams, entry.name).toEqual(template);
           expect(JSON.stringify(snapshot), entry.name).not.toContain("template-secret");
           expect(snapshot.session.dispatched.params, entry.name).toEqual(dispatchedParams);
+          // A retry after an unusable resume session is told apart from a stored session that was never resumable.
+          expect(snapshot.invocation.freshSessionRetry, entry.name).toBe(entry.name === "fresh-session retry");
           expect(adapterOutputRecoveryContextFromSnapshot(snapshot)?.invocation, entry.name).toEqual({
-            firstSeq: 3, sessionIdBefore: entry.sessionIdBefore, sessionParams: template,
+            firstSeq: 3, sessionIdBefore: entry.sessionIdBefore, freshSessionRetry: entry.name === "fresh-session retry",
+            sessionParams: template,
           });
         }
       });

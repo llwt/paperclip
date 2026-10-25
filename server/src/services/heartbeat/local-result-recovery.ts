@@ -57,6 +57,8 @@ export interface LocalResultRecoverySnapshot {
     startedAt: string;
     engine: string | null;
     sessionIdBefore: string | null;
+    /** The adapter started this invocation after its resume session proved unusable. */
+    freshSessionRetry: boolean;
     sessionParams: Record<string, unknown> | null;
     accounting: {
       provider: string | null;
@@ -186,6 +188,7 @@ export function buildLocalResultRecoverySnapshot(input: {
       startedAt: input.startedAt.toISOString(),
       engine: readNonEmptyString(recovery?.engine),
       sessionIdBefore: readNonEmptyString(recovery?.sessionIdBefore),
+      freshSessionRetry: recovery?.freshSessionRetry === true,
       sessionParams: safeRecoveryTemplateParams(input.codec, recovery?.sessionParams),
       accounting: {
         provider: readNonEmptyString(recovery?.accounting.provider),
@@ -211,6 +214,7 @@ export function adapterOutputRecoveryContextFromSnapshot(
     invocation: {
       firstSeq: snapshot.invocation.firstSeq,
       sessionIdBefore: snapshot.invocation.sessionIdBefore,
+      freshSessionRetry: snapshot.invocation.freshSessionRetry === true,
       sessionParams: snapshot.invocation.sessionParams,
     },
     accounting: { ...snapshot.invocation.accounting },
@@ -246,4 +250,63 @@ export function recoveredHotRestartResultJson(
       ? { leftoverProcessSweep }
       : {}),
   };
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function isStringOrNull(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function isParamsOrNull(value: unknown): value is Record<string, unknown> | null {
+  return value === null || isObject(value);
+}
+
+/**
+ * The recovery snapshot persisted in a run's contextSnapshot, or null when the
+ * run has none (it started before the snapshot existed) or it does not have the
+ * shape this version writes. Nothing is guessed for a missing or damaged field.
+ */
+export function readLocalResultRecoverySnapshot(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+): LocalResultRecoverySnapshot | null {
+  const value = parseObject(contextSnapshot)[LOCAL_RESULT_RECOVERY_CONTEXT_KEY];
+  if (!isObject(value) || value.version !== 1) return null;
+  const { session, invocation } = value;
+  if (typeof value.adapterType !== "string" || value.adapterType.length === 0) return null;
+  if (!isStringOrNull(value.taskKey) || !isStringOrNull(value.configuredModel)) return null;
+  if (!isObject(value.configFreshness)) return null;
+  if (!isObject(session) || !isObject(invocation)) return null;
+  const dispatched = session.dispatched;
+  const config = session.config;
+  if (
+    !isParamsOrNull(session.previousParams) ||
+    !isObject(dispatched) ||
+    !isStringOrNull(dispatched.sessionId) ||
+    !isStringOrNull(dispatched.sessionDisplayId) ||
+    !isParamsOrNull(dispatched.params) ||
+    typeof session.taskSessionReused !== "boolean" ||
+    typeof session.rotated !== "boolean" ||
+    !isStringOrNull(session.rotationReason) ||
+    !isObject(config) ||
+    typeof config.version !== "number" ||
+    typeof config.fingerprint !== "string" ||
+    !Array.isArray(config.categories) ||
+    !isObject(config.categoryFingerprints) ||
+    !isStringOrNull(config.aiCredentialIdentity)
+  ) return null;
+  const accounting = invocation.accounting;
+  if (
+    !Number.isSafeInteger(invocation.number) ||
+    !Number.isSafeInteger(invocation.firstSeq) ||
+    (invocation.firstSeq as number) < 0 ||
+    typeof invocation.startedAt !== "string" ||
+    !isStringOrNull(invocation.engine) ||
+    !isStringOrNull(invocation.sessionIdBefore) ||
+    !isParamsOrNull(invocation.sessionParams) ||
+    !isObject(accounting)
+  ) return null;
+  return value as unknown as LocalResultRecoverySnapshot;
 }

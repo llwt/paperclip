@@ -3,7 +3,17 @@ import path from "node:path";
 import { and, asc, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRunEvents } from "@paperclipai/db";
-import type { AdapterOutputRecoveryRecord } from "../adapters/types.js";
+import type {
+  AdapterExecutionResult,
+  AdapterOutputRecoveryRecord,
+  AdapterOutputRecoveryResult,
+  ServerAdapterModule,
+} from "../adapters/types.js";
+import {
+  adapterOutputRecoveryContextFromSnapshot,
+  readLocalResultRecoverySnapshot,
+  type LocalResultRecoverySnapshot,
+} from "./heartbeat/local-result-recovery.js";
 import type { RunLogStore } from "./run-log-store.js";
 
 // Reads what a run whose parent process was lost left behind: its persisted
@@ -418,4 +428,213 @@ export async function readAdoptedOutputReceipt(
 ): Promise<AdoptedOutputReceipt> {
   const events = await listAdoptedRunLifecycleEvents(db, scope);
   return classifyAdoptedOutputReceipt(events, scope.relayPid);
+}
+
+// ---------------------------------------------------------------------------
+// Deciding the result of an adopted run from its output
+// ---------------------------------------------------------------------------
+
+// Why a run was not finalized from its output. Each stays a process_lost run
+// with the existing one-retry rule; the reason only says why.
+export type AdoptedResultFallbackReason =
+  | "not_adopted"
+  | "snapshot_unavailable"
+  | "adapter_changed"
+  | "adapter_unavailable"
+  | "no_recovery_hook"
+  | "no_recovery_context"
+  | "output_not_captured"
+  | "tail_not_drained"
+  | "tail_stopped_early"
+  | "tail_gave_up"
+  | "log_inconclusive"
+  | "hook_error"
+  | "hook_inconclusive"
+  | "unexpected_result"
+  | "finalization_error";
+
+export interface AdoptedRunRecoveryRow extends AdoptedRunLogRow {
+  resultJson: Record<string, unknown> | null;
+  contextSnapshot: Record<string, unknown> | null;
+}
+
+export type AdoptedResultDecision =
+  | {
+      kind: "recovered";
+      outcome: "succeeded" | "failed";
+      result: AdapterExecutionResult;
+      snapshot: LocalResultRecoverySnapshot;
+      resultRecovery: Record<string, unknown>;
+    }
+  | {
+      kind: "fallback";
+      reason: AdoptedResultFallbackReason;
+      resultRecovery: Record<string, unknown>;
+    };
+
+export interface DecideAdoptedRunResultInput {
+  db: Db;
+  runLogStore: RunLogStore;
+  run: AdoptedRunRecoveryRow;
+  /** The agent's adapter today; a run started with another one is not parsed. */
+  agentAdapterType: string;
+  findAdapter: (type: string) => ServerAdapterModule | null;
+  now?: () => Date;
+}
+
+const OBSERVED_SESSION_ID_PATTERN = /^[\x21-\x7e]{1,256}$/;
+
+function objectOrEmpty(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function observedSessionIdFrom(result: AdapterOutputRecoveryResult | null): string | null {
+  if (!result) return null;
+  const candidate =
+    result.kind === "inconclusive"
+      ? result.observedSessionId
+      : result.result.sessionId ?? objectOrEmpty(result.result.sessionParams).sessionId;
+  return typeof candidate === "string" && OBSERVED_SESSION_ID_PATTERN.test(candidate) ? candidate : null;
+}
+
+/**
+ * Reads the final result of an adopted local CLI run from its persisted run
+ * log, once the caller has established that the child and its process group
+ * are gone and that no output tail is still writing. Returns a recovered
+ * result only when the output tail drained to the end of the child's output,
+ * the whole log from the latest invocation is intact, and the adapter's hook
+ * found a complete provider verdict. Everything else is a fallback with a
+ * distinct reason. Never throws and writes nothing.
+ */
+export async function decideAdoptedRunResult(
+  input: DecideAdoptedRunResultInput,
+): Promise<AdoptedResultDecision> {
+  const { db, runLogStore, run } = input;
+  const decidedAt = (input.now?.() ?? new Date()).toISOString();
+  const hotRestart = objectOrEmpty(objectOrEmpty(run.resultJson).hotRestart);
+  const outputCapture = objectOrEmpty(hotRestart.outputCapture);
+  const relayCaptured = outputCapture.mode === "relay";
+  const relayPid = typeof outputCapture.relayPid === "number" ? outputCapture.relayPid : undefined;
+  const base = { version: 1, source: "run_log", exitCodeKnown: false, decidedAt };
+
+  const fallback = (
+    decision: "inconclusive" | "unsupported",
+    reason: AdoptedResultFallbackReason,
+    extra: Record<string, unknown> = {},
+  ): AdoptedResultDecision => ({
+    kind: "fallback",
+    reason,
+    resultRecovery: { ...base, decision, reason, ...extra },
+  });
+
+  if (hotRestart.adopted !== true) return fallback("unsupported", "not_adopted");
+  const snapshot = readLocalResultRecoverySnapshot(run.contextSnapshot);
+  if (!snapshot) return fallback("unsupported", "snapshot_unavailable");
+  const invocation = {
+    adapterType: snapshot.adapterType,
+    invocationNumber: snapshot.invocation.number,
+    firstSeq: snapshot.invocation.firstSeq,
+  };
+  if (snapshot.adapterType !== input.agentAdapterType) {
+    return fallback("unsupported", "adapter_changed", { invocation });
+  }
+  const adapter = input.findAdapter(snapshot.adapterType);
+  if (!adapter) return fallback("unsupported", "adapter_unavailable", { invocation });
+  const recover = adapter.recoverResultFromOutput;
+  if (!recover) return fallback("unsupported", "no_recovery_hook", { invocation });
+  const context = adapterOutputRecoveryContextFromSnapshot(snapshot);
+  if (!context) return fallback("unsupported", "no_recovery_context", { invocation });
+
+  const identity: AdoptedRunIdentity = { companyId: run.companyId, agentId: run.agentId, runId: run.id };
+  let receipt: AdoptedOutputReceipt = { kind: "absent" };
+  if (relayCaptured) {
+    try {
+      receipt = await readAdoptedOutputReceipt(db, { ...identity, relayPid });
+    } catch {
+      return fallback("inconclusive", "tail_not_drained", { invocation, receipt: "unreadable" });
+    }
+  }
+  const drained = relayCaptured && receipt.kind === "drained";
+  const receiptEvidence = relayCaptured ? { receipt: receipt.kind, receiptEventSeq: receipt.kind === "absent" ? null : receipt.eventSeq } : {};
+
+  // Parse the output with the hook. Without a drained tail the verdict is not
+  // trusted; the parse then only looks for a session id to keep as evidence.
+  let hookResult: AdapterOutputRecoveryResult | null = null;
+  let hookError = false;
+  const reader = openAdoptedRunOutput({
+    runLogStore,
+    run,
+    expected: identity,
+    fromSeq: snapshot.invocation.firstSeq,
+  });
+  try {
+    hookResult = await recover({ output: reader.output, context });
+  } catch {
+    hookError = true;
+  }
+  const readOutcome = await reader.settle();
+  const intact = readOutcome.kind === "intact";
+  const observedSessionId = intact ? observedSessionIdFrom(hookResult) : null;
+  const evidence = {
+    invocation,
+    ...receiptEvidence,
+    ...(observedSessionId
+      ? { observedSession: { sessionId: observedSessionId, source: "pre_restart_output" } }
+      : {}),
+  };
+
+  if (!relayCaptured) return fallback("unsupported", "output_not_captured", evidence);
+  if (!drained) {
+    const reason =
+      receipt.kind === "stopped_early"
+        ? "tail_stopped_early"
+        : receipt.kind === "gave_up"
+          ? "tail_gave_up"
+          : "tail_not_drained";
+    return fallback("inconclusive", reason, evidence);
+  }
+  if (readOutcome.kind === "inconclusive") {
+    return fallback("inconclusive", "log_inconclusive", { ...evidence, logReason: readOutcome.reason });
+  }
+  if (hookError || !hookResult) return fallback("inconclusive", "hook_error", evidence);
+  if (hookResult.kind === "inconclusive") {
+    return fallback("inconclusive", "hook_inconclusive", {
+      ...evidence,
+      hookReason: String(hookResult.reason ?? "").slice(0, 200),
+    });
+  }
+  const { result } = hookResult;
+  if (
+    (hookResult.outcome !== "succeeded" && hookResult.outcome !== "failed") ||
+    result.exitCode !== null ||
+    result.signal ||
+    result.timedOut
+  ) {
+    return fallback("inconclusive", "unexpected_result", evidence);
+  }
+  return {
+    kind: "recovered",
+    outcome: hookResult.outcome,
+    result,
+    snapshot,
+    resultRecovery: {
+      ...base,
+      decision: "recovered",
+      outcome: hookResult.outcome,
+      terminalEvent: hookResult.terminalEvent,
+      invocation,
+      receipt: receipt.kind,
+      receiptEventSeq: receipt.kind === "drained" ? receipt.eventSeq : null,
+      recordsRead: readOutcome.records,
+      lastSeq: readOutcome.lastSeq,
+      known: {
+        summary: typeof result.summary === "string" && result.summary.length > 0,
+        session: Boolean(result.sessionId ?? result.sessionDisplayId ?? result.sessionParams),
+        usage: result.usage != null,
+        costUsd: result.costUsd != null,
+      },
+    },
+  };
 }
