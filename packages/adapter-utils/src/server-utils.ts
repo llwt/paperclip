@@ -95,6 +95,8 @@ export {
   configureAgentProcessIsolation,
   getAgentProcessIsolation,
   resetAgentProcessIsolation,
+  formatProcessIsolationDegradedLine,
+  RunIsolationTracker,
   scopeTerminationSettled,
   terminateOwnedScope,
   type AgentProcessIsolationRuntime,

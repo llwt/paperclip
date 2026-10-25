@@ -14,6 +14,7 @@
 import type { ChildProcess } from "node:child_process";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import type { AcpRuntime, AcpRuntimeHandle } from "acpx/runtime";
+import type { AcpxAgentScopeOwner } from "./agent-process-scope.js";
 import type {
   AcpRunContext,
   HostReuseCandidate,
@@ -38,6 +39,8 @@ export type AcpxProcessIdentitySink = {
   current: AdapterExecutionContext["onSpawn"];
   latest: AcpxAgentProcessIdentity | null;
   localProcess?: ChildProcess;
+  /** The provider's scope owner; null or absent in off mode. Travels with the warm runtime. */
+  scope?: AcpxAgentScopeOwner | null;
 };
 
 /** The live-line buffer and log path a warm runtime's child stderr carries. */
