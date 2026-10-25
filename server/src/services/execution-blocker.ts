@@ -2,13 +2,14 @@ import { isPreDispatchReviewWait } from "./pre-dispatch-review-wait.js";
 import { and, desc, eq, gt, inArray, not, or, sql, type SQL } from "drizzle-orm";
 import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
 import { z } from "zod";
-import { agentWakeupRequests, chatConversations, chatEndpoints, heartbeatRuns, issueComments, issues, issueRecoveryActions, toolConnections, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, chatConversations, chatEndpoints, environmentLeases, heartbeatRuns, issueComments, issues, issueRecoveryActions, toolConnections, type Db } from "@paperclipai/db";
 import { adapterExecutionControls } from "./adapter-execution-control.js";
-import { canContinueCancelledRun, readRunCancellation } from "./run-cancellation.js";
+import { canContinueCancelledRun, isConfirmedReassignmentStop, readRunCancellation } from "./run-cancellation.js";
 import { canRetryStoppedRun } from "./cancelled-native-startup.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { EXECUTION_RECONCILIATION_CAUSES, type ExecutionBlocker } from "@paperclipai/shared";
-import { LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "./workspace-restore-recovery-state.js";
+import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "./workspace-restore-recovery-state.js";
+import { isPidAlive } from "./local-service-supervisor.js";
 
 /** Resolved recovery bookkeeping can still carry an effective no-replay hold. */
 export function executionBlockerPredicate() {
@@ -46,6 +47,25 @@ function isHoldForFormerOwner(
   return run.agentId !== assigneeAgentId && action.returnOwnerAgentId !== assigneeAgentId;
 }
 
+// Differs from upstream (fork, SX-1735, SX-2419). Before the reassignment stop
+// fix, a confirmed stop was settled as a no-replay hold. Those holds stay in the
+// table as audit history, but a run that was stopped on purpose, has ended, and
+// holds nothing live is not uncertain work, so it must not block any assignee.
+function isHoldForConfirmedReassignmentStop(
+  action: typeof issueRecoveryActions.$inferSelect,
+  run: typeof heartbeatRuns.$inferSelect | undefined,
+  liveEnvironmentLeaseRunIds: Set<string>,
+) {
+  if (action.status !== "resolved") return false;
+  const automaticRecovery = action.evidence.automaticRecovery as Record<string, unknown> | undefined;
+  if (automaticRecovery?.replay !== "blocked") return false;
+  if (!run || !run.finishedAt || adapterExecutionControls.has(run.id) || !isConfirmedReassignmentStop(run)) return false;
+  if (run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" || hasRequiredWorkspaceRecovery(run.resultJson)) return false;
+  if (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt.getTime() > Date.now()) return false;
+  if (run.processPid !== null && isPidAlive(run.processPid)) return false;
+  return !liveEnvironmentLeaseRunIds.has(run.id);
+}
+
 async function firstBlockingAction(db: Db, companyId: string, issueId: string, assigneeAgentId: string | null, afterBoundary: SQL | undefined) {
   const actions = await db.select().from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, companyId),
@@ -58,9 +78,17 @@ async function firstBlockingAction(db: Db, companyId: string, issueId: string, a
     eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, runIds),
   )) : [];
   const runsById = new Map(runs.map((run) => [run.id, run]));
+  const stoppedRunIds = runs.filter(isConfirmedReassignmentStop).map((run) => run.id);
+  const liveLeases = stoppedRunIds.length ? await db.select({ runId: environmentLeases.heartbeatRunId }).from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, stoppedRunIds),
+    eq(environmentLeases.status, "active"), sql`${environmentLeases.releasedAt} is null`,
+  )) : [];
+  const liveEnvironmentLeaseRunIds = new Set(liveLeases.flatMap((lease) => lease.runId ? [lease.runId] : []));
   return actions.find((action) => {
     const runId = runIdOf(action);
-    return !isHoldForFormerOwner(action, runId ? runsById.get(runId) : undefined, assigneeAgentId);
+    const run = runId ? runsById.get(runId) : undefined;
+    return !isHoldForFormerOwner(action, run, assigneeAgentId) &&
+      !isHoldForConfirmedReassignmentStop(action, run, liveEnvironmentLeaseRunIds);
   });
 }
 

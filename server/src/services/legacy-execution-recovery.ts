@@ -13,6 +13,7 @@ import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { logActivity } from "./activity-log.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 import { issueService } from "./issues.js";
+import { isConfirmedReassignmentStop } from "./run-cancellation.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
@@ -31,8 +32,7 @@ export function legacyExecutionNeedsReconciliation(
   // The issue route stopped this run on purpose to hand the task to someone
   // else. The stop happens while the issue is still assigned to the run's
   // agent, so a hold would block the successor's wake and every later comment.
-  if (run.status === "cancelled" && run.errorCode === "issue_reassigned" &&
-      run.resultJson?.reassignmentStopConfirmed === true) return false;
+  if (isConfirmedReassignmentStop(run)) return false;
   // The dispatch gate cancelled a disposition repair run before the provider
   // was called, because the task moved on while the repair waited. Nothing ran
   // that needs a check, and a hold would skip every later wake on the task.
