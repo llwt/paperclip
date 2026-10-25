@@ -4065,7 +4065,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               };
             }
             if (admission.kind === "deferred") {
-              if (activeExecutionRun.status === "scheduled_retry" && activeExecutionRun.agentId === agentId) {
+              if (
+                isConversation(issue) &&
+                activeExecutionRun.status === "scheduled_retry" &&
+                activeExecutionRun.agentId === agentId
+              ) {
                 parkedRetryDeferredBehind = activeExecutionRun;
               }
               return { kind: "deferred" as const };

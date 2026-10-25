@@ -2069,11 +2069,22 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
           sql`${agentWakeupRequests.payload}->>'issueId' = ${fixture.issueId}`,
         ));
 
+      const chatCommentWake = (
+        fixture: { issueId: string },
+        commentId: string,
+        actor: { type: "user" | "agent"; id: string },
+      ) => ({
+        ...commentWake(fixture, commentId, actor),
+        source: "on_demand" as const,
+        triggerDetail: "manual" as const,
+        idempotencyKey: `conversation-comment:${commentId}`,
+      });
+
       it("starts the parked run now when a board user replies, and keeps the reply as a deferred wake", async () => {
         const fixture = await seedParkedConversationRetry();
         const commentId = randomUUID();
 
-        await heartbeat.wakeup(fixture.agentId, commentWake(fixture, commentId, { type: "user", id: "board-user" }));
+        await heartbeat.wakeup(fixture.agentId, chatCommentWake(fixture, commentId, { type: "user", id: "board-user" }));
 
         const run = await readRun(fixture.retryRunId);
         expect(run.status).toBe("queued");
@@ -2098,7 +2109,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         const fixture = await seedParkedConversationRetry();
         const commentId = randomUUID();
 
-        await heartbeat.wakeup(fixture.agentId, commentWake(fixture, commentId, { type: "agent", id: fixture.agentId }));
+        await heartbeat.wakeup(fixture.agentId, chatCommentWake(fixture, commentId, { type: "agent", id: fixture.agentId }));
 
         const run = await readRun(fixture.retryRunId);
         expect(run.status).toBe("scheduled_retry");
@@ -2116,12 +2127,13 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         const commentId = randomUUID();
 
         await expect(
-          heartbeat.wakeup(fixture.agentId, commentWake(fixture, commentId, { type: "user", id: "board-user" })),
+          heartbeat.wakeup(fixture.agentId, chatCommentWake(fixture, commentId, { type: "user", id: "board-user" })),
         ).resolves.not.toThrow();
 
         const run = await readRun(fixture.retryRunId);
         expect(run.status).toBe("scheduled_retry");
         expect(run.scheduledRetryAt!.getTime()).toBe(fixture.dueAt.getTime());
+        expect(await deferredReplies(fixture)).toHaveLength(1);
         expect(await db.select().from(activityLog).where(
           eq(activityLog.action, "issue.scheduled_retry_retry_now"),
         )).toHaveLength(0);
@@ -2139,7 +2151,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         }) as never);
         try {
           await expect(
-            heartbeat.wakeup(fixture.agentId, commentWake(fixture, commentId, { type: "user", id: "board-user" })),
+            heartbeat.wakeup(fixture.agentId, chatCommentWake(fixture, commentId, { type: "user", id: "board-user" })),
           ).resolves.not.toThrow();
         } finally {
           spy.mockRestore();
@@ -2150,6 +2162,23 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         expect(run.scheduledRetryAt!.getTime()).toBe(fixture.dueAt.getTime());
         expect(await deferredReplies(fixture)).toHaveLength(1);
       });
+    });
+
+    it("leaves a parked interaction-continuation retry scheduled when a board user comments on a normal issue", async () => {
+      const fixture = await seedParkedRetry();
+      const parked = await readRun(fixture.retryRunId);
+      await db.update(heartbeatRuns).set({
+        contextSnapshot: { ...(parked.contextSnapshot as Record<string, unknown>), interactionId: randomUUID() },
+      }).where(eq(heartbeatRuns.id, fixture.retryRunId));
+
+      await heartbeat.wakeup(fixture.agentId, commentWake(fixture, randomUUID(), { type: "user", id: "board-user" }));
+
+      const run = await readRun(fixture.retryRunId);
+      expect(run.status).toBe("scheduled_retry");
+      expect(run.scheduledRetryAt!.getTime()).toBe(fixture.dueAt.getTime());
+      expect(await db.select().from(activityLog).where(
+        eq(activityLog.action, "issue.scheduled_retry_retry_now"),
+      )).toHaveLength(0);
     });
 
     it("refuses the retry-now request without touching the run when the agent is paused", async () => {
