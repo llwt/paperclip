@@ -116,7 +116,8 @@ async function runReport(
   }
   const [report, five, result] = await Promise.all([
     readStream(child.stdio[3] as Readable),
-    readStream(child.stdio[5] as Readable),
+    // ChildProcess types only five stdio slots; descriptor 5 exists at runtime.
+    readStream((child.stdio as unknown as Readable[])[5]),
     collect(child),
   ]);
   return {

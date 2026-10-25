@@ -189,6 +189,8 @@ function recordBelongsTo(record: ScopeRecord, instanceId: string): boolean {
   if (!manifest.unit.startsWith(scopeUnitNamespace(instanceId))) return false;
   if (!manifest.unit.endsWith(`-${manifest.nonce}.scope`)) return false;
   if (status === null) return true;
+  // A preflight fallback means the helper never ran, so it cannot have written a status.
+  if (manifest.preflight) return false;
   if (status.unit !== manifest.unit || status.slice !== manifest.slice) return false;
   // An enrolled status must name this record's own scope.
   return status.outcome !== "enrolled" || isOwnedScopePath(record, status.cgroup);

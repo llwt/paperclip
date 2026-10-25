@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { chmodSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { spawnIsolated, prepareIsolatedLaunch } from "./launch.js";
+import { prepareIsolatedLaunch, recordSpawnedProcess, spawnIsolated } from "./launch.js";
 import { OFF_ISOLATION_POLICY } from "./policy.js";
 import { readScopeRecord } from "./registry.js";
 import { collect, tempDirs, testPolicy } from "./test-support.js";
@@ -13,7 +13,7 @@ const owner = { kind: "run", id: "run-1", companyId: "company-a" } as const;
 
 describe("off mode", () => {
   it("is exactly the existing spawn call, with no probing", () => {
-    const fakeSpawn = vi.fn(() => ({ pid: 1 }) as never);
+    const fakeSpawn = vi.fn((..._args: unknown[]) => ({ pid: 1 }) as never);
     const options = { cwd: "/tmp", env: { A: "1" }, detached: true, stdio: "pipe" as const };
     const { child, launch } = spawnIsolated(
       { command: "provider", args: ["--flag", "$X y"], options },
@@ -97,6 +97,20 @@ describe("systemd mode fallbacks before any workload starts", () => {
     expect(fakeSpawn).toHaveBeenCalledTimes(2);
     expect(result.stdout.toString()).toBe("ran once\n");
     expect(launch.isolation).toMatchObject({ state: "degraded", reason: "helper_spawn_failed" });
+  });
+
+  it("lets a caller that spawns a prepared launch record its PID", async () => {
+    const registryDir = temp.make();
+    const prepared = prepareIsolatedLaunch(
+      { command: "true" },
+      { policy: testPolicy({ registryDir, helperPath: "/nonexistent/helper" }), owner },
+    );
+    const record = prepared.isolation.state === "degraded" ? prepared.isolation.record! : null;
+    expect(readScopeRecord(record!)?.manifest).toMatchObject({ state: "intent", pid: null });
+    const child = spawn(prepared.command, prepared.args, prepared.options);
+    recordSpawnedProcess(record!, child.pid!);
+    expect(readScopeRecord(record!)?.manifest).toMatchObject({ state: "spawned", pid: child.pid });
+    await collect(child);
   });
 
   it("never writes arguments, environment or titles into the registry", async () => {

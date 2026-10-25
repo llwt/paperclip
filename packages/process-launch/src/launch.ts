@@ -5,6 +5,7 @@ import { PROCESS_OWNER_KINDS } from "./policy.js";
 import { readBootId, readProcCgroup, readProcStat, userManagerCgroup } from "./proc.js";
 import {
   ensureRegistryDir,
+  readScopeRecord,
   readScopeStatus,
   removeScopeRecord,
   SCOPE_MANIFEST_KIND,
@@ -223,18 +224,30 @@ export function prepareIsolatedLaunch(
   return prepared;
 }
 
-function recordSpawn(ref: ScopeRecordRef | null, manifest: ScopeManifest | null, child: ChildProcess): void {
-  if (!ref || !manifest || child.pid === undefined) return;
+function markSpawned(ref: ScopeRecordRef, manifest: ScopeManifest, pid: number): void {
   manifest.state = "spawned";
-  manifest.pid = child.pid;
+  manifest.pid = pid;
   // The start time does not change across exec, so this identifies the
   // target even if the helper has already replaced itself.
-  manifest.pidStartTime = readProcStat(child.pid)?.startTime ?? null;
+  manifest.pidStartTime = readProcStat(pid)?.startTime ?? null;
   try {
     writeScopeManifest(ref.registryDir, manifest);
   } catch {
     // The intent record stays; recovery treats it as a partial launch.
   }
+}
+
+function recordSpawn(ref: ScopeRecordRef | null, manifest: ScopeManifest | null, child: ChildProcess): void {
+  if (ref && manifest && child.pid !== undefined) markSpawned(ref, manifest, child.pid);
+}
+
+/**
+ * For callers that spawn a {@link prepareIsolatedLaunch} result themselves:
+ * record the PID right after `spawn` returns it.
+ */
+export function recordSpawnedProcess(ref: ScopeRecordRef, pid: number): void {
+  const record = readScopeRecord(ref);
+  if (record) markSpawned(ref, record.manifest, pid);
 }
 
 function makeHandle(isolation: LaunchIsolation): LaunchHandle {
