@@ -62,6 +62,7 @@ function callbacks(db: Db) {
     // Fork (SX-1386, SX-1537).
     resumeDeferredExecutionStageWakes: vi.fn<HeartbeatQueueDependencies["resumeDeferredExecutionStageWakes"]>(async () => "none"),
     scheduleOwnerExitRecheck: vi.fn<HeartbeatQueueDependencies["scheduleOwnerExitRecheck"]>(),
+    retryScheduledRetryNow: vi.fn<HeartbeatQueueDependencies["retryScheduledRetryNow"]>(),
   } satisfies HeartbeatQueueDependencies;
 }
 function guardedDatabase() {
