@@ -1455,6 +1455,7 @@ export function heartbeatService(
     filterZombieCoalesceTarget,
     resumeDeferredExecutionStageWakes,
     scheduleOwnerExitRecheck,
+    retryScheduledRetryNow,
   });
 
   const {

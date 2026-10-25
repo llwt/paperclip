@@ -1639,6 +1639,10 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
       actorId?: string | null;
     };
     now?: Date;
+    // Fork (SX-2526): promote only this run, and refuse without side effects
+    // (no cancel, no retry time change) when the promotion gate would block it.
+    onlyRunId?: string;
+    leaveParkedWhenGateRefuses?: boolean;
   }) {
     const now = input.now ?? new Date();
     const issue = await db
@@ -1669,6 +1673,33 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
         message: "No live scheduled retry exists for this issue",
         scheduledRetry: null,
       };
+    }
+
+    if (input.onlyRunId && scheduled.run.id !== input.onlyRunId) {
+      return {
+        outcome: "no_scheduled_retry" as const,
+        message: "The scheduled retry on this issue is a different run",
+        scheduledRetry: null,
+      };
+    }
+
+    if (input.leaveParkedWhenGateRefuses) {
+      const gate = await runDispatch.evaluateScheduledRetryGate({
+        runId: scheduled.run.id,
+        companyId: scheduled.run.companyId,
+        retryReasonOverride:
+          scheduled.run.scheduledRetryReason ??
+          readNonEmptyString(parseObject(scheduled.run.contextSnapshot).retryReason) ??
+          "",
+        now,
+      });
+      if (!gate.allowed) {
+        return {
+          outcome: "gate_suppressed" as const,
+          message: gate.reason,
+          scheduledRetry: summarizeIssueScheduledRetryRun(scheduled),
+        };
+      }
     }
 
     const contextSnapshot = {
