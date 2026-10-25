@@ -1,3 +1,4 @@
+import { scopeTerminationSettled, terminateOwnedScope } from "@paperclipai/adapter-utils/server-utils";
 import { runningProcesses } from "../../../adapters/utils.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../../../services/local-service-supervisor.js";
 import type { RunProcessController } from "../application/ports.js";
@@ -52,13 +53,18 @@ export function createProcessAdapter(): RunProcessController {
       }
 
       try {
-        await terminateLocalService(
-          {
-            pid: terminationPid,
-            processGroupId,
-          },
-          running ? { forceAfterMs: Math.max(1, running.graceSec) * 1000 } : undefined,
-        );
+        const scopeResult = running?.ownedScope
+          ? await terminateOwnedScope(running.ownedScope, { graceMs: Math.max(1, running.graceSec) * 1000 })
+          : null;
+        if (!scopeResult || !scopeTerminationSettled(scopeResult)) {
+          await terminateLocalService(
+            {
+              pid: terminationPid,
+              processGroupId,
+            },
+            running ? { forceAfterMs: Math.max(1, running.graceSec) * 1000 } : undefined,
+          );
+        }
         runningProcesses.delete(input.runId);
         const stillAlive =
           (pid !== null && isPidAlive(pid)) ||

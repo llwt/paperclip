@@ -79,6 +79,7 @@ import {
 } from "../native-runtime/index.js";
 import { drainRetainedRunnerdMaintenanceOperations } from "../../vendor/paperclip-runner/index.js";
 import { runningProcesses } from "../../adapters/index.js";
+import type { OwnedScope } from "@paperclipai/adapter-utils/server-utils";
 import { parseObject } from "../../adapters/utils.js";
 import {
   isNativeRunnerOwnershipHeld,
@@ -142,6 +143,7 @@ export interface HeartbeatRecoveryDependencies extends Pick<HeartbeatRetryDepend
     pid: number | null | undefined;
     processGroupId: number | null | undefined;
     graceMs?: number;
+    ownedScope?: OwnedScope | null;
   }) => Promise<void>;
   setRunStatus: (runId: string, status: string, patch?: Partial<typeof heartbeatRuns.$inferInsert>) => Promise<HeartbeatRun | null>;
   setRunStatusFromLive: (runId: string, status: string, fromStatuses: string[], patch?: Partial<typeof heartbeatRuns.$inferInsert>) => Promise<{
@@ -1786,6 +1788,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           await terminateHeartbeatRunProcess({
             pid: running.child.pid,
             processGroupId: running.processGroupId,
+            ownedScope: running.ownedScope,
             graceMs: Math.max(1, running.graceSec) * 1000,
           });
         }
@@ -1856,7 +1859,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
             new Date(Math.max(Date.now(), settlementDeadline.getTime())));
           if (runningProcesses.get(run.id) === running && running) {
             await terminateHeartbeatRunProcess({ pid: running.child.pid, processGroupId: running.processGroupId,
-              graceMs: Math.max(1, running.graceSec) * 1000 });
+              ownedScope: running.ownedScope, graceMs: Math.max(1, running.graceSec) * 1000 });
             if (runningProcesses.get(run.id) === running) runningProcesses.delete(run.id);
           }
         }

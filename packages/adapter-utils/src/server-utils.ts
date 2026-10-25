@@ -21,6 +21,15 @@ import {
   type RunProcessSweepOptions,
 } from "./run-process-sweep.js";
 import { spawnRunOutputRelay } from "./run-output-relay.js";
+import {
+  discardScopeRecord,
+  formatProcessIsolationDegradedLine,
+  scopeTerminationSettled,
+  spawnRunProcess,
+  terminateOwnedScope,
+  type OwnedScope,
+  type ProcessIsolationEvidence,
+} from "./process-isolation.js";
 import { paperclipChatFilePreparationDelivery } from "./chat-file-delivery.js";
 import {
   PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES,
@@ -77,7 +86,22 @@ export interface RunProcessResult {
   // What the end-of-run sweep stopped; null when no sweep ran (non-Linux, or
   // the child env does not carry this run's PAPERCLIP_RUN_ID).
   leftoverProcessSweep?: RunProcessSweepEvidence | null;
+  // How the host's agent process isolation applied to this run; absent when
+  // isolation is off. A degraded value means the run used normal execution.
+  processIsolation?: ProcessIsolationEvidence | null;
 }
+
+export {
+  configureAgentProcessIsolation,
+  getAgentProcessIsolation,
+  resetAgentProcessIsolation,
+  scopeTerminationSettled,
+  terminateOwnedScope,
+  type AgentProcessIsolationRuntime,
+  type OwnedScope,
+  type ProcessIsolationEvidence,
+  type ScopeTermination,
+} from "./process-isolation.js";
 
 export {
   sweepRunProcesses,
@@ -152,6 +176,8 @@ interface RunningProcess {
   child: ChildProcess;
   graceSec: number;
   processGroupId: number | null;
+  /** The run's own scope when the host launched it under process isolation. */
+  ownedScope?: OwnedScope | null;
   /** Hot restart: give the child's output pipes to a detached relay. */
   handOffOutput?: (dir: string) => Promise<{ relayPid: number }>;
 }
@@ -4873,13 +4899,27 @@ export async function runChildProcess(
             });
           return leftoverSweep;
         };
-        const child = spawn(target.command, target.args, {
-          cwd: target.cwd ?? opts.cwd,
-          env: childEnv,
-          detached: process.platform !== "win32",
-          shell: false,
-          stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
-        }) as ChildProcessWithEvents;
+        let logChain: Promise<void> = Promise.resolve();
+        const isolated = spawnRunProcess({
+          runId,
+          companyId: opts.env.PAPERCLIP_COMPANY_ID,
+          command: target.command,
+          args: target.args,
+          options: {
+            cwd: target.cwd ?? opts.cwd,
+            env: childEnv,
+            detached: process.platform !== "win32",
+            shell: false,
+            stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
+          },
+          onDegraded: (evidence) => {
+            logChain = logChain
+              .then(() => opts.onLog("stderr", formatProcessIsolationDegradedLine(evidence)))
+              .catch((err) => onLogError(err, runId, "failed to log process isolation fallback"));
+          },
+        });
+        const child = isolated.child as ChildProcessWithEvents;
+        const { ownedScope, tracker: isolationTracker } = isolated;
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
 
@@ -4901,13 +4941,48 @@ export async function runChildProcess(
           child,
           graceSec: opts.graceSec,
           processGroupId,
+          ownedScope,
           handOffOutput: (dir) => handOffOutput(dir),
         });
+        isolationTracker?.start();
+
+        // A scoped run is stopped through its scope, which also reaches
+        // descendants that left the process group. Anything the scope cannot
+        // confirm, and every unscoped run, keeps the process-group signals.
+        const stopScope = (signal: NodeJS.Signals, graceSec: number): boolean => {
+          if (!ownedScope?.isScopeActive()) return false;
+          void terminateOwnedScope(ownedScope, { graceMs: Math.max(1, graceSec) * 1000, signal }).then((result) => {
+            if (!scopeTerminationSettled(result)) {
+              signalRunningProcess({ child, processGroupId }, "SIGKILL");
+            }
+          });
+          return true;
+        };
+        let scopeCleanup: Promise<void> | null = null;
+        const runScopeCleanup = () => {
+          if (!ownedScope) return Promise.resolve();
+          scopeCleanup ??= (async () => {
+            if (!ownedScope.isScopeActive()) {
+              discardScopeRecord(ownedScope);
+              return;
+            }
+            const result = await terminateOwnedScope(ownedScope, {
+              graceMs: Math.max(1, opts.graceSec) * 1000,
+            });
+            if (!scopeTerminationSettled(result)) {
+              onLogError(
+                new Error(`scope cleanup ${result.outcome}`),
+                runId,
+                "failed to confirm the run's process scope is empty",
+              );
+            }
+          })().catch((err) => onLogError(err, runId, "failed to clean up the run's process scope"));
+          return scopeCleanup;
+        };
 
         let timedOut = false;
         let stdout = "";
         let stderr = "";
-        let logChain: Promise<void> = Promise.resolve();
         let terminalResultSeen = false;
         let terminalCleanupStarted = false;
         let terminalCleanupSignal: NodeJS.Signals | null = null;
@@ -4969,13 +5044,15 @@ export async function runChildProcess(
             if (terminalCleanupStarted || timedOut) return;
             terminalCleanupStarted = true;
             terminalCleanupSignal = "SIGTERM";
-            signalRunningProcess({ child, processGroupId }, "SIGTERM");
+            const scoped = stopScope("SIGTERM", opts.graceSec);
+            if (!scoped) signalRunningProcess({ child, processGroupId }, "SIGTERM");
             terminalCleanupKillTimer = setTimeout(
               () => {
                 terminalCleanupKillTimer = null;
                 terminalCleanupSignal = "SIGKILL";
                 terminalCleanupForceKilled = true;
-                signalRunningProcess({ child, processGroupId }, "SIGKILL");
+                // A scope escalates to SIGKILL on its own after the same grace.
+                if (!scoped) signalRunningProcess({ child, processGroupId }, "SIGKILL");
               },
               Math.max(1, opts.graceSec) * 1000,
             );
@@ -4987,6 +5064,7 @@ export async function runChildProcess(
             ? setTimeout(() => {
                 timedOut = true;
                 clearTerminalCleanupTimers();
+                if (stopScope("SIGTERM", opts.graceSec)) return;
                 signalRunningProcess({ child, processGroupId }, "SIGTERM");
                 setTimeout(
                   () => {
@@ -5085,18 +5163,22 @@ export async function runChildProcess(
           });
         }
 
-        child.on("error", (err: Error) => {
+        const failStart = (errno: string | undefined, detail: string) => {
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
+          isolationTracker?.stopPolling();
           runningProcesses.delete(runId);
           void target.cleanup?.();
-          const errno = (err as NodeJS.ErrnoException).code;
           const pathValue = mergedEnv.PATH ?? mergedEnv.Path ?? "";
           const msg =
             errno === "ENOENT"
               ? `Failed to start command "${command}" in "${opts.cwd}". Verify adapter command, working directory, and PATH (${pathValue}).`
-              : `Failed to start command "${command}" in "${opts.cwd}": ${err.message}`;
-          void runLeftoverSweep().finally(() => reject(new Error(msg)));
+              : `Failed to start command "${command}" in "${opts.cwd}": ${detail}`;
+          void Promise.all([runLeftoverSweep(), runScopeCleanup()]).finally(() => reject(new Error(msg)));
+        };
+
+        child.on("error", (err: Error) => {
+          failStart((err as NodeJS.ErrnoException).code, err.message);
         });
 
         child.on("exit", () => {
@@ -5108,6 +5190,8 @@ export async function runChildProcess(
           // "close" waits for it. Starting here keeps the whole wait within one
           // grace time from adapter exit; "close" reuses this sweep.
           void runLeftoverSweep();
+          // The same for a scope: whatever still runs in it is a leftover.
+          void runScopeCleanup();
         });
 
         child.on(
@@ -5120,14 +5204,25 @@ export async function runChildProcess(
             // from a partial stdout would race that.
             if (outputHandedOff) return;
             runningProcesses.delete(runId);
+            const launchExit = isolationTracker?.finish(code, signal) ?? null;
+            if (launchExit?.kind === "target_exec_failed") {
+              // The helper could not execute the target; an unwrapped spawn
+              // reports this as an "error" event, so report it the same way.
+              failStart(launchExit.error === "ENOENT" ? "ENOENT" : undefined, `exec failed (${launchExit.error})`);
+              return;
+            }
+            if (launchExit?.kind === "helper_usage_error") {
+              failStart(undefined, "the process isolation helper rejected the launch");
+              return;
+            }
             void logChain.finally(() => {
               void Promise.resolve()
                 .then(() => target.cleanup?.())
                 .catch((err) =>
                   onLogError(err, runId, "failed to clean up spawn target"),
                 )
-                .then(() => runLeftoverSweep())
-                .then((leftoverProcessSweep) => {
+                .then(() => Promise.all([runLeftoverSweep(), runScopeCleanup()]))
+                .then(([leftoverProcessSweep]) => {
                   resolve({
                     exitCode: code,
                     signal,
@@ -5148,6 +5243,7 @@ export async function runChildProcess(
                         }
                       : null,
                     ...(leftoverProcessSweep ? { leftoverProcessSweep } : {}),
+                    ...(isolationTracker ? { processIsolation: isolationTracker.evidence } : {}),
                   });
                 });
             });

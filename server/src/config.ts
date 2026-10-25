@@ -8,12 +8,16 @@ import { resolvePaperclipEnvPath } from "./paths.js";
 import { maybeRepairLegacyWorktreeConfigAndEnvFiles } from "./worktree-config.js";
 import { shouldLoadWorkingDirectoryEnv } from "./env-file-policy.js";
 import { applyEmptyWorktreeSigningSecrets } from "./dev-runner-worktree.js";
+import { isValidSliceName } from "@paperclipai/process-launch";
 import {
+  AGENT_PROCESS_ISOLATION_MODES,
+  DEFAULT_AGENT_PROCESS_ISOLATION_SLICE,
   AUTH_BASE_URL_MODES,
   BIND_MODES,
   DEPLOYMENT_EXPOSURES,
   SECRET_PROVIDERS,
   STORAGE_PROVIDERS,
+  type AgentProcessIsolationConfig,
   type BindMode,
   type AuthBaseUrlMode,
   type DeploymentExposure,
@@ -80,6 +84,7 @@ export interface Config {
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
   workspaceReaperCooldownDays: number;
+  agentProcessIsolation: Required<Pick<AgentProcessIsolationConfig, "mode" | "slice">>;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -119,6 +124,27 @@ function detectTailnetBindHost(): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function resolveAgentProcessIsolation(
+  fileConfig: ReturnType<typeof readConfigFile>,
+): Config["agentProcessIsolation"] {
+  const fromFile = fileConfig?.server.agentProcessIsolation;
+  const modeRaw = process.env.PAPERCLIP_AGENT_PROCESS_ISOLATION?.trim();
+  if (modeRaw && !(AGENT_PROCESS_ISOLATION_MODES as readonly string[]).includes(modeRaw)) {
+    throw new Error(
+      `Invalid PAPERCLIP_AGENT_PROCESS_ISOLATION '${modeRaw}'. Expected one of: ${AGENT_PROCESS_ISOLATION_MODES.join(", ")}.`,
+    );
+  }
+  const mode = (modeRaw as Config["agentProcessIsolation"]["mode"] | undefined) ?? fromFile?.mode ?? "off";
+  const slice =
+    process.env.PAPERCLIP_AGENT_SYSTEMD_SLICE?.trim() || fromFile?.slice || DEFAULT_AGENT_PROCESS_ISOLATION_SLICE;
+  // An invalid slice only matters when isolation is on; refuse to start rather
+  // than silently run agents unisolated under a setting the operator chose.
+  if (mode === "systemd" && !isValidSliceName(slice)) {
+    throw new Error(`Invalid agent process isolation slice '${slice}'. Expected a name such as app-agents.slice.`);
+  }
+  return { mode, slice };
 }
 
 export function loadConfig(): Config {
@@ -338,6 +364,7 @@ export function loadConfig(): Config {
     databaseBackupRetentionDays,
     databaseBackupDir,
     workspaceReaperCooldownDays,
+    agentProcessIsolation: resolveAgentProcessIsolation(fileConfig),
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"

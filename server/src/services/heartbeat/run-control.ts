@@ -97,6 +97,11 @@ import {
   closeWarmNativeSessionsForEnvironment,
 } from "../native-runtime/index.js";
 import { runningProcesses } from "../../adapters/index.js";
+import {
+  scopeTerminationSettled,
+  terminateOwnedScope,
+  type OwnedScope,
+} from "@paperclipai/adapter-utils/server-utils";
 import { parseObject } from "../../adapters/utils.js";
 import { isNativeRunnerOwnershipHeld } from "../native-runtime/native-runner-ownership.js";
 import {
@@ -181,7 +186,18 @@ export async function terminateHeartbeatRunProcess(input: {
   processGroupId: number | null | undefined;
   graceMs?: number;
   signal?: NodeJS.Signals;
+  /** The run's own scope, when the host launched it under process isolation. */
+  ownedScope?: OwnedScope | null;
 }) {
+  if (input.ownedScope) {
+    // A scope reaches descendants that left the process group. Only a scope
+    // that could not be confirmed empty falls through to the group kill.
+    const result = await terminateOwnedScope(input.ownedScope, {
+      graceMs: input.graceMs,
+      signal: input.signal,
+    });
+    if (scopeTerminationSettled(result)) return;
+  }
   const pid = input.pid ?? null;
   const processGroupId = input.processGroupId ?? null;
   if (typeof pid !== "number" && typeof processGroupId !== "number") return;
@@ -1307,6 +1323,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
               await terminateHeartbeatRunProcess({
                 pid: running.child.pid,
                 processGroupId: running.processGroupId,
+                ownedScope: running.ownedScope,
                 // Codex handles Ctrl-C by cancelling its tool sessions. SIGTERM
                 // can leave commands in their separate process groups alive.
                 signal: !control && agent?.adapterType === "codex_local" ? "SIGINT" : undefined,

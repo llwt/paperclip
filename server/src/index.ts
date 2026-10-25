@@ -54,6 +54,7 @@ import {
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
+import { startAgentProcessIsolation } from "./agent-process-isolation.js";
 import { logger } from "./middleware/logger.js";
 import { runStartupHeartbeatRecoverySteps } from "./startup-heartbeat-recovery.js";
 import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
@@ -228,6 +229,7 @@ async function startServerWithDatabaseTeardown(
   ensureDecisionSigningSecret();
   let config = loadConfig();
   initTelemetry({ enabled: config.telemetryEnabled });
+  await startAgentProcessIsolation(config, logger);
   if (process.env.PAPERCLIP_SECRETS_PROVIDER === undefined) {
     process.env.PAPERCLIP_SECRETS_PROVIDER = config.secretsProvider;
   }

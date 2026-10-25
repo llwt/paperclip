@@ -153,6 +153,9 @@ importers:
 
   packages/adapter-utils:
     dependencies:
+      '@paperclipai/process-launch':
+        specifier: workspace:*
+        version: link:../process-launch
       '@paperclipai/shared':
         specifier: workspace:*
         version: link:../shared
@@ -1020,6 +1023,9 @@ importers:
       '@paperclipai/plugin-sdk':
         specifier: workspace:*
         version: link:../packages/plugins/sdk
+      '@paperclipai/process-launch':
+        specifier: workspace:*
+        version: link:../packages/process-launch
       '@paperclipai/shared':
         specifier: workspace:*
         version: link:../packages/shared
