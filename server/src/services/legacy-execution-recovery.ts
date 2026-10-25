@@ -1,4 +1,5 @@
 import { hasRequiredWorkspaceRecovery, preserveWorkspaceRestoreRecoveryMetadata, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "./workspace-restore-recovery-state.js";
+import { preserveLeftoverProcessSweep } from "./leftover-process-sweep-state.js";
 import { hasUnrestoredRemoteWorkspace, preserveLegacyWorkspaceRestoreSources, type LegacyWorkspaceRestoreSource } from "./legacy-workspace-restore-recovery.js";
 import { isPreDispatchReviewWaitVerified } from "./pre-dispatch-review-wait.js";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
@@ -111,8 +112,8 @@ export async function terminalizeLegacyExecution(input: {
     if (!current || current.runtimeMode !== "legacy" ||
         (!input.recordRestoreFailureOnly && !(input.fromStatuses ?? [run.status]).includes(current.status))) return null;
     if (patch?.resultJson !== undefined) patch = { ...patch,
-      resultJson: preserveWorkspaceRestoreRecoveryMetadata(current.resultJson,
-        input.recordRestoreFailureOnly ? { ...current.resultJson, ...patch.resultJson } : patch.resultJson),
+      resultJson: preserveLeftoverProcessSweep(current.resultJson, preserveWorkspaceRestoreRecoveryMetadata(current.resultJson,
+        input.recordRestoreFailureOnly ? { ...current.resultJson, ...patch.resultJson } : patch.resultJson)),
     };
     let [updated] = await tx
       .update(heartbeatRuns)

@@ -5386,6 +5386,37 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     },
   );
 
+  // SX-2456: the adopted run's sweep is recorded while the reaper settles the
+  // run. The reaper's terminal write is built from its earlier read of the
+  // run, so it must not erase a sweep recorded since then.
+  it("keeps a leftover sweep recorded after the reaper read the run", async () => {
+    const { runId } = await seedRunFixture({ agentStatus: "running" });
+    const [stale] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const sweep = {
+      kind: "leftover_process_sweep",
+      stopped: 1,
+      forceKilled: 0,
+      processes: [{ pid: 4242, command: "sleep 300" }],
+    };
+    await db.update(heartbeatRuns).set({
+      resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ||
+        ${JSON.stringify({ leftoverProcessSweep: sweep })}::jsonb`,
+    }).where(eq(heartbeatRuns.id, runId));
+
+    const failed = await terminalizeLegacyExecution({
+      db, run: stale!, status: "failed", fromStatuses: ["running"],
+      patch: {
+        errorCode: "process_lost",
+        resultJson: { ...(stale!.resultJson ?? {}), processLossDiagnostic: { localCheck: "not_observed_alive" } },
+      },
+    });
+    expect(failed?.status).toBe("failed");
+    expect(failed?.resultJson).toMatchObject({
+      leftoverProcessSweep: sweep,
+      processLossDiagnostic: { localCheck: "not_observed_alive" },
+    });
+  });
+
   it("terminalizes an unsupported legacy session on shutdown without speculative replay", async () => {
     const { agentId, runId, issueId, wakeupRequestId } = await seedRunFixture({
       adapterType: "process",

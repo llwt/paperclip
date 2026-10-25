@@ -17,6 +17,7 @@ import { CONFIGURATION_INCOMPLETE_FAILURE_CODE } from "./run-preparation.js";
 import { WORKSPACE_VALIDATION_FAILURE_CODE } from "./workspaces.js";
 import { boundHeartbeatRunEventPayloadForStorage } from "./run-log.js";
 import { preserveWorkspaceRestoreRecoveryMetadata } from "../workspace-restore-recovery-state.js";
+import { preserveLeftoverProcessSweep } from "../leftover-process-sweep-state.js";
 import { pendingNativeWorkspaceFinalizationCondition } from "../native-runtime/native-workspace-finalization-state.js";
 import { activeIssueInteractionCondition } from "../issue-question-context.js";
 import {
@@ -1008,7 +1009,8 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       .then((rows) => rows[0] ?? null);
 
     if (previousStatus && patch?.resultJson !== undefined) patch = { ...patch,
-      resultJson: preserveWorkspaceRestoreRecoveryMetadata(previousStatus.resultJson, patch.resultJson),
+      resultJson: preserveLeftoverProcessSweep(previousStatus.resultJson,
+        preserveWorkspaceRestoreRecoveryMetadata(previousStatus.resultJson, patch.resultJson)),
     };
 
     // Preserve the receipt-source fence when finalization enriches usage. A
@@ -1107,7 +1109,8 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     }
 
     if (previousStatus && patch?.resultJson !== undefined) patch = { ...patch,
-      resultJson: preserveWorkspaceRestoreRecoveryMetadata(previousStatus.resultJson, patch.resultJson),
+      resultJson: preserveLeftoverProcessSweep(previousStatus.resultJson,
+        preserveWorkspaceRestoreRecoveryMetadata(previousStatus.resultJson, patch.resultJson)),
     };
 
     // Preserve the receipt-source fence when finalization enriches usage. A
