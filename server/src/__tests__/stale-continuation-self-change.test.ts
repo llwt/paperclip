@@ -62,6 +62,7 @@ import * as executionContinuation from "../services/execution-continuation.js";
 const realBuildExecutionContinuation = executionContinuation.buildExecutionContinuation;
 import { heartbeatService } from "../services/heartbeat.ts";
 import { issueService } from "../services/issues.ts";
+import { activityService } from "../services/activity.ts";
 import {
   staleTaskChangedByAgent,
   TASK_VERSION_CHANGED_BY_AGENT_ACTION,
@@ -290,6 +291,13 @@ describeEmbeddedPostgres("a leftover queued wake after the task changed (SX-2550
       await changeTask(ids, "board", { status: "cancelled" }, false);
       expect(await db.select().from(activityLog).where(and(
         eq(activityLog.entityId, ids.issueId), eq(activityLog.action, TASK_VERSION_CHANGED_BY_AGENT_ACTION)))).toHaveLength(2);
+      // Internal attribution: the task and company activity lists leave it out.
+      const shown = [
+        ...await activityService(db).forIssue(ids.issueId),
+        ...await activityService(db).list({ companyId: ids.companyId }),
+      ].map(row => row.action);
+      expect(shown).toContain("issue.checked_out");
+      expect(shown).not.toContain(TASK_VERSION_CHANGED_BY_AGENT_ACTION);
     });
 
     it("follows the change that made the current version", async () => {

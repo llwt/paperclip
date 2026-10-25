@@ -11556,7 +11556,8 @@ export function issueService(db: Db) {
         // transaction; the route writes its `issue.updated` audit only after
         // commit. See task-version-attribution.ts.
         if (actorAgentId && Number(updated.statusVersion) !== Number(receiptExisting.statusVersion)) {
-          const { publication } = await persistActivity(tx as unknown as Db, {
+          // Not published: the activity lists leave it out (activity.ts).
+          await persistActivity(tx as unknown as Db, {
             companyId: updated.companyId,
             actorType: "agent",
             actorId: actorAgentId,
@@ -11572,7 +11573,6 @@ export function issueService(db: Db) {
               assigneeUserId: updated.assigneeUserId,
             },
           });
-          activityPublications.push(publication);
         }
         if (issueData.description !== undefined) await attachOwnedDraftImages(tx, updated, updated.description,
           { userId: actorUserId, agentId: actorAgentId });
