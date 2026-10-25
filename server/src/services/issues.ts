@@ -203,6 +203,7 @@ import {
   type ActivityPublication,
 } from "./activity-log.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
+import { TASK_VERSION_CHANGED_BY_AGENT_ACTION } from "./task-version-attribution.js";
 import { ensurePersonalPrivateProject } from "./projects.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
@@ -11549,6 +11550,30 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+        // Differs from upstream (fork, SX-2550). Every status change (database
+        // trigger) and owner change (above) raises statusVersion. When an agent
+        // made it, record the agent against the new version in this same
+        // transaction; the route writes its `issue.updated` audit only after
+        // commit. See task-version-attribution.ts.
+        if (actorAgentId && Number(updated.statusVersion) !== Number(receiptExisting.statusVersion)) {
+          const { publication } = await persistActivity(tx as unknown as Db, {
+            companyId: updated.companyId,
+            actorType: "agent",
+            actorId: actorAgentId,
+            agentId: actorAgentId,
+            runId: actorRunId ?? null,
+            action: TASK_VERSION_CHANGED_BY_AGENT_ACTION,
+            entityType: "issue",
+            entityId: updated.id,
+            details: {
+              statusVersion: Number(updated.statusVersion),
+              status: updated.status,
+              assigneeAgentId: updated.assigneeAgentId,
+              assigneeUserId: updated.assigneeUserId,
+            },
+          });
+          activityPublications.push(publication);
+        }
         if (issueData.description !== undefined) await attachOwnedDraftImages(tx, updated, updated.description,
           { userId: actorUserId, agentId: actorAgentId });
         if (changesPrivacy && updated.visibility === "private") {
