@@ -14,7 +14,7 @@ import {
   principalPermissionGrants,
   projects as projectsTable,
 } from "@paperclipai/db";
-import { eq, and, like, desc, inArray, sql, isNull, isNotNull, gt, lte } from "drizzle-orm";
+import { eq, and, like, desc, inArray, sql, isNull, isNotNull, gt, lte, ne } from "drizzle-orm";
 import type {
   HostServices,
   Company,
@@ -79,6 +79,7 @@ import { isIP } from "node:net";
 import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { accessService } from "./access.js";
+import { TASK_VERSION_CHANGED_BY_AGENT_ACTION } from "./task-version-attribution.js";
 import {
   authorizationService,
   canActorReadIssuePrivacy,
@@ -3419,6 +3420,8 @@ export function buildHostServices(
           : null;
         const conditions = [
           eq(activityLog.companyId, companyId),
+          // Fork (SX-2550): internal run attribution, not an audit event.
+          ne(activityLog.action, TASK_VERSION_CHANGED_BY_AGENT_ACTION),
           params.action ? eq(activityLog.action, params.action) : undefined,
           params.actorType ? eq(activityLog.actorType, params.actorType) : undefined,
           params.actorId ? eq(activityLog.actorId, params.actorId) : undefined,

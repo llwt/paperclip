@@ -1,6 +1,6 @@
 import { credentialAccessConnectionNameSql } from "./credential-access-visibility.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
-import { and, asc, desc, eq, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -21,6 +21,7 @@ import { hasWorkspaceRestoreFailure, safeWorkspaceRestorePath, ISSUE_CONTINUATIO
 import { logger } from "../middleware/logger.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { classifyRunLiveness } from "./run-liveness.js";
+import { TASK_VERSION_CHANGED_BY_AGENT_ACTION } from "./task-version-attribution.js";
 
 export interface ActivityFilters {
   companyId: string;
@@ -288,7 +289,9 @@ export function activityService(db: Db) {
           latestAt: sql<Date | null>`max(${activityLog.createdAt})`,
         })
         .from(activityLog)
-        .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, run.id)));
+        // Fork (SX-2550): internal run attribution is not run activity.
+        .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, run.id),
+          ne(activityLog.action, TASK_VERSION_CHANGED_BY_AGENT_ACTION)));
 
       const [eventStats] = await db
         .select({
@@ -367,6 +370,8 @@ export function activityService(db: Db) {
       if (filters.entityId) {
         conditions.push(eq(activityLog.entityId, filters.entityId));
       }
+      // Fork (SX-2550): internal run attribution, not an event for people.
+      conditions.push(ne(activityLog.action, TASK_VERSION_CHANGED_BY_AGENT_ACTION));
 
       return db
         .select({ activityLog })
@@ -396,13 +401,15 @@ export function activityService(db: Db) {
       db
         .select()
         .from(activityLog)
-        .where(
+        .where(and(
+          // Fork (SX-2550): internal run attribution, not an event for people.
+          ne(activityLog.action, TASK_VERSION_CHANGED_BY_AGENT_ACTION),
           or(
             and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)),
             and(or(eq(activityLog.action, "project.created"), eq(activityLog.action, "company.skill_created")), sql`${activityLog.details}->>'sourceIssueId' = ${issueId}`,
               sql`${activityLog.companyId} = (select company_id from issues where id = ${issueId})`),
           ),
-        )
+        ))
         .orderBy(desc(activityLog.createdAt)),
 
     runsForIssue: async (companyId: string, issueId: string, viewerUserId: string | null = null) => {
