@@ -87,3 +87,10 @@ export function isUnexpectedRunCancellation(run: Run): boolean {
     !(bootstrap?.kind === "bootstrap" && bootstrap.providerWorkStarted === false) &&
     readRunCancellation(run.resultJson)?.expected !== true;
 }
+
+// Differs from upstream (fork, SX-1735, SX-2419). The issue route stopped this
+// run on purpose to hand the task over and the stop was acknowledged.
+export function isConfirmedReassignmentStop(run: Pick<Run, "status" | "errorCode" | "resultJson">): boolean {
+  return run.status === "cancelled" && run.errorCode === "issue_reassigned" &&
+    run.resultJson?.reassignmentStopConfirmed === true;
+}
