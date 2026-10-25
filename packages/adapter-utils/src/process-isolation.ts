@@ -9,6 +9,7 @@ import {
   type IsolationHealth,
   type LaunchExit,
   type LaunchHandle,
+  type ScopeEnrollmentStatus,
   type ScopeRecordRef,
   type TerminateResult,
 } from "@paperclipai/process-launch";
@@ -116,6 +117,7 @@ export function formatProcessIsolationDegradedLine(evidence: ProcessIsolationEvi
 export class RunIsolationTracker {
   private state: ProcessIsolationEvidence;
   private observed = false;
+  private status: ScopeEnrollmentStatus | null = null;
   private timer: NodeJS.Timeout | null = null;
 
   constructor(
@@ -159,11 +161,19 @@ export class RunIsolationTracker {
     this.timer = null;
   }
 
+  /** Read the helper's status now. Call before anything removes the launch record. */
+  observe(): void {
+    this.poll();
+  }
+
   /** Final read after the process ended. */
   finish(code: number | null, signal: NodeJS.Signals | null): LaunchExit | null {
     this.stopPolling();
     this.poll();
-    return this.launch ? this.launch.classifyExit(code, signal) : null;
+    if (!this.launch) return null;
+    // The status file may be gone by now (scope cleanup removes the record), so use what was read.
+    if (this.status?.execError) return { kind: "target_exec_failed", error: this.status.execError, code };
+    return this.launch.classifyExit(code, signal);
   }
 
   private poll(): boolean {
@@ -171,6 +181,7 @@ export class RunIsolationTracker {
     const status = this.launch.readEnrollment();
     if (!status) return false;
     this.observed = true;
+    this.status = status;
     if (status.outcome === "enrolled") {
       this.state = { ...this.state, state: "enrolled", reason: null, unit: status.unit };
     } else {
@@ -245,13 +256,18 @@ export function spawnRunProcess(input: SpawnRunProcessInput): RunProcessSpawn {
     degraded ? isolation.reason : null,
     input.onDegraded,
   );
+  let degradedSeen = false;
   const ownedScope: OwnedScope | null = isolation.record
     ? {
         ref: isolation.record,
         instanceId: policy.instanceId,
         slice: policy.slice,
         unit: isolation.unit ?? isolation.record.unit,
-        isScopeActive: () => !degraded && launch.readEnrollment()?.outcome !== "degraded",
+        isScopeActive: () => {
+          if (degraded || degradedSeen) return false;
+          if (launch.readEnrollment()?.outcome === "degraded") degradedSeen = true;
+          return !degradedSeen;
+        },
       }
     : null;
   return { child, ownedScope, tracker };

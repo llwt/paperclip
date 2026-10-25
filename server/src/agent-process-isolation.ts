@@ -5,7 +5,9 @@ import {
   agentScopeRegistryDir,
   createSystemdIsolationPolicy,
   resolveUserBusAddress,
+  type CapabilityResult,
   type IsolationLogger,
+  type SystemdIsolationPolicy,
 } from "@paperclipai/process-launch";
 import type { Config } from "./config.js";
 import { resolvePaperclipInstanceId, resolvePaperclipInstanceRoot } from "./home-paths.js";
@@ -21,6 +23,7 @@ import { resolvePaperclipInstanceId, resolvePaperclipInstanceRoot } from "./home
 export async function startAgentProcessIsolation(
   config: Pick<Config, "agentProcessIsolation">,
   logger: IsolationLogger,
+  options: { probe?: (policy: SystemdIsolationPolicy) => Promise<CapabilityResult> } = {},
 ): Promise<IsolationHealth | null> {
   const { mode, slice } = config.agentProcessIsolation;
   if (mode === "off") {
@@ -34,7 +37,7 @@ export async function startAgentProcessIsolation(
     registryDir: agentScopeRegistryDir(resolvePaperclipInstanceRoot()),
     userBusAddress: resolveUserBusAddress(),
   });
-  const health = new IsolationHealth(policy, { logger });
+  const health = new IsolationHealth(policy, { logger, probe: options.probe });
   configureAgentProcessIsolation({ policy, health });
   await health.start();
   return health;

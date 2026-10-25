@@ -4951,6 +4951,7 @@ export async function runChildProcess(
         // confirm, and every unscoped run, keeps the process-group signals.
         const stopScope = (signal: NodeJS.Signals, graceSec: number): boolean => {
           if (!ownedScope?.isScopeActive()) return false;
+          isolationTracker?.observe();
           void terminateOwnedScope(ownedScope, { graceMs: Math.max(1, graceSec) * 1000, signal }).then((result) => {
             if (!scopeTerminationSettled(result)) {
               signalRunningProcess({ child, processGroupId }, "SIGKILL");
@@ -4961,6 +4962,7 @@ export async function runChildProcess(
         let scopeCleanup: Promise<void> | null = null;
         const runScopeCleanup = () => {
           if (!ownedScope) return Promise.resolve();
+          isolationTracker?.observe();
           scopeCleanup ??= (async () => {
             if (!ownedScope.isScopeActive()) {
               discardScopeRecord(ownedScope);
