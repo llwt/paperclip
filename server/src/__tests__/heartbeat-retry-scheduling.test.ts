@@ -57,6 +57,7 @@ vi.mock("../services/heartbeat-run-events.js", async (importOriginal) => {
 
 import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
 import {
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
@@ -2036,6 +2037,141 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       await expect(
         heartbeat.wakeup(fixture.agentId, commentWake(fixture, commentId, { type: "user", id: "board-user" })),
       ).rejects.toThrow(/not invokable/);
+
+      const run = await readRun(fixture.retryRunId);
+      expect(run.status).toBe("scheduled_retry");
+      expect(run.scheduledRetryAt!.getTime()).toBe(fixture.dueAt.getTime());
+      expect(await db.select().from(activityLog).where(
+        eq(activityLog.action, "issue.scheduled_retry_retry_now"),
+      )).toHaveLength(0);
+    });
+
+    describe("in a conversation issue", () => {
+      afterEach(async () => {
+        await instanceSettingsService(db).updateExperimental({ enableAgentChat: false });
+      });
+
+      async function seedParkedConversationRetry() {
+        await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+        const fixture = await seedParkedRetry();
+        await db.update(issues).set({
+          conversationAgentId: fixture.agentId,
+          conversationUserId: "board-user",
+          conversationState: "active",
+        }).where(eq(issues.id, fixture.issueId));
+        return fixture;
+      }
+
+      const deferredReplies = (fixture: { agentId: string; issueId: string }) =>
+        db.select().from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.agentId, fixture.agentId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          sql`${agentWakeupRequests.payload}->>'issueId' = ${fixture.issueId}`,
+        ));
+
+      const chatCommentWake = (
+        fixture: { issueId: string },
+        commentId: string,
+        actor: { type: "user" | "agent"; id: string },
+      ) => ({
+        ...commentWake(fixture, commentId, actor),
+        source: "on_demand" as const,
+        triggerDetail: "manual" as const,
+        idempotencyKey: `conversation-comment:${commentId}`,
+      });
+
+      it("starts the parked run now when a board user replies, and keeps the reply as a deferred wake", async () => {
+        const fixture = await seedParkedConversationRetry();
+        const commentId = randomUUID();
+
+        await heartbeat.wakeup(fixture.agentId, chatCommentWake(fixture, commentId, { type: "user", id: "board-user" }));
+
+        const run = await readRun(fixture.retryRunId);
+        expect(run.status).toBe("queued");
+        expect(run.scheduledRetryAt!.getTime()).toBeLessThan(fixture.dueAt.getTime());
+        expect(run.contextSnapshot).toMatchObject({
+          retryNowRequestedByActorType: "user",
+          retryNowRequestedByActorId: "board-user",
+        });
+        const deferred = await deferredReplies(fixture);
+        expect(deferred).toHaveLength(1);
+        expect(deferred[0]?.payload).toMatchObject({ commentId });
+
+        const activity = await db.select().from(activityLog).where(and(
+          eq(activityLog.entityId, fixture.issueId),
+          eq(activityLog.action, "issue.scheduled_retry_retry_now"),
+        ));
+        expect(activity).toHaveLength(1);
+        expect(activity[0]?.details).toMatchObject({ trigger: "human_comment", commentId, outcome: "promoted" });
+      });
+
+      it("leaves the parked run scheduled when an agent replies", async () => {
+        const fixture = await seedParkedConversationRetry();
+        const commentId = randomUUID();
+
+        await heartbeat.wakeup(fixture.agentId, chatCommentWake(fixture, commentId, { type: "agent", id: fixture.agentId }));
+
+        const run = await readRun(fixture.retryRunId);
+        expect(run.status).toBe("scheduled_retry");
+        expect(run.scheduledRetryAt!.getTime()).toBe(fixture.dueAt.getTime());
+        expect(await deferredReplies(fixture)).toHaveLength(1);
+        expect(await db.select().from(activityLog).where(
+          eq(activityLog.action, "issue.scheduled_retry_retry_now"),
+        )).toHaveLength(0);
+      });
+
+      it("does not throw and leaves the run scheduled when the promotion gate refuses it", async () => {
+        const fixture = await seedParkedConversationRetry();
+        // A max-turn continuation only runs while the issue is in_progress.
+        await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, fixture.issueId));
+        const commentId = randomUUID();
+
+        await expect(
+          heartbeat.wakeup(fixture.agentId, chatCommentWake(fixture, commentId, { type: "user", id: "board-user" })),
+        ).resolves.not.toThrow();
+
+        const run = await readRun(fixture.retryRunId);
+        expect(run.status).toBe("scheduled_retry");
+        expect(run.scheduledRetryAt!.getTime()).toBe(fixture.dueAt.getTime());
+        expect(await deferredReplies(fixture)).toHaveLength(1);
+        expect(await db.select().from(activityLog).where(
+          eq(activityLog.action, "issue.scheduled_retry_retry_now"),
+        )).toHaveLength(0);
+      });
+
+      it("does not throw and leaves the run scheduled when starting it throws", async () => {
+        const fixture = await seedParkedConversationRetry();
+        const commentId = randomUUID();
+        const realTransaction = db.transaction.bind(db);
+        const spy = vi.spyOn(db, "transaction").mockImplementation(((fn: never, config: never) => {
+          if (String(fn).includes("scheduledRetryAt: now")) {
+            return Promise.reject(new Error("retry-now write failed"));
+          }
+          return realTransaction(fn, config);
+        }) as never);
+        try {
+          await expect(
+            heartbeat.wakeup(fixture.agentId, chatCommentWake(fixture, commentId, { type: "user", id: "board-user" })),
+          ).resolves.not.toThrow();
+        } finally {
+          spy.mockRestore();
+        }
+
+        const run = await readRun(fixture.retryRunId);
+        expect(run.status).toBe("scheduled_retry");
+        expect(run.scheduledRetryAt!.getTime()).toBe(fixture.dueAt.getTime());
+        expect(await deferredReplies(fixture)).toHaveLength(1);
+      });
+    });
+
+    it("leaves a parked interaction-continuation retry scheduled when a board user comments on a normal issue", async () => {
+      const fixture = await seedParkedRetry();
+      const parked = await readRun(fixture.retryRunId);
+      await db.update(heartbeatRuns).set({
+        contextSnapshot: { ...(parked.contextSnapshot as Record<string, unknown>), interactionId: randomUUID() },
+      }).where(eq(heartbeatRuns.id, fixture.retryRunId));
+
+      await heartbeat.wakeup(fixture.agentId, commentWake(fixture, randomUUID(), { type: "user", id: "board-user" }));
 
       const run = await readRun(fixture.retryRunId);
       expect(run.status).toBe("scheduled_retry");
