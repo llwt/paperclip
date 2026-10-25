@@ -1374,6 +1374,18 @@ export function authorizationService(db: Db | DbTransaction) {
         explanation,
       });
 
+    if (input.action === "project:read") {
+      const scopeProjectIds = taskBridgeScopeIds(input.scope, "projectId", "projectIds");
+      if (
+        input.resource.type === "project" &&
+        input.resource.projectId &&
+        scopeProjectIds.includes(input.resource.projectId)
+      ) {
+        return allowBridge("Allowed for the task bridge key's own scope project.");
+      }
+      return denyBridge("Task bridge keys cannot use company-wide, peer-agent, project, runtime, or secret APIs.");
+    }
+
     if (
       input.action === "company_scope:read" ||
       input.action === "decision_queue:manage" ||
@@ -1381,7 +1393,6 @@ export function authorizationService(db: Db | DbTransaction) {
       input.action === "decision_triage:manage" ||
       input.action === "agent:read" ||
       input.action === "agent:wake" ||
-      input.action === "project:read" ||
       input.action === "runtime:manage" ||
       input.action === "secrets:read" ||
       input.action === "secrets:propose"

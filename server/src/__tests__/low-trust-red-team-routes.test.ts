@@ -1798,6 +1798,32 @@ describeEmbeddedPostgres(
       expect(afterBulkSummary.runs.length).toBe(beforeBulkSummary.runs.length);
     });
 
+    it("lets a task bridge key create an issue in its own scope project and refuses other projects", async () => {
+      const fixture = await seedLowTrustFixture(db);
+      const bridgeActor: Express.Request["actor"] = {
+        ...agentActor(fixture, fixture.agents.standard.id),
+        runId: null,
+        source: "agent_key",
+        keyId: randomUUID(),
+        keyScope: { kind: "task_bridge", projectId: fixture.projects.allowed.id },
+      };
+      const app = createApp(db, bridgeActor);
+
+      const ok = await request(app)
+        .post(`/api/companies/${fixture.company.id}/issues`)
+        .send({ title: "Bridge issue in scope project", projectId: fixture.projects.allowed.id });
+      expect(ok.status, JSON.stringify(ok.body)).toBe(201);
+      expect(ok.body.projectId).toBe(fixture.projects.allowed.id);
+
+      const refused = await request(app)
+        .post(`/api/companies/${fixture.company.id}/issues`)
+        .send({ title: "Bridge issue in other project", projectId: fixture.projects.outOfScope.id });
+      expect([403, 404], JSON.stringify(refused.body)).toContain(refused.status);
+      const leaked = await db.select({ id: issues.id }).from(issues)
+        .where(eq(issues.projectId, fixture.projects.outOfScope.id));
+      expect(leaked.map((row) => row.id)).not.toContain(refused.body.id);
+    });
+
     it("denies skill-test scoped tokens on foreign issue-adjacent reads", async () => {
       const fixture = await seedLowTrustFixture(db);
       const app = createApp(db, skillTestActor(fixture));
