@@ -364,6 +364,31 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     );
   });
 
+  it("leaves a process-gone run alone while an adopted result is pending, then terminalizes it once it is not", async () => {
+    const { companyId, agentId, runningRunId } = await seed();
+    await db.update(heartbeatRuns).set({ processPid: 2_000_000_000 }).where(eq(heartbeatRuns.id, runningRunId));
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Adopted result pending", status: "in_progress", priority: "high",
+      assigneeAgentId: agentId, checkoutRunId: runningRunId, executionRunId: runningRunId, executionLockedAt: new Date(),
+    });
+    const pending = new Set([runningRunId]);
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(), adoptedResultPending: pending });
+
+    const held = await recovery.sweepStaleIssueLocks();
+    expect(held.terminalizedRunIds).toEqual([]);
+    const afterHeld = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runningRunId)).then((rows) => rows[0]);
+    expect(afterHeld?.status).toBe("running");
+
+    pending.clear();
+    const released = await recovery.sweepStaleIssueLocks();
+    expect(released.terminalizedRunIds).toEqual([runningRunId]);
+    const afterReleased = await db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns).where(eq(heartbeatRuns.id, runningRunId)).then((rows) => rows[0]);
+    expect(afterReleased).toEqual({ status: "interrupted", errorCode: "orphaned_running_run" });
+  });
+
   it.each(["in_progress", "done"])("preserves a live legacy controller lease when the issue is %s", async (status) => {
     const { companyId, agentId, runningRunId } = await seed();
     await db.update(heartbeatRuns).set({

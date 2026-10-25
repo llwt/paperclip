@@ -1139,7 +1139,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             continuationSummaryBody,
           })
         : "";
-    const runAttempt = async (resumeSessionId: string | null) => {
+    const runAttempt = async (resumeSessionId: string | null, freshSessionRetry = false) => {
       await hydrateFreshSessionHandoff(ctx, { resumedSession: Boolean(resumeSessionId) });
       const renderedBootstrapPrompt =
         !resumeSessionId && bootstrapPromptTemplate.trim().length > 0
@@ -1277,6 +1277,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             version: 1,
             engine: "cli",
             sessionIdBefore: resumeSessionId,
+            freshSessionRetry,
             sessionParams: {
               cwd: effectiveExecutionCwd,
               ...(executionTargetIsRemote
@@ -1645,7 +1646,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           "stdout",
           `[paperclip] Codex resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
         );
-        const retry = await runAttempt(null);
+        const retry = await runAttempt(null, true);
         const retryResult = withLeftoverProcessSweep(toResult(retry, true, true), [initial.proc, retry.proc]);
         if (retryResult.errorMessage) {
           executionError = new Error(retryResult.errorMessage);

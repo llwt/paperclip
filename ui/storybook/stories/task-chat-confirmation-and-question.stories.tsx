@@ -13,7 +13,7 @@ import { storybookAgentMap } from "../fixtures/paperclipData";
 
 // Fork (SX-1581): one run posts a confirmation and, 0.1 s later, a question
 // with a legacy payload (no questionSet, a free-text option, allowOther). The
-// user has since written a comment, so neither card is fresh for them.
+// user has since written a comment; both cards stay docked anyway (SX-1603).
 const issueId = "task-confirmation-and-question-demo";
 const confirmation: RequestConfirmationInteraction = {
   ...pendingRequestConfirmationInteraction,
@@ -86,7 +86,7 @@ type Story = StoryObj<typeof meta>;
 export const SameRun: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await waitFor(() => expect(canvas.getByTestId("task-chat-composer-takeover")).toHaveTextContent("Approve the copy route"));
+    await waitFor(() => expect(canvas.getByTestId("task-chat-composer-takeover")).toHaveTextContent("Which route copies the set?"));
     await expect(canvas.getByRole("button", { name: "2 pending" })).toBeVisible();
   },
 };
@@ -101,10 +101,10 @@ export const SameRunDismissed: Story = {
 export const AnswerBoth: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
+    await waitFor(() => expect(canvas.getByTestId("task-chat-composer-takeover")).toHaveTextContent("Which route copies the set?"));
+    await userEvent.click(canvas.getByRole("button", { name: "2 pending" }));
     await waitFor(() => expect(canvas.getByTestId("task-chat-composer-takeover")).toHaveTextContent("Approve the copy route"));
     await userEvent.click(canvas.getByRole("button", { name: "Approve" }));
-    await waitFor(() => expect(canvas.getByTestId("task-chat-pending-input-indicator")).toHaveTextContent("1 pending input"));
-    await userEvent.click(canvas.getByTestId("task-chat-pending-input-indicator"));
     await waitFor(() => expect(canvas.getByTestId("task-chat-composer-takeover")).toHaveTextContent("Which route copies the set?"));
   },
 };
