@@ -34,6 +34,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getRun: vi.fn(async () => null),
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
+  recordSelfHandoffOutcome: vi.fn(async () => null),
 }));
 
 const mockAgentService = vi.hoisted(() => ({
@@ -2840,6 +2841,7 @@ describe("issue comment reopen routes", () => {
     expect(res.status).toBe(200);
     expect(mockHeartbeatService.getRun).toHaveBeenCalledWith("run-1");
     expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("run-1");
+    expect(mockHeartbeatService.recordSelfHandoffOutcome).not.toHaveBeenCalled();
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
@@ -2850,6 +2852,56 @@ describe("issue comment reopen routes", () => {
         }),
       }),
     );
+  });
+
+  // Fork (SX-2509): the run that cancels its own task is stopped as before,
+  // then recorded `succeeded` once the change has committed.
+  describe.each([
+    ["the run itself", "self"],
+    ["a board user", "other"],
+  ] as const)("cancelled status set by %s (SX-2509)", (_name, who) => {
+    it(who === "self"
+      ? "stops the run with this request's stop id and records the self hand-off"
+      : "cancels the assignee's run exactly as before", async () => {
+      const issue = { ...makeIssue("in_progress"), executionRunId: "run-1" };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(
+        async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }),
+      );
+      mockHeartbeatService.getRun.mockResolvedValue({
+        id: "run-1",
+        companyId: "company-1",
+        agentId: "22222222-2222-4222-8222-222222222222",
+        status: "running",
+      });
+      mockHeartbeatService.cancelRun.mockResolvedValue({
+        id: "run-1",
+        companyId: "company-1",
+        agentId: "22222222-2222-4222-8222-222222222222",
+        status: "cancelled",
+      });
+      const res = await request(await installActor(createApp(), who === "self" ? agentActor() : undefined))
+        .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+        .send({ status: "cancelled" });
+
+      expect(res.status).toBe(200);
+      if (who === "other") {
+        expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("run-1");
+        expect(mockHeartbeatService.recordSelfHandoffOutcome).not.toHaveBeenCalled();
+        return;
+      }
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("run-1", undefined, {
+        resultJson: { issueMutationStopId: expect.any(String) },
+      });
+      const stopId = (mockHeartbeatService.cancelRun.mock.calls[0] as unknown as [string, undefined, {
+        resultJson: { issueMutationStopId: string };
+      }])[2].resultJson.issueMutationStopId;
+      expect(mockHeartbeatService.recordSelfHandoffOutcome).toHaveBeenCalledWith({
+        runId: "run-1",
+        issueMutationStopId: stopId,
+        kind: "cancelled_status",
+      });
+    });
   });
 
   it("does not cancel active runs when an issue is marked done", async () => {

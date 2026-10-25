@@ -420,6 +420,12 @@ vi.mock("../services/plugin-worker-manager.js", () => ({
   createPluginWorkerManager: vi.fn(() => ({ id: "plugin-worker-manager" })),
 }));
 
+// The real sweep scans os.tmpdir(), so its idle-work lifetime depends on disk I/O.
+vi.mock("../services/run-temp-dirs.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../services/run-temp-dirs.js")>(),
+  sweepRunTempDirs: vi.fn(async () => ({ scanned: 0, removed: [], kept: [] })),
+}));
+
 vi.mock("../services/systemd-notify.js", () => ({ systemdNotify: vi.fn(async () => false) }));
 vi.mock("../startup-banner.js", () => ({
   printStartupBanner: vi.fn(),
@@ -540,16 +546,15 @@ describe("startServer feedback export wiring", () => {
     const report = () => readIdleSleepSafety(emptyDb as never, () => hold, Date.now, hold.ownerId, async () => "none");
     try {
       await startServer();
-      await new Promise(resolve => setImmediate(resolve));
-      expect(idleWorkSnapshot().active).toBe(1);
+      // The other startup sweeps are mocked to settle in microtasks, so only the held reconcile stays counted.
+      await vi.waitFor(() => expect(idleWorkSnapshot().active).toBe(1));
       expect((await report()).backgroundWork).toBe("unknown");
       finishStartup();
-      await new Promise(resolve => setImmediate(resolve));
-      expect(idleWorkSnapshot().active).toBe(0);
+      await vi.waitFor(() => expect(idleWorkSnapshot().active).toBe(0));
       expect((await report()).backgroundWork).toBe("none");
     } finally {
       finishStartup();
-      await new Promise(resolve => setImmediate(resolve));
+      await vi.waitFor(() => expect(idleWorkSnapshot().active).toBe(0));
     }
   });
 

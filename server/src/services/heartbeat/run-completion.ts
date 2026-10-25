@@ -9,6 +9,7 @@ import { preserveWorkspaceRestoreRecoveryMetadataSql } from "../legacy-workspace
 import { cancellationResultJson, readRunCancellation } from "../run-cancellation.js";
 import { isLegacyControllerLeaseLost, LEGACY_CONTROLLER_LEASE_LOST_CODE, legacyControllerBootId } from "../legacy-controller-lease.js";
 import { accountRunCost } from "../run-cost-accounting.js";
+import { recoveredHotRestartResultJson } from "./local-result-recovery.js";
 import { isConversation, settleConversationTurn } from "../agent-conversations.js";
 import { legacyExecutionNeedsReconciliationWithEvidence } from "../legacy-execution-recovery.js";
 import { isWorkspaceGitScanError } from "../workspace-git-operation-scheduler.js";
@@ -116,6 +117,30 @@ export interface CompleteHeartbeatRunInput extends RunCompletionInput {
   onProviderTraceFinalized: () => void;
   issueContext: IssueContext;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+}
+
+/**
+ * Fork (SX-1745): who finalizes the run. The live executor ("execute", the
+ * default) classifies the adapter result as before. A run whose result was
+ * read back from its persisted output after its parent was lost
+ * ("adopted_output") carries the provider's verdict explicitly.
+ */
+export type CompleteHeartbeatRunSource =
+  | { source?: "execute" }
+  | {
+      source: "adopted_output";
+      recoveredOutcome: "succeeded" | "failed";
+      /** Stored as hotRestart.resultRecovery, next to the adoption provenance. */
+      resultRecovery?: Record<string, unknown>;
+    };
+
+export interface CompleteHeartbeatRunResult {
+  /** This caller's terminal compare-and-set changed the run. */
+  won: boolean;
+  /** Lost the compare-and-set, but the native or owned-Stop exception let it record its result. */
+  lateWrite: boolean;
+  run: Run | null;
+  outcome: RunSessionOutcome;
 }
 
 export interface FailHeartbeatRunInput extends RunCompletionInput {
@@ -354,7 +379,15 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     failedProcessRunCancellations,
   } = dependencies;
 
-  async function completeRun(input: CompleteHeartbeatRunInput) {
+  // Only a caller that wins the terminal compare-and-set (or, for the live
+  // executor, takes the native or owned-Stop late-write exception) writes its
+  // result and runs the effects. A live loser still settles the run's pending
+  // accounting receipt, which accountRunCost does at most once. An adopted
+  // loser does nothing (SX-1677 plan section 6): the winner or the cost
+  // accounting reconciler settles that receipt.
+  async function completeRun(
+    input: CompleteHeartbeatRunInput & CompleteHeartbeatRunSource,
+  ): Promise<CompleteHeartbeatRunResult> {
     const { run, agent, issueId, issueRef, signal, output, session, readFailureReportSecrets, sessionCodec, taskSessionForRun, sessionCompaction,
       configFreshnessResultMetadata, runLedgerScope, currentUserRedactionOptions,
       providerTraceCapture, onProviderTraceFinalized, issueContext, onLog } = input;
@@ -396,6 +429,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       outcome = latestRun.status;
     } else if (signal.aborted && !leaseLostWithoutEffect) {
       outcome = "cancelled";
+    } else if (input.source === "adopted_output") {
+      // The provider's own verdict; never the null-exit heuristic below.
+      outcome = input.recoveredOutcome;
     } else if (adapterResult.nativeFinalization) {
       const nativeTerminal =
         adapterResult.nativeFinalization.terminal.runTerminalState;
@@ -631,6 +667,12 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
             ...(adapterResult.executionRecovery
               ? { executionRecovery: adapterResult.executionRecovery }
               : {}),
+            ...(input.source === "adopted_output"
+              ? recoveredHotRestartResultJson(
+                  latestRun?.resultJson ?? run.resultJson,
+                  input.resultRecovery,
+                )
+              : {}),
             configFreshness: configFreshnessResultMetadata,
           },
           errorFamily: adapterResult.errorFamily ?? null,
@@ -670,6 +712,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     );
     let persistedRun: typeof heartbeatRuns.$inferSelect | null =
       persistedRunWrite.run;
+    let lateWrite = false;
     if (!persistedRunWrite.updated) {
       persistedRun = null;
       // Native reconciliation can commit and project the terminal status in
@@ -680,7 +723,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       // same terminal status; a conflicting terminal outcome remains owned
       // by the path that won the compare-and-set. Owned legacy cancellation
       // likewise keeps the provider session, logs, and usage after Stop wins.
+      // Both exceptions belong to the live executor only.
       if (
+        input.source !== "adopted_output" &&
         (adapterResult.nativeFinalization ||
           (processCancellation && !processCancellation.failed && status === "cancelled")) &&
         persistedRunWrite.run?.status === status
@@ -707,10 +752,13 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           .returning()
           .then((rows) => rows[0] ?? null);
       }
+      lateWrite = persistedRun != null;
       if (!persistedRun) {
-        await accountRunCost(db, run.id, budgetHooks).catch((err) => {
-          logger.error({ err, runId: run.id }, "Late run accounting queued for recovery");
-        });
+        if (input.source !== "adopted_output") {
+          await accountRunCost(db, run.id, budgetHooks).catch((err) => {
+            logger.error({ err, runId: run.id }, "Late run accounting queued for recovery");
+          });
+        }
         logger.info(
           {
             runId: run.id,
@@ -719,7 +767,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           },
           "skipping late run finalization because the run already left running state",
         );
-        return;
+        return { won: false, lateWrite: false, run: null, outcome };
       }
     }
     if (persistedRun) {
@@ -1092,6 +1140,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           isWorkspaceSyncConflictFailure(adapterResult.errorMessage)),
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
     });
+    return { won: persistedRunWrite.updated, lateWrite, run: finalizedRun ?? null, outcome };
   }
 
   async function failRun(input: FailHeartbeatRunInput) {

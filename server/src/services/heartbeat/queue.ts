@@ -33,6 +33,7 @@ import {
   undeliveredLegacyUserCommentIds,
 } from "../explicit-native-continuation.js";
 import { canRetryStoppedRun } from "../cancelled-native-startup.js";
+import { isConfirmedReassignmentStop } from "../run-cancellation.js";
 import { getExecutionBlocker } from "../execution-blocker.js";
 import { isConversationAdapter } from "../conversation-continuation.js";
 import { recordExecutionWait } from "../execution-wait.js";
@@ -276,6 +277,20 @@ async function hasPendingRunCleanup(db: Db, companyId: string, runId: string) {
 // another agent, started before this wake, and is the run the wake names when
 // it names one. "cleanup_pending" means that run has not fully ended yet.
 // An operator Stop or a stop of the wake agent's own run is never promoted here.
+// SQL twin of isConfirmedReassignmentStop for the plain cancel shape and the
+// self hand-off shape (fork, SX-2509).
+export function confirmedReassignmentStopRunSql() {
+  return or(
+    and(eq(heartbeatRuns.status, "cancelled"), eq(heartbeatRuns.errorCode, "issue_reassigned")),
+    and(
+      eq(heartbeatRuns.status, "succeeded"),
+      sql`${heartbeatRuns.resultJson}->'selfHandoff' = 'true'::jsonb`,
+      sql`${heartbeatRuns.resultJson}->'selfHandoffStop'->>'errorCode' = 'issue_reassigned'`,
+      sql`${heartbeatRuns.resultJson}->'reassignmentStopConfirmed' = 'true'::jsonb`,
+    ),
+  )!;
+}
+
 export async function readAssignmentHandoffPredecessor(
   db: Db,
   wake: Pick<typeof agentWakeupRequests.$inferSelect, "companyId" | "agentId" | "requestedAt" | "payload">,
@@ -292,8 +307,7 @@ export async function readAssignmentHandoffPredecessor(
   const namedRunId = readNonEmptyString(parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]).interruptedRunId) ??
     readNonEmptyString(payload.interruptedRunId);
   if (!latest || (namedRunId && namedRunId !== latest.id)) return { state: "none" };
-  if (latest.status !== "cancelled" || latest.errorCode !== "issue_reassigned" ||
-      parseObject(latest.resultJson).reassignmentStopConfirmed !== true ||
+  if (!isConfirmedReassignmentStop({ ...latest, resultJson: parseObject(latest.resultJson) }) ||
       latest.agentId === wake.agentId || latest.createdAt.getTime() > wake.requestedAt.getTime()) {
     return { state: "none" };
   }
@@ -2859,6 +2873,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       // Set when a stage or assignment hand-off wake is saved behind a run
       // that still owns execution (fork, SX-1386, SX-2418).
       let handoffDeferred = false;
+      // Fork (SX-2537): set when admission defers a wake behind a parked
+      // scheduled retry of this agent (conversation issues never coalesce).
+      let parkedRetryDeferredBehind: typeof heartbeatRuns.$inferSelect | null = null;
       // Differs from upstream (fork, SX-1386): resuming a saved stage hand-off.
       // Its saved row is settled in the same transaction as the admission
       // result, so it is never finished without a successor run or a decision.
@@ -2910,6 +2927,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const outcome = await db
         .transaction(async (tx) => settleStageHandoffResume(tx, await (async () => {
           handoffDeferred = false;
+          parkedRetryDeferredBehind = null;
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
@@ -4061,6 +4079,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               };
             }
             if (admission.kind === "deferred") {
+              if (
+                isConversation(issue) &&
+                activeExecutionRun.status === "scheduled_retry" &&
+                activeExecutionRun.agentId === agentId
+              ) {
+                parkedRetryDeferredBehind = activeExecutionRun;
+              }
               return { kind: "deferred" as const };
             }
             // admission.kind === "proceed": no active run absorbed this wake,
@@ -4287,7 +4312,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             issue.assigneeAgentId === agentId && interruptedRunId && isUuidLike(interruptedRunId)
               ? await tx.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns).where(and(
                   eq(heartbeatRuns.id, interruptedRunId), eq(heartbeatRuns.companyId, issue.companyId),
-                  eq(heartbeatRuns.status, "cancelled"), eq(heartbeatRuns.errorCode, "issue_reassigned"),
+                  confirmedReassignmentStopRunSql(),
                   ne(heartbeatRuns.agentId, agentId),
                   sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`,
                   or(isNull(heartbeatRuns.nativeIssueId), eq(heartbeatRuns.nativeIssueId, issue.id)),
@@ -4440,6 +4465,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         if (await resumeDeferredExecutionStageWakes(agent.companyId, issueId) === "blocked") {
           // Fork (SX-1537): a process exit has no release hook; recheck it.
           scheduleOwnerExitRecheck(agent.companyId, issueId);
+        }
+      }
+      if (outcome.kind === "deferred" && parkedRetryDeferredBehind) {
+        // Fork (SX-2537): the reply stays a deferred wake; a board user's
+        // reply still starts the parked retry now (the chat banner says so).
+        if (await promoteParkedRetryForHumanReply(parkedRetryDeferredBehind)) {
+          await startNextQueuedRunForAgent(agent.id);
         }
       }
       if (outcome.kind === "deferred" || outcome.kind === "skipped") {

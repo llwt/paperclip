@@ -300,11 +300,14 @@ describeEmbeddedPostgres("execution stage hand-off wake through the issue routes
         .post(`/api/issues/${ids.issueId}/comments`)
         .send({ body: "## Review: APPROVED\n\nLooks good." });
     expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
-    const [decidingRun] = await db.select({ status: heartbeatRuns.status })
+    const [decidingRun] = await db.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
       .from(heartbeatRuns).where(eq(heartbeatRuns.id, ids.decidingRunId));
-    // PATCH stops its own run before the reassignment. The comment route does
-    // not; the deciding run ends on its own after its comment.
-    if (route === "patch") expect(decidingRun?.status).toBe("cancelled");
+    // PATCH stops its own run before the reassignment and, as a self hand-off
+    // (SX-2509), records it `succeeded`. The comment route does not stop it;
+    // the deciding run ends on its own after its comment.
+    if (route === "patch") {
+      expect(decidingRun).toMatchObject({ status: "succeeded", resultJson: expect.objectContaining({ selfHandoff: true }) });
+    }
   }
 
   const cases = [

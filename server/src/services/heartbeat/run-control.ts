@@ -16,7 +16,10 @@ import {
   canContinueCancelledRun,
   readRunCancellation,
   requestedRunCancellation,
+  type SelfHandoffKind,
 } from "../run-cancellation.js";
+import { publishLiveEvent } from "../live-events.js";
+import { buildHeartbeatRunStatusLiveEventPayload } from "../heartbeat-run-status-payload.js";
 import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
 import { readQueuedInteractionResponse } from "../queued-interaction-response.js";
 import {
@@ -1487,6 +1490,90 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     }
   }
 
+  // Differs from upstream (fork, SX-2509). A run that changed its own task was
+  // stopped like any other run, so the change could commit under the existing
+  // stop fence and the next owner could start. Once the change has committed,
+  // record the run's real result: it finished its work. Only the stop that
+  // carries this request's issueMutationStopId is relabelled. While an
+  // executor in this server still cleans the run up, the run stays `cancelled`
+  // (every cleanup and ownership check sees today's state) and the executor
+  // finalizes the outcome when it settles. The wake request stays cancelled so
+  // a revoked request never regains retry authority.
+  async function recordSelfHandoffOutcome(input: {
+    runId: string;
+    issueMutationStopId: string;
+    kind: SelfHandoffKind;
+  }) {
+    const [marked] = await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || jsonb_build_object(
+          'selfHandoffPending', jsonb_build_object('kind', ${input.kind}::text)
+        )`,
+      })
+      .where(
+        and(
+          eq(heartbeatRuns.id, input.runId),
+          eq(heartbeatRuns.status, "cancelled"),
+          isNotNull(heartbeatRuns.errorCode),
+          sql`${heartbeatRuns.resultJson}->>'issueMutationStopId' = ${input.issueMutationStopId}`,
+        ),
+      )
+      .returning({ id: heartbeatRuns.id });
+    if (!marked) return null;
+    // The executor deletes itself from this set before it finalizes, so one of
+    // the two paths always sees the marker.
+    if (activeRunExecutions.has(input.runId)) return getRun(input.runId);
+    return finalizeSelfHandoffOutcome(input.runId);
+  }
+
+  async function finalizeSelfHandoffOutcome(runId: string) {
+    const now = new Date();
+    const [updated] = await db
+      .update(heartbeatRuns)
+      .set({
+        status: "succeeded",
+        error: null,
+        errorCode: null,
+        // SET reads the old row, so errorCode and error are the stop's values.
+        resultJson: sql`(${heartbeatRuns.resultJson} - 'selfHandoffPending') || jsonb_build_object(
+          'selfHandoff', true,
+          'stopReason', 'completed',
+          'selfHandoffStop', jsonb_build_object(
+            'kind', ${heartbeatRuns.resultJson}->'selfHandoffPending'->>'kind',
+            'errorCode', ${heartbeatRuns.errorCode},
+            'error', ${heartbeatRuns.error},
+            'recordedAt', ${now.toISOString()}::text
+          )
+        )`,
+        executionStatusDeliveryId: randomUUID(),
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(heartbeatRuns.id, runId),
+          eq(heartbeatRuns.status, "cancelled"),
+          isNotNull(heartbeatRuns.errorCode),
+          sql`${heartbeatRuns.resultJson}->'selfHandoffPending'->>'kind' is not null`,
+        ),
+      )
+      .returning();
+    if (!updated) return null;
+    publishLiveEvent({
+      companyId: updated.companyId,
+      type: "heartbeat.run.status",
+      payload: buildHeartbeatRunStatusLiveEventPayload(updated),
+    });
+    await appendRunEvent(updated, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: "run ended after changing its own task",
+      payload: { selfHandoff: parseObject(updated.resultJson).selfHandoffStop ?? null },
+    }).catch((err: unknown) => logger.warn({ err, runId: updated.id }, "failed to record self hand-off run event"));
+    return updated;
+  }
+
   async function cancelActiveForAgentInternal(
     agentId: string,
     reason = "Cancelled due to agent pause",
@@ -1589,6 +1676,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     acknowledgeRemoteStop,
     resumeRemoteStopComments,
     cancelRunInternal,
+    recordSelfHandoffOutcome,
+    finalizeSelfHandoffOutcome,
     resumeExecutionWaitComments,
     resumeQueuedCommentInterrupt,
     resumeSavedLegacyComments,
