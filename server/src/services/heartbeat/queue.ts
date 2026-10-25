@@ -1281,6 +1281,25 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         updatedAt: claimedAt,
       }).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)));
     }
+    // Fork (SX-2485): two open run tasks of one routine can be live at once.
+    // Binding this run to its issue then breaks issues_open_routine_execution_uq.
+    // The claim transaction rolls back, so the run stays queued; the periodic
+    // resumeQueuedRuns pass and the other task's lock release start it later.
+    const deferOnOpenRoutineExecutionClash = <T>(fallback: T) => (error: unknown): T => {
+      if (!isUniqueViolation(error, OPEN_ROUTINE_EXECUTION_CONSTRAINT)) throw error;
+      logger.warn(
+        {
+          err: error,
+          issueId,
+          runId: run.id,
+          agentId: run.agentId,
+          companyId: run.companyId,
+          constraint: OPEN_ROUTINE_EXECUTION_CONSTRAINT,
+        },
+        "queued heartbeat run claim hit the open routine execution constraint; leaving the run queued and the issue unchanged",
+      );
+      return fallback;
+    };
     const nativeReviewContext = readNativeReviewAssignmentContext(context);
     const queuedCommentIds = queuedCommentIdsFromRunContext(context);
     if (
@@ -1564,7 +1583,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             .catch((error) => {
               if (isExternalChatWaitAuthorizationContention(error))
                 return { kind: "stale" as const, run: null };
-              throw error;
+              return deferOnOpenRoutineExecutionClash({
+                kind: "stale" as const,
+                run: null,
+              })(error);
             })
         : null;
     if (queuedCommentClaim?.kind === "cancelled") {
@@ -1631,7 +1653,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             await bindClaimedIssueExecution(claimTx as unknown as Db, issueClaim.ownsIssue, claimedRun);
             return claimedRun;
           });
-        });
+        }).catch(deferOnOpenRoutineExecutionClash(null));
     if (!claimed) return null;
 
     publishLiveEvent({
@@ -1826,7 +1848,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
-    await resumeExecutionWaitComments();
+    await resumeExecutionWaitComments().catch((err) => {
+      logger.error({ err }, "failed to resume execution-wait comments; continuing queued run recovery");
+    });
     const cutoff = await getWorktreeExecutionCutoff();
     const pendingInterrupts = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
       .from(agentWakeupRequests).innerJoin(companies, eq(companies.id, agentWakeupRequests.companyId))
@@ -1837,12 +1861,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     for (const wake of pendingInterrupts) {
-      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
-        eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
-      ));
-      await resumeQueuedCommentInterrupt(wake.companyId, wake.id).catch(err => {
-        logger.warn({ err, queueId: wake.id }, "failed to resume interrupted comment queue");
-      });
+      try {
+        await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+          eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ));
+        await resumeQueuedCommentInterrupt(wake.companyId, wake.id).catch(err => {
+          logger.warn({ err, queueId: wake.id }, "failed to resume interrupted comment queue");
+        });
+      } catch (err) {
+        logger.error({ err, queueId: wake.id, companyId: wake.companyId }, "failed to retry interrupted comment queue wake; continuing");
+      }
     }
     // Differs from upstream (fork, SX-1386): a saved stage hand-off normally
     // starts when the blocking run releases its lease. Retry it here after a
@@ -1866,13 +1894,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       .limit(50);
     for (const { companyId, issueId } of stageHandoffIssues) {
       if (!issueId) continue;
-      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
-        eq(agentWakeupRequests.companyId, companyId),
-        eq(agentWakeupRequests.status, "deferred_issue_execution"),
-        sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
-        savedHandoffWakeSql(),
-      ));
-      await resumeDeferredExecutionStageWakes(companyId, issueId);
+      try {
+        await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+          savedHandoffWakeSql(),
+        ));
+        await resumeDeferredExecutionStageWakes(companyId, issueId);
+      } catch (err) {
+        logger.error({ err, issueId, companyId }, "failed to resume saved hand-off wakes for issue; continuing");
+      }
     }
     // A server restart or a message/cleanup race can leave a deferred wake
     // after its owner has released the issue lock. Revisit it through the same
@@ -1893,33 +1925,37 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     for (const { wake } of strandedQueues) {
-      if (!queuedCommentIdsFromWakePayload(wake.payload).length &&
-          !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
-      const [latest] = await db.select().from(heartbeatRuns).where(and(
-        eq(heartbeatRuns.companyId, wake.companyId), eq(heartbeatRuns.agentId, wake.agentId),
-        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${String(wake.payload?.issueId)}`,
-      )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
-      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
-        eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
-      ));
-      if (!latest || !isHeartbeatRunTerminalStatus(latest.status)) continue;
-      if (latest.runtimeMode === "native" && typeof wake.payload?.dotAssignmentFollowUp === "string") {
+      try {
+        if (!queuedCommentIdsFromWakePayload(wake.payload).length &&
+            !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
+        const [latest] = await db.select().from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.companyId, wake.companyId), eq(heartbeatRuns.agentId, wake.agentId),
+          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${String(wake.payload?.issueId)}`,
+        )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+        await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+          eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ));
+        if (!latest || !isHeartbeatRunTerminalStatus(latest.status)) continue;
+        if (latest.runtimeMode === "native" && typeof wake.payload?.dotAssignmentFollowUp === "string") {
+          await releaseIssueExecutionAndPromote(latest, { suppressImmediateRecovery: true }).catch(err => {
+            logger.warn({ err, queueId: wake.id }, "failed to promote unread Dot comment after recovery");
+          });
+          continue;
+        }
+        if (latest.runtimeMode !== "legacy") continue;
+        const cancelledAdmission = latest.status === "cancelled" && !latest.startedAt &&
+          latest.errorCode === "execution_reconciliation_required";
+        if ((latest.status !== "cancelled" || cancelledAdmission) && await getExecutionBlocker(db, wake.companyId, String(wake.payload?.issueId))) {
+          await resumeSavedLegacyComments(wake.companyId, wake.id).catch(err => {
+            logger.warn({ err, queueId: wake.id }, "failed to deliver saved legacy comment after recovery stopped");
+          });
+        }
         await releaseIssueExecutionAndPromote(latest, { suppressImmediateRecovery: true }).catch(err => {
-          logger.warn({ err, queueId: wake.id }, "failed to promote unread Dot comment after recovery");
+          logger.warn({ err, queueId: wake.id }, "failed to promote stranded legacy comments");
         });
-        continue;
+      } catch (err) {
+        logger.error({ err, queueId: wake.id }, "failed to recover stranded deferred wake; continuing");
       }
-      if (latest.runtimeMode !== "legacy") continue;
-      const cancelledAdmission = latest.status === "cancelled" && !latest.startedAt &&
-        latest.errorCode === "execution_reconciliation_required";
-      if ((latest.status !== "cancelled" || cancelledAdmission) && await getExecutionBlocker(db, wake.companyId, String(wake.payload?.issueId))) {
-        await resumeSavedLegacyComments(wake.companyId, wake.id).catch(err => {
-          logger.warn({ err, queueId: wake.id }, "failed to deliver saved legacy comment after recovery stopped");
-        });
-      }
-      await releaseIssueExecutionAndPromote(latest, { suppressImmediateRecovery: true }).catch(err => {
-        logger.warn({ err, queueId: wake.id }, "failed to promote stranded legacy comments");
-      });
     }
 
     // The cancellation marker is durable intent. Retry while its exact queue
@@ -1961,7 +1997,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
     const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
     for (const agentId of agentIds) {
-      await startNextQueuedRunForAgent(agentId);
+      try {
+        await startNextQueuedRunForAgent(agentId);
+      } catch (err) {
+        logger.error({ err, agentId }, "failed to start queued runs for agent; continuing with the other agents");
+      }
     }
   }
 
@@ -2126,24 +2166,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         } catch (err) {
           if (isPermanentClaimRejection(err)) {
             rejectedClaims.push({ run: queuedRun, err });
-            continue;
-          }
-          if (isUniqueViolation(err, OPEN_ROUTINE_EXECUTION_CONSTRAINT)) {
-            // Another open issue of the same routine and fingerprint already
-            // holds a live execution run. The claim transaction rolled back, so
-            // the run stays queued and the issue is untouched; keep going so one
-            // row cannot stop the rest of the queue or startup recovery.
-            logger.warn(
-              {
-                err,
-                runId: queuedRun.id,
-                issueId: readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId),
-                agentId: queuedRun.agentId,
-                companyId: queuedRun.companyId,
-                constraint: OPEN_ROUTINE_EXECUTION_CONSTRAINT,
-              },
-              "queued heartbeat run claim hit the open routine execution constraint; leaving the run queued and the issue unchanged",
-            );
             continue;
           }
           if (!isDeferrableClaimRejection(err)) throw err;
