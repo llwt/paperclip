@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
+  activityLog,
   agentWakeupRequests,
   heartbeatRuns,
   issueComments,
@@ -22,6 +23,35 @@ export class StaleExecutionContinuationError extends Error {
     super(code);
     this.name = "StaleExecutionContinuationError";
   }
+}
+
+// Differs from upstream (fork, SX-2509). True when the latest recorded change
+// of the task's owner or status was made by this agent itself (for example an
+// earlier run of the agent closed or handed off the task). A leftover queued
+// wake of that agent is then obsolete by the agent's own doing, not stopped.
+export async function taskOwnershipLastChangedByAgent(db: Db, input: {
+  companyId: string;
+  issueId: string;
+  agentId: string;
+}): Promise<boolean> {
+  const [latest] = await db
+    .select({ actorType: activityLog.actorType, actorId: activityLog.actorId })
+    .from(activityLog)
+    .where(and(
+      eq(activityLog.companyId, input.companyId),
+      eq(activityLog.entityType, "issue"),
+      eq(activityLog.entityId, input.issueId),
+      or(
+        inArray(activityLog.action, ["issue.reassigned", "issue.checked_out"]),
+        and(
+          eq(activityLog.action, "issue.updated"),
+          sql`${activityLog.details}->'changes' ?| array['status', 'assigneeAgentId', 'assigneeUserId']`,
+        ),
+      ),
+    ))
+    .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+    .limit(1);
+  return latest?.actorType === "agent" && latest.actorId === input.agentId;
 }
 
 const object = (v: unknown): Record<string, unknown> =>

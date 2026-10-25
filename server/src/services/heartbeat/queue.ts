@@ -33,6 +33,7 @@ import {
   undeliveredLegacyUserCommentIds,
 } from "../explicit-native-continuation.js";
 import { canRetryStoppedRun } from "../cancelled-native-startup.js";
+import { isConfirmedReassignmentStop } from "../run-cancellation.js";
 import { getExecutionBlocker } from "../execution-blocker.js";
 import { isConversationAdapter } from "../conversation-continuation.js";
 import { recordExecutionWait } from "../execution-wait.js";
@@ -274,6 +275,20 @@ async function hasPendingRunCleanup(db: Db, companyId: string, runId: string) {
 // another agent, started before this wake, and is the run the wake names when
 // it names one. "cleanup_pending" means that run has not fully ended yet.
 // An operator Stop or a stop of the wake agent's own run is never promoted here.
+// SQL twin of isConfirmedReassignmentStop for the plain cancel shape and the
+// self hand-off shape (fork, SX-2509).
+export function confirmedReassignmentStopRunSql() {
+  return or(
+    and(eq(heartbeatRuns.status, "cancelled"), eq(heartbeatRuns.errorCode, "issue_reassigned")),
+    and(
+      eq(heartbeatRuns.status, "succeeded"),
+      sql`${heartbeatRuns.resultJson}->'selfHandoff' = 'true'::jsonb`,
+      sql`${heartbeatRuns.resultJson}->'selfHandoffStop'->>'errorCode' = 'issue_reassigned'`,
+      sql`${heartbeatRuns.resultJson}->'reassignmentStopConfirmed' = 'true'::jsonb`,
+    ),
+  )!;
+}
+
 export async function readAssignmentHandoffPredecessor(
   db: Db,
   wake: Pick<typeof agentWakeupRequests.$inferSelect, "companyId" | "agentId" | "requestedAt" | "payload">,
@@ -290,8 +305,7 @@ export async function readAssignmentHandoffPredecessor(
   const namedRunId = readNonEmptyString(parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]).interruptedRunId) ??
     readNonEmptyString(payload.interruptedRunId);
   if (!latest || (namedRunId && namedRunId !== latest.id)) return { state: "none" };
-  if (latest.status !== "cancelled" || latest.errorCode !== "issue_reassigned" ||
-      parseObject(latest.resultJson).reassignmentStopConfirmed !== true ||
+  if (!isConfirmedReassignmentStop({ ...latest, resultJson: parseObject(latest.resultJson) }) ||
       latest.agentId === wake.agentId || latest.createdAt.getTime() > wake.requestedAt.getTime()) {
     return { state: "none" };
   }
@@ -4204,7 +4218,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             issue.assigneeAgentId === agentId && interruptedRunId && isUuidLike(interruptedRunId)
               ? await tx.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns).where(and(
                   eq(heartbeatRuns.id, interruptedRunId), eq(heartbeatRuns.companyId, issue.companyId),
-                  eq(heartbeatRuns.status, "cancelled"), eq(heartbeatRuns.errorCode, "issue_reassigned"),
+                  confirmedReassignmentStopRunSql(),
                   ne(heartbeatRuns.agentId, agentId),
                   sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`,
                   or(isNull(heartbeatRuns.nativeIssueId), eq(heartbeatRuns.nativeIssueId, issue.id)),
