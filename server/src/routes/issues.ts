@@ -13552,10 +13552,44 @@ export function issueRoutes(
     if (active) throw conflict("An agent currently owns execution. Wait for it to finish, or manage execution in Paperclip.", { code: "MCP_ACTIVE_EXECUTION" });
   }
 
+  // Fork (SX-2551): the stop of the actor's own run is marked
+  // `selfHandoffRequested`, so its `cancelled` status event announces nothing.
+  // If the PATCH handler settles (returns or throws) before it records the
+  // self hand-off outcome, the change did not complete: announce each armed
+  // stop as an ordinary cancellation after all. This follows the handler, not
+  // the response, so a client that disconnects mid-request changes nothing.
+  type SelfHandoffStopFallback = {
+    arm: (runId: string) => void;
+    outcomeAttempted: () => void;
+  };
+  const settlingSelfHandoffStops = (
+    handler: (req: Request, res: Response, fallback: SelfHandoffStopFallback) => Promise<void>,
+  ) => async (req: Request, res: Response) => {
+    const armed = new Set<string>();
+    let attempted = false;
+    try {
+      await handler(req, res, {
+        arm: (runId) => { armed.add(runId); },
+        outcomeAttempted: () => { attempted = true; },
+      });
+    } finally {
+      if (!attempted) {
+        for (const runId of armed) {
+          void Promise.resolve()
+            .then(() => heartbeat.announceSelfHandoffStopCancelled(runId))
+            .catch((err: unknown) => logger.warn(
+              { err, runId },
+              "failed to announce the unfinished self hand-off stop",
+            ));
+        }
+      }
+    }
+  };
+
   router.patch(
     "/issues/:id",
     validateIssueMutationBody(updateIssueRouteSchema),
-    async (req, res) => {
+    settlingSelfHandoffStops(async (req, res, selfHandoffStopFallback) => {
       // Snapshot-guarded writes are policy-only. Do not admit task-control
       // actions that can stop execution before the service takes its row lock.
       if (req.body.expectedExecutionPolicy !== undefined && (
@@ -14297,27 +14331,9 @@ export function issueRoutes(
         actor.actorType === "agent" && Boolean(actor.agentId) &&
         (actor.runId ? run.id === actor.runId : run.agentId === actor.agentId);
       let selfHandoffStop = null as { runId: string; kind: SelfHandoffKind } | null;
-      // Fork (SX-2551): the stop of the actor's own run is marked
-      // `selfHandoffRequested`, so its `cancelled` status event announces
-      // nothing. If this request ends before the outcome is recorded (the
-      // change failed, or the stop itself threw after it published the marked
-      // event), announce the stop as an ordinary cancellation after all. Armed
-      // before cancelRun so a throw inside it is covered too.
-      let selfHandoffOutcomeAttempted = false;
-      const armedSelfHandoffStops = new Set<string>();
-      const armSelfHandoffStopFallback = (runId: string) => {
-        if (armedSelfHandoffStops.has(runId)) return;
-        armedSelfHandoffStops.add(runId);
-        res.once("close", () => {
-          if (selfHandoffOutcomeAttempted) return;
-          void Promise.resolve()
-            .then(() => heartbeat.announceSelfHandoffStopCancelled(runId))
-            .catch((err: unknown) => logger.warn(
-              { err, issueId: existing.id, runId },
-              "failed to announce the unfinished self hand-off stop",
-            ));
-        });
-      };
+      // Fork (SX-2551): armed before cancelRun, so a throw inside it after it
+      // published the marked stop event is covered too.
+      const armSelfHandoffStopFallback = selfHandoffStopFallback.arm;
       const markSelfHandoffStop = (stop: { runId: string; kind: SelfHandoffKind }) => {
         armSelfHandoffStopFallback(stop.runId);
         selfHandoffStop = stop;
@@ -14792,7 +14808,7 @@ export function issueRoutes(
       }
 
       if (selfHandoffStop) {
-        selfHandoffOutcomeAttempted = true;
+        selfHandoffStopFallback.outcomeAttempted();
         try {
           await heartbeat.recordSelfHandoffOutcome({
             runId: selfHandoffStop.runId,
@@ -15916,7 +15932,7 @@ export function issueRoutes(
         return;
       }
       res.json({ ...issueResponse, changes, comment });
-    },
+    }),
   );
 
   router.delete("/issues/:id", async (req, res) => {
