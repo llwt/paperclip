@@ -931,6 +931,12 @@ export function recoveryService(
       run: typeof heartbeatRuns.$inferSelect,
     ) => boolean;
     liveRunExecutions?: Readonly<{ has(id: string): boolean }>;
+    /**
+     * Fork (SX-1746): runs whose result the orphan reaper is reading back from
+     * their output. The process-gone backstop leaves them to the reaper, which
+     * finalizes them with the real result or falls back to process_lost.
+     */
+    adoptedResultPending?: Readonly<{ has(id: string): boolean }>;
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
     /**
      * Releases the environment leases of a run the stale-lock sweep just
@@ -5975,7 +5981,7 @@ export function recoveryService(
           (typeof pid === "number" && isPidAlive(pid)) ||
           (typeof processGroupId === "number" &&
             isProcessGroupAlive(processGroupId));
-        processGone = !processAlive;
+        processGone = !processAlive && !deps.adoptedResultPending?.has(run.id);
       }
     }
 

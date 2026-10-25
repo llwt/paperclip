@@ -16,6 +16,7 @@ function context(overrides: Partial<AdapterOutputRecoveryContext> = {}): Adapter
     invocation: {
       firstSeq: null,
       sessionIdBefore: null,
+      freshSessionRetry: false,
       sessionParams: { cwd: "/work", workspaceId: "ws-1" },
     },
     accounting: { provider: "openai", biller: "chatgpt", model: "gpt-5", billingType: "subscription" },
@@ -230,16 +231,27 @@ describe("recoverCodexResultFromOutput", () => {
 
   describe("clearing a stale session after a fresh-session retry", () => {
     const runStart = { sessionIdBefore: OLD_THREAD, sessionDisplayId: OLD_THREAD, sessionParams: null };
+    const retryInvocation = { ...context().invocation, freshSessionRetry: true };
 
     it("clears the session when the retry's output names no thread", async () => {
-      const outcome = expectComplete(await recover([turnStarted, completed()], context({ runStart })));
+      const ctx = context({ runStart, invocation: retryInvocation });
+      const outcome = expectComplete(await recover([turnStarted, completed()], ctx));
       expect(outcome.result).toMatchObject({ sessionId: null, sessionParams: null, clearSession: true });
-      const failure = expectComplete(await recover([turnStarted, failed()], context({ runStart })));
+      const failure = expectComplete(await recover([turnStarted, failed()], ctx));
       expect(failure.result).toMatchObject({ sessionId: null, sessionParams: null, clearSession: true });
     });
 
+    it("keeps the stored session when it was never resumable, not retried", async () => {
+      const ctx = context({ runStart });
+      const outcome = expectComplete(await recover([turnStarted, completed()], ctx));
+      expect(outcome.result).toMatchObject({ sessionId: null, sessionParams: null, clearSession: false });
+      const failure = expectComplete(await recover([turnStarted, failed()], ctx));
+      expect(failure.result).toMatchObject({ sessionId: null, clearSession: false });
+    });
+
     it("keeps the session when the retry's output names a thread", async () => {
-      const outcome = expectComplete(await recover([started(), turnStarted, completed()], context({ runStart })));
+      const ctx = context({ runStart, invocation: retryInvocation });
+      const outcome = expectComplete(await recover([started(), turnStarted, completed()], ctx));
       expect(outcome.result).toMatchObject({ sessionId: THREAD, clearSession: false });
     });
 
