@@ -415,8 +415,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
   // Differs from upstream (fork, SX-1386). A stage hand-off wake that met an
   // execution blocker is saved as `deferred_issue_execution`. Fork (SX-2418):
   // so is the new owner's assignment wake after a confirmed reassignment stop;
-  // the wake queue release does not promote it after that acknowledged stop. Start it through
-  // normal admission once the blocker is gone. Admission claims the saved row
+  // the wake queue release does not promote it after that acknowledged stop.
+  // Start it through normal admission once the blocker is gone. Admission claims the saved row
   // and writes its successor run in one transaction under the issue lock, so a
   // failed or interrupted attempt leaves the row saved for the next retry, and
   // a retry after a commit finds nothing left to start. Callers: the end of
