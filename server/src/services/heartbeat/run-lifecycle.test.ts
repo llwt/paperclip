@@ -8,6 +8,7 @@ import { publishLiveEvent } from "../live-events.js";
 import { getHeartbeatRunRuntimeStatus } from "../heartbeat-run-runtime-status.js";
 import { createHeartbeatRunState } from "./run-state.js";
 import { createHeartbeatRunPreparation } from "./run-preparation.js";
+import { terminalizeLegacyExecution } from "../legacy-execution-recovery.js";
 import { createHeartbeatLifecycle, persistHeartbeatRunProcessMetadata, type HeartbeatLifecycleDependencies } from "./run-lifecycle.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
@@ -143,6 +144,32 @@ describe.skipIf(!support.supported)("heartbeat lifecycle database wiring", () =>
     expect(deps.emitTerminalAgentTaskRun).toHaveBeenCalledTimes(1);
     expect(deps.emitTerminalAgentTaskRun).toHaveBeenCalledWith(winner.run, "running", undefined);
     expect(vi.mocked(publishLiveEvent).mock.calls.filter(([event]) => event.type === "heartbeat.run.status")).toHaveLength(1);
+  });
+
+  it.each(["native", "legacy"] as const)("keeps the leftover sweep evidence recorded after the reaper read the run when it writes process_lost on a %s run", async (runtimeMode) => {
+    const sweep = { kind: "leftover_process_sweep", stopped: 1, processes: [{ pid: 4242, command: "sleep 300" }] };
+    const { run } = await fixture({ runtimeMode, resultJson: { hotRestart: { adopted: true }, leftoverProcessSweep: sweep } });
+    const lifecycle = createHeartbeatLifecycle(db, callbacks(db));
+    const staleResult = { hotRestart: { adopted: true }, processLossDiagnostic: { retryEligible: false } };
+    const write = await lifecycle.setRunStatusFromLive(run.id, "failed", ["running"], {
+      errorCode: "process_lost", finishedAt: new Date(), resultJson: staleResult,
+    });
+    expect(write.updated).toBe(true);
+    const [persisted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    expect(persisted.status).toBe("failed");
+    expect(persisted.resultJson).toMatchObject({ leftoverProcessSweep: sweep, processLossDiagnostic: { retryEligible: false } });
+  });
+
+  it("keeps sweep evidence recorded between the unlocked read and the legacy terminal transaction", async () => {
+    const sweep = { kind: "leftover_process_sweep", stopped: 1, processes: [{ pid: 4242, command: "sleep 300" }] };
+    const { run } = await fixture({ runtimeMode: "legacy", resultJson: { hotRestart: { adopted: true }, leftoverProcessSweep: sweep } });
+    const staleRun = { ...run, resultJson: { hotRestart: { adopted: true } } };
+    const updated = await terminalizeLegacyExecution({
+      db, run: staleRun, status: "failed", fromStatuses: ["running"],
+      patch: { errorCode: "process_lost", finishedAt: new Date(), resultJson: { hotRestart: { adopted: true }, processLossDiagnostic: { retryEligible: false } } },
+    });
+    expect(updated?.status).toBe("failed");
+    expect(updated?.resultJson).toMatchObject({ leftoverProcessSweep: sweep, processLossDiagnostic: { retryEligible: false } });
   });
 
   it("rechecks native ownership atomically before a terminal write", async () => {
