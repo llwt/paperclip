@@ -36,6 +36,28 @@ async function canonicalDirectory(value: string): Promise<string | null> {
   }
 }
 
+const URL_FORM = /^(?:https?|ssh|git):\/\/(?:[^@/]*@)?([^/:@]+)(?::\d*)?\/(.*)$/i;
+const SCP_FORM = /^[^@/:\s]+@([^/:@\s]+):(?!\/\/)(.*)$/;
+
+/** Reduces equivalent remote URL spellings to `host/path`; unrecognized values (local paths) pass through trimmed. */
+export function normalizeRepositoryIdentity(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const match = URL_FORM.exec(trimmed) ?? SCP_FORM.exec(trimmed);
+  if (!match) return trimmed;
+  const host = match[1]!.toLowerCase();
+  let repoPath = match[2]!.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/, "").replace(/\/+$/, "");
+  if (!repoPath) return trimmed;
+  if (host === "github.com") repoPath = repoPath.toLowerCase();
+  return `${host}/${repoPath}`;
+}
+
+export function sameRepository(a: string | null, b: string | null): boolean {
+  if (a === null || b === null) return false;
+  const left = normalizeRepositoryIdentity(a);
+  return left !== null && left === normalizeRepositoryIdentity(b);
+}
+
 // Read the stored identity, not `remote get-url` which expands transport-only
 // insteadOf settings (including the managed SSH-to-HTTPS credential rewrite).
 async function readOrigin(cwd: string): Promise<string | null> {
@@ -163,7 +185,7 @@ export async function resolvePersistedGitWorkspaceSource(input: {
       const inspection = await inspectManagedGitWorktreeBranch({ worktreePath: existing, repoRoot: owner, expectedBranchName: null });
       if (inspection.inspectionDiagnostic) failedInspection ??= inspection.inspectionDiagnostic;
       if (!inspection.valid || !await hasLinkedWorktreeStorage(existing, owner)) continue;
-      if (workspace.repoUrl && await readOrigin(owner) !== workspace.repoUrl.trim()) {
+      if (workspace.repoUrl && !sameRepository(await readOrigin(owner), workspace.repoUrl)) {
         repositoryMismatch = true;
         continue;
       }
@@ -181,7 +203,7 @@ export async function resolvePersistedGitWorkspaceSource(input: {
   // primary is never a fallback for a missing historical worktree.
   let failedInspection: ManagedGitInspectionDiagnostic | null = null;
   for (const candidate of knownRoots) {
-    if (workspace.repoUrl && await readOrigin(candidate) !== workspace.repoUrl.trim()) continue;
+    if (workspace.repoUrl && !sameRepository(await readOrigin(candidate), workspace.repoUrl)) continue;
     const inspection = await inspectManagedGitWorktreeBranch({ worktreePath: candidate, repoRoot: candidate, expectedBranchName: null });
     if (inspection.valid) return candidate;
     if (inspection.inspectionDiagnostic) failedInspection ??= inspection.inspectionDiagnostic;
@@ -194,7 +216,7 @@ export async function resolvePersistedGitWorkspaceSource(input: {
     const materialized = await input.materializeOriginalRepository();
     const owner = await canonicalDirectory(materialized);
     const expectedRoots = await roots();
-    if (owner && expectedRoots.has(owner) && await readOrigin(owner) === workspace.repoUrl.trim()) return owner;
+    if (owner && expectedRoots.has(owner) && sameRepository(await readOrigin(owner), workspace.repoUrl)) return owner;
   }
   fail(workspace, "source_repository_unavailable");
 }

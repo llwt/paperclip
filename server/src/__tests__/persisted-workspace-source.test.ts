@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { resolvePersistedGitWorkspaceSource } from "../services/persisted-workspace-source.js";
+import { normalizeRepositoryIdentity, resolvePersistedGitWorkspaceSource, sameRepository } from "../services/persisted-workspace-source.js";
 
 const exec = promisify(execFile);
 const roots: string[] = [];
@@ -36,7 +36,47 @@ async function fixture() {
   } };
 }
 
+describe("repository identity comparison", () => {
+  const base = "https://github.com/o/r";
+  it.each([
+    "https://github.com/o/r.git", "https://github.com/o/r/", "https://GitHub.com/O/R", "ssh://git@github.com/o/r.git",
+    "ssh://git@github.com:22/o/r", "git@github.com:o/r.git", "https://x-access-token:abc@github.com/o/r.git",
+    "http://github.com/o/r", "git://github.com/o/r.git", "  https://github.com/o/r  ", "https://github.com/o/r.git/",
+  ])("matches %s with the canonical HTTPS form in both directions", other => {
+    expect(sameRepository(base, other)).toBe(true);
+    expect(sameRepository(other, base)).toBe(true);
+  });
+
+  it.each(["https://github.com/o/other", "https://github.com/other/r", "https://gitlab.com/o/r", "/srv/git/r", ""])(
+    "does not match %j", other => {
+      expect(sameRepository(base, other)).toBe(false);
+      expect(sameRepository(other, base)).toBe(false);
+    });
+
+  it("never matches null or empty values", () => {
+    expect(sameRepository(null, base)).toBe(false);
+    expect(sameRepository(base, null)).toBe(false);
+    expect(sameRepository(null, null)).toBe(false);
+    expect(sameRepository("", "")).toBe(false);
+    expect(sameRepository("  ", base)).toBe(false);
+  });
+
+  it("keeps path case outside github.com and compares local paths as trimmed text", () => {
+    expect(sameRepository("https://example.com/O/R", "https://example.com/o/r")).toBe(false);
+    expect(sameRepository("https://EXAMPLE.com/o/r", "git@example.com:o/r.git")).toBe(true);
+    expect(normalizeRepositoryIdentity(" /srv/git/r.git ")).toBe("/srv/git/r.git");
+    expect(sameRepository("/srv/git/r.git", " /srv/git/r.git")).toBe(true);
+  });
+});
+
 describe("persisted Git workspace source", () => {
+  it("accepts an owner with an SSH origin when the recorded repository is the HTTPS form", async () => {
+    const { original, input } = await fixture();
+    await exec("git", ["-C", original, "remote", "set-url", "origin", "git@github.com:o/r.git"]);
+    const workspace = { ...input.workspace, repoUrl: "https://github.com/o/r" };
+    expect(await resolvePersistedGitWorkspaceSource({ ...input, workspace })).toBe(original);
+  });
+
   it("keeps the original registered source after its project binding is deleted", async () => {
     const { original, replacement, worktree, input } = await fixture();
     const source = await resolvePersistedGitWorkspaceSource(input);
