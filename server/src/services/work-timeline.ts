@@ -1,5 +1,6 @@
 import { withAgentAppearance } from "@paperclipai/shared";
-import { and, asc, desc, eq, gte, inArray, isNull, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, lte, ne, or, sql } from "drizzle-orm";
+import { TASK_VERSION_CHANGED_BY_AGENT_ACTION } from "./task-version-attribution.js";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -252,6 +253,8 @@ export function workTimelineService(db: Db) {
         and(
           eq(activityLog.companyId, input.companyId),
           eq(activityLog.entityType, "issue"),
+          // Fork (SX-2550): internal run attribution, not an event.
+          ne(activityLog.action, TASK_VERSION_CHANGED_BY_AGENT_ACTION),
           gte(activityLog.createdAt, from),
           lte(activityLog.createdAt, to),
         ),
@@ -576,6 +579,8 @@ export function workTimelineService(db: Db) {
             eq(activityLog.companyId, input.companyId),
             eq(heartbeatRuns.companyId, input.companyId),
             eq(activityLog.entityType, "issue"),
+            // Fork (SX-2550): internal run attribution, not an event.
+            ne(activityLog.action, TASK_VERSION_CHANGED_BY_AGENT_ACTION),
             inArray(activityLog.entityId, readableIssueIds),
             runOverlapsWindow(from, to),
           ),

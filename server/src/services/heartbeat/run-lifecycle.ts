@@ -51,6 +51,7 @@ import {
   or,
   sql,
 } from "drizzle-orm";
+import { TASK_VERSION_CHANGED_BY_AGENT_ACTION } from "../task-version-attribution.js";
 import type { Db } from "@paperclipai/db";
 import {
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
@@ -230,6 +231,7 @@ const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
   "cost.reported",
+  TASK_VERSION_CHANGED_BY_AGENT_ACTION, // Fork (SX-2550): internal run attribution.
 ];
 
 export const NON_RETRYABLE_PREFLIGHT_FAILURE_CODES = new Set<string>([
