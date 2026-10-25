@@ -1,7 +1,8 @@
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
-import { DEFERRED_WAKE_CONTEXT_KEY } from "./queue.js";
+import { DEFERRED_WAKE_CONTEXT_KEY, readAssignmentHandoffPredecessor, savedHandoffWakeSql } from "./queue.js";
 import { CANCELLABLE_HEARTBEAT_RUN_STATUSES, HEARTBEAT_RUN_TERMINAL_STATUSES } from "./recovery.js";
 import {
+  isAssignmentHandoffWake,
   isExecutionStageHandoffWakeContext,
   type WakeupOptions,
 } from "./run-preparation.js";
@@ -412,7 +413,9 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
   }
 
   // Differs from upstream (fork, SX-1386). A stage hand-off wake that met an
-  // execution blocker is saved as `deferred_issue_execution`. Start it through
+  // execution blocker is saved as `deferred_issue_execution`. Fork (SX-2418):
+  // so is the new owner's assignment wake after a confirmed reassignment stop;
+  // the wake queue release does not promote it after that acknowledged stop. Start it through
   // normal admission once the blocker is gone. Admission claims the saved row
   // and writes its successor run in one transaction under the issue lock, so a
   // failed or interrupted attempt leaves the row saved for the next retry, and
@@ -431,12 +434,21 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         eq(agentWakeupRequests.companyId, companyId),
         eq(agentWakeupRequests.status, "deferred_issue_execution"),
         sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
-        sql`${agentWakeupRequests.payload}->${DEFERRED_WAKE_CONTEXT_KEY}->>'source' = 'issue.execution_stage'`,
+        savedHandoffWakeSql(),
       )).orderBy(asc(agentWakeupRequests.requestedAt));
       for (const wake of waits) {
         const payload = parseObject(wake.payload);
         const context = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
-        if (!isExecutionStageHandoffWakeContext(context)) continue;
+        // Fork (SX-2418): a saved assignment hand-off behind a confirmed
+        // reassignment stop. Other saved assignment wakes keep their own paths.
+        const assignment = !isExecutionStageHandoffWakeContext(context) &&
+          isAssignmentHandoffWake(wake.source, context);
+        if (!assignment && !isExecutionStageHandoffWakeContext(context)) continue;
+        if (assignment) {
+          const predecessor = await readAssignmentHandoffPredecessor(db, wake, liveRunExecutions);
+          if (predecessor.state === "none") continue;
+          if (predecessor.state === "cleanup_pending") return "blocked";
+        }
         // Admission checks again under the issue lock; this only saves work.
         if (await getExecutionBlocker(db, companyId, issueId)) return "blocked";
         state = "attempted";
@@ -452,7 +464,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           requestedByActorType: (wake.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
           requestedByActorId: wake.requestedByActorId,
           idempotencyKey: wake.idempotencyKey,
-        }, wake.id).catch((err) => {
+        }, wake.id, assignment ? "assignment_handoff" : undefined).catch((err) => {
           logger.warn({ err, wakeId: wake.id, issueId }, "failed to resume deferred execution stage wake");
         });
       }
@@ -496,7 +508,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       eq(agentWakeupRequests.companyId, companyId),
       eq(agentWakeupRequests.status, "deferred_issue_execution"),
       sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
-      sql`${agentWakeupRequests.payload}->${DEFERRED_WAKE_CONTEXT_KEY}->>'source' = 'issue.execution_stage'`,
+      savedHandoffWakeSql(),
       sql`${agentWakeupRequests.payload}->'executionWait'->>'ownerExitTimedOutAt' is null`,
     )).returning({ id: agentWakeupRequests.id });
     if (marked.length > 0) {
