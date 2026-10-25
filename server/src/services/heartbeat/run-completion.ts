@@ -381,8 +381,10 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
 
   // Only a caller that wins the terminal compare-and-set (or, for the live
   // executor, takes the native or owned-Stop late-write exception) writes its
-  // result and runs the effects. A loser of either source only settles the
-  // run's pending accounting receipt, which accountRunCost does at most once.
+  // result and runs the effects. A live loser still settles the run's pending
+  // accounting receipt, which accountRunCost does at most once. An adopted
+  // loser does nothing (SX-1677 plan section 6): the winner or the cost
+  // accounting reconciler settles that receipt.
   async function completeRun(
     input: CompleteHeartbeatRunInput & CompleteHeartbeatRunSource,
   ): Promise<CompleteHeartbeatRunResult> {
@@ -752,9 +754,11 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       }
       lateWrite = persistedRun != null;
       if (!persistedRun) {
-        await accountRunCost(db, run.id, budgetHooks).catch((err) => {
-          logger.error({ err, runId: run.id }, "Late run accounting queued for recovery");
-        });
+        if (input.source !== "adopted_output") {
+          await accountRunCost(db, run.id, budgetHooks).catch((err) => {
+            logger.error({ err, runId: run.id }, "Late run accounting queued for recovery");
+          });
+        }
         logger.info(
           {
             runId: run.id,

@@ -644,6 +644,42 @@ describeSupported("heartbeat run finalization", () => {
       expect(runtime).toMatchObject({ totalInputTokens: 1_000, totalCostCents: 50 });
     });
 
+    it("leaves a pending receipt to the reconciler when an adopted finalizer loses to Stop", async () => {
+      for (const source of [{ source: "execute" }, { source: "adopted_output", recoveredOutcome: "succeeded" }] as const) {
+        const ids = await seed();
+        const row = await runningRun(ids);
+        // Stop won first; the receipt the adapter checkpointed is still pending.
+        await db.update(heartbeatRuns).set({
+          status: "cancelled", finishedAt: new Date(), error: "Stopped", errorCode: "cancelled", costAccountingPending: true,
+          usageJson: { ...usage, costUsd: 0.5, provider: "openai", model: "gpt-x", usageBasis: "per_run", accountingReceiptReady: true },
+        }).where(eq(heartbeatRuns.id, row.run.id));
+        const result = await heartbeat.completeRunForTests(finalizeInput(row, {
+          ...nullExit, usage, usageBasis: "per_run", costUsd: 0.5, provider: "openai", model: "gpt-x",
+        }, source));
+        expect(result).toMatchObject({ won: false, lateWrite: false, run: null });
+        const [stored] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, row.run.id));
+        expect(stored).toMatchObject({ status: "cancelled", error: "Stopped" });
+        const costsAfterLoser = await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, row.run.id));
+        if (source.source === "execute") {
+          // Upstream: the live loser settles the receipt once.
+          expect(stored.costAccountingPending).toBe(false);
+        } else {
+          // The adopted loser runs no accounting at all.
+          expect(stored.costAccountingPending).toBe(true);
+          expect(stored.costAccountedAt).toBeNull();
+          expect(costsAfterLoser).toHaveLength(0);
+        }
+        // Either way the receipt ends up settled exactly once.
+        await heartbeat.reconcileCostAccounting();
+        const [settled] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, row.run.id));
+        expect(settled.costAccountingPending).toBe(false);
+        expect(settled.costAccountedAt).toEqual(expect.any(Date));
+        const costs = await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, row.run.id));
+        expect(costs).toEqual([expect.objectContaining({ costCents: 50, inputTokens: 1_000 })]);
+        if (source.source === "execute") expect(costs).toEqual(costsAfterLoser);
+      }
+    });
+
     it("keeps the native late write for the live executor only", async () => {
       for (const source of [{ source: "execute" }, { source: "adopted_output", recoveredOutcome: "succeeded" }] as const) {
         const ids = await seed();
