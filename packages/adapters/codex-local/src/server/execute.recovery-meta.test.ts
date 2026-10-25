@@ -105,7 +105,65 @@ describe("Codex CLI recovery metadata", () => {
       accounting: { provider: "openai", model: "gpt-test", billingType: "api" },
     });
     expect(typeof (recovery.sessionParams as Record<string, unknown>).cwd).toBe("string");
-    expect(Object.keys(recovery).sort()).toEqual(["accounting", "engine", "sessionIdBefore", "sessionParams", "version"]);
+    expect(Object.keys(recovery).sort()).toEqual(["accounting", "engine", "freshSessionRetry", "sessionIdBefore", "sessionParams", "version"]);
     expect(JSON.stringify(recovery)).not.toContain("sk-openai-super-secret");
+  });
+
+  it("marks only the invocation after an unusable resume session as a fresh-session retry", async () => {
+    runAdapterExecutionTargetProcess
+      .mockImplementationOnce(async () => ({
+        exitCode: 1, signal: null, timedOut: false, stdout: "", stderr: "Error: unknown thread thread-before", pid: 1,
+        startedAt: new Date().toISOString(),
+      }))
+      .mockImplementationOnce(async () => ({
+        exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: 2,
+        startedAt: new Date().toISOString(),
+      }));
+    const metas: Array<Record<string, unknown>> = [];
+
+    await execute({
+      runId: "run-1",
+      agent: { id: "agent-1", companyId: "company-1", name: "Codex Coder", adapterType: "codex_local", adapterConfig: {} },
+      runtime: { sessionId: "thread-before", sessionParams: { sessionId: "thread-before", cwd: process.cwd() }, sessionDisplayId: null, taskKey: null },
+      config: { outputInactivityTimeoutMs: null, model: "gpt-test", env: { OPENAI_API_KEY: "sk-openai-super-secret" } },
+      context: {},
+      onLog: vi.fn(async () => {}),
+      onMeta: async (meta) => {
+        metas.push(meta as unknown as Record<string, unknown>);
+      },
+    });
+
+    const recoveries = metas.map((meta) => meta.recovery as Record<string, unknown>);
+    expect(recoveries).toHaveLength(2);
+    expect(recoveries[0]).toMatchObject({ sessionIdBefore: "thread-before", freshSessionRetry: false });
+    expect(recoveries[1]).toMatchObject({ sessionIdBefore: null, freshSessionRetry: true });
+  });
+
+  it("does not mark a first invocation that could not resume the stored session", async () => {
+    runAdapterExecutionTargetProcess.mockImplementation(async () => ({
+      exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: 1,
+      startedAt: new Date().toISOString(),
+    }));
+    const metas: Array<Record<string, unknown>> = [];
+
+    await execute({
+      runId: "run-1",
+      agent: { id: "agent-1", companyId: "company-1", name: "Codex Coder", adapterType: "codex_local", adapterConfig: {} },
+      runtime: {
+        sessionId: "thread-before",
+        sessionParams: { sessionId: "thread-before", cwd: "/somewhere/else/entirely" },
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: { outputInactivityTimeoutMs: null, model: "gpt-test", env: { OPENAI_API_KEY: "sk-openai-super-secret" } },
+      context: {},
+      onLog: vi.fn(async () => {}),
+      onMeta: async (meta) => {
+        metas.push(meta as unknown as Record<string, unknown>);
+      },
+    });
+
+    expect(metas).toHaveLength(1);
+    expect(metas[0]?.recovery).toMatchObject({ sessionIdBefore: null, freshSessionRetry: false });
   });
 });

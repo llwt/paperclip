@@ -232,6 +232,12 @@ vi.mock("../adapters/index.ts", async () => {
 
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import { getRunLogStore } from "../services/run-log-store.js";
+import * as agentConversations from "../services/agent-conversations.js";
+import { logger } from "../middleware/logger.js";
+import {
+  ADOPTED_OUTPUT_DRAINED_MESSAGE,
+  ADOPTED_OUTPUT_STOPPED_EARLY_MESSAGE,
+} from "../services/adopted-run-result.js";
 import {
   HOT_RESTART_OUTPUT_NOT_CAPTURED_MESSAGE,
   HOT_RESTART_OUTPUT_TAIL_FAILED_MESSAGE,
@@ -5217,6 +5223,570 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(records.map((record) => record.chunk)).toEqual([
         "[paperclip] stopped 2 leftover processes from this run\n",
       ]);
+    });
+  });
+
+  // ---- SX-1746: the reaper records the real result of adopted runs ----
+
+  const CODEX_THREAD_ID = "019a0000-0000-7000-8000-000000000001";
+  const codexJsonLine = (value: unknown) => `${JSON.stringify(value)}\n`;
+  const codexSuccessOutput = [
+    codexJsonLine({ type: "thread.started", thread_id: CODEX_THREAD_ID }),
+    codexJsonLine({ type: "turn.started" }),
+    codexJsonLine({ type: "item.completed", item: { type: "agent_message", text: "final answer" } }),
+    codexJsonLine({ type: "turn.completed", usage: { input_tokens: 100, cached_input_tokens: 40, output_tokens: 9 } }),
+  ];
+  const codexFailureOutput = [
+    codexJsonLine({ type: "thread.started", thread_id: CODEX_THREAD_ID }),
+    codexJsonLine({ type: "turn.started" }),
+    codexJsonLine({ type: "turn.failed", error: { message: "provider rejected the request" } }),
+  ];
+  const CLAUDE_SESSION_ID = "11111111-1111-4111-8111-111111111111";
+  const claudeSuccessOutput = [
+    codexJsonLine({ type: "system", subtype: "init", session_id: CLAUDE_SESSION_ID, model: "claude-opus" }),
+    codexJsonLine({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "All done",
+      session_id: CLAUDE_SESSION_ID,
+      total_cost_usd: 0.42,
+      usage: { input_tokens: 10, cache_creation_input_tokens: 5, cache_read_input_tokens: 7, output_tokens: 3 },
+    }),
+  ];
+
+  function adoptedResultSnapshot(overrides?: {
+    adapterType?: string;
+    engine?: string | null;
+    firstSeq?: number;
+    billingType?: string;
+  }) {
+    return {
+      version: 1,
+      adapterType: overrides?.adapterType ?? "codex_local",
+      taskKey: null,
+      configuredModel: null,
+      session: {
+        previousParams: null,
+        dispatched: { sessionId: null, sessionDisplayId: null, params: null },
+        taskSessionReused: false,
+        rotated: false,
+        rotationReason: null,
+        config: { version: 1, fingerprint: "fp", categories: [], categoryFingerprints: {}, aiCredentialIdentity: null },
+      },
+      configFreshness: {},
+      invocation: {
+        number: 1,
+        firstSeq: overrides?.firstSeq ?? 1,
+        startedAt: "2026-03-19T00:00:00.000Z",
+        engine: overrides && "engine" in overrides ? overrides.engine : "cli",
+        sessionIdBefore: null,
+        freshSessionRetry: false,
+        sessionParams: null,
+        accounting: {
+          provider: overrides?.adapterType === "claude_local" ? "anthropic" : "openai",
+          biller: overrides?.adapterType === "claude_local" ? "anthropic" : "openai",
+          model: null,
+          billingType: overrides?.billingType ?? "api",
+        },
+      },
+    };
+  }
+
+  type AdoptedReceipt = "drained" | "stopped_early" | "gave_up" | "absent";
+
+  // An adopted run whose child is gone: its output is in the run log and the
+  // tail left (or did not leave) a receipt. No relay or child is running.
+  async function seedAdoptedResultRun(input?: {
+    adapterType?: string;
+    snapshotAdapterType?: string;
+    snapshot?: Record<string, unknown> | null;
+    output?: string[];
+    seqs?: number[];
+    receipt?: AdoptedReceipt;
+    outputCapture?: "relay" | "not_captured";
+    processLossRetryCount?: number;
+    agentStatus?: "paused" | "idle" | "running";
+  }) {
+    const adapterType = input?.adapterType ?? "codex_local";
+    const snapshot =
+      input && "snapshot" in input
+        ? input.snapshot
+        : adoptedResultSnapshot({ adapterType: input?.snapshotAdapterType ?? adapterType });
+    const deadChild = spawnAliveProcess();
+    deadChild.kill("SIGKILL");
+    expect(await waitForPidExit(deadChild.pid!)).toBe(true);
+    const fixture = await seedRunFixture({
+      adapterType,
+      agentStatus: input?.agentStatus ?? "running",
+      processPid: deadChild.pid ?? null,
+      processGroupId: null,
+      processLossRetryCount: input?.processLossRetryCount ?? 0,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+        ...(snapshot ? { localResultRecovery: snapshot } : {}),
+      },
+    });
+    const { companyId, agentId, runId } = fixture;
+    const handle = await getRunLogStore().begin({ companyId, agentId, runId });
+    const chunks = input?.output ?? codexSuccessOutput;
+    for (const [index, chunk] of chunks.entries()) {
+      await getRunLogStore().append(handle, {
+        stream: "stdout",
+        chunk,
+        ts: "2026-03-19T00:00:01.000Z",
+        seq: input?.seqs?.[index] ?? index + 1,
+      });
+    }
+    const capture = input?.outputCapture ?? "relay";
+    await db
+      .update(heartbeatRuns)
+      .set({
+        logStore: handle.store,
+        logRef: handle.logRef,
+        nextEventSeq: 3,
+        resultJson: {
+          hotRestart: {
+            adopted: true,
+            adoptedAt: "2026-03-19T00:05:00.000Z",
+            previousServerPid: 111,
+            newServerPid: 222,
+            processPid: deadChild.pid ?? null,
+            processGroupId: null,
+            outputCapture: capture === "relay" ? { mode: "relay", relayPid: 4242 } : { mode: "not_captured" },
+          },
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    const receipt = input?.receipt ?? "drained";
+    if (capture === "relay" && receipt !== "absent") {
+      await db.insert(heartbeatRunEvents).values({
+        companyId,
+        agentId,
+        runId,
+        seq: 2,
+        eventType: "lifecycle",
+        level: receipt === "drained" ? "info" : "warn",
+        message:
+          receipt === "drained"
+            ? ADOPTED_OUTPUT_DRAINED_MESSAGE
+            : receipt === "stopped_early"
+              ? ADOPTED_OUTPUT_STOPPED_EARLY_MESSAGE
+              : HOT_RESTART_OUTPUT_TAIL_FAILED_MESSAGE,
+        payload: receipt === "gave_up" ? { reason: "output_tail_failed" } : { relayPid: 4242 },
+      });
+    }
+    return { ...fixture, deadPid: deadChild.pid! };
+  }
+
+  async function loadRun(runId: string) {
+    return db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]!);
+  }
+
+  async function retryRunsOf(runId: string) {
+    return db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+  }
+
+  function resultRecoveryOf(run: { resultJson: unknown }) {
+    const hotRestart = (run.resultJson as Record<string, unknown> | null)?.hotRestart as
+      | Record<string, unknown>
+      | undefined;
+    return (hotRestart?.resultRecovery ?? null) as Record<string, unknown> | null;
+  }
+
+  it("adopted result: records a recovered success as the run's real result", async () => {
+    const { companyId, agentId, runId, issueId } = await seedAdoptedResultRun();
+    await withTempPaperclipHome(async () => {
+      const heartbeat = heartbeatService(db);
+      const reap = await heartbeat.reapOrphanedRuns();
+      expect(reap).toEqual({ reaped: 1, runIds: [runId] });
+      const run = await loadRun(runId);
+      expect(run).toMatchObject({
+        status: "succeeded",
+        exitCode: null,
+        errorCode: null,
+        sessionIdAfter: CODEX_THREAD_ID,
+      });
+      expect(run.finishedAt).toBeInstanceOf(Date);
+      expect(run.usageJson).toMatchObject({ inputTokens: 60, cachedInputTokens: 40, outputTokens: 9 });
+      expect(run.resultJson).toMatchObject({
+        summary: "final answer",
+        hotRestart: {
+          adopted: true,
+          outputCapture: { mode: "relay" },
+          resultRecovery: { version: 1, source: "run_log", decision: "recovered", outcome: "succeeded", exitCodeKnown: false },
+        },
+      });
+      expect(await retryRunsOf(runId)).toHaveLength(0);
+      const runtime = await db
+        .select()
+        .from(agentRuntimeState)
+        .where(eq(agentRuntimeState.agentId, agentId))
+        .then((rows) => rows[0] ?? null);
+      expect(runtime).toMatchObject({ lastRunId: runId, lastRunStatus: "succeeded" });
+      expect(runtime?.totalInputTokens).toBe(60);
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+      expect(issue.checkoutRunId).not.toBe(runId);
+      void companyId;
+    });
+  });
+
+  it("adopted result: records a recovered provider failure as a failed run without process loss", async () => {
+    const { runId } = await seedAdoptedResultRun({ output: codexFailureOutput });
+    await withTempPaperclipHome(async () => {
+      const reap = await heartbeatService(db).reapOrphanedRuns();
+      expect(reap).toEqual({ reaped: 1, runIds: [runId] });
+      const run = await loadRun(runId);
+      expect(run.status).toBe("failed");
+      expect(run.exitCode).toBeNull();
+      expect(run.errorCode).not.toBe("process_lost");
+      expect(run.error).toContain("provider rejected the request");
+      expect(resultRecoveryOf(run)).toMatchObject({ decision: "recovered", outcome: "failed" });
+      // The ordinary bounded retry of a provider failure applies; process loss does not.
+      const retries = await retryRunsOf(runId);
+      for (const retry of retries) {
+        expect(retry.contextSnapshot).toMatchObject({ retryReason: "transient_failure" });
+        expect(retry.processLossRetryCount).toBe(0);
+      }
+    });
+  });
+
+  it("adopted result: two sweeps account a recovered run once", async () => {
+    const { agentId, runId } = await seedAdoptedResultRun({
+      adapterType: "claude_local",
+      output: claudeSuccessOutput,
+    });
+    await withTempPaperclipHome(async () => {
+      const heartbeat = heartbeatService(db);
+      expect(await heartbeat.reapOrphanedRuns()).toEqual({ reaped: 1, runIds: [runId] });
+      const costs = await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId));
+      expect(costs).toHaveLength(1);
+      const runtimeAfterFirst = await db
+        .select()
+        .from(agentRuntimeState)
+        .where(eq(agentRuntimeState.agentId, agentId))
+        .then((rows) => rows[0]!);
+      expect(runtimeAfterFirst.totalCostCents).toBe(42);
+      const first = await loadRun(runId);
+
+      expect(await heartbeat.reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
+      expect(await heartbeatService(db).reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
+      expect(await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId))).toHaveLength(1);
+      const runtimeAfterSecond = await db
+        .select()
+        .from(agentRuntimeState)
+        .where(eq(agentRuntimeState.agentId, agentId))
+        .then((rows) => rows[0]!);
+      expect(runtimeAfterSecond).toMatchObject({
+        totalInputTokens: runtimeAfterFirst.totalInputTokens,
+        totalOutputTokens: runtimeAfterFirst.totalOutputTokens,
+        totalCostCents: 42,
+      });
+      const second = await loadRun(runId);
+      expect(second.status).toBe("succeeded");
+      expect(second.finishedAt).toEqual(first.finishedAt);
+      expect(second.resultJson).toEqual(first.resultJson);
+    });
+  });
+
+  it("adopted result: two reapers racing on one run record it once", async () => {
+    const { runId } = await seedAdoptedResultRun({ adapterType: "claude_local", output: claudeSuccessOutput });
+    await withTempPaperclipHome(async () => {
+      const results = await Promise.all([
+        heartbeatService(db).reapOrphanedRuns(),
+        heartbeatService(db).reapOrphanedRuns(),
+      ]);
+      expect(results.reduce((sum, result) => sum + result.reaped, 0)).toBe(1);
+      expect(await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId))).toHaveLength(1);
+      expect((await loadRun(runId)).status).toBe("succeeded");
+      expect(await retryRunsOf(runId)).toHaveLength(0);
+    });
+  });
+
+  it("adopted result: Stop that lands first is not overwritten and nothing is accounted", async () => {
+    const { runId } = await seedAdoptedResultRun({ adapterType: "claude_local", output: claudeSuccessOutput });
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", errorCode: "cancelled", error: "Stopped", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+    await withTempPaperclipHome(async () => {
+      expect(await heartbeatService(db).reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
+      const run = await loadRun(runId);
+      expect(run).toMatchObject({ status: "cancelled", errorCode: "cancelled", error: "Stopped" });
+      expect(resultRecoveryOf(run)).toBeNull();
+      expect(await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId))).toHaveLength(0);
+    });
+  });
+
+  it("adopted result: Stop that lands while the log is being read wins", async () => {
+    const { runId } = await seedAdoptedResultRun({ adapterType: "claude_local", output: claudeSuccessOutput });
+    await withTempPaperclipHome(async () => {
+      const store = getRunLogStore();
+      const realRead = store.read.bind(store);
+      let stopped = false;
+      const readSpy = vi.spyOn(store, "read").mockImplementation(async (...args) => {
+        if (!stopped) {
+          stopped = true;
+          await db
+            .update(heartbeatRuns)
+            .set({ status: "cancelled", errorCode: "cancelled", error: "Stopped", finishedAt: new Date() })
+            .where(eq(heartbeatRuns.id, runId));
+        }
+        return realRead(...args);
+      });
+      try {
+        const reap = await heartbeatService(db).reapOrphanedRuns();
+        expect(reap.runIds).not.toContain(runId);
+      } finally {
+        readSpy.mockRestore();
+      }
+      const run = await loadRun(runId);
+      expect(run).toMatchObject({ status: "cancelled", errorCode: "cancelled", error: "Stopped" });
+      expect(resultRecoveryOf(run)).toBeNull();
+      expect(await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId))).toHaveLength(0);
+      expect(await retryRunsOf(runId)).toHaveLength(0);
+    });
+  });
+
+  it("adopted result: the process-gone backstop leaves a run alone while the reaper is reading its output", async () => {
+    const { runId } = await seedAdoptedResultRun({ adapterType: "claude_local", output: claudeSuccessOutput });
+    await withTempPaperclipHome(async () => {
+      const store = getRunLogStore();
+      const realRead = store.read.bind(store);
+      let reading!: () => void;
+      const readingStarted = new Promise<void>((resolve) => {
+        reading = resolve;
+      });
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const readSpy = vi.spyOn(store, "read").mockImplementation(async (...args) => {
+        reading();
+        await gate;
+        return realRead(...args);
+      });
+      const heartbeat = heartbeatService(db);
+      try {
+        const reaping = heartbeat.reapOrphanedRuns();
+        await readingStarted;
+        const sweep = await heartbeat.sweepStaleIssueLocks();
+        expect(sweep.terminalizedRunIds).not.toContain(runId);
+        expect((await loadRun(runId)).status).toBe("running");
+        release();
+        expect(await reaping).toEqual({ reaped: 1, runIds: [runId] });
+      } finally {
+        release();
+        readSpy.mockRestore();
+      }
+      expect((await loadRun(runId)).status).toBe("succeeded");
+    });
+  });
+
+  it("adopted result: a live child or process group prevents finalization", async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", detached: true });
+    childProcesses.add(child);
+    const { runId } = await seedAdoptedResultRun();
+    await db.update(heartbeatRuns).set({ processPid: child.pid ?? null }).where(eq(heartbeatRuns.id, runId));
+    await withTempPaperclipHome(async () => {
+      const heartbeat = heartbeatService(db);
+      expect(await heartbeat.reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
+      expect((await loadRun(runId)).status).toBe("running");
+
+      // A recorded group that still has members also keeps the run live.
+      await db
+        .update(heartbeatRuns)
+        .set({ processPid: null, processGroupId: child.pid ?? null })
+        .where(eq(heartbeatRuns.id, runId));
+      expect(await heartbeat.reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
+      expect((await loadRun(runId)).status).toBe("running");
+      expect(resultRecoveryOf(await loadRun(runId))).toBeNull();
+    });
+  });
+
+  it("adopted result: an active output tail prevents finalization until it has drained", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+      contextSnapshot: {
+        executionEngine: "cli",
+        processTopology: "detached",
+        localResultRecovery: adoptedResultSnapshot(),
+      },
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ logStore: "local_file", logRef: path.join(companyId, agentId, `${runId}.ndjson`) })
+      .where(eq(heartbeatRuns.id, runId));
+    await withTempPaperclipHome(async () => {
+      const heartbeat = heartbeatService(db);
+      await writeFakeRelay(runId, Buffer.from(codexSuccessOutput.slice(0, 2).join("")), "running");
+      expect(await adoptAfterHotRestart(heartbeat, "2026-03-19T00:05:00.000Z")).toMatchObject({
+        adoptedRunIds: [runId],
+      });
+      child.kill("SIGKILL");
+      expect(await waitForPidExit(child.pid!)).toBe(true);
+
+      // The child is gone but the relay is still running, so the tail is active.
+      expect(await heartbeat.reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
+      expect((await loadRun(runId)).status).toBe("running");
+
+      await writeFakeRelay(runId, Buffer.from(codexSuccessOutput.slice(2).join("")), "ended");
+      expect(await heartbeat.waitForAdoptedRunOutputTails()).toBe(true);
+      const records = await readRunLogRecords(companyId, agentId, runId);
+      expect(records.map((record) => record.chunk).join("")).toBe(codexSuccessOutput.join(""));
+
+      expect(await heartbeat.reapOrphanedRuns()).toEqual({ reaped: 1, runIds: [runId] });
+      const run = await loadRun(runId);
+      expect(run).toMatchObject({ status: "succeeded", exitCode: null, sessionIdAfter: CODEX_THREAD_ID });
+      expect(resultRecoveryOf(run)).toMatchObject({ decision: "recovered", receipt: "drained" });
+      expect(await retryRunsOf(runId)).toHaveLength(0);
+    });
+  });
+
+  const fallbackCases: Array<{
+    name: string;
+    reason: string;
+    seed: Parameters<typeof seedAdoptedResultRun>[0];
+    observedSession?: string;
+  }> = [
+    { name: "a tail that gave up", reason: "tail_gave_up", seed: { receipt: "gave_up" }, observedSession: CODEX_THREAD_ID },
+    { name: "a tail that stopped early", reason: "tail_stopped_early", seed: { receipt: "stopped_early" }, observedSession: CODEX_THREAD_ID },
+    { name: "a tail without a receipt", reason: "tail_not_drained", seed: { receipt: "absent" }, observedSession: CODEX_THREAD_ID },
+    { name: "output that was not captured", reason: "output_not_captured", seed: { outputCapture: "not_captured" }, observedSession: CODEX_THREAD_ID },
+    { name: "a run without a recovery snapshot", reason: "snapshot_unavailable", seed: { snapshot: null } },
+    {
+      name: "an ACP run without a CLI engine",
+      reason: "no_recovery_context",
+      seed: { snapshot: adoptedResultSnapshot({ engine: null }) },
+    },
+    {
+      name: "an adapter without a recovery hook",
+      reason: "no_recovery_hook",
+      seed: { adapterType: "gemini_local", snapshot: adoptedResultSnapshot({ adapterType: "gemini_local" }) },
+    },
+    { name: "an agent whose adapter changed", reason: "adapter_changed", seed: { snapshotAdapterType: "claude_local" } },
+    {
+      name: "output with no final event",
+      reason: "hook_inconclusive",
+      seed: { output: codexSuccessOutput.slice(0, 3) },
+      observedSession: CODEX_THREAD_ID,
+    },
+    {
+      name: "output with a malformed final event",
+      reason: "hook_inconclusive",
+      seed: { output: [...codexSuccessOutput.slice(0, 3), '{"type":"turn.completed","usage":\n'] },
+      observedSession: CODEX_THREAD_ID,
+    },
+    {
+      name: "a run log with a missing record",
+      reason: "log_inconclusive",
+      seed: { seqs: [1, 2, 3, 5] },
+    },
+  ];
+
+  // The same lost run with no adoption record: what the reaper did before recovery existed.
+  async function seedPlainProcessLostRun(processLossRetryCount: number) {
+    const deadChild = spawnAliveProcess();
+    deadChild.kill("SIGKILL");
+    expect(await waitForPidExit(deadChild.pid!)).toBe(true);
+    return seedRunFixture({
+      agentStatus: "running",
+      processPid: deadChild.pid ?? null,
+      processGroupId: null,
+      processLossRetryCount,
+      contextSnapshot: { executionEngine: "cli", processTopology: "detached" },
+    });
+  }
+
+  it.each(fallbackCases)(
+    "adopted result: keeps process_lost and the existing retry rule for $name",
+    async ({ reason, seed, observedSession }) => {
+      const { runId } = await seedAdoptedResultRun(seed);
+      const baseline = await seedPlainProcessLostRun(0);
+      await withTempPaperclipHome(async () => {
+        const reap = await heartbeatService(db).reapOrphanedRuns();
+        expect(reap.runIds).toEqual(expect.arrayContaining([runId, baseline.runId]));
+        const run = await loadRun(runId);
+        expect(run).toMatchObject({ status: "failed", errorCode: "process_lost", sessionIdAfter: null });
+        expect(run.resultJson).toMatchObject({
+          hotRestart: { adopted: true, resultRecovery: { version: 1, source: "run_log", reason } },
+        });
+        const recovery = resultRecoveryOf(run);
+        expect(recovery?.decision).not.toBe("recovered");
+        if (observedSession) {
+          expect(recovery?.observedSession).toEqual({ sessionId: observedSession, source: "pre_restart_output" });
+        } else {
+          expect(recovery).not.toHaveProperty("observedSession");
+        }
+        const retries = await retryRunsOf(runId);
+        expect(retries).toHaveLength(1);
+        expect(retries).toHaveLength((await retryRunsOf(baseline.runId)).length);
+      });
+    },
+  );
+
+  it("adopted result: a fallback follows the same retry rule as an ordinary lost run once the retry is spent", async () => {
+    const { runId } = await seedAdoptedResultRun({ receipt: "gave_up", processLossRetryCount: 1 });
+    const baseline = await seedPlainProcessLostRun(1);
+    await withTempPaperclipHome(async () => {
+      expect((await heartbeatService(db).reapOrphanedRuns()).runIds).toEqual(
+        expect.arrayContaining([runId, baseline.runId]),
+      );
+      const run = await loadRun(runId);
+      expect(run).toMatchObject({ status: "failed", errorCode: "process_lost" });
+      expect(resultRecoveryOf(run)).toMatchObject({ reason: "tail_gave_up" });
+      const retries = await retryRunsOf(runId);
+      const baselineRetries = await retryRunsOf(baseline.runId);
+      expect(retries.map((retry) => (retry.contextSnapshot as Record<string, unknown>).retryReason)).toEqual(
+        baselineRetries.map((retry) => (retry.contextSnapshot as Record<string, unknown>).retryReason),
+      );
+    });
+  });
+
+  it("adopted result: an error after the terminal write is logged as a finalization error, not process loss", async () => {
+    const { runId } = await seedAdoptedResultRun({ adapterType: "claude_local", output: claudeSuccessOutput });
+    const settle = vi
+      .spyOn(agentConversations, "settleConversationTurn")
+      .mockRejectedValueOnce(new Error("settle failed after the terminal write"));
+    const logged = vi.spyOn(logger, "error");
+    try {
+      await withTempPaperclipHome(async () => {
+        const reap = await heartbeatService(db).reapOrphanedRuns();
+        expect(reap).toEqual({ reaped: 1, runIds: [runId] });
+        expect(settle).toHaveBeenCalledTimes(1);
+        const run = await loadRun(runId);
+        expect(run).toMatchObject({ status: "succeeded", exitCode: null, errorCode: null });
+        expect(run.errorCode).not.toBe("process_lost");
+        expect(resultRecoveryOf(run)).toMatchObject({ decision: "recovered" });
+        expect(await retryRunsOf(runId)).toHaveLength(0);
+        expect(
+          logged.mock.calls.some(([, message]) => String(message).includes("failed after the terminal write")),
+        ).toBe(true);
+        // A later sweep leaves the finalized run alone.
+        expect(await heartbeatService(db).reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
+        expect(await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId))).toHaveLength(1);
+      });
+    } finally {
+      settle.mockRestore();
+      logged.mockRestore();
+    }
+  });
+
+  it("adopted result: a recovered run needs no retry even when none was spent", async () => {
+    const { runId } = await seedAdoptedResultRun({ processLossRetryCount: 0 });
+    await withTempPaperclipHome(async () => {
+      await heartbeatService(db).reapOrphanedRuns();
+      expect(await retryRunsOf(runId)).toHaveLength(0);
+      expect((await loadRun(runId)).processLossRetryCount).toBe(0);
     });
   });
 

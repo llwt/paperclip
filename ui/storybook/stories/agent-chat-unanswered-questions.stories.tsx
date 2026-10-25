@@ -4,7 +4,6 @@ import { QuestionChat, question } from "../fixtures/unansweredQuestionChat";
 
 const meta = { title: "Chat & Comments/Agent Chat Unanswered Questions", parameters: { layout: "fullscreen" }, component: QuestionChat,
   beforeEach: () => {
-    localStorage.removeItem(`paperclip:task-question-dismissals:user-board:${question.issueId}`);
     for (const key of Object.keys(localStorage)) {
       if (key.includes(`paperclip:task-input:${question.issueId}:`)) localStorage.removeItem(key);
     }
@@ -20,13 +19,14 @@ export const DismissFreshQuestion: Story = { args: {}, play: async ({ canvasElem
   await userEvent.click(canvas.getByRole("button", { name: /^Cancel$/ }));
   await expect(canvas.getByTestId("task-chat-unanswered-question")).toBeVisible();
   await expect(canvas.queryByTestId("task-chat-composer-takeover")).not.toBeInTheDocument();
-  await expect(canvas.getByTestId("task-chat-pending-input-indicator")).toHaveTextContent("1 pending input");
+  await expect(canvas.getByTestId("task-chat-pending-input-indicator")).toHaveTextContent("1 pending");
+  await userEvent.click(canvas.getByTestId("task-chat-pending-input-indicator"));
+  await expect(canvas.getByRole("radio", { name: "Green" })).toBeChecked();
 } };
 export const MovedOn: Story = { args: { movedOn: true }, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement);
   await waitFor(() => expect(canvas.getByTestId("task-chat-unanswered-question")).toBeVisible());
-  await expect(canvas.queryByTestId("task-chat-composer-takeover")).not.toBeInTheDocument();
-  await expect(canvas.getByTestId("task-chat-pending-input-indicator")).toHaveTextContent("1 pending input");
+  await expect(canvas.getByTestId("task-chat-composer-takeover")).toHaveTextContent("Which color should the welcome note use?");
 } };
 export const Reopened: Story = { args: { movedOn: true }, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement);
@@ -47,8 +47,7 @@ export const AnswerLater: Story = { args: { movedOn: true }, play: async ({ canv
 export const MultipleUnanswered: Story = { args: { multiple: true }, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement);
   await waitFor(() => expect(canvas.getAllByTestId("task-chat-unanswered-question")).toHaveLength(2));
-  await expect(canvas.queryByTestId("task-chat-composer-takeover")).not.toBeInTheDocument();
-  await expect(canvas.getByTestId("task-chat-pending-input-indicator")).toHaveTextContent("2 pending inputs");
+  await expect(canvas.getByTestId("task-chat-composer-takeover")).toHaveTextContent("2 pending");
 } };
 export const AnsweredHistory: Story = { args: { answered: true } };
 export const Mobile: Story = { args: { movedOn: true }, globals: { viewport: { value: "mobile", isRotated: false } } };
@@ -59,8 +58,6 @@ export const MoveOnWithoutAnswering: Story = { args: {}, play: async ({ canvasEl
   await userEvent.click(canvas.getByRole("radio", { name: "Green" }));
   await userEvent.type(canvas.getByRole("textbox", { name: "editable markdown" }), "Leave that for later. Tell me about tasks.");
   await userEvent.click(canvas.getByRole("button", { name: /^Send$/ }));
-  await expect(canvas.queryByTestId("task-chat-composer-takeover")).not.toBeInTheDocument();
-  await expect(canvas.getByTestId("task-chat-pending-input-indicator")).toHaveTextContent("1 pending input");
-  await userEvent.click(canvas.getByTestId("task-chat-unanswered-question"));
+  await expect(canvas.getByTestId("task-chat-composer-takeover")).toBeVisible();
   await expect(canvas.getByRole("radio", { name: "Green" })).toBeChecked();
 } };

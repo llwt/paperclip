@@ -79,6 +79,7 @@ function callbacks(db: Db) {
     dispatchPendingNativeStatusWakeups: vi.fn(async () => undefined),
     cancelRunInternal: vi.fn(async () => undefined),
     startNextQueuedRunForAgent: vi.fn(async () => undefined),
+    recoverAdoptedRunResult: vi.fn(async () => ({ kind: "lost" as const })),
     // Fork (SX-1600, SX-1851): adopted-run output and sweep dependencies.
     runLogStore: {} as HeartbeatRecoveryDependencies["runLogStore"],
     getCurrentUserRedactionOptions: vi.fn(async () => ({ enabled: false })),

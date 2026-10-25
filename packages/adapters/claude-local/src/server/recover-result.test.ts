@@ -16,6 +16,7 @@ function context(overrides: Partial<AdapterOutputRecoveryContext> = {}): Adapter
     invocation: {
       firstSeq: null,
       sessionIdBefore: null,
+      freshSessionRetry: false,
       sessionParams: { cwd: "/work", promptBundleKey: "bundle-1", mcpServerIdentity: "[]" },
     },
     accounting: { provider: "anthropic", biller: "anthropic", model: "claude-sonnet", billingType: "subscription" },
@@ -330,15 +331,23 @@ describe("recoverClaudeResultFromOutput", () => {
 
   describe("clearing a stale session after a fresh-session retry", () => {
     const runStart = { sessionIdBefore: OLD_SESSION, sessionDisplayId: OLD_SESSION, sessionParams: null };
+    const retryInvocation = { ...context().invocation, freshSessionRetry: true };
     const noSession = json({ type: "result", subtype: "success", is_error: false, result: "ok" });
 
     it("clears the session when the retry's output names no session id", async () => {
-      const outcome = expectComplete(await recover([noSession], context({ runStart })));
+      const outcome = expectComplete(await recover([noSession], context({ runStart, invocation: retryInvocation })));
       expect(outcome.result).toMatchObject({ sessionId: null, sessionParams: null, clearSession: true });
     });
 
+    it("keeps the stored session when it was never resumable, not retried", async () => {
+      const outcome = expectComplete(await recover([noSession], context({ runStart })));
+      expect(outcome.result).toMatchObject({ sessionId: null, sessionParams: null, clearSession: false });
+    });
+
     it("keeps the session when the retry's output names one", async () => {
-      const outcome = expectComplete(await recover([init(), success()], context({ runStart })));
+      const outcome = expectComplete(
+        await recover([init(), success()], context({ runStart, invocation: retryInvocation })),
+      );
       expect(outcome.result).toMatchObject({ sessionId: SESSION, clearSession: false });
     });
 

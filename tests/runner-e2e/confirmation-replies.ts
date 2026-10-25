@@ -206,8 +206,11 @@ export async function runUnansweredQuestionReturn(context: {
   await page.getByTestId("task-chat-composer-takeover").getByRole("button", { name: "Cancel", exact: true }).click();
   await expect(questionRow()).toBeVisible();
   await expect(page.getByTestId("task-chat-composer-takeover")).toHaveCount(0);
-  await expect(page.getByTestId("task-chat-pending-input-indicator")).toHaveCount(0);
-  await input.capture("question-dismissed", "Dismissing a fresh question leaves only its history card", "question-dismissed.png");
+  await expect(page.getByTestId("task-chat-pending-input-indicator")).toBeVisible();
+  await input.capture("question-dismissed", "Closing a fresh question moves it to the pending-input badge", "question-dismissed.png");
+  await page.getByTestId("task-chat-pending-input-indicator").click();
+  await expect(page.getByTestId("task-chat-composer-takeover")).toBeVisible();
+  await page.getByTestId("task-chat-composer-takeover").getByRole("button", { name: "Cancel", exact: true }).click();
   await questionRow().click();
   await expect(page.getByTestId("task-chat-composer-takeover")).toBeVisible();
 
@@ -221,13 +224,12 @@ export async function runUnansweredQuestionReturn(context: {
     && unrelatedComment && comment.createdAt >= unrelatedComment.createdAt);
   expect(afterMove).toMatchObject({ status: "pending", resolvedAt: null, result: null });
   expect(unrelatedReply?.body).toMatch(/\bParis\b/i);
-  await expect(page.getByTestId("task-chat-pending-input-indicator")).toHaveCount(0);
+  // A later message does not take the pending question out of the dock.
+  await expect(page.getByTestId("task-chat-composer-takeover")).toContainText(/color/i);
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(questionRow()).toBeVisible();
-  await expect(page.getByTestId("task-chat-composer-input")).toBeVisible();
-  await expect(page.getByTestId("task-chat-composer-takeover")).toHaveCount(0);
-  await expect(page.getByTestId("task-chat-pending-input-indicator")).toHaveCount(0);
-  await input.capture("question-left-unanswered", "After reload: question stays in history without a duplicate composer reminder", "question-left-unanswered.png");
+  await expect(page.getByTestId("task-chat-composer-takeover")).toContainText(/color/i);
+  await input.capture("question-left-unanswered", "After reload: the unanswered question is docked again and stays in history", "question-left-unanswered.png");
 
   await questionRow().click();
   const form = page.getByTestId("task-chat-composer-takeover");
