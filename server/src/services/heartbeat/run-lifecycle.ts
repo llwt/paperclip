@@ -36,7 +36,7 @@ import {
   CONVERSATION_CONTINUATION_POLICY,
   isConversationAdapter,
 } from "../conversation-continuation.js";
-import { terminalizeLegacyExecution } from "../legacy-execution-recovery.js";
+import { preserveLeftoverProcessSweep, terminalizeLegacyExecution } from "../legacy-execution-recovery.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "../heartbeat-run-status-payload.js";
 import { randomUUID } from "node:crypto";
 import {
@@ -1109,6 +1109,12 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     if (previousStatus && patch?.resultJson !== undefined) patch = { ...patch,
       resultJson: preserveWorkspaceRestoreRecoveryMetadata(previousStatus.resultJson, patch.resultJson),
     };
+
+    // The orphan reaper builds its result from the row it read earlier, so
+    // carry over leftover sweep evidence recorded since. The xmin fence on the
+    // native write makes this read the row it replaces; legacy runs repeat the
+    // carry-over against the locked row in terminalizeLegacyExecution.
+    patch = preserveLeftoverProcessSweep(previousStatus?.resultJson, patch, status);
 
     // Preserve the receipt-source fence when finalization enriches usage. A
     // late spool replay must still be able to complete an unfinished receipt.
