@@ -18,12 +18,26 @@ describe("parseCodexJsonl", () => {
     const parsed = parseCodexJsonl(JSON.stringify(completed));
     expect(parsed.usageBasis).toBe("session_cumulative");
     expect(parsed.usage).toEqual({
-      inputTokens: completed.usage.input_tokens,
+      // Upstream v2026.1023.0 stores cache hits apart from input.
+      inputTokens: completed.usage.input_tokens - completed.usage.cached_input_tokens,
       cachedInputTokens: completed.usage.cached_input_tokens,
       outputTokens: completed.usage.output_tokens,
     });
   });
 
+  it.each(["turn.failed", "error", "turn.completed"])("does not invent zero usage for %s without counters", (type) => {
+    expect(parseCodexJsonl(JSON.stringify({ type }))).toMatchObject({
+      sawProtocolTerminalEvent: true, usageReported: false, usageComplete: false,
+    });
+  });
+  it.each([{}, { input_tokens: 0 }, { input_tokens: -1, output_tokens: 0 }, { input_tokens: 1, output_tokens: 0, cached_input_tokens: 2 }])("rejects missing or invalid completion counters: %j", (usage) => {
+    expect(parseCodexJsonl(JSON.stringify({ type: "turn.completed", usage })).usageComplete).toBe(false);
+  });
+  it("distinguishes explicit zero usage from missing usage", () => {
+    expect(parseCodexJsonl(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 0, output_tokens: 0 } }))).toMatchObject({
+      usageReported: true, usageComplete: true, usage: { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 },
+    });
+  });
   it("captures session id, assistant summary, usage, and error message", () => {
     const stdout = [
       JSON.stringify({ type: "thread.started", thread_id: "thread_123" }),
@@ -42,7 +56,7 @@ describe("parseCodexJsonl", () => {
       sessionId: "thread_123",
       summary: "Recovered response",
       usage: {
-        inputTokens: 10,
+        inputTokens: 8,
         cachedInputTokens: 2,
         outputTokens: 4,
       },
@@ -50,6 +64,8 @@ describe("parseCodexJsonl", () => {
       errorMessage: "resume failed",
       sawProtocolEvent: true,
       sawProtocolTerminalEvent: true,
+      usageReported: true,
+      usageComplete: false,
     });
   });
 
@@ -78,7 +94,7 @@ describe("parseCodexJsonl", () => {
       sessionId: "thread_123",
       summary: "Fixed the issue and verified the targeted tests pass.",
       usage: {
-        inputTokens: 10,
+        inputTokens: 8,
         cachedInputTokens: 2,
         outputTokens: 4,
       },
@@ -86,6 +102,8 @@ describe("parseCodexJsonl", () => {
       errorMessage: null,
       sawProtocolEvent: true,
       sawProtocolTerminalEvent: true,
+      usageReported: true,
+      usageComplete: true,
     });
   });
 });

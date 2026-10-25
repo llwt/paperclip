@@ -6,6 +6,7 @@ import { WebSocketServer } from "ws";
 import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  costEvents,
   activityLog,
   authUsers,
   agentWakeupRequests,
@@ -103,6 +104,7 @@ async function deleteHeartbeatRunsAndWakeupsAfterActivityLogDrains(db: Db) {
     await db.delete(activityLog);
     try {
       await db.delete(heartbeatRunEvents);
+      await db.delete(costEvents);
       await db.delete(heartbeatRuns);
       await db.delete(agentWakeupRequests);
       return;
@@ -1366,10 +1368,8 @@ describeEmbeddedPostgres(
       expect(
         unmentionedComment.status,
         JSON.stringify(unmentionedComment.body),
-      ).toBe(403);
-      expect(unmentionedComment.body.details.code).toBe(
-        "issue_write_actor_class_excluded",
-      );
+      ).toBe(404);
+      expect(unmentionedComment.body).toEqual({ error: "Issue not found" });
     });
 
     it("propagates denied low-trust policy conflicts on control-plane guards", async () => {
@@ -1736,7 +1736,7 @@ describeEmbeddedPostgres(
         const before = await snapshot(db);
         const res = await attempt.req();
         expect(res.status, `${attempt.id}: ${JSON.stringify(res.body)}`).toBe(
-          403,
+          ["LT approvals", "LT-15/16", "LT-19", "LT-26 child", "LT-26 child with unauthorized assignee", "LT-26 company issue", "LT-26 interaction", "LT-06 resume", "LT-06 blocker mutation"].includes(attempt.id) ? 403 : 404,
         );
         expectNoCanary(res.body, ...forbiddenMarkers);
         const after = await snapshot(db);
@@ -1796,6 +1796,32 @@ describeEmbeddedPostgres(
         beforeBulkSummary.wakeups.length,
       );
       expect(afterBulkSummary.runs.length).toBe(beforeBulkSummary.runs.length);
+    });
+
+    it("lets a task bridge key create an issue in its own scope project and refuses other projects", async () => {
+      const fixture = await seedLowTrustFixture(db);
+      const bridgeActor: Express.Request["actor"] = {
+        ...agentActor(fixture, fixture.agents.standard.id),
+        runId: null,
+        source: "agent_key",
+        keyId: randomUUID(),
+        keyScope: { kind: "task_bridge", projectId: fixture.projects.allowed.id },
+      };
+      const app = createApp(db, bridgeActor);
+
+      const ok = await request(app)
+        .post(`/api/companies/${fixture.company.id}/issues`)
+        .send({ title: "Bridge issue in scope project", projectId: fixture.projects.allowed.id });
+      expect(ok.status, JSON.stringify(ok.body)).toBe(201);
+      expect(ok.body.projectId).toBe(fixture.projects.allowed.id);
+
+      const refused = await request(app)
+        .post(`/api/companies/${fixture.company.id}/issues`)
+        .send({ title: "Bridge issue in other project", projectId: fixture.projects.outOfScope.id });
+      expect([403, 404], JSON.stringify(refused.body)).toContain(refused.status);
+      const leaked = await db.select({ id: issues.id }).from(issues)
+        .where(eq(issues.projectId, fixture.projects.outOfScope.id));
+      expect(leaked.map((row) => row.id)).not.toContain(refused.body.id);
     });
 
     it("denies skill-test scoped tokens on foreign issue-adjacent reads", async () => {
@@ -1879,7 +1905,7 @@ describeEmbeddedPostgres(
       for (const attempt of attempts) {
         const res = await attempt.req();
         expect(res.status, `${attempt.id}: ${JSON.stringify(res.body)}`).toBe(
-          403,
+          404,
         );
         expectNoCanary(res.body, ...forbiddenMarkers);
       }

@@ -167,6 +167,9 @@ export async function recoverCodexResultFromOutput(
 
   const sessionId = state.sessionId ?? context.invocation.sessionIdBefore;
   const sessionParams = sessionId ? { ...(context.invocation.sessionParams ?? {}), sessionId } : null;
+  // Same as execute(): a fresh-session retry that never produced a session id leaves the old session stale.
+  const clearSession =
+    !sessionId && context.invocation.sessionIdBefore === null && context.runStart.sessionIdBefore !== null;
   const base = {
     exitCode: null,
     signal: null,
@@ -194,9 +197,16 @@ export async function recoverCodexResultFromOutput(
         errorCode: null,
         errorFamily: null,
         retryNotBefore: null,
-        ...(usage ? { usage, usageBasis: "session_cumulative" as const } : {}),
+        // Same counters as parseCodexJsonl: since upstream v2026.1023.0 the
+        // input count excludes cache hits, which Paperclip stores separately.
+        ...(usage
+          ? {
+              usage: { ...usage, inputTokens: Math.max(0, usage.inputTokens - usage.cachedInputTokens) },
+              usageBasis: "session_cumulative" as const,
+            }
+          : {}),
         resultJson: { terminalEvent: ending.event },
-        clearSession: false,
+        clearSession,
       },
     };
   }
@@ -236,7 +246,7 @@ export async function recoverCodexResultFromOutput(
           : {}),
         ...(providerQuota && retryNotBefore ? { providerQuotaRetryNotBefore: retryNotBefore.toISOString() } : {}),
       },
-      clearSession: false,
+      clearSession,
     },
   };
 }

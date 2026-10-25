@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { markMcpHttpResponseFailure, retainMcpConnectionFailure, withMcpConnectionFailure } from "./mcp-connection-failure.js";
 // Helpers for talking to remote MCP servers over the Streamable HTTP transport.
 //
 // The MCP Streamable HTTP spec requires the client to advertise that it accepts
@@ -109,22 +110,23 @@ export async function initializeMcpHttpSession(input: {
     }),
   });
   if (!initializeResponse.ok) {
-    throw new McpHttpInitializationError(
+    throw markMcpHttpResponseFailure(initializeResponse, new McpHttpInitializationError(
       `Remote MCP initialization returned HTTP ${initializeResponse.status}`,
       "initialize",
       initializeResponse.status,
       initializeResponse,
-    );
+    ));
   }
   let payload: unknown;
   try {
-    payload = await readMcpHttpResponse(initializeResponse, `${input.requestId}-initialize`, { signal: input.signal });
+    payload = await withMcpConnectionFailure(() =>
+      readMcpHttpResponse(initializeResponse, `${input.requestId}-initialize`, { signal: input.signal }));
   } catch (error) {
     input.signal?.throwIfAborted();
     // A bounded response still proves the server answered. Preserve the size
     // reason so callers can leave connection health unchanged.
     if (error instanceof McpHttpResponseError && error.reason === "too_large") throw error;
-    throw new McpHttpInitializationError("Remote MCP initialization returned an invalid response", "initialize", null);
+    throw retainMcpConnectionFailure(error, new McpHttpInitializationError("Remote MCP initialization returned an invalid response", "initialize", null));
   }
   const result = payload && typeof payload === "object" && "result" in payload
     ? (payload as { result?: unknown }).result
@@ -150,11 +152,11 @@ export async function initializeMcpHttpSession(input: {
     }),
   });
   if (!initializedResponse.ok) {
-    throw new McpHttpInitializationError(
+    throw markMcpHttpResponseFailure(initializedResponse, new McpHttpInitializationError(
       `Remote MCP initialized notification returned HTTP ${initializedResponse.status}`,
       "initialized_notification",
       initializedResponse.status,
-    );
+    ));
   }
   return sessionHeaders;
 }
@@ -222,7 +224,7 @@ export function parseMcpHttpResponseBody(bodyText: string, contentType: string |
  * keep a stream alive without answering, and each chunk resets the transport's
  * idle deadline, so a caller whose request carries no deadline of its own must
  * pass one here. An abort rejects with the signal's reason and cancels the stream.
- * Differs from upstream v2026.1012.0, which has no `signal` here or in
+ * Differs from upstream v2026.1023.0, which has no `signal` here or in
  * initializeMcpHttpSession. Keep this when porting to a newer base. */
 export async function readMcpHttpResponse(
   response: Response,
@@ -280,7 +282,7 @@ export async function readMcpHttpResponse(
   const event = async (value: string) => {
     const data = value.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).replace(/^ /, "")).join("\n");
     if (!data) return undefined;
-    // Differs from upstream v2026.1012.0, which fails the whole call on a
+    // Differs from upstream v2026.1023.0, which fails the whole call on a
     // non-JSON event. Skip it and keep reading, as parseMcpHttpResponseBody
     // does, so a stray keep-alive or comment-like event before the result does
     // not fail the call (and, in the gateway, mark the connection errored).
@@ -325,10 +327,14 @@ const sessions = new Map<string, { headers: Record<string, string>; expiresAt: n
 const initializing = new Map<string, Promise<Record<string, string>>>();
 const SESSION_TTL_MS = 30 * 60_000;
 
+function mcpHttpSessionKey(scope: string, headers: Record<string, string> | undefined) {
+  return `${scope}:${createHash("sha256").update(JSON.stringify(Object.entries(headers ?? {}).sort())).digest("hex")}`;
+}
+
 /** Cache only protocol headers; credential hashes and scope separate every
  * connection and effective identity. Never cache a tool call or replay a write. */
 export async function getMcpHttpSession(input: Parameters<typeof initializeMcpHttpSession>[0] & { scope: string }) {
-  const key = `${input.scope}:${createHash("sha256").update(JSON.stringify(Object.entries(input.headers ?? {}).sort())).digest("hex")}`;
+  const key = mcpHttpSessionKey(input.scope, input.headers);
   const cached = sessions.get(key);
   if (cached && cached.expiresAt > Date.now()) return { ...input.headers, ...cached.headers };
   const pending = initializing.get(key);
@@ -343,6 +349,15 @@ export async function getMcpHttpSession(input: Parameters<typeof initializeMcpHt
   }).finally(() => { if (initializing.get(key) === promise) initializing.delete(key); });
   initializing.set(key, promise);
   return promise;
+}
+
+/** Drop one identity's cached session after the server may have ended it. Other
+ * identities, in-flight initializations, and a session that already replaced
+ * the failed one are kept. */
+export function forgetMcpHttpSession(input: { scope: string; headers?: Record<string, string>; sessionId: string }) {
+  const key = mcpHttpSessionKey(input.scope, input.headers);
+  const cached = sessions.get(key);
+  if (cached && new Headers(cached.headers).get("mcp-session-id") === input.sessionId) sessions.delete(key);
 }
 
 export function forgetMcpHttpSessions(connectionId: string) {

@@ -1,21 +1,95 @@
 import { isPreDispatchReviewWait } from "./pre-dispatch-review-wait.js";
-import { and, desc, eq, gt, inArray, not, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, not, or, sql, type SQL } from "drizzle-orm";
 import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
 import { z } from "zod";
-import { agentWakeupRequests, chatConversations, chatEndpoints, heartbeatRuns, issueComments, issues, issueRecoveryActions, toolConnections, type Db } from "@paperclipai/db";
-import { canContinueCancelledRun, readRunCancellation } from "./run-cancellation.js";
+import { agentWakeupRequests, chatConversations, chatEndpoints, environmentLeases, heartbeatRuns, issueComments, issues, issueRecoveryActions, toolConnections, type Db } from "@paperclipai/db";
+import { adapterExecutionControls } from "./adapter-execution-control.js";
+import { canContinueCancelledRun, isConfirmedReassignmentStop, readRunCancellation } from "./run-cancellation.js";
 import { canRetryStoppedRun } from "./cancelled-native-startup.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { EXECUTION_RECONCILIATION_CAUSES, type ExecutionBlocker } from "@paperclipai/shared";
+import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "./workspace-restore-recovery-state.js";
+import { isPidAlive } from "./local-service-supervisor.js";
 
 /** Resolved recovery bookkeeping can still carry an effective no-replay hold. */
 export function executionBlockerPredicate() {
   return and(
     not(conversationRecoveryActionPredicate()!),
     inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
+    // A repair run cancelled at the dispatch gate never reached the provider.
+    // Holds that earlier code wrote for it must not block or skip later wakes.
+    sql`coalesce(${issueRecoveryActions.evidence}->>'originalFailureCode', '') <> 'legacy_disposition_repair_suppressed'`,
     or(inArray(issueRecoveryActions.status, ["active", "escalated"]),
       sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`),
   );
+}
+
+const TERMINAL_RUN_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
+
+function runIdOf(action: typeof issueRecoveryActions.$inferSelect) {
+  const parsed = z.string().guid().safeParse(action.evidence.runId ?? action.evidence.sourceRunId);
+  return parsed.success ? parsed.data : null;
+}
+
+// Differs from upstream (fork, SX-2384). A resolved no-replay hold means "do not
+// replay that agent's uncertain work". Once the stopped run has fully ended and
+// the task belongs to someone else, a fresh run by the new owner is not a
+// replay, so the hold must not save that owner's stage and comment wakes.
+function isHoldForFormerOwner(
+  action: typeof issueRecoveryActions.$inferSelect,
+  run: typeof heartbeatRuns.$inferSelect | undefined,
+  assigneeAgentId: string | null,
+) {
+  if (action.status !== "resolved") return false;
+  const automaticRecovery = action.evidence.automaticRecovery as Record<string, unknown> | undefined;
+  if (automaticRecovery?.replay !== "blocked") return false;
+  if (!run || !TERMINAL_RUN_STATUSES.has(run.status) || !run.finishedAt || adapterExecutionControls.has(run.id)) return false;
+  return run.agentId !== assigneeAgentId && action.returnOwnerAgentId !== assigneeAgentId;
+}
+
+// Differs from upstream (fork, SX-1735, SX-2419). Before the reassignment stop
+// fix, a confirmed stop was settled as a no-replay hold. Those holds stay in the
+// table as audit history, but a run that was stopped on purpose, has ended, and
+// holds nothing live is not uncertain work, so it must not block any assignee.
+function isHoldForConfirmedReassignmentStop(
+  action: typeof issueRecoveryActions.$inferSelect,
+  run: typeof heartbeatRuns.$inferSelect | undefined,
+  liveEnvironmentLeaseRunIds: Set<string>,
+) {
+  if (action.status !== "resolved") return false;
+  const automaticRecovery = action.evidence.automaticRecovery as Record<string, unknown> | undefined;
+  if (automaticRecovery?.replay !== "blocked") return false;
+  if (!run || !run.finishedAt || adapterExecutionControls.has(run.id) || !isConfirmedReassignmentStop(run)) return false;
+  if (run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" || hasRequiredWorkspaceRecovery(run.resultJson)) return false;
+  if (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt.getTime() > Date.now()) return false;
+  if (run.processPid !== null && isPidAlive(run.processPid)) return false;
+  return !liveEnvironmentLeaseRunIds.has(run.id);
+}
+
+async function firstBlockingAction(db: Db, companyId: string, issueId: string, assigneeAgentId: string | null, afterBoundary: SQL | undefined) {
+  const actions = await db.select().from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, companyId),
+    eq(issueRecoveryActions.sourceIssueId, issueId),
+    executionBlockerPredicate(),
+    afterBoundary,
+  )).orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id));
+  const runIds = [...new Set(actions.map(runIdOf).filter((id): id is string => id !== null))];
+  const runs = runIds.length ? await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, runIds),
+  )) : [];
+  const runsById = new Map(runs.map((run) => [run.id, run]));
+  const stoppedRunIds = runs.filter(isConfirmedReassignmentStop).map((run) => run.id);
+  const liveLeases = stoppedRunIds.length ? await db.select({ runId: environmentLeases.heartbeatRunId }).from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, stoppedRunIds),
+    eq(environmentLeases.status, "active"), sql`${environmentLeases.releasedAt} is null`,
+  )) : [];
+  const liveEnvironmentLeaseRunIds = new Set(liveLeases.flatMap((lease) => lease.runId ? [lease.runId] : []));
+  return actions.find((action) => {
+    const runId = runIdOf(action);
+    const run = runId ? runsById.get(runId) : undefined;
+    return !isHoldForFormerOwner(action, run, assigneeAgentId) &&
+      !isHoldForConfirmedReassignmentStop(action, run, liveEnvironmentLeaseRunIds);
+  });
 }
 
 export async function getExecutionBlocker(db: Db, companyId: string, issueId: string, options?: { conversationResetCommentId?: string | null }): Promise<ExecutionBlocker | null> {
@@ -24,13 +98,16 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     assigneeAgentId: issues.assigneeAgentId }).from(issues).where(and(
     eq(issues.companyId, companyId), eq(issues.id, issueId),
   )).limit(1);
-  // Resetting model context cannot make an unsafe workspace safe. This hold
+  // Resetting model context cannot repair or recover a workspace. This hold
   // survives conversation boundaries until the existing repair/reconciliation path clears it.
   const [restoreHold] = await db.select().from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, companyId),
     eq(issueRecoveryActions.sourceIssueId, issueId),
     executionBlockerPredicate(),
-    sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
+    or(
+      sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
+      sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`,
+    ),
   )).orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
   // A persisted user /new is an ordered context command, not a retry of uncertain work.
   // The normal issue execution lock still serializes it behind any active turn.
@@ -61,15 +138,10 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
       : ownership.nextAction;
     return { ...ownership, nextAction, recoveryActionId: null };
   }
-  const [action] = restoreHold ? [restoreHold] : await db.select().from(issueRecoveryActions).where(and(
-    eq(issueRecoveryActions.companyId, companyId),
-    eq(issueRecoveryActions.sourceIssueId, issueId),
-    executionBlockerPredicate(),
-    boundary ? gt(issueRecoveryActions.createdAt, boundary.createdAt) : undefined,
-  )).orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id)).limit(1);
+  const action = restoreHold ? restoreHold : await firstBlockingAction(db, companyId, issueId, conversation?.assigneeAgentId ?? null,
+    boundary ? gt(issueRecoveryActions.createdAt, boundary.createdAt) : undefined);
   if (!action) return null;
-  const parsedRunId = z.string().guid().safeParse(action.evidence.runId ?? action.evidence.sourceRunId);
-  const runId = parsedRunId.success ? parsedRunId.data : null;
+  const runId = runIdOf(action);
   const [run] = runId ? await db.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId),
   )).limit(1) : [];
@@ -92,9 +164,9 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
         or consumed.context_snapshot->'wakeCommentIds' @> jsonb_build_array(${issueComments.id}::text)))`,
   )) : [];
   const cancellation = run ? readRunCancellation(run.resultJson) : null;
-  const eligibleContinuation = Boolean(run && conversation?.assigneeAgentId === run.agentId &&
+  const eligibleContinuation = Boolean(!restoreHold && run && conversation?.assigneeAgentId === run.agentId &&
     !["done", "cancelled"].includes(conversation.status) && canContinueCancelledRun(run));
-  const canRetry = Boolean(run && conversation?.assigneeAgentId === run.agentId &&
+  const canRetry = Boolean(!restoreHold && run && conversation?.assigneeAgentId === run.agentId &&
     !["done", "cancelled"].includes(conversation.status) && await canRetryStoppedRun(db, run));
   const runError = run && canRetry && isPreDispatchReviewWait(run)
     ? "Waiting for review; this continuation never started."
@@ -122,7 +194,7 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     } else {
       nextAction = "Send a new chat message to continue this conversation.";
     }
-  } else if (run?.status === "cancelled" && !eligibleContinuation && !canRetry && action.cause === "legacy_execution_requires_reconciliation") {
+  } else if (!restoreHold && run?.status === "cancelled" && !eligibleContinuation && !canRetry && action.cause === "legacy_execution_requires_reconciliation") {
     nextAction += " Inspect the run before sending a new message to request continuation.";
   }
 
@@ -137,6 +209,7 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     runError: runError?.slice(0, 1024) ?? null,
     canContinue: eligibleContinuation && !chatBinding,
     canRetry: canRetry && !chatBinding,
+    ...(restoreHold ? { workspaceRepairRequired: true } : {}),
     savedMessageCount: saved.length,
   };
 }

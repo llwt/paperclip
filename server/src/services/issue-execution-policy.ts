@@ -325,12 +325,9 @@ function nextAssigneeIds(input: {
 export function stripMonitorFromExecutionPolicy(policy: IssueExecutionPolicy | null): IssueExecutionPolicy | null {
   if (!policy) return null;
   if (!policy.monitor) return policy;
-  if (policy.stages.length === 0) return null;
-  return {
-    mode: policy.mode,
-    commentRequired: policy.commentRequired,
-    stages: policy.stages,
-  };
+  const { monitor: _monitor, ...rest } = policy;
+  if (rest.stages.length === 0 && !rest.reviewPreset && !rest.authorizationPolicy) return null;
+  return rest;
 }
 
 export function setIssueExecutionPolicyMonitorScheduledBy(
@@ -401,7 +398,8 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
   const reviewPreset = parsed.data.reviewPreset;
   const authorizationPolicy = parsed.data.authorizationPolicy;
 
-  if (stages.length === 0 && !monitor && !reviewPreset && !authorizationPolicy) return null;
+  if (stages.length === 0 && !monitor && !reviewPreset && !authorizationPolicy
+    && parsed.data.maxReviewRounds == null) return null;
 
   return {
     mode: parsed.data.mode ?? "normal",
@@ -845,6 +843,16 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         requestedStatus !== "in_progress"
       ) {
         patch.executionState = null;
+        return { patch };
+      }
+
+      // Parking the task on a blocker is not a decision: keep the participant
+      // as assignee and current participant, and record no decision (a counted
+      // decision at the round cap would escalate the task to a human).
+      if (requestedStatus === "blocked") {
+        if (requestedAssigneePatchProvided && !principalsEqual(explicitAssignee, currentParticipant)) {
+          throw unprocessable("Only the active reviewer or approver can advance the current execution stage");
+        }
         return { patch };
       }
 

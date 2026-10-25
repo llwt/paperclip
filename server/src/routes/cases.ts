@@ -999,15 +999,18 @@ export function caseRoutes(db: Db, storage: StorageService) {
       });
       await autoLinkRunIssue(tx, { companyId: caseRow.companyId, caseId: caseRow.id, actor, role: "work" });
       return {
-        document: {
-          ...document!,
-          title: body.title ?? document!.title,
-          format: body.format,
-          latestBody: body.body,
-          latestRevisionId: revision!.id,
-          latestRevisionNumber: revision!.revisionNumber,
-          updatedAt: now,
-        },
+        document: caseDocumentResponse({
+          key,
+          document: {
+            ...document!,
+            title: body.title ?? document!.title,
+            format: body.format,
+            latestBody: body.body,
+            latestRevisionId: revision!.id,
+            latestRevisionNumber: revision!.revisionNumber,
+            updatedAt: now,
+          },
+        }),
         revision,
       };
     });
