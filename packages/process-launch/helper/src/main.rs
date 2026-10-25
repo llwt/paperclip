@@ -89,9 +89,11 @@ fn parse(argv: Vec<OsString>) -> Option<Invocation> {
         let Some(value) = rest.next() else {
             return None;
         };
-        if value == "--" {
-            // A flag without a value directly before the target separator.
-            // Treat the target as found and the options as invalid.
+        // `--argv0` takes any text, `--` included: it is the target's own
+        // argv[0]. For the other flags a value of `--` means the flag had no
+        // value before the target separator. Treat the target as found and
+        // the options as invalid.
+        if value == "--" && flag != "--argv0" {
             options.invalid = true;
             break;
         }
@@ -266,12 +268,12 @@ fn exec_target(file: &OsStr, argv: &[CString]) -> i32 {
     let mut saw_eacces = false;
     let mut result = libc::ENOENT;
     for entry in search_path().split(|byte| *byte == b':') {
-        let mut candidate = if entry.is_empty() {
-            b".".to_vec()
-        } else {
-            entry.to_vec()
-        };
-        candidate.push(b'/');
+        // An empty entry is the current directory, spelled as the bare name
+        // (no `./`), as glibc and libuv do; a script sees it in `$0`.
+        let mut candidate = entry.to_vec();
+        if !entry.is_empty() {
+            candidate.push(b'/');
+        }
         candidate.extend_from_slice(bytes);
         let Ok(path) = CString::new(candidate) else {
             continue;
@@ -426,6 +428,22 @@ mod tests {
         assert_eq!(invocation.file, "true");
         let invocation = parse(os(&["helper", "--busctl", "relative", "--", "true"])).unwrap();
         assert!(invocation.options.invalid);
+    }
+
+    #[test]
+    fn accepts_the_separator_text_as_argv0() {
+        let invocation = parse(os(&[
+            "helper", "--argv0", "--", "--unit", "a.scope", "--", "node", "x",
+        ]))
+        .unwrap();
+        assert!(!invocation.options.invalid);
+        assert_eq!(invocation.options.argv0.as_deref(), Some(OsStr::new("--")));
+        assert_eq!(invocation.options.unit.as_deref(), Some("a.scope"));
+        assert_eq!(invocation.file, "node");
+        assert_eq!(invocation.args, os(&["x"]));
+        let invocation = parse(os(&["helper", "--argv0", "--", "--", "--"])).unwrap();
+        assert!(!invocation.options.invalid);
+        assert_eq!(invocation.file, "--");
     }
 
     #[test]

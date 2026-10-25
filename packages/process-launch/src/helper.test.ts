@@ -281,6 +281,44 @@ for (const mode of modes) {
       }
     });
 
+    it("passes an argv0 that reads like the option separator", async () => {
+      const registryDir = temp.make();
+      registries.push(registryDir);
+      const target: LaunchTarget = {
+        command: process.execPath,
+        args: ["-e", "console.log(JSON.stringify({ argv0: process.argv0, argv: process.argv.slice(1) }))", "--", "x"],
+        options: { argv0: "--" },
+      };
+      const direct = await collect(spawn(target.command, target.args!, target.options!));
+      expect(direct.code).toBe(0);
+      const wrapped = spawnIsolated(target, { policy: mode.policy(registryDir), owner });
+      const result = await collect(wrapped.child);
+      expectOutcome(mode, wrapped.launch);
+      expect(result.code).toBe(0);
+      expect(result.stdout.toString()).toBe(direct.stdout.toString());
+      expect(JSON.parse(result.stdout.toString()).argv0).toBe("--");
+      expect(result.stderr.toString()).toBe(direct.stderr.toString());
+    });
+
+    it("spells a target found through an empty PATH entry like an unwrapped spawn", async () => {
+      const registryDir = temp.make();
+      registries.push(registryDir);
+      const bin = temp.make();
+      writeFileSync(path.join(bin, "bare-target"), 'printf "%s\\n" "$0"\n', { mode: 0o700 });
+      const policy = mode.policy(registryDir);
+      for (const searchPath of ["", ":/nonexistent", "/nonexistent:", "/nonexistent::/nonexistent2"]) {
+        const options = { cwd: bin, env: { PATH: searchPath } };
+        const direct = await collect(spawn("bare-target", [], options));
+        expect(direct.code).toBe(0);
+        expect(direct.stdout.toString()).toBe("bare-target\n");
+        const wrapped = spawnIsolated({ command: "bare-target", options }, { policy, owner });
+        const result = await collect(wrapped.child);
+        expect(result.stdout.toString()).toBe(direct.stdout.toString());
+        expect(result.stderr.toString()).toBe(direct.stderr.toString());
+        expect(wrapped.launch.classifyExit(result.code, result.signal)).toEqual({ kind: "target", code: 0, signal: null });
+      }
+    });
+
     it("writes a versioned status with identity only", async () => {
       const registryDir = temp.make();
       registries.push(registryDir);
