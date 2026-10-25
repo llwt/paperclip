@@ -1,5 +1,6 @@
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
 import { normalizeAgentNameKey } from "./retries.js";
+import { isUniqueViolation } from "../../db-errors.js";
 import { publishActiveDotComment } from "../dot-assignment-follow-up.js";
 import {
   type WakeupOptions,
@@ -300,6 +301,8 @@ export async function readAssignmentHandoffPredecessor(
   }
   return { state: "ready", runId: latest.id };
 }
+
+const OPEN_ROUTINE_EXECUTION_CONSTRAINT = "issues_open_routine_execution_uq";
 
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
 
@@ -2109,6 +2112,24 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         } catch (err) {
           if (isPermanentClaimRejection(err)) {
             rejectedClaims.push({ run: queuedRun, err });
+            continue;
+          }
+          if (isUniqueViolation(err, OPEN_ROUTINE_EXECUTION_CONSTRAINT)) {
+            // Another open issue of the same routine and fingerprint already
+            // holds a live execution run. The claim transaction rolled back, so
+            // the run stays queued and the issue is untouched; keep going so one
+            // row cannot stop the rest of the queue or startup recovery.
+            logger.warn(
+              {
+                err,
+                runId: queuedRun.id,
+                issueId: readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId),
+                agentId: queuedRun.agentId,
+                companyId: queuedRun.companyId,
+                constraint: OPEN_ROUTINE_EXECUTION_CONSTRAINT,
+              },
+              "queued heartbeat run claim hit the open routine execution constraint; leaving the run queued and the issue unchanged",
+            );
             continue;
           }
           if (!isDeferrableClaimRejection(err)) throw err;
