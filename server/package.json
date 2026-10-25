@@ -75,6 +75,7 @@
     "@paperclipai/db": "workspace:*",
     "@paperclipai/hermes-paperclip-adapter": "workspace:*",
     "@paperclipai/plugin-sdk": "workspace:*",
+    "@paperclipai/process-launch": "workspace:*",
     "@paperclipai/shared": "workspace:*",
     "@paperclipai/skills-catalog": "workspace:*",
     "@photon-ai/advanced-imessage": "2.1.0",

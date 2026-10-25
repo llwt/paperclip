@@ -45,6 +45,14 @@ export const loggingConfigSchema = z.object({
   logDir: z.string().default("~/.paperclip/instances/default/logs"),
 }).passthrough();
 
+export const AGENT_PROCESS_ISOLATION_MODES = ["off", "systemd"] as const;
+export const DEFAULT_AGENT_PROCESS_ISOLATION_SLICE = "app-agents.slice";
+
+export const agentProcessIsolationConfigSchema = z.object({
+  mode: z.enum(AGENT_PROCESS_ISOLATION_MODES).default("off"),
+  slice: z.string().default(DEFAULT_AGENT_PROCESS_ISOLATION_SLICE),
+}).passthrough();
+
 export const serverConfigSchema = z.object({
   deploymentMode: z.enum(DEPLOYMENT_MODES).default("local_trusted"),
   exposure: z.enum(DEPLOYMENT_EXPOSURES).default("private"),
@@ -54,6 +62,7 @@ export const serverConfigSchema = z.object({
   port: z.number().int().min(1).max(65535).default(3100),
   allowedHostnames: z.array(z.string().min(1)).default([]),
   serveUi: z.boolean().default(true),
+  agentProcessIsolation: agentProcessIsolationConfigSchema.optional(),
 }).passthrough();
 
 export const authConfigSchema = z.object({
@@ -194,6 +203,7 @@ export type LlmConfig = z.infer<typeof llmConfigSchema>;
 export type DatabaseConfig = z.infer<typeof databaseConfigSchema>;
 export type LoggingConfig = z.infer<typeof loggingConfigSchema>;
 export type ServerConfig = z.infer<typeof serverConfigSchema>;
+export type AgentProcessIsolationConfig = z.infer<typeof agentProcessIsolationConfigSchema>;
 export type StorageConfig = z.infer<typeof storageConfigSchema>;
 export type StorageLocalDiskConfig = z.infer<typeof storageLocalDiskConfigSchema>;
 export type StorageS3Config = z.infer<typeof storageS3ConfigSchema>;

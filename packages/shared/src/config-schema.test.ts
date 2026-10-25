@@ -135,3 +135,35 @@ describe("paperclip config schema", () => {
     ]);
   });
 });
+
+describe("agent process isolation config", () => {
+  const base = {
+    $meta: { version: 1, updatedAt: "2026-10-25T00:00:00.000Z", source: "configure" },
+    database: { mode: "embedded-postgres" },
+    logging: { mode: "file" },
+  };
+
+  it("is optional so existing config files stay valid", () => {
+    const parsed = paperclipConfigSchema.parse({ ...base, server: {} });
+    expect(parsed.server.agentProcessIsolation).toBeUndefined();
+  });
+
+  it("defaults to off with the app-agents slice", () => {
+    const parsed = paperclipConfigSchema.parse({ ...base, server: { agentProcessIsolation: {} } });
+    expect(parsed.server.agentProcessIsolation).toEqual({ mode: "off", slice: "app-agents.slice" });
+  });
+
+  it("accepts the systemd mode and a custom slice", () => {
+    const parsed = paperclipConfigSchema.parse({
+      ...base,
+      server: { agentProcessIsolation: { mode: "systemd", slice: "work-agents.slice" } },
+    });
+    expect(parsed.server.agentProcessIsolation).toEqual({ mode: "systemd", slice: "work-agents.slice" });
+  });
+
+  it("rejects an unknown mode", () => {
+    expect(() =>
+      paperclipConfigSchema.parse({ ...base, server: { agentProcessIsolation: { mode: "cgroup" } } }),
+    ).toThrow();
+  });
+});
