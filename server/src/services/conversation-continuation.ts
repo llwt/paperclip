@@ -112,7 +112,10 @@ export async function getConversationOwnershipBlocker(db: Db, companyId: string,
       eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.runtimeMode, "legacy"),
       conversationRunPredicate(),
       sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueId}`,
-      inArray(heartbeatRuns.status, ["failed", "timed_out", "interrupted", "cancelled"]),
+      or(inArray(heartbeatRuns.status, ["failed", "timed_out", "interrupted", "cancelled"]),
+        // A self hand-off (fork, SX-2509) was stopped like a cancel; its
+        // executor cleanup still owns the task until it settles.
+        and(eq(heartbeatRuns.status, "succeeded"), sql`${heartbeatRuns.resultJson}->'selfHandoff' = 'true'::jsonb`)),
       or(isNotNull(heartbeatRuns.processPid), isNotNull(heartbeatRuns.processGroupId), activeLease,
         sql`${heartbeatRuns.resultJson}->'workspaceRestoreRecovery'->>'schema' = 'paperclip.workspace-restore-recovery.v1'`),
     )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));

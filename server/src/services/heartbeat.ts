@@ -5266,6 +5266,11 @@ export function heartbeatService(
           logger.error({ err, runId: run.id }, "failed to promote legacy comment queue after cleanup");
         });
       }
+      // Fork (SX-2509): a self hand-off recorded while this executor still
+      // cleaned up is finalized as `succeeded` only now.
+      await runControl.finalizeSelfHandoffOutcome(run.id).catch(err => {
+        logger.warn({ err, runId: run.id }, "failed to finalize the self hand-off run outcome");
+      });
       if (
         !nativeSessionResumeScheduled &&
         !nativeWorkspaceFinalizeScheduled &&
@@ -5478,6 +5483,10 @@ export function heartbeatService(
 
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) =>
       cancelRunInternal(runId, reason, options),
+
+    // Fork (SX-2509): record `succeeded` for a run stopped by its own task change.
+    recordSelfHandoffOutcome: (input: Parameters<typeof runControl.recordSelfHandoffOutcome>[0]) =>
+      runControl.recordSelfHandoffOutcome(input),
 
     /**
      * Pause-only. Emits errorCode "agent_paused" unconditionally; its sole caller is the

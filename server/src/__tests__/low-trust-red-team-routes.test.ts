@@ -978,7 +978,15 @@ describeEmbeddedPostgres(
         .send({ status: "in_review", assigneeAgentId: null, assigneeUserId: "board-user", comment: "Ready for human review" });
       expect(handoff.status, JSON.stringify(handoff.body)).toBe(200);
       const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, directRun.id));
-      expect(stopped).toMatchObject({ status: "cancelled", errorCode: "issue_reassigned" });
+      // The run handed off its own task: stopped as a reassignment, then
+      // recorded as a self hand-off (fork, SX-2509).
+      expect(stopped).toMatchObject({
+        status: "succeeded", errorCode: null,
+        resultJson: expect.objectContaining({
+          selfHandoff: true, reassignmentStopConfirmed: true,
+          selfHandoffStop: expect.objectContaining({ kind: "reassignment", errorCode: "issue_reassigned" }),
+        }),
+      });
       const returned = await request(board).patch(`/api/issues/${created.body.id}`)
         .send({ status: "backlog", assigneeAgentId: fixture.agents.lowTrust.id, assigneeUserId: null });
       expect(returned.status, JSON.stringify(returned.body)).toBe(200);
