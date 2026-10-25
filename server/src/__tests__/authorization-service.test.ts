@@ -2335,6 +2335,55 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  it("lets task bridge keys read only their own scope project", async () => {
+    const company = await createCompany(db, "TaskBridgeProject");
+    const bridgeAgent = await createAgent(db, company.id);
+    const scopeProject = await createProject(db, company.id, "Scope");
+    const otherProject = await createProject(db, company.id, "Other");
+    const actor = {
+      type: "agent" as const,
+      agentId: bridgeAgent.id,
+      companyId: company.id,
+      source: "agent_jwt" as const,
+      keyId: randomUUID(),
+      keyScope: {
+        kind: "task_bridge" as const,
+        projectId: scopeProject.id,
+      },
+    };
+    const authz = authorizationService(db);
+
+    await expect(authz.decide({
+      actor,
+      action: "project:read",
+      resource: { type: "project", companyId: company.id, projectId: scopeProject.id },
+    })).resolves.toMatchObject({ allowed: true });
+
+    await expect(authz.decide({
+      actor,
+      action: "project:read",
+      resource: { type: "project", companyId: company.id, projectId: otherProject.id },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
+
+    await expect(authz.decide({
+      actor,
+      action: "project:read",
+      resource: { type: "project", companyId: company.id },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
+
+    await expect(authz.decide({
+      actor,
+      action: "project:read",
+      resource: { type: "company", companyId: company.id },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
+
+    await expect(authz.decide({
+      actor: { ...actor, keyScope: { kind: "task_bridge" as const, parentIssueId: randomUUID() } },
+      action: "project:read",
+      resource: { type: "project", companyId: company.id, projectId: scopeProject.id },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
+  });
+
   it("scopes skill-test keys to their own issue only", async () => {
     const company = await createCompany(db, "SkillTest");
     const skillTestAgent = await createAgent(db, company.id);

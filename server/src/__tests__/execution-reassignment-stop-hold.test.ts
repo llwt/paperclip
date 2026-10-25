@@ -7,6 +7,7 @@ import {
   companies,
   createDb,
   environmentLeases,
+  environments,
   heartbeatRuns,
   issueRecoveryActions,
   issues,
@@ -23,6 +24,8 @@ import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.j
 // The cancel lands while the issue is still assigned to the author, so it must
 // not leave the issue-wide `legacy_execution_requires_reconciliation` hold that
 // would save every later wake (the stage hand-off and user comments) forever.
+// Fork test (SX-2418): a plain reassignment from A to B while A runs gives B
+// exactly one run after A's cleanup, also when the hand-off has no comment.
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 
@@ -479,5 +482,98 @@ describeEmbeddedPostgres("wakes after the author's run is stopped for a stage ha
         recoveryActionId: ids.actionId,
       });
     });
+  });
+
+  it.each([
+    { by: "the board", actorType: "user" as const, actor: () => "board-user" },
+    // A hands the task to B in its own last step (SX-2272).
+    { by: "A itself", actorType: "agent" as const, actor: (formerOwnerId: string) => formerOwnerId },
+  ])("reassigning A to B while A runs ($by): B gets exactly one run after A's cleanup, with no comment (SX-2418)", async ({ actorType, actor }) => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const formerOwnerId = await insertAgent(companyId, "A");
+    const newOwnerId = await insertAgent(companyId, "B");
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: formerOwnerId,
+      status: "running",
+      invocationSource: "assignment",
+      startedAt: new Date(Date.now() - 60_000),
+      contextSnapshot: { issueId },
+      runnerProfileJson: { adapterDispatch: { adapterType: "claude_local" } },
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Reassigned while running",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: formerOwnerId,
+      responsibleUserId: "responsible-user",
+      checkoutRunId: runId,
+    });
+    // A's executor still has to release its environment lease.
+    const [localEnvironment] = await db.select({ id: environments.id }).from(environments)
+      .where(eq(environments.driver, "local")).then(async (rows) => rows.length ? rows
+        : db.insert(environments).values({ name: "Local", driver: "local", status: "active", config: {} })
+          .returning({ id: environments.id }));
+    await db.insert(environmentLeases).values({
+      companyId,
+      environmentId: localEnvironment!.id,
+      issueId,
+      heartbeatRunId: runId,
+      status: "active",
+      leasePolicy: "ephemeral",
+      provider: "local",
+      metadata: { driver: "local" },
+    });
+
+    // The exact stop the issue PATCH route makes before it commits B.
+    const cancelled = await heartbeat.cancelRun(runId, "Cancelled before issue reassignment", {
+      errorCode: "issue_reassigned",
+      resultJson: { reassignmentStopConfirmed: true, issueMutationStopId: randomUUID() },
+      eventMessage: "run cancelled before issue reassignment",
+      eventPayload: { issueId },
+      suppressImmediateRecovery: true,
+    });
+    expect(cancelled?.status).toBe("cancelled");
+    await db.update(issues).set({ assigneeAgentId: newOwnerId, checkoutRunId: null }).where(eq(issues.id, issueId));
+
+    // The route's wake for the new assignee, with no comment.
+    await heartbeat.wakeup(newOwnerId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId, mutation: "update", interruptedRunId: runId },
+      requestedByActorType: actorType,
+      requestedByActorId: actor(formerOwnerId),
+      contextSnapshot: { issueId, source: "issue.update", interruptedRunId: runId },
+    });
+
+    expect(await deferredWakes(newOwnerId, issueId)).toHaveLength(1);
+    expect(await runsFor(newOwnerId, "issue_assigned")).toHaveLength(0);
+
+    // A's executor finishes its cleanup (the release at the end of its run),
+    // then a late scheduler sweep.
+    await heartbeat.releaseEnvironmentLeasesForRun({
+      runId, companyId, agentId: formerOwnerId, status: "cancelled",
+    });
+    await db.update(agentWakeupRequests).set({ requestedAt: new Date(Date.now() - 60_000) })
+      .where(eq(agentWakeupRequests.agentId, newOwnerId));
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+    expect(await runsFor(newOwnerId, "issue_assigned")).toHaveLength(1);
+    expect(await deferredWakes(newOwnerId, issueId)).toEqual([]);
   });
 });
