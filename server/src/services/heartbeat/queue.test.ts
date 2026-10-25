@@ -7,6 +7,7 @@ import { createRunDispatch } from "../../modules/run-dispatch/index.js";
 import type { createWakeQueue } from "../../modules/wake-queue/index.js";
 import { createHeartbeatRunState } from "./run-state.js";
 import { createHeartbeatRunPreparation } from "./run-preparation.js";
+import { logger } from "../../middleware/logger.js";
 import { createHeartbeatQueue, type HeartbeatQueueDependencies } from "./queue.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
@@ -172,6 +173,78 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     await createHeartbeatQueue(db, callbacks(db)).releaseRunClaimedJustBeforeSuppression(run.id);
     const [current] = await db.select().from(issues).where(eq(issues.id, issue.id));
     expect(current.executionRunId).toBe(newOwner.id);
+  });
+
+  it("leaves a queued run and its issue unchanged when the claim hits the open routine execution constraint, and still claims the next run", async () => {
+    const [company] = await db.insert(companies).values({ name: "Routine collision", issuePrefix: "RC" }).returning();
+    const [ownerAgent] = await db.insert(agents).values({ companyId: company.id, name: "Owner agent", role: "engineer", status: "idle", adapterType: "process", adapterConfig: {} }).returning();
+    const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Queue agent", role: "engineer", status: "idle", adapterType: "process", adapterConfig: {}, runtimeConfig: { heartbeat: { maxConcurrentRuns: 5 } } }).returning();
+    const routine = { originKind: "routine_execution", originId: "routine-1", originFingerprint: "fingerprint-1" };
+    const [liveRun] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: ownerAgent.id, status: "running", invocationSource: "automation", startedAt: new Date() }).returning();
+    await db.insert(issues).values({ companyId: company.id, title: "Open routine issue", status: "in_progress", assigneeAgentId: ownerAgent.id, executionRunId: liveRun.id, ...routine });
+    const [collidingIssue] = await db.insert(issues).values({ companyId: company.id, title: "Colliding routine issue", status: "todo", assigneeAgentId: agent.id, ...routine }).returning();
+    const [otherIssue] = await db.insert(issues).values({ companyId: company.id, title: "Unrelated issue", status: "todo", assigneeAgentId: agent.id }).returning();
+    const [collidingWake] = await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id, source: "automation", status: "queued" }).returning();
+    const [collidingRun] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, status: "queued", invocationSource: "automation", responsibleUserId: "user-1", wakeupRequestId: collidingWake.id, contextSnapshot: { issueId: collidingIssue.id } }).returning();
+    const [otherWake] = await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id, source: "automation", status: "queued" }).returning();
+    const [otherRun] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, status: "queued", invocationSource: "automation", responsibleUserId: "user-1", wakeupRequestId: otherWake.id, contextSnapshot: { issueId: otherIssue.id } }).returning();
+
+    const deps = callbacks(db);
+    deps.getAgent.mockResolvedValue(agent);
+    deps.instanceSettings.getExperimental.mockResolvedValue({} as Awaited<ReturnType<HeartbeatQueueDependencies["instanceSettings"]["getExperimental"]>>);
+    const warn = vi.spyOn(logger, "warn");
+    try {
+      await createHeartbeatQueue(db, deps).resumeQueuedRuns();
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ runId: collidingRun.id, issueId: collidingIssue.id, constraint: "issues_open_routine_execution_uq" }),
+        expect.stringContaining("open routine execution constraint"),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+
+    expect(deps.executeRun).toHaveBeenCalledTimes(1);
+    expect(deps.executeRun).toHaveBeenCalledWith(otherRun.id);
+    const [stillQueued] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, collidingRun.id));
+    const [untouchedIssue] = await db.select().from(issues).where(eq(issues.id, collidingIssue.id));
+    const [claimedOther] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, otherRun.id));
+    const [lockedOther] = await db.select().from(issues).where(eq(issues.id, otherIssue.id));
+    expect(stillQueued.status).toBe("queued");
+    expect(untouchedIssue.executionRunId).toBeNull();
+    expect(claimedOther.status).toBe("running");
+    expect(lockedOther.executionRunId).toBe(otherRun.id);
+  });
+
+  it("claimQueuedRun called directly (the executeRun path) returns null and leaves the run queued, not failed, on the open routine execution constraint", async () => {
+    const [company] = await db.insert(companies).values({ name: "Routine direct claim", issuePrefix: "RD" }).returning();
+    const [ownerAgent] = await db.insert(agents).values({ companyId: company.id, name: "Owner agent", role: "engineer", status: "idle", adapterType: "process", adapterConfig: {} }).returning();
+    const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Queue agent", role: "engineer", status: "idle", adapterType: "process", adapterConfig: {} }).returning();
+    const routine = { originKind: "routine_execution", originId: "routine-2", originFingerprint: "fingerprint-2" };
+    const [liveRun] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: ownerAgent.id, status: "running", invocationSource: "automation", startedAt: new Date() }).returning();
+    await db.insert(issues).values({ companyId: company.id, title: "Open routine issue", status: "in_progress", assigneeAgentId: ownerAgent.id, executionRunId: liveRun.id, ...routine });
+    const [collidingIssue] = await db.insert(issues).values({ companyId: company.id, title: "Colliding routine issue", status: "todo", assigneeAgentId: agent.id, ...routine }).returning();
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id, source: "automation", status: "queued" }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, status: "queued", invocationSource: "automation", responsibleUserId: "user-1", wakeupRequestId: wake.id, contextSnapshot: { issueId: collidingIssue.id } }).returning();
+
+    const deps = callbacks(db);
+    deps.getAgent.mockResolvedValue(agent);
+    deps.instanceSettings.getExperimental.mockResolvedValue({} as Awaited<ReturnType<HeartbeatQueueDependencies["instanceSettings"]["getExperimental"]>>);
+    const warn = vi.spyOn(logger, "warn");
+    try {
+      await expect(createHeartbeatQueue(db, deps).claimQueuedRun(run)).resolves.toBeNull();
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ runId: run.id, issueId: collidingIssue.id, constraint: "issues_open_routine_execution_uq" }),
+        expect.stringContaining("open routine execution constraint"),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+
+    const [stillQueued] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    const [untouchedIssue] = await db.select().from(issues).where(eq(issues.id, collidingIssue.id));
+    expect(stillQueued).toMatchObject({ status: "queued", errorCode: null, startedAt: null, finishedAt: null });
+    expect(untouchedIssue.executionRunId).toBeNull();
+    expect(deps.executeRun).not.toHaveBeenCalled();
   });
 
   it("cancels at the daily run cap before claiming or dispatching", async () => {
