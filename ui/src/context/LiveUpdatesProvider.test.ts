@@ -1268,21 +1268,6 @@ describe("LiveUpdatesProvider run lifecycle toasts", () => {
     }, () => "Assistant")).toBeNull();
   });
 
-  // Fork (SX-2509): the server's event sequence for a run that changes its own
-  // task is a marked transient stop, then `succeeded`. Neither is announced.
-  // A stop by anyone else, or a self stop whose change did not complete, is.
-  it("does not toast the transient stop of a run that changes its own task", () => {
-    const base = { runId: "self-run", agentId: "agent-1", error: "Cancelled before issue reassignment", errorCode: "issue_reassigned" };
-    const sequence = [
-      { ...base, status: "cancelled", selfHandoffPending: true },
-      { runId: "self-run", agentId: "agent-1", status: "succeeded", error: null, errorCode: null },
-    ];
-    expect(sequence.map(payload => __liveUpdatesTestUtils.buildRunStatusToast(payload, () => "Reviewer")))
-      .toEqual([null, null]);
-    expect(__liveUpdatesTestUtils.buildRunStatusToast({ ...base, status: "cancelled" }, () => "Reviewer"))
-      .toMatchObject({ title: "Reviewer run cancelled", tone: "info" });
-  });
-
   it("still builds failure toasts for agent errors and failed runs", () => {
     const queryClient = {
       getQueryData: () => [

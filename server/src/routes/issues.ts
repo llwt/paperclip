@@ -14296,26 +14296,7 @@ export function issueRoutes(
       const isActorOwnRun = (run: { id: string; agentId?: string | null }) =>
         actor.actorType === "agent" && Boolean(actor.agentId) &&
         (actor.runId ? run.id === actor.runId : run.agentId === actor.agentId);
-      let selfHandoffStop = null as { runId: string; kind: SelfHandoffKind } | null;
-      // The stop of the actor's own run is marked `selfHandoffRequested`, so
-      // its `cancelled` status event announces nothing. If this request ends
-      // before the outcome is recorded (the change failed), announce the stop
-      // as an ordinary cancellation after all.
-      let selfHandoffOutcomeAttempted = false;
-      const markSelfHandoffStop = (stop: { runId: string; kind: SelfHandoffKind }) => {
-        if (!selfHandoffStop) {
-          res.once("close", () => {
-            if (selfHandoffOutcomeAttempted) return;
-            void Promise.resolve()
-              .then(() => heartbeat.announceSelfHandoffStopCancelled(stop.runId))
-              .catch((err: unknown) => logger.warn(
-                { err, issueId: existing.id, runId: stop.runId },
-                "failed to announce the unfinished self hand-off stop",
-              ));
-          });
-        }
-        selfHandoffStop = stop;
-      };
+      let selfHandoffStop: { runId: string; kind: SelfHandoffKind } | null = null;
       if (req.actor.source !== "mcp_oauth" && assigneeWillChange && existing.assigneeAgentId) {
         await stopRunnerGoalForOwnershipChange({
           companyId: existing.companyId,
@@ -14324,17 +14305,12 @@ export function issueRoutes(
         });
         const runToStopForReassignment = await resolveActiveIssueRun(existing);
         if (runToStopForReassignment) {
-          const ownRun = isActorOwnRun(runToStopForReassignment);
           const cancelled = await heartbeat.cancelRun(
             runToStopForReassignment.id,
             "Cancelled before issue reassignment",
             {
               errorCode: "issue_reassigned",
-              resultJson: {
-                reassignmentStopConfirmed: true,
-                issueMutationStopId,
-                ...(ownRun ? { selfHandoffRequested: true } : {}),
-              },
+              resultJson: { reassignmentStopConfirmed: true, issueMutationStopId },
               eventMessage: "run cancelled before issue reassignment",
               eventPayload: { issueId: existing.id },
               suppressImmediateRecovery: true,
@@ -14350,8 +14326,8 @@ export function issueRoutes(
             );
           }
           interruptedRunId = cancelled.id;
-          if (ownRun) {
-            markSelfHandoffStop({ runId: cancelled.id, kind: "reassignment" });
+          if (isActorOwnRun(runToStopForReassignment)) {
+            selfHandoffStop = { runId: cancelled.id, kind: "reassignment" };
           }
         }
       }
@@ -14374,17 +14350,12 @@ export function issueRoutes(
           ? await resolveActiveIssueRun(existing)
           : null;
         if (goalStopAction && runToStopForTerminalization) {
-          const ownRun = isActorOwnRun(runToStopForTerminalization);
           const cancelled = await heartbeat.cancelRun(
             runToStopForTerminalization.id,
             "Cancelled before issue terminalization",
             {
               errorCode: "issue_terminalized",
-              resultJson: {
-                terminalizationStopConfirmed: true,
-                issueMutationStopId,
-                ...(ownRun ? { selfHandoffRequested: true } : {}),
-              },
+              resultJson: { terminalizationStopConfirmed: true, issueMutationStopId },
               eventMessage: "run cancelled before issue terminalization",
               eventPayload: {
                 issueId: existing.id,
@@ -14402,8 +14373,8 @@ export function issueRoutes(
             );
           }
           interruptedRunId = cancelled.id;
-          if (ownRun) {
-            markSelfHandoffStop({ runId: cancelled.id, kind: "terminalization" });
+          if (isActorOwnRun(runToStopForTerminalization)) {
+            selfHandoffStop = { runId: cancelled.id, kind: "terminalization" };
           }
         }
       }
@@ -14731,13 +14702,13 @@ export function issueRoutes(
           const ownRun = isActorOwnRun(runToCancelForCancelledStatus);
           const cancelled = ownRun
             ? await heartbeat.cancelRun(runToCancelForCancelledStatus.id, undefined, {
-                resultJson: { issueMutationStopId, selfHandoffRequested: true },
+                resultJson: { issueMutationStopId },
               })
             : await heartbeat.cancelRun(runToCancelForCancelledStatus.id);
           if (cancelled) {
             cancelledStatusRunId = cancelled.id;
             if (ownRun && cancelled.status === "cancelled") {
-              markSelfHandoffStop({ runId: cancelled.id, kind: "cancelled_status" });
+              selfHandoffStop = { runId: cancelled.id, kind: "cancelled_status" };
             }
             await logActivity(db, {
               companyId: cancelled.companyId,
@@ -14783,7 +14754,6 @@ export function issueRoutes(
       }
 
       if (selfHandoffStop) {
-        selfHandoffOutcomeAttempted = true;
         try {
           await heartbeat.recordSelfHandoffOutcome({
             runId: selfHandoffStop.runId,
@@ -14796,7 +14766,6 @@ export function issueRoutes(
             { err, issueId: existing.id, runId: selfHandoffStop.runId },
             "failed to record the self hand-off run outcome",
           );
-          await heartbeat.announceSelfHandoffStopCancelled(selfHandoffStop.runId).catch(() => undefined);
         }
       }
 

@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
-  activityLog,
   agentWakeupRequests,
   heartbeatRuns,
   issueComments,
@@ -23,49 +22,6 @@ export class StaleExecutionContinuationError extends Error {
     super(code);
     this.name = "StaleExecutionContinuationError";
   }
-}
-
-// Differs from upstream (fork, SX-2509). True when this agent itself made the
-// task stale for its own wake (for example an earlier run of the agent closed
-// or handed off the task). A leftover queued wake is then obsolete by the
-// agent's own doing, not stopped. Bound to the committed task state: every
-// field that makes the wake stale (owner, closed status) must have, as its
-// latest recorded change, a change by this agent whose new value is the
-// current value. A change whose audit is not written yet (the task row commits
-// first) leaves an older entry whose value no longer matches, so the answer is
-// false and the run is cancelled as before.
-export async function taskOwnershipLastChangedByAgent(db: Db, input: {
-  companyId: string;
-  issueId: string;
-  agentId: string;
-}): Promise<boolean> {
-  const [issue] = await db
-    .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
-    .from(issues)
-    .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
-  if (!issue) return false;
-  const staleFields: Array<{ field: "assigneeAgentId" | "status"; value: string | null }> = [];
-  if (issue.assigneeAgentId !== input.agentId) staleFields.push({ field: "assigneeAgentId", value: issue.assigneeAgentId });
-  if (issue.status === "done" || issue.status === "cancelled") staleFields.push({ field: "status", value: issue.status });
-  if (staleFields.length === 0) return false;
-  for (const { field, value } of staleFields) {
-    const [latest] = await db
-      .select({ actorType: activityLog.actorType, actorId: activityLog.actorId, details: activityLog.details })
-      .from(activityLog)
-      .where(and(
-        eq(activityLog.companyId, input.companyId),
-        eq(activityLog.entityType, "issue"),
-        eq(activityLog.entityId, input.issueId),
-        eq(activityLog.action, "issue.updated"),
-        sql`${activityLog.details}->'changes' ? ${field}`,
-      ))
-      .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
-      .limit(1);
-    if (!latest || latest.actorType !== "agent" || latest.actorId !== input.agentId) return false;
-    const change = object(object(object(latest.details).changes)[field]);
-    if (!("to" in change) || (change.to ?? null) !== value) return false;
-  }
-  return true;
 }
 
 const object = (v: unknown): Record<string, unknown> =>

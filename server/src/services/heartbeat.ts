@@ -311,7 +311,7 @@ import {
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
-import { buildExecutionContinuation, StaleExecutionContinuationError, taskOwnershipLastChangedByAgent } from "./execution-continuation.js";
+import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 
 import {
@@ -334,7 +334,6 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import {
   createHash,
-  randomUUID,
 } from "node:crypto";
 import {
   and,
@@ -4955,29 +4954,11 @@ export function heartbeatService(
         // The queued continuation became obsolete before adapter dispatch.
         // Use cancellation settlement so wakeup, issue ownership, agent state,
         // and notifications agree; do not retry work for the previous owner.
-        // Fork (SX-2509): when this agent itself closed or handed off the
-        // task, the leftover wake ends `succeeded` (nothing left to do), not
-        // as a cancel. A change by anyone else still cancels as before.
-        const staleIssueId = readNonEmptyString(run.contextSnapshot?.issueId);
-        const selfChange = staleIssueId
-          ? await taskOwnershipLastChangedByAgent(db, { companyId: run.companyId, issueId: staleIssueId, agentId: run.agentId })
-              .catch(() => false)
-          : false;
-        const issueMutationStopId = selfChange ? randomUUID() : null;
-        const cancelled = await cancelRunInternal(run.id, outerErr.code, {
+        await cancelRunInternal(run.id, outerErr.code, {
           errorCode: outerErr.code,
-          ...(issueMutationStopId ? { resultJson: { issueMutationStopId, selfHandoffRequested: true } } : {}),
           eventMessage: "stale execution continuation cancelled before dispatch",
           suppressImmediateRecovery: true,
         });
-        if (issueMutationStopId && cancelled?.status === "cancelled") {
-          await runControl.recordSelfHandoffOutcome({
-            runId: run.id, issueMutationStopId, kind: "stale_continuation",
-          }).catch(async (err: unknown) => {
-            logger.warn({ err, runId: run.id }, "failed to record the self hand-off run outcome");
-            await runControl.announceSelfHandoffStopCancelled(run.id).catch(() => undefined);
-          });
-        }
       } else if (isWorkspaceBusyDeferral(outerErr)) {
         // Expected contention on a shared project workspace, not a
         // failure: park the run as a bounded scheduled retry and leave the
@@ -5465,8 +5446,6 @@ export function heartbeatService(
     // Fork (SX-2509): record `succeeded` for a run stopped by its own task change.
     recordSelfHandoffOutcome: (input: Parameters<typeof runControl.recordSelfHandoffOutcome>[0]) =>
       runControl.recordSelfHandoffOutcome(input),
-    announceSelfHandoffStopCancelled: (runId: string) =>
-      runControl.announceSelfHandoffStopCancelled(runId),
 
     /**
      * Pause-only. Emits errorCode "agent_paused" unconditionally; its sole caller is the
