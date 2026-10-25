@@ -44,5 +44,13 @@ export function buildHeartbeatRunStatusLiveEventPayload(
     ].includes(run.status)
       ? buildHeartbeatRunIssueComment(run.resultJson ?? {})
       : null,
+    // Fork (SX-2551): the stop of a run that is changing its own task. The run
+    // is recorded `succeeded` once the change commits, so this transient
+    // `cancelled` status is not announced as a cancellation. If the change
+    // does not complete, announceSelfHandoffStopCancelled publishes it again
+    // without this flag.
+    ...(run.status === "cancelled" && run.resultJson?.selfHandoffRequested === true
+      ? { selfHandoffRequested: true }
+      : {}),
   };
 }

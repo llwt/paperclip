@@ -1503,11 +1503,26 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         ),
       )
       .returning({ id: heartbeatRuns.id });
-    if (!marked) return null;
+    if (!marked) {
+      await announceSelfHandoffStopCancelled(input.runId);
+      return null;
+    }
     // The executor deletes itself from this set before it finalizes, so one of
     // the two paths always sees the marker.
     if (activeRunExecutions.has(input.runId)) return getRun(input.runId);
     return finalizeSelfHandoffOutcome(input.runId);
+  }
+
+  // Fork (SX-2551): the stop of a self hand-off published its `cancelled`
+  // status marked `selfHandoffRequested`, which announces nothing. When the
+  // hand-off does not complete (the change failed, or the outcome could not be
+  // recorded), the run keeps today's cancelled record: announce it as an
+  // ordinary stop.
+  async function announceSelfHandoffStopCancelled(runId: string) {
+    const run = await getRun(runId);
+    if (!run || run.status !== "cancelled" || parseObject(run.resultJson).selfHandoffRequested !== true) return;
+    const { selfHandoffRequested: _requested, ...payload } = buildHeartbeatRunStatusLiveEventPayload(run);
+    publishLiveEvent({ companyId: run.companyId, type: "heartbeat.run.status", payload });
   }
 
   async function finalizeSelfHandoffOutcome(runId: string) {
@@ -1661,6 +1676,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     cancelRunInternal,
     recordSelfHandoffOutcome,
     finalizeSelfHandoffOutcome,
+    announceSelfHandoffStopCancelled,
     resumeExecutionWaitComments,
     resumeQueuedCommentInterrupt,
     resumeSavedLegacyComments,
