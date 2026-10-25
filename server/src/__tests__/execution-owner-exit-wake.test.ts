@@ -24,6 +24,7 @@ import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.j
 // author's provider process is still exiting. The reviewer's wake must wait for
 // that process and then start exactly one run; it must never be left skipped,
 // and no reviewer run may start while the old process is alive.
+// Fork test (SX-2418): the same for a plain reassignment's `issue_assigned` wake.
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 
@@ -536,5 +537,39 @@ describeEmbeddedPostgres("stage hand-off wake behind a stopped run whose process
     const wakes = await reviewWakes(ids.reviewerId, ids.issueId);
     expect(wakes).toHaveLength(1);
     expect(wakes[0]).toMatchObject({ reason: REVIEW_REASON, runId: run!.id });
+  }, 30_000);
+
+  it("plain reassignment while the old process is alive: the new owner's assignment wake starts one run after the exit (SX-2418)", async () => {
+    const child = startOwnerProcess();
+    const ids = await seedHandoffToReview({ kind: "pid", child });
+    // Not a stage hand-off: the task was simply given to another agent.
+    await db.update(issues).set({ status: "in_progress", executionState: null }).where(eq(issues.id, ids.issueId));
+    const assignmentRuns = () => db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.agentId, ids.reviewerId),
+      sql`${heartbeatRuns.contextSnapshot}->>'wakeReason' = 'issue_assigned'`,
+    ));
+
+    expect(await heartbeat.wakeup(ids.reviewerId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: ids.issueId, mutation: "update", interruptedRunId: ids.authorRunId },
+      requestedByActorType: "agent",
+      requestedByActorId: ids.authorId,
+      contextSnapshot: { issueId: ids.issueId, source: "issue.update", interruptedRunId: ids.authorRunId },
+    })).toBeNull();
+    expect(await heartbeat.recheckOwnerExitWait(ids.companyId, ids.issueId, new Date())).toBe("waiting");
+    expect(await otherRunsOnIssue(ids.issueId, ids.authorRunId)).toHaveLength(0);
+
+    await stopOwnerProcess(child);
+    const runs = await waitFor(assignmentRuns, (rows) => rows.length > 0, OWNER_EXIT_RECHECK_INTERVAL_MS * 3);
+    expect(runs).toHaveLength(1);
+
+    expect(await heartbeat.recheckOwnerExitWait(ids.companyId, ids.issueId, new Date())).toBe("done");
+    await db.update(agentWakeupRequests).set({ requestedAt: new Date(Date.now() - 60_000) })
+      .where(eq(agentWakeupRequests.agentId, ids.reviewerId));
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    expect(await assignmentRuns()).toHaveLength(1);
   }, 30_000);
 });

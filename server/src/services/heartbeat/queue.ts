@@ -8,6 +8,7 @@ import {
   hasInteractionContinuationWakeContext,
   isInteractionResolutionWakePayload,
   isExecutionStageHandoffWakeContext,
+  isAssignmentHandoffWake,
 } from "./run-preparation.js";
 import { resolveExecutionWorkspaceReuseRequestForIssue } from "./workspaces.js";
 import {
@@ -225,6 +226,80 @@ export const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "running",
   "scheduled_retry",
 ] as const;
+
+// Differs from upstream (fork, SX-1386, SX-2418): saved wakes that the
+// hand-off resume owns. A stage decision, or an assignment wake (only one
+// behind a confirmed reassignment stop is promoted, see below).
+export function savedHandoffWakeSql() {
+  return or(
+    sql`${agentWakeupRequests.payload}->${DEFERRED_WAKE_CONTEXT_KEY}->>'source' = 'issue.execution_stage'`,
+    and(
+      eq(agentWakeupRequests.source, "assignment"),
+      sql`${agentWakeupRequests.payload}->${DEFERRED_WAKE_CONTEXT_KEY}->>'wakeReason' = 'issue_assigned'`,
+      sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
+    ),
+  )!;
+}
+
+// A terminal result can precede workspace/lease cleanup on this or another
+// controller. Local absence alone is not a release receipt.
+async function hasPendingRunCleanup(db: Db, companyId: string, runId: string) {
+  const [pendingLease] = await db.select({ id: environmentLeases.id })
+    .from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, companyId),
+      eq(environmentLeases.heartbeatRunId, runId),
+      or(and(isNull(environmentLeases.releasedAt),
+          // Warm release deliberately retains the sandbox. Its successful
+          // receipt settles the old run without destroying the resource.
+          sql`not coalesce(${environmentLeases.status} = 'retained'
+            and ${environmentLeases.leasePolicy} = 'reuse_by_environment'
+            and ${environmentLeases.cleanupStatus} = 'success', false)`),
+        eq(environmentLeases.status, "pending_cleanup"),
+        eq(environmentLeases.cleanupStatus, "failed")),
+    )).limit(1);
+  const [finalization] = await db.select({
+    phase: nativeRunFinalizations.phase, leaseOwner: nativeRunFinalizations.leaseOwner,
+  }).from(nativeRunFinalizations).where(and(
+    eq(nativeRunFinalizations.companyId, companyId),
+    eq(nativeRunFinalizations.runId, runId),
+  ));
+  return Boolean(pendingLease || (finalization && (finalization.leaseOwner ||
+    !["committed", "applied", "terminal_failure"].includes(finalization.phase))));
+}
+
+// Differs from upstream (fork, SX-2418). A saved assignment wake is promoted
+// only behind a confirmed reassignment stop: the latest run on the task (the
+// shape of upstream #16673) was stopped by the reassignment, belongs to
+// another agent, started before this wake, and is the run the wake names when
+// it names one. "cleanup_pending" means that run has not fully ended yet.
+// An operator Stop or a stop of the wake agent's own run is never promoted here.
+export async function readAssignmentHandoffPredecessor(
+  db: Db,
+  wake: Pick<typeof agentWakeupRequests.$inferSelect, "companyId" | "agentId" | "requestedAt" | "payload">,
+  liveRuns?: { has(id: string): boolean },
+): Promise<{ state: "none" } | { state: "cleanup_pending" | "ready"; runId: string }> {
+  const payload = parseObject(wake.payload);
+  const issueId = readNonEmptyString(payload.issueId);
+  if (!issueId || !isUuidLike(issueId)) return { state: "none" };
+  const [latest] = await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, wake.companyId),
+    sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+    or(isNull(heartbeatRuns.nativeIssueId), eq(heartbeatRuns.nativeIssueId, issueId)),
+  )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+  const namedRunId = readNonEmptyString(parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]).interruptedRunId) ??
+    readNonEmptyString(payload.interruptedRunId);
+  if (!latest || (namedRunId && namedRunId !== latest.id)) return { state: "none" };
+  if (latest.status !== "cancelled" || latest.errorCode !== "issue_reassigned" ||
+      parseObject(latest.resultJson).reassignmentStopConfirmed !== true ||
+      latest.agentId === wake.agentId || latest.createdAt.getTime() > wake.requestedAt.getTime()) {
+    return { state: "none" };
+  }
+  if (!latest.finishedAt || liveRuns?.has(latest.id) || adapterExecutionControls.has(latest.id) ||
+      await hasPendingRunCleanup(db, wake.companyId, latest.id)) {
+    return { state: "cleanup_pending", runId: latest.id };
+  }
+  return { state: "ready", runId: latest.id };
+}
 
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
 
@@ -1174,27 +1249,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             liveRunExecutions.has(previousRunId)) {
           return { ownsIssue, blocked: true };
         }
-        const [pendingLease] = await tx.select({ id: environmentLeases.id })
-          .from(environmentLeases).where(and(
-            eq(environmentLeases.companyId, run.companyId),
-            eq(environmentLeases.heartbeatRunId, previousRunId),
-            or(and(isNull(environmentLeases.releasedAt),
-                // Warm release deliberately retains the sandbox. Its successful
-                // receipt settles the old run without destroying the resource.
-                sql`not coalesce(${environmentLeases.status} = 'retained'
-                  and ${environmentLeases.leasePolicy} = 'reuse_by_environment'
-                  and ${environmentLeases.cleanupStatus} = 'success', false)`),
-              eq(environmentLeases.status, "pending_cleanup"),
-              eq(environmentLeases.cleanupStatus, "failed")),
-          )).limit(1);
-        const [finalization] = await tx.select({
-          phase: nativeRunFinalizations.phase, leaseOwner: nativeRunFinalizations.leaseOwner,
-        }).from(nativeRunFinalizations).where(and(
-          eq(nativeRunFinalizations.companyId, run.companyId),
-          eq(nativeRunFinalizations.runId, previousRunId),
-        ));
-        if (pendingLease || (finalization && (finalization.leaseOwner ||
-            !["committed", "applied", "terminal_failure"].includes(finalization.phase)))) {
+        if (await hasPendingRunCleanup(tx as unknown as Db, run.companyId, previousRunId)) {
           return { ownsIssue, blocked: true };
         }
       }
@@ -1775,6 +1830,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     // Differs from upstream (fork, SX-1386): a saved stage hand-off normally
     // starts when the blocking run releases its lease. Retry it here after a
     // restart, or when a different blocker cleared without a lease release.
+    // Fork (SX-2418): the same for a saved assignment hand-off; this needs no
+    // earlier run of the new owner on the task.
     // Fork (SX-1537): the least recently tried tasks go first and each try is
     // stamped, so hand-offs behind a process that never exits cannot starve
     // the rest of the batch.
@@ -1784,7 +1841,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       .from(agentWakeupRequests).innerJoin(companies, eq(companies.id, agentWakeupRequests.companyId))
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
         eq(companies.status, "active"),
-        sql`${agentWakeupRequests.payload}->${DEFERRED_WAKE_CONTEXT_KEY}->>'source' = 'issue.execution_stage'`,
+        savedHandoffWakeSql(),
         lte(agentWakeupRequests.requestedAt, new Date(Date.now() - 30_000)),
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .groupBy(agentWakeupRequests.companyId, stageHandoffIssueId)
@@ -1796,7 +1853,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         eq(agentWakeupRequests.companyId, companyId),
         eq(agentWakeupRequests.status, "deferred_issue_execution"),
         sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
-        sql`${agentWakeupRequests.payload}->${DEFERRED_WAKE_CONTEXT_KEY}->>'source' = 'issue.execution_stage'`,
+        savedHandoffWakeSql(),
       ));
       await resumeDeferredExecutionStageWakes(companyId, issueId);
     }
@@ -2114,7 +2171,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     return promise;
   }
 
-  async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
+  // Fork (SX-2418): `resumeKind` is set only by the saved hand-off resume in
+  // run control, for a saved assignment hand-off.
+  async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string,
+    resumeKind?: "assignment_handoff") {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = {
@@ -2692,9 +2752,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const agentNameKey = normalizeAgentNameKey(agent.name);
 
       const cancelledRunsToEmit: (typeof heartbeatRuns.$inferSelect)[] = [];
-      // Set when a stage hand-off wake is saved behind a run that still owns
-      // execution (fork, SX-1386).
-      let stageHandoffDeferred = false;
+      // Set when a stage or assignment hand-off wake is saved behind a run
+      // that still owns execution (fork, SX-1386, SX-2418).
+      let handoffDeferred = false;
       // Differs from upstream (fork, SX-1386): resuming a saved stage hand-off.
       // Its saved row is settled in the same transaction as the admission
       // result, so it is never finished without a successor run or a decision.
@@ -2702,27 +2762,50 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         !opts.queuedCommentInterruptId && !opts.queuedCommentRequestId &&
         isExecutionStageHandoffWakeContext(enrichedContextSnapshot)
         ? executionWaitRequestId : null;
+      // Fork (SX-2418): resuming a saved assignment hand-off, settled the same way.
+      const assignmentHandoffResumeId = executionWaitRequestId && !stageHandoffResumeId &&
+        resumeKind === "assignment_handoff" && !opts.queuedCommentInterruptId && !opts.queuedCommentRequestId &&
+        isAssignmentHandoffWake(source, enrichedContextSnapshot)
+        ? executionWaitRequestId : null;
+      const handoffResumeId = stageHandoffResumeId ?? assignmentHandoffResumeId;
       const settleStageHandoffResume = async <T extends { kind: string }>(
         tx: Parameters<Parameters<typeof db.transaction>[0]>[0], result: T,
       ): Promise<T> => {
-        if (!stageHandoffResumeId || result.kind === "deferred") return result;
+        if (!handoffResumeId || result.kind === "deferred") return result;
         const run = "run" in result ? (result as { run?: { id: string } | null }).run ?? null : null;
         await tx.update(agentWakeupRequests).set({
           status: run ? "coalesced" : "skipped",
           runId: run?.id ?? null,
-          error: run ? null : "Admission skipped the saved stage hand-off; see the skipped wake for the reason.",
+          error: run ? null : "Admission skipped the saved hand-off; see the skipped wake for the reason.",
           finishedAt: new Date(),
           updatedAt: new Date(),
         }).where(and(
-          eq(agentWakeupRequests.id, stageHandoffResumeId), eq(agentWakeupRequests.companyId, agent.companyId),
+          eq(agentWakeupRequests.id, handoffResumeId), eq(agentWakeupRequests.companyId, agent.companyId),
           eq(agentWakeupRequests.status, "deferred_issue_execution"),
         ));
+        if (assignmentHandoffResumeId && run) {
+          // Older saved assignment wakes of this owner on this task mean the
+          // same hand-off. Settle them with this run, so a later retry cannot
+          // start a second one. Saved messages keep their own rows.
+          await tx.update(agentWakeupRequests).set({
+            status: "coalesced", runId: run.id, finishedAt: new Date(), updatedAt: new Date(),
+          }).where(and(
+            eq(agentWakeupRequests.companyId, agent.companyId), eq(agentWakeupRequests.agentId, agentId),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+            savedHandoffWakeSql(),
+            sql`${agentWakeupRequests.payload}->${DEFERRED_WAKE_CONTEXT_KEY}->>'source' is distinct from 'issue.execution_stage'`,
+            sql`coalesce(jsonb_array_length(case when jsonb_typeof(${agentWakeupRequests.payload}->${DEFERRED_WAKE_CONTEXT_KEY}->'wakeCommentIds') = 'array'
+              then ${agentWakeupRequests.payload}->${DEFERRED_WAKE_CONTEXT_KEY}->'wakeCommentIds' end), 0) = 0`,
+            sql`${agentWakeupRequests.payload}->${DEFERRED_WAKE_CONTEXT_KEY}->>'wakeCommentId' is null`,
+          ));
+        }
         return result;
       };
 
       const outcome = await db
         .transaction(async (tx) => settleStageHandoffResume(tx, await (async () => {
-          stageHandoffDeferred = false;
+          handoffDeferred = false;
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
@@ -2755,6 +2838,42 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               }).where(eq(agentWakeupRequests.id, pending.id));
               return { kind: "deferred" as const };
             }
+          } else if (assignmentHandoffResumeId) {
+            // Fork (SX-2418): recheck the saved assignment hand-off under the
+            // issue lock. It must still be saved, its agent must still own the
+            // open task, and the former owner's confirmed stop must be fully
+            // cleaned up. Later gates below (execution holds, pause, budget,
+            // dependencies) still apply as for any wake.
+            const [pending] = await tx.select().from(agentWakeupRequests).where(and(
+              eq(agentWakeupRequests.id, assignmentHandoffResumeId), eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+              savedHandoffWakeSql(),
+            ));
+            if (!pending) return { kind: "deferred" as const };
+            const [current] = await tx.select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+              .from(issues).where(and(eq(issues.companyId, agent.companyId), eq(issues.id, issueId)));
+            if (!current || current.assigneeAgentId !== agentId ||
+                ["backlog", "done", "cancelled"].includes(current.status)) {
+              await tx.update(agentWakeupRequests).set({
+                status: "cancelled",
+                error: "The task has another owner or is no longer open; this hand-off is not current.",
+                finishedAt: new Date(),
+                updatedAt: new Date(),
+              }).where(eq(agentWakeupRequests.id, pending.id));
+              return { kind: "deferred" as const };
+            }
+            const predecessor = await readAssignmentHandoffPredecessor(tx as unknown as Db, pending, liveRunExecutions);
+            if (predecessor.state !== "ready") return { kind: "deferred" as const };
+            const [liveRun] = await tx.select().from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, agent.companyId),
+              sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+              inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+            )).orderBy(asc(heartbeatRuns.createdAt)).limit(1);
+            // The new owner already has a turn on the task: it gets the task
+            // there. Any other live turn: wait for it.
+            if (liveRun?.agentId === agentId) return { kind: "coalesced" as const, run: liveRun };
+            if (liveRun) return { kind: "deferred" as const };
           } else if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
               eq(agentWakeupRequests.id, executionWaitRequestId), eq(agentWakeupRequests.companyId, agent.companyId),
@@ -3199,10 +3318,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             // as a deferred wake, like a message. A skipped receipt here was
             // never resumed, so the next participant got no run.
             const stageHandoff = isExecutionStageHandoffWakeContext(enrichedContextSnapshot);
-            if (durableRequest || wakeCommentId || stageHandoff ||
+            // Fork (SX-2418): so is the new owner's assignment wake behind the
+            // former owner's stopped run that still owns execution, also when
+            // the hand-off has no comment.
+            const assignmentHandoff = isAssignmentHandoffWake(source, enrichedContextSnapshot) &&
+              issue.assigneeAgentId === agentId && executionBlocker.recoveryActionId === null &&
+              executionBlocker.cause === "execution_owner_active" && executionBlocker.agentId !== agentId;
+            if (durableRequest || wakeCommentId || stageHandoff || assignmentHandoff ||
                 hasInteractionContinuationWakeContext(enrichedContextSnapshot) ||
                 readNonEmptyString(enrichedContextSnapshot.nativeStatusWakeIntentId)) {
-              stageHandoffDeferred = stageHandoff;
+              handoffDeferred = stageHandoff || assignmentHandoff;
               await tx.insert(agentWakeupRequests).values({
                 ...durableReceiptFields,
                 companyId: agent.companyId, agentId, source, triggerDetail, reason,
@@ -4205,7 +4330,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       if (outcome.kind === "durable") {
         return outcome.receipt.runId ? getRun(outcome.receipt.runId) : null;
       }
-      if (outcome.kind === "deferred" && stageHandoffDeferred) {
+      if (outcome.kind === "deferred" && handoffDeferred) {
         // The run that held execution may have released it while this
         // transaction held the issue lock; its own release found nothing then.
         if (await resumeDeferredExecutionStageWakes(agent.companyId, issueId) === "blocked") {
