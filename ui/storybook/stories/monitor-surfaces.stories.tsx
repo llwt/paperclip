@@ -198,6 +198,19 @@ const overdueMonitorIssue = withMonitor({
   clearReason: null,
 });
 
+const scheduledRetryIssue: Issue = {
+  ...baseIssue,
+  monitorNextCheckAt: null,
+  executionState: { ...executionStateStub, monitor: null },
+  scheduledRetry: {
+    ...(baseIssue.scheduledRetry ?? {}),
+    status: "scheduled_retry",
+    scheduledRetryAt: new Date(Date.now() + 47 * 60_000),
+    scheduledRetryAttempt: 2,
+    scheduledRetryReason: "provider_quota",
+  } as Issue["scheduledRetry"],
+};
+
 function MonitorSurfaceStories() {
   return (
     <div className="space-y-8 p-6">
@@ -228,6 +241,15 @@ function MonitorSurfaceStories() {
         <IssueMonitorBanner issue={overdueMonitorIssue} onCheckNow={() => undefined} />
 
         <div className="text-xs uppercase tracking-wide text-muted-foreground">
+          Pinned top banner — scheduled retry (Retry now)
+        </div>
+        <IssueMonitorBanner
+          issue={scheduledRetryIssue}
+          onCheckNow={() => undefined}
+          onRetryNow={() => undefined}
+        />
+
+        <div className="text-xs uppercase tracking-wide text-muted-foreground">
           Pinned top banner — cleared / none (renders nothing)
         </div>
         <div className="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
@@ -250,6 +272,15 @@ function MonitorSurfaceStories() {
           Composer strip — overdue
         </div>
         <IssueMonitorComposerStrip issue={overdueMonitorIssue} onCheckNow={() => undefined} />
+
+        <div className="text-xs uppercase tracking-wide text-muted-foreground">
+          Composer strip — scheduled retry (Retry now)
+        </div>
+        <IssueMonitorComposerStrip
+          issue={scheduledRetryIssue}
+          onCheckNow={() => undefined}
+          onRetryNow={() => undefined}
+        />
       </section>
 
       <div className="grid gap-6 lg:grid-cols-2">

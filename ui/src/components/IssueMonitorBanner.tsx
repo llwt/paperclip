@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { Clock, X } from "lucide-react";
 import type { Issue, IssueWorkProduct } from "@paperclipai/shared";
 
@@ -190,6 +190,45 @@ function CheckNowButton({
   );
 }
 
+function RetryNowButton({ onRetryNow, retryingNow }: { onRetryNow: () => void; retryingNow: boolean }) {
+  return (
+    <Button
+      type="button"
+      variant="outline"
+      size="sm"
+      className="shrink-0 shadow-none"
+      onClick={onRetryNow}
+      disabled={retryingNow}
+    >
+      {retryingNow ? "Retrying…" : "Retry now"}
+    </Button>
+  );
+}
+
+function renderMonitorAction({
+  issue,
+  copy,
+  onCheckNow,
+  checkingNow,
+  onRetryNow,
+  retryingNow,
+}: {
+  issue: Issue;
+  copy: MonitorSurfaceCopy;
+  onCheckNow: (() => void) | null;
+  checkingNow: boolean;
+  onRetryNow: (() => void) | null;
+  retryingNow: boolean;
+}): ReactNode {
+  if (copy.workspaceWait) return null;
+  if (deriveMonitorState(issue).source === "scheduled-retry") {
+    return onRetryNow ? <RetryNowButton onRetryNow={onRetryNow} retryingNow={retryingNow} /> : null;
+  }
+  return onCheckNow ? (
+    <CheckNowButton onCheckNow={onCheckNow} checkingNow={checkingNow} reviewRequested={copy.pullRequestReview} />
+  ) : null;
+}
+
 function CancelMonitorButton({ onCancel }: { onCancel: () => Promise<unknown> }) {
   const [open, setOpen] = useState(false);
   const [pending, setPending] = useState(false);
@@ -232,6 +271,8 @@ export interface IssueMonitorSurfaceProps {
   issue: Issue;
   onCheckNow?: (() => void) | null;
   checkingNow?: boolean;
+  onRetryNow?: (() => void) | null;
+  retryingNow?: boolean;
   workProducts?: IssueWorkProduct[] | null;
   checkError?: string | null;
   onCancelMonitor?: (() => Promise<unknown>) | null;
@@ -246,6 +287,8 @@ export function IssueMonitorBanner({
   issue,
   onCheckNow = null,
   checkingNow = false,
+  onRetryNow = null,
+  retryingNow = false,
   workProducts,
   checkError,
   onCancelMonitor,
@@ -262,7 +305,7 @@ export function IssueMonitorBanner({
       icon={Clock}
       title={copy.bannerTitle}
       className={cn("relative my-3", canCancel && "pr-12")}
-      actions={onCheckNow && !copy.workspaceWait ? <CheckNowButton onCheckNow={onCheckNow} checkingNow={checkingNow} reviewRequested={copy.pullRequestReview} /> : null}
+      actions={renderMonitorAction({ issue, copy, onCheckNow, checkingNow, onRetryNow, retryingNow })}
     >
       {canCancel ? <CancelMonitorButton key={issue.id} onCancel={onCancelMonitor} /> : null}
       <div className="flex flex-col gap-2">
@@ -283,6 +326,8 @@ export function IssueMonitorComposerStrip({
   issue,
   onCheckNow = null,
   checkingNow = false,
+  onRetryNow = null,
+  retryingNow = false,
   workProducts,
   checkError,
   className,
@@ -306,7 +351,7 @@ export function IssueMonitorComposerStrip({
             <div className="text-xs text-muted-foreground">{copy.stripMeta.join(" · ")}</div>
           </div>
         </div>
-        {onCheckNow && !copy.workspaceWait ? <CheckNowButton onCheckNow={onCheckNow} checkingNow={checkingNow} reviewRequested={copy.pullRequestReview} /> : null}
+        {renderMonitorAction({ issue, copy, onCheckNow, checkingNow, onRetryNow, retryingNow })}
       </div>
       <p className="mt-1.5 text-xs text-muted-foreground">
         {copy.pullRequestReview
