@@ -224,13 +224,13 @@ describe("IssueMonitorBanner / IssueMonitorComposerStrip rendering", () => {
       status: "in_progress", scheduledRetry: { status: "scheduled_retry", scheduledRetryReason: "ai_connection_pool_wait", scheduledRetryAt: new Date(NOW.getTime() + 60_000).toISOString(), scheduledRetryAttempt: 1 },
     } as Issue;
     const root = createRoot(container);
-    flushSync(() => root.render(<><IssueMonitorBanner issue={issue} onCheckNow={vi.fn()} /><IssueMonitorComposerStrip issue={issue} onCheckNow={vi.fn()} /></>));
+    flushSync(() => root.render(<><IssueMonitorBanner issue={issue} onRetryNow={vi.fn()} /><IssueMonitorComposerStrip issue={issue} onRetryNow={vi.fn()} /></>));
     expect(container.textContent).toContain("Pool exhausted");
     expect(container.textContent).toContain("Usage recheck in 1m");
     expect(container.textContent).toContain("Tasks with a selected account keep it while waiting.");
     expect(container.textContent).toContain("Work resumes when usage permits.");
     expect(container.textContent).not.toContain("Attempt 1");
-    expect(container.querySelector("button")).not.toBeNull();
+    expect(Array.from(container.querySelectorAll("button")).map((b) => b.textContent)).toEqual(["Retry now", "Retry now"]);
     flushSync(() => root.unmount());
   });
 
@@ -258,6 +258,83 @@ describe("IssueMonitorBanner / IssueMonitorComposerStrip rendering", () => {
     expect(onCheckNow).toHaveBeenCalledTimes(1);
 
     flushSync(() => root.unmount());
+  });
+
+  describe("action button by source", () => {
+    const retryIssue = {
+      status: "in_progress",
+      scheduledRetry: {
+        status: "scheduled_retry",
+        scheduledRetryReason: "provider_quota",
+        scheduledRetryAt: new Date(NOW.getTime() + 60 * 60_000).toISOString(),
+        scheduledRetryAttempt: 1,
+      },
+    } as unknown as Issue;
+    const monitorIssue = issueWithMonitor(new Date(NOW.getTime() + 60 * 60_000).toISOString());
+
+    const surfaces = [
+      ["banner", (props: Record<string, unknown>, issue: Issue) => <IssueMonitorBanner issue={issue} {...props} />],
+      ["composer strip", (props: Record<string, unknown>, issue: Issue) => <IssueMonitorComposerStrip issue={issue} {...props} />],
+    ] as const;
+
+    function clickButton(label: string) {
+      const button = Array.from(container.querySelectorAll("button")).find((b) => b.textContent === label);
+      expect(button).toBeTruthy();
+      flushSync(() => button?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    }
+
+    it.each(surfaces)("%s: a scheduled retry shows Retry now and fires onRetryNow only", (_name, renderSurface) => {
+      const onCheckNow = vi.fn();
+      const onRetryNow = vi.fn();
+      const root = createRoot(container);
+      flushSync(() => root.render(renderSurface({ onCheckNow, onRetryNow }, retryIssue)));
+
+      expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent?.includes("Check now"))).toBe(false);
+      clickButton("Retry now");
+      expect(onRetryNow).toHaveBeenCalledTimes(1);
+      expect(onCheckNow).not.toHaveBeenCalled();
+      flushSync(() => root.unmount());
+    });
+
+    it.each(surfaces)("%s: a scheduled retry disables the button while retrying", (_name, renderSurface) => {
+      const root = createRoot(container);
+      flushSync(() => root.render(renderSurface({ onCheckNow: vi.fn(), onRetryNow: vi.fn(), retryingNow: true }, retryIssue)));
+      const button = Array.from(container.querySelectorAll("button")).find((b) => b.textContent === "Retrying…");
+      expect(button).toBeTruthy();
+      expect((button as HTMLButtonElement).disabled).toBe(true);
+      flushSync(() => root.unmount());
+    });
+
+    it.each(surfaces)("%s: a scheduled retry without onRetryNow shows no button", (_name, renderSurface) => {
+      const root = createRoot(container);
+      flushSync(() => root.render(renderSurface({ onCheckNow: vi.fn() }, retryIssue)));
+      expect(container.querySelector("button")).toBeNull();
+      flushSync(() => root.unmount());
+    });
+
+    it.each(surfaces)("%s: a monitor keeps Check now and fires onCheckNow only", (_name, renderSurface) => {
+      const onCheckNow = vi.fn();
+      const onRetryNow = vi.fn();
+      const root = createRoot(container);
+      flushSync(() => root.render(renderSurface({ onCheckNow, onRetryNow }, monitorIssue)));
+
+      expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent === "Retry now")).toBe(false);
+      clickButton("Check now");
+      expect(onCheckNow).toHaveBeenCalledTimes(1);
+      expect(onRetryNow).not.toHaveBeenCalled();
+      flushSync(() => root.unmount());
+    });
+
+    it.each(surfaces)("%s: workspace wait still hides the button", (_name, renderSurface) => {
+      const waiting = {
+        status: "todo",
+        scheduledRetry: { status: "scheduled_retry", scheduledRetryReason: "workspace_busy", scheduledRetryAt: NOW.toISOString() },
+      } as unknown as Issue;
+      const root = createRoot(container);
+      flushSync(() => root.render(renderSurface({ onCheckNow: vi.fn(), onRetryNow: vi.fn() }, waiting)));
+      expect(container.querySelector("button")).toBeNull();
+      flushSync(() => root.unmount());
+    });
   });
 
   it("hides the banner and strip when there is no monitor", () => {
