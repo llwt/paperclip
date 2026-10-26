@@ -74,6 +74,8 @@ export interface HeartbeatRunCompletionDependencies extends Pick<RunState,
   traceStore: Pick<ReturnType<typeof providerTraceStore>, "finalize">;
   processRunCancellationSettlements: Pick<HeartbeatRunControlDependencies["processRunCancellationSettlements"], "get">;
   failedProcessRunCancellations: HeartbeatRunCompletionDependencies["processRunCancellationSettlements"];
+  /** Fork (SX-2922): best-effort, never awaited, never allowed to change the retry outcome. */
+  claudeQuotaCard?: { observeFailedRun: (run: { id: string; companyId: string }) => Promise<unknown> };
 }
 
 interface RunCompletionOutput {
@@ -377,6 +379,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     traceStore,
     processRunCancellationSettlements,
     failedProcessRunCancellations,
+    claudeQuotaCard,
   } = dependencies;
 
   // Only a caller that wins the terminal compare-and-set (or, for the live
@@ -1140,6 +1143,12 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           isWorkspaceSyncConflictFailure(adapterResult.errorMessage)),
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
     });
+    if (claudeQuotaCard && finalizedRun && outcome === "failed" && readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota") {
+      const observed = { id: finalizedRun.id, companyId: finalizedRun.companyId };
+      void Promise.resolve()
+        .then(() => claudeQuotaCard.observeFailedRun(observed))
+        .catch((err) => logger.warn({ err, runId: observed.id }, "Claude quota card observer failed"));
+    }
     return { won: persistedRunWrite.updated, lateWrite, run: finalizedRun ?? null, outcome };
   }
 

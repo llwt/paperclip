@@ -373,6 +373,8 @@ vi.mock("../services/index.js", () => ({
   })),
 }));
 
+vi.mock("../services/claude-quota-card.js", () => ({ warnClaudeQuotaCardConfig: vi.fn() }));
+
 vi.mock("../services/chat-completion-delivery.js", () => ({ chatCompletionDeliveryService: () => ({ hasPending: vi.fn(async () => false), sweepPending: completionSweepMock }) }));
 
 vi.mock("../services/connection-intent-delivery.js", () => ({

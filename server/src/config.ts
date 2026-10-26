@@ -62,6 +62,42 @@ const TAILSCALE_DETECT_TIMEOUT_MS = 3000;
 
 type DatabaseMode = "embedded-postgres" | "postgres";
 
+export interface ClaudeQuotaCardConfig {
+  companyIds: ReadonlySet<string>;
+  operatorUserId: string | null;
+  warnings: string[];
+}
+
+const CLAUDE_QUOTA_CARD_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Fork (SX-2922): the feature is off unless both settings are valid. Any
+// invalid value disables it entirely and is reported as a warning; it must
+// never throw, because ordinary recovery shares the caller.
+export function resolveClaudeQuotaCardConfig(
+  env: Record<string, string | undefined> = process.env,
+): ClaudeQuotaCardConfig {
+  const disabled = (warning: string): ClaudeQuotaCardConfig => ({
+    companyIds: new Set(),
+    operatorUserId: null,
+    warnings: [warning],
+  });
+  const rawCompanies = env.PAPERCLIP_CLAUDE_QUOTA_CARD_COMPANY_IDS?.trim() ?? "";
+  if (!rawCompanies) return { companyIds: new Set(), operatorUserId: null, warnings: [] };
+  const tokens = rawCompanies.split(",").map((token) => token.trim());
+  if (tokens.some((token) => !CLAUDE_QUOTA_CARD_UUID_RE.test(token))) {
+    return disabled("Claude quota card disabled: PAPERCLIP_CLAUDE_QUOTA_CARD_COMPANY_IDS must be a comma separated list of company UUIDs.");
+  }
+  const operatorUserId = env.PAPERCLIP_CLAUDE_QUOTA_CARD_OPERATOR_USER_ID?.trim() ?? "";
+  if (!operatorUserId || operatorUserId.length > 255 || /\s/.test(operatorUserId)) {
+    return disabled("Claude quota card disabled: PAPERCLIP_CLAUDE_QUOTA_CARD_OPERATOR_USER_ID is missing or invalid.");
+  }
+  return {
+    companyIds: new Set(tokens.map((token) => token.toLowerCase())),
+    operatorUserId,
+    warnings: [],
+  };
+}
+
 export interface Config {
   deploymentMode: DeploymentMode;
   deploymentExposure: DeploymentExposure;
@@ -105,6 +141,7 @@ export interface Config {
   telemetryEnabled: boolean;
   announcementsEnabled: boolean;
   announcementsFeedUrl: string;
+  claudeQuotaCard: ClaudeQuotaCardConfig;
 }
 
 function detectTailnetBindHost(): string | undefined {
@@ -393,5 +430,6 @@ export function loadConfig(): Config {
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
     announcementsEnabled: process.env.PAPERCLIP_ANNOUNCEMENTS_ENABLED !== "false",
     announcementsFeedUrl: process.env.PAPERCLIP_ANNOUNCEMENTS_FEED_URL?.trim() || "https://pages.paperclip.ing/announcements/v1/current.json",
+    claudeQuotaCard: resolveClaudeQuotaCardConfig(process.env),
   };
 }

@@ -8,7 +8,7 @@ import express from "express";
 import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { activityLog, agents, companies, companyMemberships, createDb, closeRegisteredClients, heartbeatRuns, issues, plugins, principalPermissionGrants, toolConnectionInstalls } from "@paperclipai/db";
+import { activityLog, agents, authUsers, companies, companyMemberships, createDb, closeRegisteredClients, heartbeatRuns, issues, plugins, principalPermissionGrants, toolConnectionInstalls } from "@paperclipai/db";
 import { type AiConnectionBinding, type AiConnectionPoolMember, type PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentRoutes } from "../routes/agents.js";
@@ -533,6 +533,48 @@ describe("hired agents sharing a subscription", () => {
       lock.mockRestore();
       await heartbeat.drainActiveRunExecutions();
       unregisterServerAdapter(f.adapterType);
+    }
+  });
+
+  it.each([true, false])("stores quota card eligibility evidence and opens one incident only when the company is allowlisted (%s)", async (allowlisted) => {
+    const f = await fixture("anthropic");
+    const shared = await aiConnectionService(db).save(f.companyId, f.userId, { provider: "anthropic", method: "api_key", name: "Shared Claude", ownership: "shared", apiKey: "fixture-shared-key", agentIds: [f.agentId], allAgents: true }, "fixture-shared-key");
+    await db.insert(authUsers).values({ id: f.userId, name: "Owner", email: `${f.userId}@example.test`, createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+    vi.stubEnv("PAPERCLIP_CLAUDE_QUOTA_CARD_COMPANY_IDS", allowlisted ? f.companyId : randomUUID());
+    vi.stubEnv("PAPERCLIP_CLAUDE_QUOTA_CARD_OPERATOR_USER_ID", f.userId);
+    const agent = hired(await request(f.app).post(`/api/companies/${f.companyId}/agent-hires`).send({ name: "Quota teammate", role: "engineer", adapterType: f.adapterType, reportsTo: f.agentId, adapterConfig: { engine: "cli" }, runtimeConfig: { heartbeat: { enabled: false } } }));
+    await db.update(agents).set({ adapterConfig: { ...agent.adapterConfig, cwd: home }, runtimeConfig: { ...agent.runtimeConfig, aiConnection: { provider: "anthropic", method: "api_key", mode: "shared", ...shared } } }).where(eq(agents.id, agent.id));
+    await finishSetup(agent.id);
+    const [issue] = await db.insert(issues).values({ companyId: f.companyId, title: "Quota seam task", status: "todo", assigneeAgentId: agent.id, responsibleUserId: f.userId, createdByUserId: f.userId }).returning();
+    const execute = vi.fn(async () => ({ exitCode: 1, signal: null, timedOut: false, errorCode: "provider_quota", errorMessage: "You've hit your limit. resets 5pm (America/New_York)", resultJson: {} }));
+    registerServerAdapter({ ...getServerAdapter(f.adapterType), execute });
+    const heartbeat = heartbeatService(db);
+    try {
+      const run = await heartbeat.invoke(agent.id, "assignment", { issueId: issue.id, wakeReason: "issue_assigned", responsibleUserId: f.userId }, "system");
+      expect(run).not.toBeNull();
+      await expect.poll(async () => (await heartbeat.getRun(run!.id))?.status, { timeout: 6_000 }).toBe("failed");
+      await heartbeat.drainActiveRunExecutions();
+      const failed = await heartbeat.getRun(run!.id);
+      expect(failed?.errorCode).toBe("provider_quota");
+      const [row] = await db.select({ contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
+      const snapshot = row!.contextSnapshot as Record<string, any>;
+      if (allowlisted) {
+        expect(snapshot.claudeQuotaCardEligibility).toMatchObject({ eligible: true, binding: { connectionId: shared.connectionId, grantId: shared.grantId } });
+        expect(JSON.stringify(snapshot.claudeQuotaCardEligibility)).not.toContain("fixture-shared-key");
+        await expect.poll(async () => (await db.select().from(issues).where(and(eq(issues.companyId, f.companyId), eq(issues.originKind, "claude_quota_incident")))).length, { timeout: 6_000 }).toBe(1);
+        await expect.poll(async () => ((await heartbeat.getRun(run!.id))?.resultJson as Record<string, any> | null)?.claudeQuotaCard?.status, { timeout: 6_000 }).toBe("recorded");
+      } else {
+        expect(snapshot.claudeQuotaCardEligibility).toBeUndefined();
+        expect(await db.select().from(issues).where(and(eq(issues.companyId, f.companyId), eq(issues.originKind, "claude_quota_incident")))).toHaveLength(0);
+        expect((failed?.resultJson as Record<string, any> | null)?.claudeQuotaCard).toBeUndefined();
+      }
+    } finally {
+      await heartbeat.drainActiveRunExecutions();
+      unregisterServerAdapter(f.adapterType);
+      vi.unstubAllEnvs();
+      vi.stubEnv("PAPERCLIP_HOME", home);
+      vi.stubEnv("PAPERCLIP_INSTANCE_ID", "hire-ai");
+      vi.stubEnv("PAPERCLIP_IN_WORKTREE", "false");
     }
   });
 

@@ -138,6 +138,47 @@ describe.skipIf(!support.supported)("heartbeat run completion boundary", () => {
     expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(f.agent.id, expected, expect.any(String), expect.objectContaining({ keepIdleOnFailure: result.errorCode === "provider_quota" }));
   });
 
+  describe("Claude quota card observer seam", () => {
+    const quotaResult = { errorMessage: "You've hit your limit", errorCode: "provider_quota" };
+
+    it("observes a provider_quota failure once after the terminal write", async () => {
+      const observeFailedRun = vi.fn(async () => ({ status: "recorded" }));
+      const f = await fixture();
+      Object.assign(f.input.adapterResult, quotaResult);
+      await createHeartbeatRunCompletion(db, { ...f.deps, claudeQuotaCard: { observeFailedRun } }).completeRun(f.input);
+      await vi.waitFor(() => expect(observeFailedRun).toHaveBeenCalledTimes(1));
+      expect(observeFailedRun).toHaveBeenCalledWith({ id: f.run.id, companyId: f.run.companyId });
+      expect(await read(f.run.id)).toMatchObject({ status: "failed", errorCode: "provider_quota" });
+    });
+
+    it.each([
+      ["a non-quota failure", { signal: "SIGTERM", errorCode: "adapter_failed" }],
+      ["a success", {}],
+    ])("does not observe %s", async (_label, patch) => {
+      const observeFailedRun = vi.fn(async () => ({ status: "recorded" }));
+      const f = await fixture();
+      Object.assign(f.input.adapterResult, patch);
+      await createHeartbeatRunCompletion(db, { ...f.deps, claudeQuotaCard: { observeFailedRun } }).completeRun(f.input);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(observeFailedRun).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["rejects", async () => { throw new Error("observer exploded"); }],
+      ["throws synchronously", () => { throw new Error("observer exploded"); }],
+    ])("keeps the completion result and cleanup unchanged when the observer %s", async (_label, observeFailedRun) => {
+      const f = await fixture();
+      Object.assign(f.input.adapterResult, quotaResult);
+      const observer = vi.fn(observeFailedRun);
+      const result = await createHeartbeatRunCompletion(db, { ...f.deps, claudeQuotaCard: { observeFailedRun: observer } }).completeRun(f.input);
+      await vi.waitFor(() => expect(observer).toHaveBeenCalledTimes(1));
+      expect(result).toMatchObject({ won: true, outcome: "failed" });
+      expect(await read(f.run.id)).toMatchObject({ status: "failed", errorCode: "provider_quota" });
+      expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(f.agent.id, "failed", expect.any(String), expect.any(Object));
+      expect(f.deps.releaseIssueExecutionAndPromote).toHaveBeenCalledOnce();
+    });
+  });
+
   it.each(["completeRun", "failRun"] as const)("waits for an owned Stop before %s can write a competing outcome", async operation => {
     const f = await fixture();
     let settle!: () => void;

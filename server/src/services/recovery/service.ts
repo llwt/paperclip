@@ -77,6 +77,7 @@ import {
 import { visibleIssueCondition } from "../issue-visibility.js";
 import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
+import { claudeQuotaCardService } from "../claude-quota-card.js";
 import {
   isPidAlive,
   isProcessGroupAlive,
@@ -6310,8 +6311,19 @@ export function recoveryService(
     return result;
   }
 
+  // Fork (SX-2922): rides the existing periodic sweep; never throws.
+  async function reconcileClaudeQuotaCards() {
+    try {
+      return await claudeQuotaCardService(db).reconcile();
+    } catch (err) {
+      logger.warn({ err }, "Claude quota card reconciliation failed");
+      return { scanned: 0, recorded: 0, excluded: 0 };
+    }
+  }
+
   return {
     buildRunOutputSilence,
+    reconcileClaudeQuotaCards,
     escalateStrandedRecoveryIssueInPlace,
     escalateStrandedAssignedIssue,
     recordWatchdogDecision,
