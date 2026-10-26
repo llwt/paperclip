@@ -1485,6 +1485,40 @@ export interface RequestCheckboxConfirmationOption {
   description?: string | null;
 }
 
+export interface ClaudeQuotaSwitchBinding {
+  provider: string;
+  method: string;
+  mode: "shared";
+  connectionId: string;
+  grantId: string;
+}
+
+export interface ClaudeQuotaSwitchPayload {
+  version: 1;
+  incidentId: string;
+  sourceHash: string;
+  source: ClaudeQuotaSwitchBinding;
+  agents: Array<{
+    agentId: string;
+    name: string;
+    binding: ClaudeQuotaSwitchBinding;
+    expectedRevisionId: string | null;
+    expectedFingerprint: string;
+  }>;
+  targets: Array<{
+    optionId: string;
+    name: string;
+    binding: ClaudeQuotaSwitchBinding;
+  }>;
+}
+
+export interface ClaudeQuotaSwitchResult {
+  targetOptionId: string;
+  targetName: string;
+  changed: Array<{ agentId: string; revisionId: string }>;
+  skipped: Array<{ agentId: string; reason: string }>;
+}
+
 export interface RequestCheckboxConfirmationPayload {
   version: 1;
   prompt: string;
@@ -1501,6 +1535,7 @@ export interface RequestCheckboxConfirmationPayload {
   declineReasonPlaceholder?: string | null;
   supersedeOnUserComment?: boolean;
   target?: RequestConfirmationTarget | null;
+  claudeQuotaSwitch?: ClaudeQuotaSwitchPayload;
 }
 
 export type RequestItemVerdictValue = "approve" | "reject" | "defer";
@@ -1559,6 +1594,7 @@ export interface RequestConfirmationResult {
 
 export interface RequestCheckboxConfirmationResult extends RequestConfirmationResult {
   selectedOptionIds?: string[];
+  claudeQuotaSwitch?: ClaudeQuotaSwitchResult;
 }
 
 export interface RequestItemVerdictsResultItem {

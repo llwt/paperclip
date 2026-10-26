@@ -32,9 +32,12 @@ import {
   ISSUE_THREAD_INTERACTION_RESOLVER_POLICY_PROVENANCES,
   ISSUE_THREAD_INTERACTION_STATUSES,
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
+  CLAUDE_QUOTA_SWITCH_AGENT_LIMIT,
+  CLAUDE_QUOTA_SWITCH_TARGET_LIMIT,
   REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT,
   REQUEST_ITEM_VERDICTS_ITEM_LIMIT,
 } from "../constants.js";
+import { aiAuthMethodSchema, aiProviderSchema } from "../ai-connections.js";
 import { multilineTextSchema } from "./text.js";
 import {
   lowTrustReviewPresetPolicySchema,
@@ -1590,6 +1593,97 @@ export const requestCheckboxConfirmationOptionSchema = z.object({
   description: z.string().trim().max(500).nullable().optional(),
 });
 
+const claudeQuotaSwitchSharedBindingSchema = z
+  .object({
+    provider: aiProviderSchema,
+    method: aiAuthMethodSchema,
+    mode: z.literal("shared"),
+    connectionId: z.string().uuid(),
+    grantId: z.string().uuid(),
+  })
+  .strict();
+
+export const claudeQuotaSwitchPayloadSchema = z
+  .object({
+    version: z.literal(1),
+    incidentId: z.string().uuid(),
+    sourceHash: z.string().trim().min(1).max(128),
+    source: claudeQuotaSwitchSharedBindingSchema,
+    agents: z
+      .array(
+        z
+          .object({
+            agentId: z.string().uuid(),
+            name: z.string().trim().min(1).max(500),
+            binding: claudeQuotaSwitchSharedBindingSchema,
+            expectedRevisionId: z.string().uuid().nullable(),
+            expectedFingerprint: z.string().trim().min(1).max(128),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(CLAUDE_QUOTA_SWITCH_AGENT_LIMIT),
+    targets: z
+      .array(
+        z
+          .object({
+            optionId: z.string().trim().min(1).max(120),
+            name: z.string().trim().min(1).max(160),
+            binding: claudeQuotaSwitchSharedBindingSchema,
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(CLAUDE_QUOTA_SWITCH_TARGET_LIMIT),
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    const agentIds = new Set<string>();
+    for (const [index, agent] of value.agents.entries()) {
+      if (agentIds.has(agent.agentId)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "claudeQuotaSwitch agents must be unique",
+          path: ["agents", index, "agentId"],
+        });
+      }
+      agentIds.add(agent.agentId);
+    }
+    const optionIds = new Set<string>();
+    for (const [index, target] of value.targets.entries()) {
+      if (optionIds.has(target.optionId)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "claudeQuotaSwitch target option ids must be unique",
+          path: ["targets", index, "optionId"],
+        });
+      }
+      optionIds.add(target.optionId);
+    }
+  });
+
+export const claudeQuotaSwitchResultSchema = z
+  .object({
+    targetOptionId: z.string().trim().min(1).max(120),
+    targetName: z.string().trim().min(1).max(160),
+    changed: z
+      .array(
+        z.object({ agentId: z.string().uuid(), revisionId: z.string().uuid() }).strict(),
+      )
+      .max(CLAUDE_QUOTA_SWITCH_AGENT_LIMIT),
+    skipped: z
+      .array(
+        z
+          .object({
+            agentId: z.string().uuid(),
+            reason: z.string().trim().min(1).max(500),
+          })
+          .strict(),
+      )
+      .max(CLAUDE_QUOTA_SWITCH_AGENT_LIMIT),
+  })
+  .strict();
+
 export const requestCheckboxConfirmationPayloadSchema = z
   .object({
     version: z.literal(1),
@@ -1620,6 +1714,7 @@ export const requestCheckboxConfirmationPayloadSchema = z
       .optional(),
     supersedeOnUserComment: z.boolean().optional(),
     target: requestConfirmationTargetSchema.nullable().optional(),
+    claudeQuotaSwitch: claudeQuotaSwitchPayloadSchema.optional(),
   })
   .superRefine((value, ctx) => {
     const optionIds = new Set<string>();
@@ -1663,7 +1758,8 @@ export const requestCheckboxConfirmationPayloadSchema = z
         path: ["minSelected"],
       });
     }
-    if (value.defaultSelectedOptionIds.length < value.minSelected) {
+    // A several-account switch card starts with nothing chosen; accept still enforces minSelected.
+    if (!value.claudeQuotaSwitch && value.defaultSelectedOptionIds.length < value.minSelected) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: "defaultSelectedOptionIds must satisfy minSelected",
@@ -1690,6 +1786,23 @@ export const requestCheckboxConfirmationPayloadSchema = z
           code: z.ZodIssueCode.custom,
           message: "defaultSelectedOptionIds cannot exceed maxSelected",
           path: ["defaultSelectedOptionIds"],
+        });
+      }
+    }
+
+    if (value.claudeQuotaSwitch) {
+      const targetIds = value.claudeQuotaSwitch.targets.map((target) => target.optionId).sort();
+      const ids = value.options.map((option) => option.id).sort();
+      if (
+        value.minSelected !== 1 ||
+        maxSelected !== 1 ||
+        targetIds.length !== ids.length ||
+        targetIds.some((id, index) => id !== ids[index])
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "claudeQuotaSwitch needs exactly one selection among options that match its targets",
+          path: ["claudeQuotaSwitch"],
         });
       }
     }
@@ -1756,6 +1869,7 @@ export const requestCheckboxConfirmationResultSchema =
         .array(z.string().trim().min(1).max(120))
         .max(REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT)
         .optional(),
+      claudeQuotaSwitch: claudeQuotaSwitchResultSchema.optional(),
     })
     .superRefine((value, ctx) => {
       const selectedOptionIds = value.selectedOptionIds ?? [];
