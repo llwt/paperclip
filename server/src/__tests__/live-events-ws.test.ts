@@ -1,17 +1,30 @@
 import { EventEmitter } from "node:events";
 import type { IncomingMessage } from "node:http";
+import { createServer } from "node:http";
+import { once } from "node:events";
 import type { Duplex } from "node:stream";
+import { getTableName, type SQL } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
+import { WebSocket } from "ws";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { setupLiveEventsWebSocketServer } from "../realtime/live-events-ws.js";
 import { logger } from "../middleware/logger.js";
 import { idleWorkSnapshot, startTaskDrain, stopTaskDrain } from "../services/task-admission.js";
 import { readIdleSleepSafety } from "../services/idle-sleep-safety.js";
+import { publishLiveEvent } from "../services/live-events.js";
 
 vi.mock("../middleware/logger.js", () => ({
   logger: {
     warn: vi.fn(),
     error: vi.fn(),
   },
+}));
+
+vi.mock("../services/authorization.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/authorization.js")>()),
+  authorizationService: () => ({
+    decide: async ({ resource }: { resource: { issueId: string } }) => ({ allowed: resource.issueId !== "hidden-issue" }),
+  }),
 }));
 
 class FakeUpgradeSocket extends EventEmitter {
@@ -218,5 +231,83 @@ describe("setupLiveEventsWebSocketServer", () => {
 
     expect(resolveSessionFromHeaders).toHaveBeenCalledTimes(1);
     expect(socket.endedChunks[0]).toContain("403 Forbidden");
+  });
+});
+
+
+type FakeRun = { companyId: string; scopeKind: "company" | "issue"; issueId: string | null };
+
+function runVisibilityDatabase(runs: Record<string, FakeRun>, selectedRunFields: string[][], runLimits: unknown[]) {
+  return {
+    select: (fields: Record<string, unknown>) => {
+      let table = "";
+      let params: unknown[] = [];
+      const rows = () => {
+        if (table === "heartbeat_runs") {
+          const [runId, companyId] = params;
+          const run = runs[runId as string];
+          return run && run.companyId === companyId ? [run] : [];
+        }
+        if (table === "issues") return [{ id: "issue" }];
+        if (table === "company_memberships") return [{ id: "membership" }];
+        return [];
+      };
+      const query = {
+        from: (value: Parameters<typeof getTableName>[0]) => {
+          table = getTableName(value);
+          if (table === "heartbeat_runs") selectedRunFields.push(Object.keys(fields));
+          return query;
+        },
+        where: (condition: SQL) => { params = new PgDialect().sqlToQuery(condition).params; return query; },
+        limit: async (n: number) => {
+          if (table === "heartbeat_runs") runLimits.push(n);
+          return rows();
+        },
+        then: (resolve: (value: unknown[]) => unknown) => Promise.resolve(rows()).then(resolve),
+      };
+      return query;
+    },
+  };
+}
+
+describe("live event run visibility", () => {
+  it("reads only the access-check columns of the run and keeps delivery unchanged", async () => {
+    const runs: Record<string, FakeRun> = {
+      "run-readable": { companyId: "company", scopeKind: "issue", issueId: "visible-issue" },
+      "run-unreadable": { companyId: "company", scopeKind: "issue", issueId: "hidden-issue" },
+      "run-company": { companyId: "company", scopeKind: "company", issueId: null },
+      "run-other-company": { companyId: "other-company", scopeKind: "company", issueId: null },
+    };
+    const selectedRunFields: string[][] = [];
+    const runLimits: unknown[] = [];
+    const server = createServer();
+    setupLiveEventsWebSocketServer(server, runVisibilityDatabase(runs, selectedRunFields, runLimits) as never, {
+      deploymentMode: "authenticated",
+      resolveCloudActor: async () => ({ userId: "viewer", companyIds: ["company"] }),
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const socket = new WebSocket(`ws://127.0.0.1:${(server.address() as { port: number }).port}/api/companies/company/events/ws`);
+    try {
+      await once(socket, "open");
+      const delivered: string[] = [];
+      const sentinel = new Promise<void>((resolve) => socket.on("message", (data) => {
+        const event = JSON.parse(data.toString());
+        if (event.type === "plugin.sentinel") resolve();
+        else delivered.push(event.payload.runId);
+      }));
+      for (const runId of ["run-readable", "run-unreadable", "run-missing", "run-other-company", "run-company"]) {
+        publishLiveEvent({ companyId: "company", type: "heartbeat.run.log", payload: { runId } });
+      }
+      publishLiveEvent({ companyId: "company", type: "plugin.sentinel", payload: {} });
+      await sentinel;
+      expect(delivered).toEqual(["run-readable", "run-company"]);
+      expect(selectedRunFields).toHaveLength(5);
+      for (const fields of selectedRunFields) expect(fields.sort()).toEqual(["companyId", "issueId", "scopeKind"]);
+      expect(runLimits).toEqual([1, 1, 1, 1, 1]);
+    } finally {
+      socket.terminate();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });
