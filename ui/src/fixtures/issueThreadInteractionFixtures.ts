@@ -1242,6 +1242,91 @@ export const acceptedRequestCheckboxConfirmationInteraction =
     },
   });
 
+const quotaSourceBinding = {
+  provider: "anthropic",
+  method: "subscription",
+  mode: "shared",
+  connectionId: "connection-team-max",
+  grantId: "grant-team-max",
+} as const;
+
+function quotaTarget(name: string, key: string) {
+  return {
+    optionId: `grant-${key}`,
+    name,
+    binding: { ...quotaSourceBinding, connectionId: `connection-${key}`, grantId: `grant-${key}` },
+  };
+}
+
+function createClaudeQuotaSwitchInteraction(
+  targetList: Array<ReturnType<typeof quotaTarget>>,
+  overrides: Partial<RequestCheckboxConfirmationInteraction> = {},
+): RequestCheckboxConfirmationInteraction {
+  const single = targetList.length === 1;
+  return createRequestCheckboxConfirmationInteraction({
+    id: `interaction-claude-quota-${targetList.length}`,
+    title: "Claude usage limit reached on Team Max",
+    summary: "Two agents are bound to Team Max. Choose the account to switch them to.",
+    resolverPolicy: "human_only",
+    payload: {
+      version: 1,
+      prompt: "Switch the listed agents to another Claude account?",
+      detailsMarkdown:
+        "Agents: Coder 0, Coder 1.\n\nOnly the account binding changes. Held tasks keep their recovery time.",
+      options: targetList.map((target) => ({ id: target.optionId, label: target.name })),
+      defaultSelectedOptionIds: single ? [targetList[0]!.optionId] : [],
+      minSelected: 1,
+      maxSelected: 1,
+      acceptLabel: single ? `Switch listed agents to ${targetList[0]!.name}` : "Switch listed agents",
+      rejectLabel: "Keep current account",
+      rejectRequiresReason: false,
+      allowDeclineReason: false,
+      claudeQuotaSwitch: {
+        version: 1,
+        incidentId: "issue-claude-quota-incident",
+        sourceHash: "a".repeat(64),
+        source: quotaSourceBinding,
+        agents: [
+          { agentId: "agent-coder-0", name: "Coder 0", binding: quotaSourceBinding, expectedRevisionId: null, expectedFingerprint: "f".repeat(64) },
+          { agentId: "agent-coder-1", name: "Coder 1", binding: quotaSourceBinding, expectedRevisionId: null, expectedFingerprint: "e".repeat(64) },
+        ],
+        targets: targetList,
+      },
+    },
+    ...overrides,
+  });
+}
+
+export const pendingClaudeQuotaSwitchOneTargetInteraction = createClaudeQuotaSwitchInteraction([
+  quotaTarget("Backup Max", "backup-max"),
+]);
+
+export const pendingClaudeQuotaSwitchSeveralTargetsInteraction = createClaudeQuotaSwitchInteraction([
+  quotaTarget("Backup Max", "backup-max"),
+  quotaTarget("Overflow Pro", "overflow-pro"),
+]);
+
+export const acceptedClaudeQuotaSwitchStaleInteraction = createClaudeQuotaSwitchInteraction(
+  [quotaTarget("Backup Max", "backup-max")],
+  {
+    status: "accepted",
+    resolvedByUserId: issueThreadInteractionFixtureMeta.currentUserId,
+    resolvedAt: new Date("2026-04-20T14:49:00.000Z"),
+    updatedAt: new Date("2026-04-20T14:49:00.000Z"),
+    result: {
+      version: 1,
+      outcome: "accepted",
+      selectedOptionIds: ["grant-backup-max"],
+      claudeQuotaSwitch: {
+        targetOptionId: "grant-backup-max",
+        targetName: "Backup Max",
+        changed: [{ agentId: "agent-coder-0", revisionId: "revision-1" }],
+        skipped: [{ agentId: "agent-coder-1", reason: "config_changed" }],
+      },
+    },
+  },
+);
+
 const manyOptionList = Array.from({ length: 100 }, (_, index) => {
   const number = index + 1;
   return {

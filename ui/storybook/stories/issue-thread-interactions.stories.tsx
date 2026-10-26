@@ -68,6 +68,9 @@ import {
   declinedConnectionIntentInteraction,
   supersededConnectionIntentInteraction,
   expiredConnectionIntentInteraction,
+  pendingClaudeQuotaSwitchOneTargetInteraction,
+  pendingClaudeQuotaSwitchSeveralTargetsInteraction,
+  acceptedClaudeQuotaSwitchStaleInteraction,
 } from "@/fixtures/issueThreadInteractionFixtures";
 import type {
   AskUserQuestionsAnswer,
@@ -1345,6 +1348,82 @@ export const CheckboxConfirmationAccepted: Story = {
       >
         <IssueThreadInteractionCard
           interaction={acceptedRequestCheckboxConfirmationInteraction}
+          agentMap={storybookAgentMap}
+          currentUserId={issueThreadInteractionFixtureMeta.currentUserId}
+          userLabelMap={boardUserLabels}
+        />
+      </ScenarioCard>
+    </StoryFrame>
+  ),
+};
+
+export const ClaudeQuotaSwitchOneTarget: Story = {
+  render: () => (
+    <StoryFrame>
+      <ScenarioCard
+        title="Claude account switch, one target"
+        description="One compatible account is preselected, so a single click switches the listed agents."
+      >
+        <IssueThreadInteractionCard
+          interaction={pendingClaudeQuotaSwitchOneTargetInteraction}
+          agentMap={storybookAgentMap}
+          currentUserId={issueThreadInteractionFixtureMeta.currentUserId}
+          userLabelMap={boardUserLabels}
+          onAcceptInteraction={() => undefined}
+          onRejectInteraction={() => undefined}
+        />
+      </ScenarioCard>
+    </StoryFrame>
+  ),
+};
+
+export const ClaudeQuotaSwitchSeveralTargets: Story = {
+  render: () => (
+    <StoryFrame>
+      <ScenarioCard
+        title="Claude account switch, several targets"
+        description="Nothing is preselected; the board user must choose exactly one account."
+      >
+        <IssueThreadInteractionCard
+          interaction={pendingClaudeQuotaSwitchSeveralTargetsInteraction}
+          agentMap={storybookAgentMap}
+          currentUserId={issueThreadInteractionFixtureMeta.currentUserId}
+          userLabelMap={boardUserLabels}
+          onAcceptInteraction={() => undefined}
+          onRejectInteraction={() => undefined}
+        />
+      </ScenarioCard>
+    </StoryFrame>
+  ),
+};
+
+export const ClaudeQuotaSwitchNoTarget: Story = {
+  render: () => (
+    <StoryFrame>
+      <ScenarioCard
+        title="Claude usage limit, no compatible target"
+        description="With no compatible account or eligible agent the card stays acknowledgement only."
+      >
+        <IssueThreadInteractionCard
+          interaction={pendingRequestConfirmationInteraction}
+          agentMap={storybookAgentMap}
+          currentUserId={issueThreadInteractionFixtureMeta.currentUserId}
+          userLabelMap={boardUserLabels}
+        />
+      </ScenarioCard>
+    </StoryFrame>
+  ),
+};
+
+export const ClaudeQuotaSwitchStaleResult: Story = {
+  render: () => (
+    <StoryFrame>
+      <ScenarioCard
+        title="Claude account switch, stale result"
+        description="Agents changed since the card was made are skipped and named with the reason."
+      >
+        <IssueThreadInteractionCard
+          interaction={acceptedClaudeQuotaSwitchStaleInteraction}
           agentMap={storybookAgentMap}
           currentUserId={issueThreadInteractionFixtureMeta.currentUserId}
           userLabelMap={boardUserLabels}

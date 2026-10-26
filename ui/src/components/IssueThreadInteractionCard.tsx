@@ -2775,6 +2775,51 @@ function RequestConfirmationCard({
 
 const CHECKBOX_SUMMARY_LABEL_LIMIT = 8;
 
+function claudeQuotaSkipReasonLabel(reason: string): string {
+  const [base, code] = reason.split(":");
+  const label =
+    {
+      agent_not_found: "agent no longer exists",
+      agent_not_active: "agent is not active",
+      adapter_changed: "adapter changed",
+      binding_changed: "already uses a different account",
+      config_changed: "configuration changed since this card was made",
+      no_permission: "you cannot edit this agent",
+      target_unavailable: "target account is not usable by this agent",
+    }[base ?? ""] ?? reason;
+  return code ? `${label} (${code})` : label;
+}
+
+function ClaudeQuotaSwitchSummary({
+  interaction,
+}: {
+  interaction: RequestCheckboxConfirmationInteraction;
+}) {
+  const result = interaction.result?.claudeQuotaSwitch;
+  if (!result) return null;
+  const names = new Map(
+    (interaction.payload.claudeQuotaSwitch?.agents ?? []).map((agent) => [agent.agentId, agent.name]),
+  );
+  return (
+    <div className="space-y-1 text-sm leading-6 text-foreground" data-testid="claude-quota-switch-result">
+      <p className="font-medium">
+        {result.changed.length === 0
+          ? `No agents were switched to ${result.targetName}`
+          : `Switched ${result.changed.length} ${result.changed.length === 1 ? "agent" : "agents"} to ${result.targetName}`}
+      </p>
+      {result.skipped.length > 0 ? (
+        <ul className="list-disc space-y-0.5 pl-5 text-muted-foreground">
+          {result.skipped.map((entry) => (
+            <li key={entry.agentId}>
+              {`${names.get(entry.agentId) ?? entry.agentId}: skipped, ${claudeQuotaSkipReasonLabel(entry.reason)}`}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
 function RequestCheckboxConfirmationResolution({
   interaction,
 }: {
@@ -2798,6 +2843,9 @@ function RequestCheckboxConfirmationResolution({
     const chipClassName =
       "inline-flex items-center rounded-sm border border-border/60 bg-transparent px-2 py-0.5 text-(length:--text-nano) font-medium uppercase tracking-(--tracking-eyebrow) text-muted-foreground";
 
+    if (interaction.result?.claudeQuotaSwitch) {
+      return <ClaudeQuotaSwitchSummary interaction={interaction} />;
+    }
     return (
       <div className="space-y-3">
         <div className="flex flex-wrap items-center gap-2 text-sm leading-6 text-foreground">
