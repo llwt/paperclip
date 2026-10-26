@@ -117,7 +117,10 @@ export function createNativeLaunchRoots(input: NativeLaunchRootsInput): NativeLa
               void terminateOwnedProcessTree(record, { instanceId: policy.instanceId })
                 .catch((): TerminateResult => ({ outcome: "unconfirmed", containment: "none", signalled: 0, reason: "terminate_failed" }))
                 .then((result) => {
-                  if (result.outcome !== "terminated" && result.outcome !== "already_empty" && result.outcome !== "missing_record") {
+                  // A missing record proves nothing: this root's record was
+                  // written at launch and only this cleanup removes it, so
+                  // its loss leaves the scope unchecked, not empty.
+                  if (result.outcome !== "terminated" && result.outcome !== "already_empty") {
                     const reason = result.reason ?? result.outcome;
                     cleanupUnconfirmed ??= reason;
                     return resolve({ confirmed: false, reason });

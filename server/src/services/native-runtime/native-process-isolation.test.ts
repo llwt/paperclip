@@ -235,6 +235,63 @@ describe.skipIf(systemd.skipReason !== null)(
       expect(await launchRoots.settle()).toMatchObject({ cleanupUnconfirmed: "record_unreadable" });
     }, 30_000);
 
+    it("never confirms a cleanup whose record went missing, also after settlement", async () => {
+      const root = await mkdtemp(join(tmpdir(), "paperclip-native-scope-missing-"));
+      roots.push(root);
+      const registryDir = join(root, "registry");
+      const policy = createSystemdIsolationPolicy({
+        slice: systemd.slice,
+        instanceId: "nativescopetest",
+        registryDir,
+        userBusAddress: systemd.userBusAddress,
+        helperPath: systemd.helper,
+      });
+      // Stands in for `codex app-server`: leaves a setsid grandchild that
+      // ignores SIGTERM, then runs until the transport stops it.
+      const script = join(root, "app-server.mjs");
+      const leftoverFile = join(root, "leftover");
+      const leftoverSource = `process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(leftoverFile)}, String(process.pid)); setInterval(() => {}, 1000);`;
+      await writeFile(script, [
+        'import { spawn } from "node:child_process";',
+        `spawn(process.execPath, ["-e", ${JSON.stringify(leftoverSource)}], { detached: true, env: {}, stdio: "ignore" }).unref();`,
+        "setInterval(() => {}, 1000);",
+      ].join("\n"));
+      const launchRoots = createNativeLaunchRoots({ companyId: "company-1", runtime: { policy, health: null } });
+      const launcher = launchRoots.root("warm_provider", "provider-missing-test")!;
+      let provider: ChildProcess | undefined;
+      const transport = new ProcessCodexAppServerTransport({
+        command: process.execPath,
+        args: [script],
+        environment: { PATH: process.env.PATH },
+        processGroup: true,
+        processIsolation: {
+          spawn: (command, args, options) => (provider = launcher.spawn(command, args, options)),
+          reaped: (child) => launcher.reaped(child),
+        },
+      });
+      let leftover = 0;
+      for (let attempt = 0; attempt < 500 && leftover === 0; attempt += 1) {
+        leftover = Number(await readFile(leftoverFile, "utf8").catch(() => "0"));
+        if (leftover === 0) await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(alive(leftover)).toBe(true);
+      // Only this test's scratch record is removed: the cleanup can no longer
+      // check the scope, so it must not report it empty.
+      const refs = listScopeRecordRefs(registryDir, scopeUnitNamespace("nativescopetest"));
+      expect(refs).toHaveLength(1);
+      await rm(join(registryDir, `${refs[0]!.unit}.json`));
+      try {
+        await expect(transport.close()).rejects.toMatchObject({ name: "LaunchRootCleanupUnconfirmedError", reason: "missing_record" });
+        expect(alive(leftover)).toBe(true);
+        expect(await launchRoots.settle()).toMatchObject({ cleanupUnconfirmed: "missing_record" });
+        expect(await launcher.reaped(provider!)).toEqual({ confirmed: false, reason: "missing_record" });
+        await expect(transport.close()).rejects.toMatchObject({ reason: "missing_record" });
+      } finally {
+        // The leftover this test made, by its recorded PID; its scope then empties.
+        if (alive(leftover)) process.kill(leftover, "SIGKILL");
+      }
+    }, 30_000);
+
     it("runs the root once outside the slice when enrollment fails, and logs the degraded marker", async () => {
       const root = await mkdtemp(join(tmpdir(), "paperclip-native-scope-degraded-"));
       roots.push(root);
