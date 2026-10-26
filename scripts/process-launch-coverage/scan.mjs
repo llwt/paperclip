@@ -170,13 +170,13 @@ function unwrap(node) {
 
 // The module name loaded by require("x"), import("x"), createRequire(...)("x")
 // or process.getBuiltinModule("x"), or null.
-function loadedModule(node) {
+function loadedModule(node, requireAliases = new Set()) {
   if (node?.type !== "CallExpression") return null;
   const first = staticString(node.arguments[0]);
   if (first === null) return null;
   const callee = node.callee;
   if (callee.type === "Import") return first;
-  if (callee.type === "Identifier" && callee.name === "require") return first;
+  if (callee.type === "Identifier" && (callee.name === "require" || requireAliases.has(callee.name))) return first;
   if (callee.type === "MemberExpression") {
     const name = propertyName(callee);
     if (name === "getBuiltinModule" || name === "require") return first;
@@ -326,8 +326,9 @@ export function scanSource(source, file) {
 
   // require()/import()/getBuiltinModule loads and their bindings.
   const handledLoads = new Set();
+  const requireAliases = collectRequireAliases(records);
   for (const { node, path } of records) {
-    const rawSpecifier = loadedModule(node);
+    const rawSpecifier = loadedModule(node, requireAliases);
     if (rawSpecifier === null || !isProcessSpecifier(rawSpecifier)) continue;
     handledLoads.add(node);
     const parent = path[path.length - 1];
@@ -503,6 +504,45 @@ export function scanSource(source, file) {
   // A (await import("node:child_process")).spawn(...) style direct member use.
   sites.sort((a, b) => a.line - b.line || (a.api < b.api ? -1 : 1));
   return { sites, parseErrors };
+}
+
+// Names bound to a require function: const r = createRequire(import.meta.url),
+// import { createRequire as make } from "node:module" then make(...), and
+// aliases of those (const r2 = r).
+function collectRequireAliases(records) {
+  const factories = new Set(["createRequire"]);
+  const aliases = new Set();
+  for (const { node } of records) {
+    if (node.type === "ImportDeclaration" && /^(?:node:)?module$/.test(node.source.value)) {
+      for (const spec of node.specifiers) {
+        if (spec.type === "ImportSpecifier") {
+          const imported = spec.imported.type === "Identifier" ? spec.imported.name : spec.imported.value;
+          if (imported === "createRequire") factories.add(spec.local.name);
+        }
+      }
+    }
+  }
+  const isFactoryCall = (init) => {
+    const call = unwrap(init);
+    if (call?.type !== "CallExpression") return false;
+    const callee = unwrap(call.callee);
+    if (callee.type === "Identifier") return factories.has(callee.name);
+    return callee.type === "MemberExpression" && propertyName(callee) === "createRequire";
+  };
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const { node } of records) {
+      if (node.type !== "VariableDeclarator" || !node.init || node.id.type !== "Identifier") continue;
+      if (aliases.has(node.id.name)) continue;
+      const init = unwrap(node.init);
+      if (isFactoryCall(init) || (init.type === "Identifier" && aliases.has(init.name))) {
+        aliases.add(node.id.name);
+        changed = true;
+      }
+    }
+  }
+  return aliases;
 }
 
 function isBoundLoad(path, loadNode) {

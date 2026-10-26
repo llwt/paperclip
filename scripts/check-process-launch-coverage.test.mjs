@@ -137,6 +137,16 @@ const BYPASSES = {
     code: "unclassified",
     file: "packages/adapter-utils/src/new-bypass.ts",
   },
+  "createRequire binding with another name in a new production file": {
+    overlay: { "server/src/services/require-bypass.ts": `import { createRequire } from "node:module";\nconst r = createRequire(import.meta.url);\nexport const go = () => r("node:child_process").execFile("sh");\n` },
+    code: "unclassified",
+    file: "server/src/services/require-bypass.ts",
+  },
+  "createRequire imported under another name": {
+    overlay: { "server/src/services/require-bypass2.ts": `import { createRequire as make } from "node:module";\nconst load = make(import.meta.url);\nconst { spawn } = load("node:child_process");\nexport const go = () => spawn("sh");\n` },
+    code: "unclassified",
+    file: "server/src/services/require-bypass2.ts",
+  },
   "execFileSync in a new production file": {
     overlay: { "server/src/new-bypass.ts": `import { execFileSync } from "node:child_process";\nexport const go = () => execFileSync("sh");\n` },
     code: "unclassified",

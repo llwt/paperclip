@@ -354,13 +354,21 @@ fails when a new OS-process launch is not classified in
 there too. It has no directory exemptions: every production file with a launch
 site needs a class, an owner and a reason, and the site counts per file are
 pinned, so a second launch added to a classified file also fails.
+`pnpm check:process-launches --write` also refreshes the pinned counts of files
+that are already classified, so a changed count in an existing entry needs the
+same review as a new entry.
+
+Limit: a load whose module name is not a static string (`require(name)`,
+`import(name)`) is not seen. About a dozen production files use such loads for
+plugin and ESM entry paths, and none names `child_process`; a reviewer has to
+catch a computed name.
 
 What it checks:
 
 - Every Node production file under `server/src`, `cli/src` and `packages/*/src`,
   by parsing it: aliased and namespace imports, promisified `execFile`,
-  `execFileSync`, `spawnSync`, `fork`, dynamic `import` and `require`,
-  `process.getBuiltinModule`, `execa`-style libraries and SDK launch hooks.
+  `execFileSync`, `spawnSync`, `fork`, dynamic `import` and `require` (also
+  through a `createRequire(...)` binding of any name), `process.getBuiltinModule`, `execa`-style libraries and SDK launch hooks.
 - The generated launchers (`github-launcher.ts`, `local-process-sandbox.ts`,
   `execution-target.ts`, `installation-integrity.ts`,
   `native-distribution-integrity.ts` and `providers/grok/launcher.cjs`):
