@@ -302,8 +302,11 @@ no migration.
 
 When the incident is raised, the card lists the target accounts and the agents
 it would switch. A target is an active organization grant to a healthy,
-enabled Anthropic connection that is not the failing one and that at least one
-listed agent can use (checked with the same DB-only `select` a run uses). The
+enabled Anthropic connection that is not the failing one, uses the same auth
+method as the failing one (a subscription agent is never moved onto API-key
+billing, or the reverse) and that every listed agent can use (checked with the
+same DB-only `select` a run uses). The card shows each target's method and the
+agents left out, with the reason. The
 card is then a checkbox confirmation that selects exactly one account:
 
 - One target: it is preselected and the accept button reads
@@ -334,7 +337,14 @@ The accept click runs inside the existing acceptance transaction:
 4. Each remaining agent gets exactly one configuration revision with source
    `claude_quota_card_switch`, created by the clicker, that changes only
    `runtimeConfig.aiConnection`. All other runtime settings are unchanged.
-5. Any failure rolls back the acceptance and all revisions. A second click, a
+5. In the same transaction each changed agent gets an `agent.claude_quota_switched`
+   activity row (interaction, incident, source and target connection and grant
+   ids, previous and new revision ids) and the incident gets one system summary
+   comment.
+6. If no agent changes (all skipped, or the target became unavailable) the click
+   fails with 409 `claude_quota_switch_stale` or
+   `claude_quota_switch_target_unavailable`, the card stays open and nothing is
+   written. Any failure rolls back the acceptance and all revisions. A second click, a
    second simultaneous accept or a restart after commit finds the card already
    resolved and creates nothing.
 

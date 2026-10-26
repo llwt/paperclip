@@ -39,6 +39,7 @@ import { conflict, forbidden, HttpError, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { aiConnectionService } from "./ai-connections.js";
 import { updateAgentConfigurationInTransaction } from "./agent-configuration-transaction.js";
+import { persistActivity } from "./activity-log.js";
 import { issueService } from "./issues.js";
 import { CLAUDE_QUOTA_CARD_SYSTEM_ID, issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { readHeartbeatRunErrorFamily } from "./heartbeat/retries.js";
@@ -199,6 +200,10 @@ function startedAtOf(run: Pick<RunRow, "startedAt" | "createdAt">) {
 
 function compareRunOrder(a: { id: string; at: number }, b: { id: string; at: number }) {
   return a.at - b.at || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+
+function methodLabel(method: string) {
+  return method === "api_key" ? "API key" : method === "subscription" ? "subscription" : method;
 }
 
 function label(value: unknown, fallback: string) {
@@ -594,10 +599,18 @@ export function claudeQuotaCardService(db: Db, options: ClaudeQuotaCardServiceOp
     if (candidates.length === 0 || candidates.length > CLAUDE_QUOTA_SWITCH_AGENT_LIMIT) return null;
 
     const findings = await loadOwnLoginFindings(tx, companyId, candidates);
-    const eligible = candidates.filter((agent) => {
+    const eligible: AgentRow[] = [];
+    const excluded: Array<{ name: string; reason: string }> = [];
+    for (const agent of candidates) {
       const binding = agentBinding(agent);
-      return binding && sameBinding(binding, sourceBinding) && (findings.get(agent.id) ?? []).length === 0;
-    });
+      if (!binding || !sameBinding(binding, sourceBinding)) {
+        excluded.push({ name: label(agent.name, "Agent"), reason: "uses a different account binding" });
+      } else if ((findings.get(agent.id) ?? []).length > 0) {
+        excluded.push({ name: label(agent.name, "Agent"), reason: "has its own login or credential override" });
+      } else {
+        eligible.push(agent);
+      }
+    }
     if (eligible.length === 0) return null;
     const revisions = await latestRevisionIds(tx, companyId, eligible.map((agent) => agent.id));
 
@@ -627,6 +640,8 @@ export function claudeQuotaCardService(db: Db, options: ClaudeQuotaCardServiceOp
       if (row.connection.id === source.connectionId && row.grant.id === source.grantId) continue;
       const metadata = aiConnectionMetadataSchema.safeParse(row.connection.config?.ai);
       if (!metadata.success || metadata.data.provider !== "anthropic") continue;
+      // Never move subscription agents onto API-key billing, or the reverse.
+      if (metadata.data.method !== source.method) continue;
       const binding: SwitchBinding = {
         provider: "anthropic",
         method: metadata.data.method,
@@ -634,11 +649,11 @@ export function claudeQuotaCardService(db: Db, options: ClaudeQuotaCardServiceOp
         connectionId: row.connection.id,
         grantId: row.grant.id,
       };
-      // One agent that can use the account is enough to offer it; the click re-checks every agent.
-      let usable = false;
+      // A common target must pass for every proposed agent; the click re-checks each one.
+      let usable = true;
       for (const agent of eligible) {
-        if ((await trySelectTarget(connections, { companyId, userId: operatorUserId, agent, binding })) === null) {
-          usable = true;
+        if ((await trySelectTarget(connections, { companyId, userId: operatorUserId, agent, binding })) !== null) {
+          usable = false;
           break;
         }
       }
@@ -660,7 +675,7 @@ export function claudeQuotaCardService(db: Db, options: ClaudeQuotaCardServiceOp
       })),
       targets,
     };
-    return payload;
+    return { payload, excluded };
   }
 
   async function ensureCard(tx: Tx, host: typeof issues.$inferSelect, first: RunRow, operatorUserId: string) {
@@ -674,7 +689,8 @@ export function claudeQuotaCardService(db: Db, options: ClaudeQuotaCardServiceOp
       .where(and(eq(agents.id, first.agentId), eq(agents.companyId, host.companyId)));
     const agentName = label(agent?.name, "an agent");
     const reset = deriveClaudeQuotaResetDisplay(first);
-    const switchPayload = await buildSwitchProposal(tx, host, first, operatorUserId);
+    const proposal = await buildSwitchProposal(tx, host, first, operatorUserId);
+    const switchPayload = proposal?.payload ?? null;
     const common = {
       idempotencyKey: `claude-quota-card:v1:${host.id}`,
       title: `Claude usage limit: ${account}`.slice(0, 240),
@@ -698,8 +714,11 @@ export function claudeQuotaCardService(db: Db, options: ClaudeQuotaCardServiceOp
         "Agents that would switch:",
         ...switchPayload.agents.map((entry) => `- ${entry.name}`),
         "",
+        ...(proposal && proposal.excluded.length > 0
+          ? ["Agents left out:", ...proposal.excluded.map((entry) => `- ${entry.name}: ${entry.reason}`), ""]
+          : []),
         "Accounts you can switch to:",
-        ...switchPayload.targets.map((target) => `- ${target.name}`),
+        ...switchPayload.targets.map((target) => `- ${target.name} (${methodLabel(target.binding.method)})`),
         "",
         "Nothing changes until you accept. Accepting changes only each listed agent's AI account, and skips any agent whose configuration changed since this card was created. Held tasks keep their existing recovery time, and the next normal run on the new account starts a fresh session.",
       ].join("\n");
@@ -1028,7 +1047,53 @@ export function claudeQuotaCardService(db: Db, options: ClaudeQuotaCardServiceOp
         throw conflict("The switch did not record a configuration revision", { code: "claude_quota_switch_revision_missing" });
       }
       changed.push({ agentId: row.id, revisionId });
+      await persistActivity(tx as unknown as Db, {
+        companyId,
+        actorType: "user",
+        actorId: resolver.userId,
+        action: "agent.claude_quota_switched",
+        entityType: "agent",
+        entityId: row.id,
+        agentId: row.id,
+        issueId: context.issue.id,
+        details: {
+          interactionId: interaction.id,
+          incidentId: context.issue.id,
+          fromConnectionId: entry.binding.connectionId,
+          fromGrantId: entry.binding.grantId,
+          toConnectionId: target.binding.connectionId,
+          toGrantId: target.binding.grantId,
+          previousRevisionId: entry.expectedRevisionId,
+          revisionId,
+        },
+      });
     }
+
+    if (changed.length === 0) {
+      const unavailable = skipped.length > 0 && skipped.every((entry) => entry.reason.startsWith("target_unavailable"));
+      throw conflict(
+        unavailable
+          ? `${target.name} can no longer be used by the listed agents. Nothing was changed and the card is still open; check the account in connection settings.`
+          : "None of the listed agents can be switched any more because their configuration changed since this card was created. Nothing was changed; open each agent's runtime settings to change its account.",
+        {
+          code: unavailable ? "claude_quota_switch_target_unavailable" : "claude_quota_switch_stale",
+          skipped,
+        },
+      );
+    }
+
+    const nameById = new Map(payload.agents.map((entry) => [entry.agentId, entry.name]));
+    const summary = [
+      `Switched ${changed.length} ${changed.length === 1 ? "agent" : "agents"} from the rate-limited account to ${label(target.name, "the new account")}: ${changed.map((entry) => label(nameById.get(entry.agentId), "Agent")).join(", ")}.`,
+      ...(skipped.length > 0
+        ? [
+            `Skipped ${skipped.length}: ${skipped.map((entry) => `${label(nameById.get(entry.agentId), "Agent")} (${entry.reason})`).join(", ")}.`,
+          ]
+        : []),
+      "Held tasks keep their existing recovery time.",
+    ].join("\n\n");
+    await issueSvc.addComment(context.issue.id, summary, {}, { authorType: "system" }, tx);
+
     return { targetOptionId: target.optionId, targetName: target.name, changed, skipped };
   }
 

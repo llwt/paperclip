@@ -339,6 +339,36 @@ describeEmbeddedPostgres("claude quota card account switch", () => {
     expect(card.kind).toBe("request_confirmation");
   });
 
+  it("does not offer a target with a different auth method than the source", async () => {
+    const world = await seedWorld();
+    await db
+      .update(toolConnections)
+      .set({ config: sql`jsonb_set(config, '{ai,method}', '"subscription"')` })
+      .where(eq(toolConnections.id, world.targets[0]!.connectionId));
+    const { card } = await raiseCard(world);
+    expect(card.kind).toBe("request_confirmation");
+  });
+
+  it("does not offer a target that only some of the listed agents can use", async () => {
+    const world = await seedWorld();
+    await db
+      .update(toolConnectionInstalls)
+      .set({ targetType: "agent", targetId: world.agentIds[0]! })
+      .where(eq(toolConnectionInstalls.connectionId, world.targets[0]!.connectionId));
+    const { card } = await raiseCard(world);
+    expect(card.kind).toBe("request_confirmation");
+  });
+
+  it("shows each target's auth method and the agents left out", async () => {
+    const world = await seedWorld();
+    await db.update(agents).set({ adapterConfig: { env: { ANTHROPIC_API_KEY: "own-login" } } }).where(eq(agents.id, world.agentIds[1]!));
+    const { card } = await raiseCard(world);
+    const details = (card.payload as Record<string, any>).detailsMarkdown as string;
+    expect(details).toContain("- Backup Max (API key)");
+    expect(details).toContain("Agents left out:");
+    expect(details).toContain("- Coder 1: has its own login or credential override");
+  });
+
   // Accept ---------------------------------------------------------------------
 
   it("switches each listed agent with exactly one revision that changes only the AI connection", async () => {
@@ -370,6 +400,26 @@ describeEmbeddedPostgres("claude quota card account switch", () => {
       const afterSnapshot = rows[0]!.afterConfig as Record<string, any>;
       expect({ ...afterSnapshot, runtimeConfig: undefined }).toEqual({ ...beforeSnapshot, runtimeConfig: undefined });
     }
+
+    const activity = await db.select().from(activityLog).where(and(eq(activityLog.companyId, world.companyId), eq(activityLog.action, "agent.claude_quota_switched")));
+    expect(activity).toHaveLength(3);
+    for (const row of activity) {
+      expect(row.actorId).toBe(OPERATOR);
+      const revisionRows = await revisions(row.entityId);
+      expect(row.details).toMatchObject({
+        interactionId: card.id,
+        incidentId: host.id,
+        fromConnectionId: world.source.connectionId,
+        toConnectionId: target.connectionId,
+        toGrantId: target.grantId,
+        revisionId: revisionRows[0]!.id,
+      });
+    }
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, host.id));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toMatchObject({ authorType: "system" });
+    expect(comments[0]!.body).toContain("Switched 3 agents");
+    expect(comments[0]!.body).toContain("Backup Max");
   });
 
   it("requires exactly one selected account that the card offers", async () => {
@@ -431,43 +481,43 @@ describeEmbeddedPostgres("claude quota card account switch", () => {
     ]));
   });
 
-  it("changes nothing when the target grant or install was revoked after the card was made", async () => {
+  it("aborts and keeps the card open when the target grant was revoked after the card was made", async () => {
     const world = await seedWorld();
     const { card, host } = await raiseCard(world);
     await db.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.id, world.targets[0]!.grantId));
 
     const response = await accept(world, host.id, card.id, [world.targets[0]!.grantId]);
 
-    expect(response.status).toBe(200);
-    const result = ((await cardOf(card.id)).result as Record<string, any>).claudeQuotaSwitch;
-    expect(result.changed).toEqual([]);
-    expect(result.skipped).toHaveLength(2);
-    expect(result.skipped[0].reason).toMatch(/^target_unavailable/);
+    expect(response.status).toBe(409);
+    expect(response.body.details).toMatchObject({ code: "claude_quota_switch_target_unavailable" });
+    expect(response.body.details.skipped).toHaveLength(2);
+    expect((await cardOf(card.id)).status).toBe("pending");
     expect(await revisionCount(world.companyId)).toBe(0);
     expect((await runtimeOf(world.agentIds[0]!)).aiConnection.connectionId).toBe(world.source.connectionId);
   });
 
-  it("changes nothing for an agent whose install for the target was removed", async () => {
+  it("aborts and keeps the card open for agents whose install for the target was removed", async () => {
     const world = await seedWorld();
     const { card, host } = await raiseCard(world);
     await db.delete(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, world.targets[0]!.connectionId));
 
     const response = await accept(world, host.id, card.id, [world.targets[0]!.grantId]);
 
-    expect(response.status).toBe(200);
-    expect(((await cardOf(card.id)).result as Record<string, any>).claudeQuotaSwitch.changed).toEqual([]);
+    expect(response.status).toBe(409);
+    expect((await cardOf(card.id)).status).toBe("pending");
     expect(await revisionCount(world.companyId)).toBe(0);
   });
 
-  it("resolves with every agent skipped when none is eligible any more", async () => {
+  it("aborts with a stale-selection error and keeps the card open when no listed agent is eligible any more", async () => {
     const world = await seedWorld();
     const { card, host } = await raiseCard(world);
     await db.update(agents).set({ adapterConfig: { env: { ANTHROPIC_API_KEY: "own-login" } } }).where(eq(agents.companyId, world.companyId));
     const response = await accept(world, host.id, card.id, [world.targets[0]!.grantId]);
-    expect(response.status).toBe(200);
-    const result = ((await cardOf(card.id)).result as Record<string, any>).claudeQuotaSwitch;
-    expect(result.changed).toEqual([]);
-    expect(result.skipped.map((entry: any) => entry.reason)).toEqual(["config_changed", "config_changed"]);
+    expect(response.status).toBe(409);
+    expect(response.body.details).toMatchObject({ code: "claude_quota_switch_stale" });
+    expect(response.body.details.skipped.map((entry: any) => entry.reason)).toEqual(["config_changed", "config_changed"]);
+    expect((await cardOf(card.id)).status).toBe("pending");
+    expect(await revisionCount(world.companyId)).toBe(0);
   });
 
   it("rolls the acceptance and every revision back when a later agent fails mid-batch", async () => {
@@ -541,10 +591,9 @@ describeEmbeddedPostgres("claude quota card account switch", () => {
     const a = await accept(world, first.host.id, first.card.id, [world.targets[0]!.grantId]);
     const b = await accept(world, second.issueId, second.id, [world.targets[0]!.grantId]);
     expect(a.status).toBe(200);
-    expect(b.status).toBe(200);
-    const secondResult = ((await cardOf(second.id)).result as Record<string, any>).claudeQuotaSwitch;
-    expect(secondResult.changed).toEqual([]);
-    expect(secondResult.skipped).toEqual([{ agentId: otherAgent, reason: "binding_changed" }]);
+    expect(b.status).toBe(409);
+    expect(b.body.details).toMatchObject({ code: "claude_quota_switch_stale", skipped: [{ agentId: otherAgent, reason: "binding_changed" }] });
+    expect((await cardOf(second.id)).status).toBe("pending");
     expect(await revisions(otherAgent)).toHaveLength(0);
     expect((await runtimeOf(otherAgent)).aiConnection.connectionId).toBe(world.source.connectionId);
     expect(await revisions(world.agentIds[0]!)).toHaveLength(1);
