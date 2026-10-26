@@ -236,6 +236,68 @@ units, absent percentages, and proto3 zero messages. The disposable database
 and encrypted vault were removed. These checks started no provider turn and
 exchanged no refresh tokens.
 
+## Claude usage-limit incident card (fork, SX-2922)
+
+When a `claude_local` run on a direct shared Anthropic connection fails with the
+typed `provider_quota` family, Paperclip raises one acknowledgement card for the
+configured operator. It only informs: no account is switched, no retry is
+scheduled or moved, and agent settings and connection health stay as they were.
+
+Opt in with two server settings. The feature is off unless both are valid.
+
+- `PAPERCLIP_CLAUDE_QUOTA_CARD_COMPANY_IDS`: comma separated company UUIDs.
+  Empty by default. Other companies get no incident, no receipt and no extra
+  writes.
+- `PAPERCLIP_CLAUDE_QUOTA_CARD_OPERATOR_USER_ID`: the board user who receives
+  the card. No default. The user must be an active member of the company when
+  the incident is raised; otherwise nothing is created and a warning is logged.
+
+An invalid value (a non-UUID company, a blank operator) disables the feature
+and logs a warning. It never fails recovery or the run.
+
+What is created, once per connection episode:
+
+- One host task, origin kind `claude_quota_incident`, status `in_review`,
+  assigned to the operator, with no agent assignee, parent, workspace or review
+  policy. Its text holds only the connection name, the agent name, the time and
+  a reset line. It never holds task descriptions, prompts, credentials or the
+  raw error or result.
+- One `request_confirmation` card on that task: `human_only`, addressed to the
+  operator, no continuation, not superseded by a comment. The buttons are
+  Acknowledge and Dismiss.
+
+The reset line shows an absolute time with its zone, for example
+`2026-10-26 17:00 America/New_York (2026-10-26T21:00:00.000Z)`, only when the
+error holds exactly one `resets 5pm (Zone)` style time that agrees with any
+saved retry time. Weekly or dated text, several different times, an unknown
+zone or a disagreeing retry time all show `unknown`.
+
+Which runs count. The run must be on a direct shared binding (not a router
+pool) whose attribution matches the binding. Agents that choose their own login
+are excluded: `CLAUDE_CONFIG_DIR`, an API key or token, `ANTHROPIC_BASE_URL`,
+cloud routing variables such as `CLAUDE_CODE_USE_BEDROCK`, auth arguments, or a
+custom command, in the agent, environment, project or routine settings. The
+check runs before managed auth stripping and stores key names only.
+
+Episodes. The identity is the connection, grant, provider and method. Failures
+on one connection share one incident until a successful managed run on that
+connection happens between two failures. Acknowledging the card, a restart, the
+7 day idempotency key cleanup, different reset text and an unknown reset never
+create another card. A late result of an old run stays on its old episode. A
+failure after a success starts the next episode.
+
+How it is made safe. The run completion hook is best effort and never awaited,
+so it cannot change retry results or block lease cleanup. A company-scoped
+advisory lock per connection serializes concurrent failures; the host is found
+through `originKind`, `originId` (hashed connection identity) and
+`originFingerprint` (first failed run) before any idempotency key. A receipt in
+`heartbeat_runs.result_json.claudeQuotaCard` marks each handled run. The
+existing stranded-issue sweep repairs a missed host, card or receipt with a
+bounded scan (50 runs per company, 48 hours), so there is no new scheduler and
+no migration.
+
+Not here: choosing a target account and a switch button (slice 2).
+
 ## Repairing a "needs reconnect" mark
 
 A run that ends with an authentication failure sets two marks: the grant
