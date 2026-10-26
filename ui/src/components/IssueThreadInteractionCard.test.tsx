@@ -23,6 +23,9 @@ import {
   failedToolActionInteraction,
   pendingRequestConfirmationInteraction,
   pendingRequestCheckboxConfirmationInteraction,
+  pendingClaudeQuotaSwitchOneTargetInteraction,
+  pendingClaudeQuotaSwitchSeveralTargetsInteraction,
+  acceptedClaudeQuotaSwitchStaleInteraction,
   pendingToolActionDestructiveInteraction,
   pendingToolActionWriteInteraction,
   issueThreadInteractionFixtureMeta,
@@ -689,6 +692,35 @@ describe("IssueThreadInteractionCard", () => {
     expect(onAcceptInteraction).not.toHaveBeenCalled();
     const reject = [...host.querySelectorAll<HTMLButtonElement>("button")].find((button) => ["Reject", "Revise…", "Add reason…"].includes(button.textContent ?? ""));
     expect(reject?.disabled).toBe(false);
+  });
+
+  it("switches Claude accounts with one click when a single target is preselected", async () => {
+    const onAcceptInteraction = vi.fn(async () => undefined);
+    const host = renderCard({ interaction: pendingClaudeQuotaSwitchOneTargetInteraction, onAcceptInteraction, onRejectInteraction: vi.fn() });
+    const buttons = Array.from(host.querySelectorAll("button"));
+    const accept = buttons.find((button) => button.textContent === "Switch listed agents to Backup Max")!;
+    expect(accept.disabled).toBe(false);
+    expect(buttons.some((button) => button.textContent === "Keep current account")).toBe(true);
+    await act(async () => { accept.click(); });
+    expect(onAcceptInteraction).toHaveBeenCalledTimes(1);
+    expect((onAcceptInteraction.mock.calls[0] as unknown[])[2]).toEqual(["grant-backup-max"]);
+  });
+
+  it("requires a choice when several Claude accounts are offered", async () => {
+    const onAcceptInteraction = vi.fn(async () => undefined);
+    const host = renderCard({ interaction: pendingClaudeQuotaSwitchSeveralTargetsInteraction, onAcceptInteraction, onRejectInteraction: vi.fn() });
+    const accept = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Switch listed agents")!;
+    expect(host.textContent).toContain("0 of 2 options selected");
+    expect(Array.from(host.querySelectorAll("button")).some((button) => button.textContent === "Revise…")).toBe(false);
+    await act(async () => { accept.click(); });
+    expect(onAcceptInteraction).not.toHaveBeenCalled();
+  });
+
+  it("names skipped agents and the reason after a Claude account switch", () => {
+    const host = renderCard({ interaction: acceptedClaudeQuotaSwitchStaleInteraction });
+    const summary = host.querySelector('[data-testid="claude-quota-switch-result"]')!;
+    expect(summary.textContent).toContain("Switched 1 agent to Backup Max");
+    expect(summary.textContent).toContain("Coder 1: skipped, configuration changed since this card was made");
   });
 
   it("invokes the confirm callback with pending request confirmations", async () => {

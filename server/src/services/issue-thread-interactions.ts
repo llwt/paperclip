@@ -47,6 +47,7 @@ import {
 } from "@paperclipai/shared/telemetry";
 import type {
   AcceptIssueThreadInteraction,
+  ClaudeQuotaSwitchResult,
   AskUserQuestionsAnswer,
   AskUserQuestionsInteraction,
   CancelIssueThreadInteraction,
@@ -144,6 +145,8 @@ import {
 export { extractGitHubPullRequestReferences } from "./github-pull-request-merge.js";
 export type { GitHubPullRequestReference } from "./github-pull-request-merge.js";
 
+export const CLAUDE_QUOTA_CARD_SYSTEM_ID = "claude-quota-card";
+
 type InteractionActor = {
   identityContextId?: string | null;
   agentId?: string | null;
@@ -202,6 +205,17 @@ type InteractionResolutionMutationOptions = {
    * effects and flush them with the root database only after its commit. */
   deferConfirmationCommitEffects?: (effect: (committedDb: Db) => Promise<void>) => void;
   beforeResolveInTransaction?: (tx: DbTransaction) => Promise<void>;
+  /** Runs inside the acceptance transaction for a reserved claudeQuotaSwitch
+   * checkbox card, after the issue and interaction locks. Accepting such a card
+   * without this handler fails closed. Any throw rolls back the acceptance. */
+  claudeQuotaSwitch?: (
+    tx: DbTransaction,
+    context: {
+      issue: { id: string; companyId: string };
+      interaction: IssueThreadInteraction;
+      selectedOptionIds: string[];
+    },
+  ) => Promise<ClaudeQuotaSwitchResult>;
   afterResolveInTransaction?: (
     tx: DbTransaction,
     interaction: IssueThreadInteraction,
@@ -2238,6 +2252,25 @@ export function issueThreadInteractionService(
             })
           : undefined;
 
+      let claudeQuotaSwitchResult: ClaudeQuotaSwitchResult | undefined;
+      if (
+        interaction.kind === "request_checkbox_confirmation" &&
+        interaction.payload.claudeQuotaSwitch
+      ) {
+        const handler = args.mutationOptions?.claudeQuotaSwitch;
+        if (!handler) {
+          throw conflict(
+            "This account switch card can only be accepted from the issue accept action",
+            { code: "claude_quota_switch_unavailable" },
+          );
+        }
+        claudeQuotaSwitchResult = await handler(tx, {
+          issue: { id: issueContext.id, companyId: issueContext.companyId },
+          interaction,
+          selectedOptionIds: selectedOptionIds ?? [],
+        });
+      }
+
       const [updated] = await tx
         .update(issueThreadInteractions)
         .set({
@@ -2246,6 +2279,9 @@ export function issueThreadInteractionService(
             version: 1,
             outcome: "accepted",
             ...(selectedOptionIds ? { selectedOptionIds } : {}),
+            ...(claudeQuotaSwitchResult
+              ? { claudeQuotaSwitch: claudeQuotaSwitchResult }
+              : {}),
           },
           resolvedByAgentId: args.actor.agentId ?? null,
           resolvedByRunId: args.actor.runId ?? null,
@@ -3383,6 +3419,15 @@ export function issueThreadInteractionService(
       const data = normalizeCreateInteractionInput(
         createIssueThreadInteractionSchema.parse(input),
       );
+      if (
+        data.kind === "request_checkbox_confirmation" &&
+        data.payload.claudeQuotaSwitch !== undefined &&
+        actor.systemId !== CLAUDE_QUOTA_CARD_SYSTEM_ID
+      ) {
+        throw unprocessable(
+          "payload.claudeQuotaSwitch is server-owned metadata and cannot be supplied when creating an interaction",
+        );
+      }
       // Chat ownership is server-owned and immutable. Ordinary human questions
       // must not depend on a model copying an opaque user identity correctly.
       let defaultAddresseeUserId: string | null = null;

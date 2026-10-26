@@ -771,6 +771,8 @@ export type {
   ConnectionIntentResult,
   RequestConfirmationSecretProposalPayload,
   RequestConfirmationSecretProposalResult,
+  ClaudeQuotaSwitchPayload,
+  ClaudeQuotaSwitchResult,
   RequestCheckboxConfirmationOption,
   RequestCheckboxConfirmationPayload,
   RequestCheckboxConfirmationResult,

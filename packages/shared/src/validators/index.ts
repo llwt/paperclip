@@ -478,6 +478,8 @@ export {
   requestConfirmationResultSchema,
   requestConfirmationSecretProposalPayloadSchema,
   requestConfirmationSecretProposalResultSchema,
+  claudeQuotaSwitchPayloadSchema,
+  claudeQuotaSwitchResultSchema,
   requestCheckboxConfirmationOptionSchema,
   requestCheckboxConfirmationPayloadSchema,
   requestCheckboxConfirmationResultSchema,

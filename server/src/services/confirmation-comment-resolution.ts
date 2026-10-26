@@ -51,7 +51,7 @@ export async function resolveConfirmationFromComment(db: Db, args: {
       throw unprocessable("Only confirmation cards can be answered from a conversation");
     }
     const payload = card.payload as unknown as Record<string, unknown>;
-    if (payload.toolAction || payload.secretProposal || payload.connectionAuthorization) {
+    if (payload.toolAction || payload.secretProposal || payload.connectionAuthorization || payload.claudeQuotaSwitch) {
       throw forbidden("Governed actions must use their dedicated approval controls");
     }
     const [comment] = await tx.select().from(issueComments).where(and(

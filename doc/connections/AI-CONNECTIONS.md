@@ -239,9 +239,10 @@ exchanged no refresh tokens.
 ## Claude usage-limit incident card (fork, SX-2922)
 
 When a `claude_local` run on a direct shared Anthropic connection fails with the
-typed `provider_quota` family, Paperclip raises one acknowledgement card for the
-configured operator. It only informs: no account is switched, no retry is
-scheduled or moved, and agent settings and connection health stay as they were.
+typed `provider_quota` family, Paperclip raises one card for the configured
+operator. The card never switches anything by itself. When another account is
+usable it offers a one-click switch (SX-2923, below); otherwise it only informs.
+No retry is ever scheduled or moved, and connection health stays as it was.
 
 Opt in with two server settings. The feature is off unless both are valid.
 
@@ -262,9 +263,10 @@ What is created, once per connection episode:
   policy. Its text holds only the connection name, the agent name, the time and
   a reset line. It never holds task descriptions, prompts, credentials or the
   raw error or result.
-- One `request_confirmation` card on that task: `human_only`, addressed to the
-  operator, no continuation, not superseded by a comment. The buttons are
-  Acknowledge and Dismiss.
+- One card on that task: `human_only`, addressed to the operator, no
+  continuation, not superseded by a comment. With no usable target account it
+  is a `request_confirmation` with the buttons Acknowledge and Dismiss. With a
+  target it is an account switch card (next section).
 
 The reset line shows an absolute time with its zone, for example
 `2026-10-26 17:00 America/New_York (2026-10-26T21:00:00.000Z)`, only when the
@@ -296,7 +298,73 @@ existing stranded-issue sweep repairs a missed host, card or receipt with a
 bounded scan (50 runs per company, 48 hours), so there is no new scheduler and
 no migration.
 
-Not here: choosing a target account and a switch button (slice 2).
+### One-click account switch (fork, SX-2923)
+
+When the incident is raised, the card lists the target accounts and the agents
+it would switch. A target is an active organization grant to a healthy,
+enabled Anthropic connection that is not the failing one, uses the same auth
+method as the failing one (a subscription agent is never moved onto API-key
+billing, or the reverse) and that every listed agent can use (checked with the
+same DB-only `select` a run uses). The card shows each target's method and the
+agents left out, with the reason. The
+card is then a checkbox confirmation that selects exactly one account:
+
+- One target: it is preselected and the accept button reads
+  `Switch listed agents to <account>`. One click switches.
+- Several targets: nothing is preselected and one account must be chosen.
+- Reject reads `Keep current account` and asks for no reason. Nothing changes
+  without the accept click.
+- No compatible target, no eligible agent, or more than 200 agents: the card
+  stays Acknowledge and Dismiss. Agents that choose their own login (see above)
+  are never listed. Cards raised before this slice stay acknowledgement only.
+
+The accept click runs inside the existing acceptance transaction:
+
+1. The route requires the addressed board user (agents and other users are
+   refused) and an `agent_config:update` permission for each listed agent.
+   These checks run before the transaction.
+2. The feature flag, host task, source account and every stored binding are
+   checked again. A forged or edited card payload cannot add an agent, because
+   the public create route rejects the reserved `claudeQuotaSwitch` payload and
+   the stored list is re-validated against the host task.
+3. The listed agents are locked in id order. An agent is skipped, with a reason
+   shown on the card, when it is gone, not active, on another adapter or
+   account (`binding_changed`), changed since the card was made
+   (`config_changed`: a newer config revision, including an A to B to A edit,
+   or a different own-login finding), not editable by the clicker
+   (`no_permission`), or when the target is no longer usable by it
+   (`target_unavailable`, with the selection error code).
+4. Each remaining agent gets exactly one configuration revision with source
+   `claude_quota_card_switch`, created by the clicker, that changes only
+   `runtimeConfig.aiConnection`. All other runtime settings are unchanged.
+5. In the same transaction each changed agent gets an `agent.claude_quota_switched`
+   activity row (interaction, incident, source and target connection and grant
+   ids, previous and new revision ids) and the incident gets one system summary
+   comment.
+6. If no agent changes (all skipped, or the target became unavailable) the click
+   fails with 409 `claude_quota_switch_stale` or
+   `claude_quota_switch_target_unavailable`, the card stays open and nothing is
+   written. Any failure rolls back the acceptance and all revisions. A second click, a
+   second simultaneous accept or a restart after commit finds the card already
+   resolved and creates nothing.
+
+Accepting the card any other way (a plugin, a chat channel, a comment) fails
+closed with 409 `claude_quota_switch_unavailable`. Reject, skip, expiry and
+withdraw never run the switch.
+
+Held tasks are not touched. Their monitor, retry and recovery times, wake
+requests and runs stay as they were; the switch makes no dispatcher call. The
+next normal run of an agent resolves the new account and starts a fresh native
+session, because the saved session identity belongs to the old account (the
+existing account identity guard; tests cover this with a fake adapter).
+
+Limits worth knowing. Own-login detection is best effort: it reads the agent
+adapter config, the default environment, the overrides of active assigned
+tasks (bounded to 500) and project env, but not routine or execution workspace
+env. Managed accounts strip auth overrides at launch regardless. Agent row
+locks are taken after the issue and interaction locks, so a concurrent agent
+edit can make Postgres abort one side with a deadlock error; the card stays
+pending and the click can be repeated.
 
 ## Repairing a "needs reconnect" mark
 
