@@ -97,6 +97,11 @@ export async function spawnRunOutputRelay(input: {
   dir: string;
   stdout: Readable | null;
   stderr: Readable | null;
+  /**
+   * The run whose output this relay carries. Its scope is owned by that run,
+   * so a later server can tell whether the relay's lifetime has ended.
+   */
+  owner?: { runId: string; companyId?: string | null };
 }): Promise<{ relayPid: number }> {
   await fs.mkdir(input.dir, { recursive: true, mode: 0o700 });
   for (const stream of RUN_OUTPUT_RELAY_STREAMS) {
@@ -119,7 +124,7 @@ export async function spawnRunOutputRelay(input: {
       env: { PAPERCLIP_RUN_OUTPUT_RELAY_DIR: input.dir },
       stdio,
     },
-    owner: { kind: "relay" },
+    owner: { kind: "relay", id: input.owner?.runId ?? null, companyId: input.owner?.companyId ?? null },
   }).child;
   if (typeof relay.pid !== "number" || relay.pid <= 0) {
     const error = await new Promise<Error>((resolve) => {

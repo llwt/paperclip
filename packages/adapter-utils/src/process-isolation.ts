@@ -64,6 +64,16 @@ export interface OwnedScope {
   isScopeActive(): boolean;
 }
 
+/**
+ * Owner ids of legacy ACP warm providers start with this. Those providers
+ * talk to the server over stdio, so no later server can adopt one.
+ */
+export const ACP_WARM_PROVIDER_OWNER_PREFIX = "acp-";
+
+export function isAcpWarmProviderOwnerId(ownerId: string): boolean {
+  return ownerId.startsWith(ACP_WARM_PROVIDER_OWNER_PREFIX);
+}
+
 export type ScopeTerminationOutcome = TerminateResult["outcome"] | "not_scoped";
 
 export interface ScopeTermination {

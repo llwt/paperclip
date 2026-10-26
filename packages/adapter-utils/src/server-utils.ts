@@ -92,8 +92,10 @@ export interface RunProcessResult {
 }
 
 export {
+  ACP_WARM_PROVIDER_OWNER_PREFIX,
   configureAgentProcessIsolation,
   getAgentProcessIsolation,
+  isAcpWarmProviderOwnerId,
   resetAgentProcessIsolation,
   formatProcessIsolationDegradedLine,
   RunIsolationTracker,
@@ -5125,6 +5127,7 @@ export async function runChildProcess(
               dir,
               stdout: child.stdout,
               stderr: child.stderr,
+              owner: { runId, companyId: opts.env.PAPERCLIP_COMPANY_ID ?? null },
             });
           } catch (err) {
             for (const readable of readables) resumeReadable(readable);
