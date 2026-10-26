@@ -46,6 +46,7 @@ import { quotaCredentialRecovery, quotaCredentialHash } from "./quota-credential
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { secretService } from "./secrets.js";
+import { systemAuditDedupe } from "./tool-access.js";
 import { probeAiConnectionUsage } from "./ai-connection-usage.js";
 import { checkAiCredential } from "./ai-credential-check.js";
 
@@ -522,7 +523,10 @@ export function aiConnectionService(db: Db) {
       if (!result) throw unprocessable("Reconnect this AI account");
       value = result.value;
     } else {
-      value = await secrets.resolveSecretValue(row.connection.companyId, secret.id, "latest", context);
+      value = await secrets.resolveSecretValue(row.connection.companyId, secret.id, "latest", {
+        ...context,
+        ...systemAuditDedupe(context, context.heartbeatRunId),
+      });
     }
     // Resolution records lastResolvedAt and can wait behind a rotating writer.
     // Re-read after that wait instead of handing a run the pre-rotation token.
