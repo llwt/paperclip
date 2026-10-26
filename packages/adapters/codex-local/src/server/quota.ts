@@ -1,4 +1,6 @@
-import { spawn } from "node:child_process";
+import type { ChildProcessByStdio } from "node:child_process";
+import type { Readable, Writable } from "node:stream";
+import { spawnScoped } from "@paperclipai/adapter-utils/scoped-process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -472,13 +474,15 @@ type PendingRequest = {
 };
 
 class CodexRpcClient {
-  private proc = spawn(
-    "codex",
+  private scoped = spawnScoped({
+    command: "codex",
     // Only account-read RPCs are sent; no agent turn is started. Keep the
     // read-only sandbox and use the approval policy supported by current CLIs.
-    ["-s", "read-only", "-a", "on-request", "app-server"],
-    { stdio: ["pipe", "pipe", "pipe"], env: process.env },
-  );
+    args: ["-s", "read-only", "-a", "on-request", "app-server"],
+    options: { stdio: ["pipe", "pipe", "pipe"], env: process.env },
+    owner: { kind: "auxiliary" },
+  });
+  private proc = this.scoped.child as ChildProcessByStdio<Writable, Readable, Readable>;
 
   private nextId = 1;
   private buffer = "";
@@ -611,10 +615,10 @@ class CodexRpcClient {
     // A failed spawn has no process to signal. Never leave a live probe behind
     // when it ignores SIGTERM, including after a request or transport failure.
     if (this.closed || this.proc.pid == null) return;
-    this.proc.kill("SIGTERM");
+    this.scoped.kill("SIGTERM");
     await this.waitForClose();
     if (!this.closed) {
-      this.proc.kill("SIGKILL");
+      this.scoped.kill("SIGKILL");
       await this.waitForClose();
     }
   }

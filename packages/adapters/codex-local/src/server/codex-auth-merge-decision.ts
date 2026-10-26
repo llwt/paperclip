@@ -1,8 +1,7 @@
-import { execFile as execFileCallback } from "node:child_process";
+import { execFileAuxiliary } from "@paperclipai/adapter-utils/scoped-process";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 
-const execFile = promisify(execFileCallback);
+const execFile = execFileAuxiliary;
 
 // The single identity-and-freshness predicate. Every credential writer that must
 // answer "should the caller replace `destination` with `source`?" runs this one

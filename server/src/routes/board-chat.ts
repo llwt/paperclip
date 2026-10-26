@@ -1,7 +1,8 @@
 import { FAST_RESPONSE_AGENT_GUIDANCE, fastResponseHistoryBody } from "@paperclipai/shared";
 import { enqueueFastResponse, supersedeFastResponse } from "../services/fast-responses.js";
 import { Router } from "express";
-import { spawn } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawnScoped } from "@paperclipai/adapter-utils/scoped-process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -252,15 +253,21 @@ export function boardChatRoutes(
       liveBoardChats -= 1;
     };
 
-    const proc = spawn("claude", args, {
-      stdio: ["pipe", "pipe", "pipe"],
-      cwd: "/tmp",
-      env: {
-        ...process.env,
-        PAPERCLIP_API_URL: apiUrl,
-        PAPERCLIP_COMPANY_ID: companyId,
+    const scopedProc = spawnScoped({
+      command: "claude",
+      args,
+      options: {
+        stdio: ["pipe", "pipe", "pipe"],
+        cwd: "/tmp",
+        env: {
+          ...process.env,
+          PAPERCLIP_API_URL: apiUrl,
+          PAPERCLIP_COMPANY_ID: companyId,
+        },
       },
+      owner: { kind: "auxiliary", companyId },
     });
+    const proc = scopedProc.child as ChildProcessWithoutNullStreams;
 
     let fullResponse = "";
     let streamedViaDelta = false;
@@ -269,7 +276,7 @@ export function boardChatRoutes(
     // 120s timeout — board conversations can involve multiple API calls.
     const timeout = setTimeout(() => {
       killed = true;
-      proc.kill("SIGTERM");
+      scopedProc.kill("SIGTERM");
     }, 120000);
 
     // If the client disconnects mid-stream, stop the subprocess rather than
@@ -279,7 +286,7 @@ export function boardChatRoutes(
     // releases the concurrency slot.
     res.on("close", () => {
       if (proc.exitCode === null && !proc.killed) {
-        proc.kill("SIGTERM");
+        scopedProc.kill("SIGTERM");
       }
     });
 

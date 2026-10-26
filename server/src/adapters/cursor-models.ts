@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawnSyncScoped } from "@paperclipai/adapter-utils/scoped-process";
 import { models as cursorFallbackModels } from "@paperclipai/adapter-cursor-local";
 import type { AdapterModel } from "./types.js";
 
@@ -110,11 +110,11 @@ function mergedWithFallback(models: AdapterModel[]): AdapterModel[] {
 }
 
 function defaultCursorModelsRunner(): CursorModelsCommandResult {
-  const result = spawnSync("agent", ["models"], {
+  const result = spawnSyncScoped("agent", ["models"], {
     encoding: "utf8",
     timeout: CURSOR_MODELS_TIMEOUT_MS,
     maxBuffer: MAX_BUFFER_BYTES,
-  });
+  }, { kind: "auxiliary" });
   return {
     status: result.status,
     stdout: typeof result.stdout === "string" ? result.stdout : "",

@@ -1,8 +1,8 @@
-import { execFile, spawn } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFileAuxiliary, spawnScoped } from "@paperclipai/adapter-utils/scoped-process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
 import { randomBytes } from "node:crypto";
 import { RailwayError, type RailwaySshInput } from "./railway.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -22,7 +22,7 @@ export async function generateRailwaySshKey(): Promise<{ publicKey: string; priv
   const directory = await mkdtemp(path.join(tmpdir(), "paperclip-railway-key-"));
   try {
     const keyPath = path.join(directory, "identity");
-    await promisify(execFile)("/usr/bin/ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-C", "paperclip-railway", "-f", keyPath], { timeout: 10_000, env: { PATH: "/usr/bin:/bin" } });
+    await execFileAuxiliary("/usr/bin/ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-C", "paperclip-railway", "-f", keyPath], { timeout: 10_000, env: { PATH: "/usr/bin:/bin" } });
     return { publicKey: (await readFile(`${keyPath}.pub`, "utf8")).trim(), privateKey: await readFile(keyPath, "utf8") };
   } catch {
     throw new RailwayError("railway_ssh_unavailable", "Generating a Railway key requires system OpenSSH (ssh-keygen) on the Paperclip runtime.", 422);
@@ -53,10 +53,12 @@ export async function runRailwaySshCommand(input: RailwaySshInput & { privateKey
     input.signal.throwIfAborted();
     return await new Promise<{ exitCode: number | null; stdout: string; stderr: string; truncated: boolean; timedOut: boolean }>((resolve, reject) => {
       // No developer SSH config/agent, CLI login, provider token or ambient env.
-      const child = spawn("/usr/bin/ssh", railwaySshArguments(directory, input.deploymentInstanceId), { env: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" }, stdio: ["pipe", "pipe", "pipe"] });
+      const scoped = spawnScoped({ command: "/usr/bin/ssh", args: railwaySshArguments(directory, input.deploymentInstanceId), options: { env: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" }, stdio: ["pipe", "pipe", "pipe"] }, owner: { kind: "auxiliary" } });
+      const child = scoped.child as ChildProcessWithoutNullStreams;
+      const settled = scoped.settled;
       let stdout = "", stderr = "", bytes = 0, truncated = false, timedOut = false, deliveryFailed = false;
       const marker = `paperclip_railway_completed_${randomBytes(16).toString("hex")}`;
-      const stop = () => { child.kill("SIGKILL"); };
+      const stop = () => { scoped.kill("SIGKILL", 1); };
       const receive = (chunk: Buffer, stream: "out" | "err") => {
         const remaining = Math.max(0, 64 * 1024 - bytes);
         bytes += chunk.length;
@@ -72,7 +74,7 @@ export async function runRailwaySshCommand(input: RailwaySshInput & { privateKey
       if (input.signal.aborted) abort();
       const cleanup = () => { clearTimeout(timer); input.signal.removeEventListener("abort", abort); };
       child.once("error", () => { cleanup(); reject(new RailwayError("railway_ssh_unavailable", "System OpenSSH is unavailable on this Paperclip runtime.", 422)); });
-      child.once("close", (exitCode) => {
+      child.once("close", (exitCode) => void settled.then(() => {
         cleanup();
         if (input.signal.aborted) { reject(input.signal.reason); return; }
         const completion = new RegExp(`\\n${marker}:(\\d+)\\r?\\n?$`).exec(stdout);
@@ -82,7 +84,7 @@ export async function runRailwaySshCommand(input: RailwaySshInput & { privateKey
         }
         if (completion) stdout = stdout.slice(0, completion.index);
         resolve({ exitCode: completion ? Number(completion[1]) : exitCode, stdout: redactSensitiveText(stdout), stderr: redactSensitiveText(stderr), truncated, timedOut });
-      });
+      }));
       child.stdin.on("error", () => { deliveryFailed = true; });
       const quotedCommand = "'" + input.command.replace(/'/g, "'\\''") + "'";
       child.stdin.end(`sh -c ${quotedCommand} </dev/null\npaperclip_command_status=$?\nprintf '\\n${marker}:%d\\n' "$paperclip_command_status"\nexit "$paperclip_command_status"\n`);

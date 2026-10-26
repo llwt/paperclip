@@ -60,6 +60,8 @@ import type {
   InitializeParams,
 } from "@paperclipai/plugin-sdk";
 import { getActiveStepContext } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
+import { getAgentProcessIsolation } from "@paperclipai/adapter-utils/process-isolation";
+import { spawnScoped } from "@paperclipai/adapter-utils/scoped-process";
 import {
   isLoginCommandKey,
   validateLoginSessionHome,
@@ -2933,15 +2935,26 @@ export function createPluginWorkerHandle(
       TZ: process.env.TZ ?? "UTC",
     };
 
-    const child = fork(options.entrypointPath, [], {
-      stdio: ["pipe", "pipe", "pipe", "ipc"],
-      execArgv: options.execArgv ?? [],
-      env: workerEnv,
-      // Don't let the child keep the parent alive
-      detached: false,
-    });
+    const stdio: ["pipe", "pipe", "pipe", "ipc"] = ["pipe", "pipe", "pipe", "ipc"];
+    if (getAgentProcessIsolation().policy.mode === "off") {
+      return fork(options.entrypointPath, [], {
+        stdio,
+        execArgv: options.execArgv ?? [],
+        env: workerEnv,
+        // Don't let the child keep the parent alive
+        detached: false,
+      });
+    }
 
-    return child;
+    // `fork` is `spawn(node, [...execArgv, entrypoint])` with an IPC channel;
+    // the scope helper keeps that descriptor open across its exec, so the
+    // channel is the worker's own. The scope lasts as long as the worker.
+    return spawnScoped({
+      command: process.execPath,
+      args: [...(options.execArgv ?? []), options.entrypointPath],
+      options: { stdio, env: workerEnv, detached: false },
+      owner: { kind: "auxiliary" },
+    }).child;
   }
 
   function attachStdioHandlers(child: ChildProcess): void {

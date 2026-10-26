@@ -1,4 +1,5 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawnScoped, type ScopedProcess } from "@paperclipai/adapter-utils/scoped-process";
 import { open } from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
@@ -52,6 +53,7 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai", home: s
   const state: LocalBrowserLoginState = { abort: () => controller.abort() };
   const args = provider === "anthropic" ? ["setup-token"] : ["login", "--device-auth"];
   let child: ChildProcessWithoutNullStreams | null = null;
+  let scoped: ScopedProcess | null = null;
   const driver = {
     async start(_command: string, onData: (chunk: string) => void): Promise<{ exitCode: number | null }> {
       let executable = "claude";
@@ -83,7 +85,8 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai", home: s
         BROWSER: "true",
       };
       return new Promise((resolve, reject) => {
-        child = spawn("python3", ["-u", "-c", PYTHON_PTY_BRIDGE, executable, ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
+        scoped = spawnScoped({ command: "python3", args: ["-u", "-c", PYTHON_PTY_BRIDGE, executable, ...args], options: { env, stdio: ["pipe", "pipe", "pipe"] }, owner: { kind: "auxiliary" } });
+        child = scoped.child as ChildProcessWithoutNullStreams;
         child.stdout.on("data", (bytes: Buffer) => onData(bytes.toString("utf8")));
         // Provider output may contain secrets. Never log or retain stderr.
         child.stderr.resume();
@@ -95,8 +98,8 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai", home: s
       });
     },
     write(input: string) { child?.stdin.write(input); },
-    stop() { child?.kill("SIGTERM"); },
-    async dispose() { child?.kill("SIGTERM"); },
+    stop() { scoped?.kill("SIGTERM"); },
+    async dispose() { scoped?.kill("SIGTERM"); },
     async readFile(file: string) { const { readLocalAiCredentialFile } = await import("./local-ai-credential-file.js"); return Buffer.from(await readLocalAiCredentialFile(file)); },
   };
   if (provider === "anthropic") {

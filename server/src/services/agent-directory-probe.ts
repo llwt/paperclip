@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import childProcess from "node:child_process";
+import { getAgentProcessIsolation } from "@paperclipai/adapter-utils/process-isolation";
+import { execFileAuxiliary } from "@paperclipai/adapter-utils/scoped-process";
 import type { DirectorySnapshot } from "@paperclipai/adapter-utils/workspace-restore-merge";
 
 /** Only for a live unchanged-turn observation. Never a save or stop receipt. */
@@ -156,11 +158,13 @@ export const agentDirectoryTransferCleanupProgram = `${childNameHelper} const re
 
 /** Bound child: no shell, inherited credentials, or event-loop hashing. */
 export async function observeLocalAgentDirectory(root: string) {
-  const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
-    childProcess.execFile(process.execPath, ["-e", agentDirectoryProbeProgram, root], {
-      cwd: root, env: {}, timeout: 10_000, maxBuffer: 1024, killSignal: "SIGKILL", encoding: "utf8",
-    }, (error, stdout, stderr) => { if (error) reject(error); else resolve({ stdout, stderr }); });
-  });
+  const probeOptions = { cwd: root, env: {}, timeout: 10_000, maxBuffer: 1024, killSignal: "SIGKILL", encoding: "utf8" } as const;
+  const result = getAgentProcessIsolation().policy.mode !== "off"
+    ? await execFileAuxiliary(process.execPath, ["-e", agentDirectoryProbeProgram, root], probeOptions)
+    : await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+      childProcess.execFile(process.execPath, ["-e", agentDirectoryProbeProgram, root], probeOptions,
+        (error, stdout, stderr) => { if (error) reject(error); else resolve({ stdout, stderr }); });
+    });
   if (result.stdout.length > 1024) throw new Error("Agent directory observation exceeds bound");
   const value = JSON.parse(result.stdout);
   if (!value || typeof value.digest !== "string" || !/^[a-f0-9]{64}$/.test(value.digest)
