@@ -21,6 +21,7 @@ import {
   type TerminateResult,
   type ScopeEnrollmentStatus,
 } from "@paperclipai/process-launch";
+import { ACP_WARM_PROVIDER_OWNER_PREFIX } from "../process-isolation.js";
 
 export interface AcpxAgentLaunchInput {
   command: string;
@@ -94,7 +95,7 @@ export interface AcpxAgentScopeOwnerInput {
 export function createAcpxAgentScopeOwner(input: AcpxAgentScopeOwnerInput): AcpxAgentScopeOwner | null {
   const policy = input.policy;
   if (!policy || policy.mode !== "systemd") return null;
-  const ownerId = input.kind === "warm_provider" ? `acp-${randomUUID()}` : input.ownerId;
+  const ownerId = input.kind === "warm_provider" ? `${ACP_WARM_PROVIDER_OWNER_PREFIX}${randomUUID()}` : input.ownerId;
   if (!ownerId || !isOpaqueId(ownerId) || !isOpaqueId(input.runId)) return null;
   if (input.companyId != null && !isOpaqueId(input.companyId)) return null;
   return new ScopeOwner(policy, { kind: input.kind, id: ownerId, companyId: input.companyId }, input);

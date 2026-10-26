@@ -60,6 +60,11 @@ export {
   shouldQueueFollowupForRunningIssueWake,
 } from "./heartbeat/queue.js";
 import {
+  abandonHeldAgentRunAdmission,
+  isAgentRunAdmissionOpen,
+  waitForAgentRunAdmission,
+} from "./agent-process-scopes.js";
+import {
   isProcessAlive,
   createHeartbeatRecovery,
 } from "./heartbeat/recovery.js";
@@ -1946,6 +1951,8 @@ export function heartbeatService(
   // activeRunExecutionPromises, and the second await drains that run. A wakeup or
   // a run can add more entries as it settles, so loop until both sets are empty.
   async function drainActiveRunExecutions() {
+    // A run still waiting for admission starts nothing and settles now.
+    abandonHeldAgentRunAdmission();
     for (const timer of nativeSessionResumeDispatchTimers.values()) {
       clearTimeout(timer);
     }
@@ -2089,6 +2096,17 @@ export function heartbeatService(
     let run = await getRun(runId);
     if (!run) return;
     if (run.status !== "queued" && run.status !== "running") return;
+
+    // No provider starts before restart reconciliation classified the agent
+    // process scopes an earlier server left. A queued run stays queued and is
+    // resumed once admission opens; a run already claimed by restart
+    // recovery waits here, and starts nothing if the server stops first.
+    if (!isAgentRunAdmissionOpen()) {
+      if (run.status === "queued") return;
+      if (!(await waitForAgentRunAdmission())) return;
+      run = await getRun(runId);
+      if (!run || run.status !== "running") return;
+    }
 
     if (run.status === "queued") {
       const claimed = await claimQueuedRun(run);

@@ -62,6 +62,7 @@ import {
   touchLocalServiceRegistryRecord,
   writeLocalServiceRegistryRecord,
 } from "./local-service-supervisor.js";
+import { terminateInheritedOwnerScopes } from "./agent-process-scopes.js";
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { executionWorkspaceService, readExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.js";
@@ -6390,6 +6391,7 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
       companyId: input.agent.companyId,
     }))) {
       await terminateLocalService(adoptedRecord);
+      await stopInheritedServiceScopes(adoptedRecord.runtimeServiceId, input.agent.companyId);
       await removeLocalServiceRegistryRecord(adoptedRecord.serviceKey);
     } else {
       releasePortReservation(reservedPort);
@@ -7041,6 +7043,26 @@ async function cleanupRecordExposure(
   await persistRuntimeServiceRecord(record.db, record).catch(() => undefined);
 }
 
+/**
+ * A service adopted from an earlier server has no in-memory scope handle; its
+ * scope, launched by that server, still holds whatever the service started.
+ * Stop it with the service. No record (isolation off) changes nothing.
+ */
+async function stopInheritedServiceScopes(runtimeServiceId: string | null | undefined, companyId: string) {
+  if (!runtimeServiceId) return;
+  const result = await terminateInheritedOwnerScopes({
+    ownerKinds: ["managed_service"],
+    ownerId: runtimeServiceId,
+    companyId,
+    reason: "service_stopped",
+  }).catch(() => null);
+  if (result && !result.settled) {
+    console.warn(
+      `[workspace-runtime] process scope of stopped service ${runtimeServiceId} was not confirmed stopped; kept for reconciliation`,
+    );
+  }
+}
+
 async function stopRuntimeService(serviceId: string) {
   const record = runtimeServicesById.get(serviceId);
   if (!record) return;
@@ -7064,7 +7086,8 @@ async function stopRuntimeService(serviceId: string) {
       });
     }
   }
-  await record.scopedProcess?.terminateScope().catch(() => undefined);
+  if (record.scopedProcess) await record.scopedProcess.terminateScope().catch(() => undefined);
+  else await stopInheritedServiceScopes(record.id, record.companyId);
   record.status = "stopped";
   record.healthStatus = "unknown";
   record.lastUsedAt = new Date().toISOString();
@@ -8630,6 +8653,7 @@ export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
       ) {
         if (backfillDecision.action === "reprovision") backfilled += 1;
         await terminateLocalService(adoptedRecord);
+        await stopInheritedServiceScopes(adoptedRecord.runtimeServiceId, row.companyId);
         await removeLocalServiceRegistryRecord(adoptedRecord.serviceKey);
       } else {
         const record: RuntimeServiceRecord = {

@@ -90,6 +90,7 @@ import { buildProcessLossDiagnostic } from "../process-loss-diagnostics.js";
 import { logActivity } from "../activity-log.js";
 import { releaseRuntimeServicesForRun } from "../workspace-runtime.js";
 import { isProcessGroupAlive } from "../local-service-supervisor.js";
+import { listRunScopeUnits, terminateInheritedOwnerScopes } from "../agent-process-scopes.js";
 import {
   findMissingHotRestartSnapshotRunIds,
   readHotRestartIntent,
@@ -579,7 +580,13 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
       .where(eq(heartbeatRuns.status, "running"));
-    const snapshotRuns = activeRuns.map(toHotRestartIntentRun);
+    // Scope references travel in the versioned handoff; the scopes themselves
+    // carry no tie to this service, so they outlive it with their processes.
+    const snapshotRuns = activeRuns.map((row) => {
+      const snapshot = toHotRestartIntentRun(row);
+      const agentScopeUnits = listRunScopeUnits(row.run.id);
+      return agentScopeUnits.length > 0 ? { ...snapshot, agentScopeUnits } : snapshot;
+    });
     const intentWithVersion = {
       ...intent,
       previousServerVersion: intent.previousServerVersion ?? serverVersion,
@@ -1142,6 +1149,31 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       .where(eq(heartbeatRuns.id, run.id));
   }
 
+  /**
+   * A reaped run's inherited scopes (run and output relay) end with it, before
+   * the agent's next queued run starts. Scopes this server launched keep
+   * their in-memory owners. An unconfirmed stop stays pending for
+   * reconciliation; it does not hold the next run.
+   */
+  async function stopReapedRunScopes(run: { id: string; companyId: string }) {
+    const scopes = await terminateInheritedOwnerScopes({
+      ownerKinds: ["run", "relay"],
+      ownerId: run.id,
+      companyId: run.companyId,
+      reason: "owner_run_reaped",
+    }).catch((err: unknown) => ({
+      found: 0,
+      settled: false,
+      results: [{ unit: "", ownerKind: null, reason: err instanceof Error ? err.message : "terminate_failed" }],
+    }));
+    if (!scopes.settled) {
+      logger.warn(
+        { runId: run.id, results: scopes.results },
+        "reaped run's process scope was not confirmed stopped; kept for reconciliation",
+      );
+    }
+  }
+
   function sweepAdoptedRunLeftovers(run: {
     id: string;
     companyId: string;
@@ -1153,6 +1185,21 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     const graceMs = options.adoptedRunLeftoverSweep?.graceMs;
     const promise = (async () => {
       try {
+        // The run's scope reaches descendants that left its process group or
+        // cleared their environment; the sweep below cannot see those.
+        const scopes = await terminateInheritedOwnerScopes({
+          ownerKinds: ["run"],
+          ownerId: run.id,
+          companyId: run.companyId,
+          reason: "adopted_run_ended",
+          ...(graceMs === undefined ? {} : { graceMs }),
+        });
+        if (!scopes.settled) {
+          logger.warn(
+            { runId: run.id, results: scopes.results },
+            "adopted run's process scope was not confirmed stopped; kept for reconciliation",
+          );
+        }
         const evidence = await sweep(
           run.id,
           graceMs === undefined ? {} : { graceMs },
@@ -1450,6 +1497,24 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         continue;
       }
 
+      // The adopted provider keeps its scope: nothing is moved or restarted.
+      // Its record stays in the registry, owned by this run, for cancel and
+      // reconciliation; a unit named by the handoff but no longer recorded
+      // is reported, since its cleanup can no longer be confirmed.
+      const handedOffScopeUnits = candidate.agentScopeUnits ?? [];
+      const recordedScopeUnits = new Set(handedOffScopeUnits.length > 0 ? listRunScopeUnits(run.id) : []);
+      const agentScopes = handedOffScopeUnits.length > 0
+        ? {
+            units: handedOffScopeUnits,
+            unrecordedUnits: handedOffScopeUnits.filter((unit) => !recordedScopeUnits.has(unit)),
+          }
+        : null;
+      if (agentScopes && agentScopes.unrecordedUnits.length > 0) {
+        logger.warn(
+          { runId: run.id, unrecordedUnits: agentScopes.unrecordedUnits },
+          "adopted run's handed-off agent process scope has no launch record",
+        );
+      }
       await appendRunEvent(updated, {
         eventType: "lifecycle",
         stream: "system",
@@ -1463,6 +1528,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           processPid,
           processGroupId,
           outputCapture,
+          ...(agentScopes ? { agentScopes } : {}),
         },
       });
       if (relay) {
@@ -1796,6 +1862,21 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
             ownedScope: running.ownedScope,
             graceMs: Math.max(1, running.graceSec) * 1000,
           });
+        } else if (!running && !control && run.runtimeMode !== "native") {
+          // A run adopted after a hot restart: its scope from the earlier
+          // server is the handle on its processes.
+          const scopes = await terminateInheritedOwnerScopes({
+            ownerKinds: ["run"],
+            ownerId: run.id,
+            companyId: run.companyId,
+            reason: "server_shutdown",
+          });
+          if (!scopes.settled) {
+            logger.warn(
+              { runId: run.id, results: scopes.results },
+              "shutdown could not confirm the adopted run's process scope stopped; kept for reconciliation",
+            );
+          }
         }
       } finally {
         if (!control && runningProcesses.get(run.id) === running) runningProcesses.delete(run.id);
@@ -2964,6 +3045,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
               status: recovered.run.status,
               failureReason: recovered.run.error ?? undefined,
             });
+            await stopReapedRunScopes(recovered.run);
             void sweepAdoptedRunLeftovers(recovered.run);
             await startNextQueuedRunForAgent(run.agentId);
           } catch (err) {
@@ -3088,6 +3170,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       await finalizeAgentStatus(run.agentId, "failed", baseMessage, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       });
+      await stopReapedRunScopes(run);
       await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
       reaped.push(run.id);

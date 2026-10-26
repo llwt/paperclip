@@ -166,6 +166,7 @@ import type { issueService } from "../issues.js";
 import type { issueTreeControlService } from "../issue-tree-control.js";
 import type { budgetService } from "../budgets.js";
 import type { instanceSettingsService } from "../instance-settings.js";
+import { isAgentRunAdmissionOpen } from "../agent-process-scopes.js";
 import type { createRunDispatch } from "../../modules/run-dispatch/index.js";
 import type { PostCommitEffect as WakeQueuePostCommitEffect, createWakeQueue } from "../../modules/wake-queue/index.js";
 
@@ -2049,6 +2050,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
   async function startNextQueuedRunForAgent(agentId: string) {
     if ((await getSchedulingSuppression()).suppressed) return [];
+    // Held until restart reconciliation classified the scopes an earlier
+    // server left; the runs stay queued and are resumed once it opens.
+    if (!isAgentRunAdmissionOpen()) return [];
     const cutoff = await getWorktreeExecutionCutoff();
     // Cancelled after the start lock is released: cancelRunInternal promotes the
     // agent's next queued run, which takes this same lock.

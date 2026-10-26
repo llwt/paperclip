@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildScopeUnitName,
   isOpaqueId,
+  isScopeUnitOfOwner,
   isValidScopeName,
   isValidSliceName,
   newLaunchNonce,
@@ -68,6 +69,16 @@ describe("scope unit names", () => {
     expect(buildScopeUnitName({ ...base, instanceId: "other", nonce }).startsWith(scopeUnitNamespace("default"))).toBe(
       false,
     );
+  });
+
+  it("ties a unit name to its owner without reading its manifest", () => {
+    const unit = buildScopeUnitName({ ...base, nonce: newLaunchNonce() });
+    expect(isScopeUnitOfOwner(unit, base)).toBe(true);
+    expect(isScopeUnitOfOwner(unit, { ...base, ownerId: "run-2" })).toBe(false);
+    expect(isScopeUnitOfOwner(unit, { ...base, ownerKind: "relay" })).toBe(false);
+    expect(isScopeUnitOfOwner(unit, { ...base, companyId: null })).toBe(false);
+    expect(isScopeUnitOfOwner(unit, { ...base, instanceId: "other" })).toBe(false);
+    expect(isScopeUnitOfOwner(unit.replace(/\.scope$/, "x.scope"), base)).toBe(false);
   });
 
   it("uses a fresh nonce per launch", () => {

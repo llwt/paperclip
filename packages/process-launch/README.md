@@ -107,6 +107,26 @@ environment, credentials, prompts or output.
   unverified PID. When it cannot confirm emptiness it keeps the record and
   returns `unconfirmed`.
 
+## Reconciliation
+
+Read-only facts for restart reconciliation; the server decides what to keep
+or stop (`server/src/services/agent-process-scopes.ts`):
+
+- `listOwnedScopeRecords(registryDir, instanceId)`: the records of one
+  instance only, plus the ones that could not be read.
+- `isScopeLaunchedByThisProcess(ref)`: records this process wrote keep their
+  in-memory owner; only records an earlier process left are reconciled.
+- `isScopeRootAlive(record)`: the recorded root still runs (same boot, PID
+  and start time).
+- `listUnmatchedScopeUnits(...)`: live units in the instance's namespace with
+  no record. They are reported, never stopped.
+- `isScopeUnitOfOwner(unit, owner)`: whether a unit name was built for an
+  owner, from the hashed identity in the name. A record that cannot be read
+  can still be attributed to its owner, so its cleanup is reported as pending.
+
+Scopes carry no `BindsTo=` or `PartOf=` dependency on the Paperclip service,
+so a hot restart can adopt the processes in them.
+
 ## Tests
 
 ```sh

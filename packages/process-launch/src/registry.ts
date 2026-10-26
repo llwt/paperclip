@@ -222,9 +222,36 @@ export function listScopeRecordRefs(registryDir: string, namespace: string): Sco
     .sort((a, b) => a.unit.localeCompare(b.unit));
 }
 
+const LAUNCHED_KEY = Symbol.for("paperclipai.process-launch.launchedByThisProcess");
+
+/** Records this process wrote and has not removed, shared by every copy of this module. */
+function launchedRecords(): Set<string> {
+  const holder = globalThis as { [LAUNCHED_KEY]?: Set<string> };
+  return (holder[LAUNCHED_KEY] ??= new Set());
+}
+
+function launchKey(ref: ScopeRecordRef): string {
+  return `${path.resolve(ref.registryDir)}\0${ref.unit}`;
+}
+
+/** Called by the launcher right after it wrote a record's intent manifest. */
+export function markLaunchedByThisProcess(ref: ScopeRecordRef): void {
+  launchedRecords().add(launchKey(ref));
+}
+
+/**
+ * Whether this process wrote the record. Its own launches keep their
+ * in-memory owners; reconciliation decides only the records an earlier
+ * process left behind.
+ */
+export function isScopeLaunchedByThisProcess(ref: ScopeRecordRef): boolean {
+  return launchedRecords().has(launchKey(ref));
+}
+
 /** Remove both files of a record. Removing a missing record is not an error. */
 export function removeScopeRecord(ref: ScopeRecordRef): void {
   assertRef(ref);
+  launchedRecords().delete(launchKey(ref));
   for (const file of [statusPath(ref), manifestPath(ref)]) {
     try {
       unlinkSync(file);
