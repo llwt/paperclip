@@ -20,6 +20,7 @@ import { useNavigate } from "../lib/router";
 import {
   defaultExecutionWorkspaceModeForProject,
   defaultProjectWorkspaceIdForProject,
+  ownedProjectWorkspaceId,
   issueExecutionWorkspaceModeForExistingWorkspace,
 } from "../lib/project-workspace-defaults";
 import { useProjectOrder } from "../hooks/useProjectOrder";
@@ -674,6 +675,9 @@ export function NewIssueDialog() {
       const nextWorkMode = isIssueWorkMode(draft.workMode) ? draft.workMode : "standard";
       const restoredProjectId = newIssueDefaults.projectId ?? draft.projectId;
       const restoredProject = orderedProjects.find((project) => project.id === restoredProjectId);
+      // A launch context can replace the drafted project; its workspace choices then no longer apply.
+      const draftProjectIsRestored = restoredProjectId === draft.projectId;
+      const draftProjectWorkspaceId = draftProjectIsRestored ? draft.projectWorkspaceId : undefined;
       const hasExplicitProjectWorkspaceId = newIssueDefaults.projectWorkspaceId !== undefined;
       const hasExplicitExecutionWorkspaceId = newIssueDefaults.executionWorkspaceId !== undefined;
       const hasExplicitExecutionWorkspaceMode = newIssueDefaults.executionWorkspaceMode !== undefined;
@@ -697,7 +701,9 @@ export function NewIssueDialog() {
       setProjectWorkspaceId(
         hasExplicitProjectWorkspaceId
           ? (newIssueDefaults.projectWorkspaceId ?? "")
-          : (draft.projectWorkspaceId ?? defaultProjectWorkspaceIdForProject(restoredProject)),
+          : ((restoredProject
+              ? ownedProjectWorkspaceId(restoredProject, draftProjectWorkspaceId)
+              : draftProjectWorkspaceId) || defaultProjectWorkspaceIdForProject(restoredProject)),
       );
       setAssigneeModelLane(draft.assigneeModelLane ?? "primary");
       setAssigneeModelOverride(draft.assigneeModelOverride ?? "");
@@ -706,19 +712,21 @@ export function NewIssueDialog() {
       setExecutionWorkspaceMode(
         hasExplicitExecutionWorkspaceId || hasExplicitExecutionWorkspaceMode
           ? defaultExecutionWorkspaceModeForIssueDefaults(newIssueDefaults, restoredProject)
-          : (draft.executionWorkspaceMode ??
-              (draft.useIsolatedExecutionWorkspace
-                ? "isolated_workspace"
-                : defaultExecutionWorkspaceModeForProject(restoredProject))),
+          : draftProjectIsRestored
+            ? (draft.executionWorkspaceMode ??
+                (draft.useIsolatedExecutionWorkspace
+                  ? "isolated_workspace"
+                  : defaultExecutionWorkspaceModeForProject(restoredProject)))
+            : defaultExecutionWorkspaceModeForProject(restoredProject),
       );
       setWorkMode(nextWorkMode);
       setSelectedExecutionWorkspaceId(
         hasExplicitExecutionWorkspaceId
           ? (newIssueDefaults.executionWorkspaceId ?? "")
-          : (draft.selectedExecutionWorkspaceId ?? ""),
+          : (draftProjectIsRestored ? (draft.selectedExecutionWorkspaceId ?? "") : ""),
       );
       executionWorkspaceDefaultProjectId.current =
-        hasExplicitProjectWorkspaceId || hasExplicitExecutionWorkspaceId || draft.projectWorkspaceId || restoredProject
+        hasExplicitProjectWorkspaceId || hasExplicitExecutionWorkspaceId || draftProjectWorkspaceId || restoredProject
           ? restoredProjectId || null
           : null;
     } else {
@@ -818,7 +826,9 @@ export function NewIssueDialog() {
       : null;
     const requestedProjectWorkspaceId = canChooseWorktrees && executionWorkspaceMode === "reuse_existing" && selectedReusableExecutionWorkspace
       ? selectedReusableExecutionWorkspace.projectWorkspaceId
-      : projectWorkspaceId;
+      : selectedProject
+        ? ownedProjectWorkspaceId(selectedProject, projectWorkspaceId) || defaultProjectWorkspaceIdForProject(selectedProject)
+        : projectWorkspaceId;
     // A task launched from a workspace (or its parent task) keeps that explicit
     // context. Draft-only choices are ignored while the selector is hidden.
     const contextualWorkspaceId =
