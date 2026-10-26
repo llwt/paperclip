@@ -3,6 +3,7 @@ import { prepareHeartbeatWorkspace } from "./heartbeat/workspace-preparation.js"
 import { executeHeartbeatRuntime, NativeSessionResumeScheduledError, NativeWorkspaceFinalizeScheduledError } from "./heartbeat/runtime-execution.js";
 import { selectHeartbeatRuntime } from "./heartbeat/runtime-selection.js";
 import { createHeartbeatRunCompletion } from "./heartbeat/run-completion.js";
+import { CLAUDE_QUOTA_ELIGIBILITY_KEY, claudeQuotaCardService, evaluateClaudeQuotaEligibility } from "./claude-quota-card.js";
 import { createAdoptedResultRecovery } from "./heartbeat/adopted-result-recovery.js";
 import { buildLocalResultRecoverySnapshot, LOCAL_RESULT_RECOVERY_CONTEXT_KEY } from "./heartbeat/local-result-recovery.js";
 export {
@@ -1124,6 +1125,7 @@ export function heartbeatService(
       return adoptedResultsPending.has(id) || hasAdoptedOutputTail(id);
     },
   };
+  const claudeQuotaCards = claudeQuotaCardService(db);
   const recovery = recoveryService(db, {
     enqueueWakeup,
     liveRunExecutions,
@@ -1859,6 +1861,7 @@ export function heartbeatService(
   }
 
   async function reconcileStrandedAssignedIssues() {
+    await recovery.reconcileClaudeQuotaCards();
     return recovery.reconcileStrandedAssignedIssues({
       issueCreatedAtGte: await getWorktreeExecutionCutoff(),
     });
@@ -2012,6 +2015,7 @@ export function heartbeatService(
   }
 
   const runCompletion = createHeartbeatRunCompletion(db, {
+    claudeQuotaCard: claudeQuotaCards,
     getRun,
     getAgent,
     clearTaskSessions,
@@ -3296,7 +3300,21 @@ export function heartbeatService(
         Object.assign(resolvedConfig, managedAiRuntime.config);
         for (const key of AI_AUTH_ENV_KEYS) secretKeys.add(key);
         context.aiConnection = { ...managedAiRuntime.attribution, accountName: managedAiRuntime.accountName, identity: managedAiRuntime.identity, sessionIdentity: managedAiRuntime.sessionIdentity };
-        await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ aiConnection: context.aiConnection, ...(context.aiRouterTaskKey ? { aiRouterTaskKey: context.aiRouterTaskKey } : {}), ...(context.aiRouterSelection ? { aiRouterSelection: context.aiRouterSelection } : {}) })}::jsonb` }).where(eq(heartbeatRuns.id, run.id));
+        // Fork (SX-2922): evidence is derived from the pre-strip inputs (stripAiAuthBindings
+        // returns copies) and stores only key names, never values. Skipped unless the company is opted in.
+        const claudeQuotaCardEligibility = claudeQuotaCards.isEnabledForCompany(agent.companyId)
+          ? evaluateClaudeQuotaEligibility({
+              adapterType: agent.adapterType,
+              requestedBinding: requestedAiBinding,
+              attribution: managedAiRuntime.attribution,
+              agentConfig: config,
+              effectiveConfig: executionRunConfig,
+              environmentEnv: selectedEnvironmentForConfig?.envVars ?? null,
+              projectEnv: projectContext?.env ?? null,
+              routineEnv: routineEnvContext.env,
+            })
+          : null;
+        await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ aiConnection: context.aiConnection, ...(claudeQuotaCardEligibility ? { [CLAUDE_QUOTA_ELIGIBILITY_KEY]: claudeQuotaCardEligibility } : {}), ...(context.aiRouterTaskKey ? { aiRouterTaskKey: context.aiRouterTaskKey } : {}), ...(context.aiRouterSelection ? { aiRouterSelection: context.aiRouterSelection } : {}) })}::jsonb` }).where(eq(heartbeatRuns.id, run.id));
       }
       if (secretManifest.length > 0) {
         context.paperclipSecrets = {
