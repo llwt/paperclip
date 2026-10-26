@@ -48,6 +48,7 @@ const CLAUDE_AUTH_ARG_RE = /^(--config|-c|--settings|--setting-sources|--api-key
 
 export interface ClaudeQuotaEligibilityEvidence {
   version: 1;
+  runId: string;
   eligible: boolean;
   reason: string | null;
   adapterType: string;
@@ -87,6 +88,7 @@ function ownLoginFindings(source: string, env: unknown, config: unknown): string
  * Never records a credential value: only source names, key names and ids.
  */
 export function evaluateClaudeQuotaEligibility(input: {
+  runId: string;
   adapterType: string;
   requestedBinding: unknown;
   attribution: unknown;
@@ -129,6 +131,7 @@ export function evaluateClaudeQuotaEligibility(input: {
     .digest("hex");
   return {
     version: 1,
+    runId: input.runId,
     eligible: reason === null,
     reason,
     adapterType: input.adapterType,
@@ -139,7 +142,8 @@ export function evaluateClaudeQuotaEligibility(input: {
 
 function readEligibility(run: RunRow): ClaudeQuotaEligibilityEvidence | null {
   const raw = parseObject(parseObject(run.contextSnapshot)[CLAUDE_QUOTA_ELIGIBILITY_KEY]);
-  if (raw.version !== 1 || typeof raw.eligible !== "boolean") return null;
+  // Scheduled retries copy the whole snapshot, so evidence from another run must not count.
+  if (raw.version !== 1 || typeof raw.eligible !== "boolean" || raw.runId !== run.id) return null;
   return raw as unknown as ClaudeQuotaEligibilityEvidence;
 }
 

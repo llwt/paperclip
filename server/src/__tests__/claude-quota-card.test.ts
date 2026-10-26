@@ -183,6 +183,7 @@ describeEmbeddedPostgres("claudeQuotaCardService", () => {
 
   function evidenceFor(connection: { connectionId: string; grantId: string }, overrides: { agentEnv?: Record<string, unknown> } = {}) {
     return evaluateClaudeQuotaEligibility({
+      runId: "pending",
       adapterType: "claude_local",
       requestedBinding: { mode: "shared", ...connection },
       attribution: aiConnection(connection),
@@ -201,6 +202,7 @@ describeEmbeddedPostgres("claudeQuotaCardService", () => {
     status?: "failed" | "succeeded";
     connection?: { connectionId: string; grantId: string };
     evidence?: ReturnType<typeof evidenceFor> | null;
+    evidenceRunId?: string;
     error?: string | null;
     durationMinutes?: number;
   }) {
@@ -209,6 +211,7 @@ describeEmbeddedPostgres("claudeQuotaCardService", () => {
     const finishedAt = new Date(startedAt.getTime() + (input.durationMinutes ?? 1) * MINUTE);
     const id = randomUUID();
     const status = input.status ?? "failed";
+    const evidence = { ...(input.evidence ?? evidenceFor(connection)), runId: input.evidenceRunId ?? id };
     await db.insert(heartbeatRuns).values({
       id,
       companyId: input.companyId,
@@ -225,7 +228,7 @@ describeEmbeddedPostgres("claudeQuotaCardService", () => {
       contextSnapshot: {
         issueId: randomUUID(),
         aiConnection: aiConnection(connection),
-        ...(input.evidence === null ? {} : { [CLAUDE_QUOTA_ELIGIBILITY_KEY]: input.evidence ?? evidenceFor(connection) }),
+        ...(input.evidence === null ? {} : { [CLAUDE_QUOTA_ELIGIBILITY_KEY]: evidence }),
       },
     });
     return id;
@@ -471,8 +474,25 @@ describeEmbeddedPostgres("claudeQuotaCardService", () => {
     expect(await receiptOf(runId)).toMatchObject({ status: "excluded" });
   });
 
+  it("ignores eligibility evidence copied from another run by a scheduled retry", async () => {
+    const { companyId, agentId } = await seedCompany();
+    const service = newService(companyId);
+    const firstRun = await seedRun({ companyId, agentId, offsetMinutes: 0 });
+    expect(await service.observeFailedRun({ id: firstRun, companyId })).toMatchObject({ status: "recorded" });
+    await seedRun({ companyId, agentId, offsetMinutes: 5, status: "succeeded" });
+
+    // The retry ran on an own login (no binding), so it carries the first run's snapshot untouched.
+    const retryRun = await seedRun({ companyId, agentId, offsetMinutes: 10, evidenceRunId: firstRun });
+    expect(await service.observeFailedRun({ id: retryRun, companyId })).toMatchObject({ status: "ignored", reason: "no_eligibility_evidence" });
+    expect(await service.reconcile()).toMatchObject({ recorded: 0 });
+    expect(await receiptOf(retryRun)).toBeNull();
+    expect(await incidents(companyId)).toHaveLength(1);
+    expect(await cards(companyId)).toHaveLength(1);
+  });
+
   it("is ineligible for router, non-shared, non-claude and mismatched bindings", () => {
     const base = {
+      runId: randomUUID(),
       adapterType: "claude_local",
       requestedBinding: { mode: "shared", ...connectionA },
       attribution: aiConnection(connectionA),

@@ -3304,6 +3304,7 @@ export function heartbeatService(
         // returns copies) and stores only key names, never values. Skipped unless the company is opted in.
         const claudeQuotaCardEligibility = claudeQuotaCards.isEnabledForCompany(agent.companyId)
           ? evaluateClaudeQuotaEligibility({
+              runId: run.id,
               adapterType: agent.adapterType,
               requestedBinding: requestedAiBinding,
               attribution: managedAiRuntime.attribution,
