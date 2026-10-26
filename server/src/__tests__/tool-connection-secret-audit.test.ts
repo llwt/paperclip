@@ -16,7 +16,8 @@ import {
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { syncConnectionCredentialBindings } from "../services/connection-credential-bindings.js";
 import { secretService } from "../services/secrets.js";
-import { systemAuditDedupe, TOOL_CONNECTION_SYSTEM_AUDIT_WINDOW_MS, toolAccessService } from "../services/tool-access.js";
+import { systemAuditDedupe, TOOL_CONNECTION_SYSTEM_AUDIT_WINDOW_MS } from "../services/system-audit-dedupe.js";
+import { toolAccessService } from "../services/tool-access.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 
