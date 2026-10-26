@@ -1,5 +1,6 @@
 import { configuredEnvironment } from "../../vendor/paperclip-runner/index.js";
 import { apiKeyBillingType } from "@paperclipai/adapter-utils/api-billing-type";
+import { createNativeLaunchRoots, type NativeLaunchRoots, type NativeLaunchRootsSummary } from "./native-process-isolation.js";
 import { agents } from "@paperclipai/db";
 import { isCloudManagedInstance } from "../cloud-instance.js";
 import { dotRunnerBroker } from "../dot-runner-broker.js";
@@ -7478,6 +7479,8 @@ export async function executePaperclipNativeSession(input: {
   runnerRemoteCodexPath?: string | null;
   runnerRemoteCodexNpmSpec?: string | null;
   runnerRemoteProviderPackPath?: string | null;
+  /** Internal: the run's agent process launch roots; made here when absent. */
+  launchRoots?: NativeLaunchRoots;
   stopTaskForReassignment?: (target: { companyId: string; issueId: string; agentId: string; runId: string | null }) => Promise<void>;
   syncIssueExternalObjects?: (issueId: string) => Promise<void>;
   enqueueWakeup?: (
@@ -7506,6 +7509,11 @@ export async function executePaperclipNativeSession(input: {
   if (nativeSessionStartups.has(runId)) {
     throw new Error("native_session_supervisor_busy");
   }
+  // Every launch root of this run (runner, in-process provider) goes through
+  // one tracker, so the run returns only after their scope cleanup.
+  const launchRoots = input.launchRoots
+    ?? createNativeLaunchRoots({ companyId: input.execution.binding.companyId, onLog: input.onLog });
+  input = { ...input, launchRoots };
   // Register before the first asynchronous operation on either backend path.
   // A duplicate execution must not replace the original startup handoff.
   let resolveStartup!: (session: ActiveNativeSession | null) => void;
@@ -7527,7 +7535,8 @@ export async function executePaperclipNativeSession(input: {
     input.runnerExecutionTarget?.environmentId ?? null,
   );
   const ownerToken = Symbol("native execution owner");
-  try {
+  // One return point: every branch's result reports what the launch roots did.
+  const executeBranch = async (): Promise<AdapterExecutionResult> => {
     // Reserve across session identities before retiring or staging anything.
     if (executingNativeOwnerScopes.has(ownerScope)) {
       throw new Error("native_session_supervisor_busy");
@@ -7611,10 +7620,16 @@ export async function executePaperclipNativeSession(input: {
       };
     }
     return await executePaperclipNativeSessionWithinScope(preparedInput);
+  };
+  try {
+    const result = await executeBranch();
+    return withLaunchRootsSummary(result, await launchRoots.settle());
   } catch (error) {
     executionFailure = error;
     throw error;
   } finally {
+    // Also on a throw: no root's leftovers outlive the run's end.
+    await launchRoots.settle().catch(() => undefined);
     if (executingNativeOwnerScopes.get(ownerScope) === ownerToken) {
       executingNativeOwnerScopes.delete(ownerScope);
     }
@@ -7652,6 +7667,24 @@ export async function executePaperclipNativeSession(input: {
         .catch(() => undefined);
     }
   }
+}
+
+/** Put what the launch roots reported into resultJson; a clean run adds no key. */
+function withLaunchRootsSummary(
+  result: AdapterExecutionResult,
+  summary: NativeLaunchRootsSummary | null,
+): AdapterExecutionResult {
+  if (!summary) return result;
+  return {
+    ...result,
+    resultJson: {
+      ...(result.resultJson ?? {}),
+      agentProcessScope: {
+        ...(summary.degraded.length > 0 ? { degraded: summary.degraded } : {}),
+        ...(summary.cleanupUnconfirmed !== null ? { cleanupUnconfirmed: summary.cleanupUnconfirmed } : {}),
+      },
+    },
+  };
 }
 
 async function executePaperclipNativeSessionWithinScope(
@@ -8687,6 +8720,8 @@ async function executePaperclipNativeSessionWithinScope(
               input.backend ??
               runnerdBackend ??
               createNativeSessionBackend(input.execution, {
+                // In-process providers are launch roots in the server.
+                processIsolation: input.launchRoots?.root("warm_provider", input.runnerInstanceId),
                 runnerInstanceId: input.runnerInstanceId,
                 onSpawn: input.onSpawn,
                 opencodeEnvironment: resolveNativeProviderEnvironment(input.execution.provider, input.runnerEnvironment),
@@ -11163,6 +11198,8 @@ export async function createRunnerdBackend(input: {
   trace?: NativeRunTrace;
   toolTrace?: NativeToolTrace;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+  /** The run's agent process launch roots; a direct caller gets its own. */
+  launchRoots?: NativeLaunchRoots;
   stopTaskForReassignment?: (target: { companyId: string; issueId: string; agentId: string; runId: string | null }) => Promise<void>;
   syncIssueExternalObjects?: (issueId: string) => Promise<void>;
   enqueueWakeup?: (
@@ -11352,6 +11389,8 @@ async function createRunnerdBackendWithinSessionClaim(
   retainedTransition?: VerifiedWarmTransitionBinding,
 ): Promise<NativeSessionBackend & { bindManagedSession(session: NativeSession): NativeSession }> {
   let recoveryPending = retainedTransition !== undefined;
+  const launchRoots = input.launchRoots
+    ?? createNativeLaunchRoots({ companyId: input.execution.binding.companyId, onLog: input.onLog });
   const target = input.runnerExecutionTarget ?? { kind: "local" as const };
   const remoteTarget = target.kind === "remote" ? target : null;
   const remoteCommandRunner = remoteTarget
@@ -11486,6 +11525,8 @@ async function createRunnerdBackendWithinSessionClaim(
       dotRunnerOptions: {
         stateDirectory: root, runnerBinary: remoteDot?.runnerBinary ?? resolvePaperclipRunnerBinary(),
         ...(remoteDot ?? {}),
+        // Used only when the runner starts locally; a remote launcher ignores it.
+        processIsolation: launchRoots.root("runner", effectiveRunnerInstanceId),
         identity: { runnerInstanceId: effectiveRunnerInstanceId, environmentLeaseId: effectiveEnvironmentLeaseId,
           runId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution),
           turnId: `turn-${input.execution.binding.runId}`, itemId: `item-${input.execution.binding.runId}` },
@@ -13172,6 +13213,8 @@ async function createRunnerdBackendWithinSessionClaim(
     ),
     codexTransportFactory: (recoveryContext) =>
       createRunnerdCodexTransport({
+        // The runner is the launch root; its providers inherit its scope.
+        processIsolation: launchRoots.root("runner", retainedTransition?.runnerInstanceId ?? input.runnerInstanceId),
         onSpawn: input.onSpawn,
         provider:
           input.execution.provider.kind === "codex"

@@ -1,5 +1,7 @@
 import { configuredEnvironmentProjection } from "../../vendor/paperclip-runner/index.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { configureAgentProcessIsolation, resetAgentProcessIsolation } from "@paperclipai/adapter-utils/server-utils";
+import { createSystemdIsolationPolicy } from "@paperclipai/process-launch";
 import { readFileSync } from "node:fs";
 import { PgDialect } from "drizzle-orm/pg-core";
 import type { SQL } from "drizzle-orm";
@@ -91,6 +93,7 @@ vi.mock("./native-github-access.js", () => ({
 
 type BackendFactoryOptions = {
   runnerInstanceId?: string;
+  processIsolation?: unknown;
   acpxRuntimeDirectory?: string;
   workingDirectoryAuthority?: "local_filesystem" | "remote_runner";
   codexTransportFactory?: (recoveryContext?: {
@@ -110,6 +113,7 @@ type BackendFactoryOptions = {
 
 type RunnerTransportOptions = {
   acpxRuntimeDirectory?: string;
+  processIsolation?: unknown;
   adoptExistingRunner?: { pid: number; isAlive: () => Promise<boolean> | boolean };
   stateDirectory?: string;
   runnerBinary?: string;
@@ -9557,6 +9561,105 @@ describe("native process ownership", () => {
       }),
     ).rejects.toThrow("exact host qualification authorization");
     expect(state.createBackend).not.toHaveBeenCalled();
+  });
+});
+
+describe("agent process isolation reaches native launch roots", () => {
+  // The policy comes only from the server's accessor, set once at startup
+  // (SX-2305). With it set to systemd, both launch paths get a scope launcher.
+  let stateDirectory: string;
+  let previousStateDirectory: string | undefined;
+
+  beforeEach(async () => {
+    previousStateDirectory = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+    stateDirectory = await mkdtemp(join(tmpdir(), "paperclip-native-isolation-"));
+    process.env.PAPERCLIP_RUNNER_STATE_DIR = stateDirectory;
+  });
+
+  afterEach(async () => {
+    resetAgentProcessIsolation();
+    if (previousStateDirectory === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
+    else process.env.PAPERCLIP_RUNNER_STATE_DIR = previousStateDirectory;
+    await rm(stateDirectory, { recursive: true, force: true });
+  });
+
+  function configureSystemd(): void {
+    configureAgentProcessIsolation({
+      policy: createSystemdIsolationPolicy({
+        slice: "app-agents.slice",
+        instanceId: "nativeisolationwiring",
+        registryDir: join(stateDirectory, "registry"),
+        userBusAddress: null,
+      }),
+      health: null,
+    });
+  }
+
+  async function inProcessLauncher(): Promise<unknown> {
+    state.createBackend.mockClear();
+    state.execute.mockReset().mockImplementation(async (options) => {
+      await options.onSessionAdmission();
+      return {
+        result: { summary: "completed" },
+        terminal: { runTerminalState: "succeeded" },
+        turnId: "turn",
+        normalizedSessionId: "session",
+        providerSessionId: null,
+        driverKind: "test",
+        driverVersion: "1",
+        nativeEventCount: 1,
+        highestContiguousSourceSeq: 1,
+      };
+    });
+    state.createBackend.mockImplementationOnce(() => ({ kind: "test" }) as never);
+    await executePaperclipNativeSession({ db: leaseDb(execution), execution, runnerInstanceId: "runner" });
+    return state.createBackend.mock.calls.at(-1)![1].processIsolation;
+  }
+
+  async function runnerLauncher(): Promise<unknown> {
+    state.createBackend.mockClear();
+    state.createTransport.mockClear();
+    await createRunnerdBackend({ db: leaseDb(execution), execution, runnerInstanceId: "runner-isolation" });
+    state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+    return state.createTransport.mock.calls.at(-1)![0].processIsolation;
+  }
+
+  it("gives the in-process provider and the runner a scope launcher when the policy is systemd", async () => {
+    configureSystemd();
+    expect(await inProcessLauncher()).toEqual({ spawn: expect.any(Function), reaped: expect.any(Function) });
+    expect(await runnerLauncher()).toEqual({ spawn: expect.any(Function), reaped: expect.any(Function) });
+  });
+
+  it("gives no launcher when isolation is not configured (off)", async () => {
+    resetAgentProcessIsolation();
+    expect(await inProcessLauncher()).toBeUndefined();
+    expect(await runnerLauncher()).toBeUndefined();
+  });
+
+  it("puts degraded launches and an unconfirmed cleanup into the run's final result", async () => {
+    state.execute.mockReset().mockImplementation(async (options) => {
+      await options.onSessionAdmission();
+      return {
+        result: { summary: "completed" },
+        terminal: { runTerminalState: "succeeded" },
+        turnId: "turn",
+        normalizedSessionId: "session",
+        providerSessionId: null,
+        driverKind: "test",
+        driverVersion: "1",
+        nativeEventCount: 1,
+        highestContiguousSourceSeq: 1,
+      };
+    });
+    state.createBackend.mockImplementationOnce(() => ({ kind: "test" }) as never);
+    const degraded = { state: "degraded", reason: "user_bus_unavailable" } as never;
+    const settle = vi.fn(async () => ({ degraded: [degraded], cleanupUnconfirmed: "terminate_failed" }));
+    const result = await executePaperclipNativeSession({
+      db: leaseDb(execution), execution, runnerInstanceId: "runner",
+      launchRoots: { root: () => undefined, settle },
+    });
+    expect(result.resultJson?.agentProcessScope).toEqual({ degraded: [degraded], cleanupUnconfirmed: "terminate_failed" });
+    expect(settle).toHaveBeenCalled();
   });
 });
 
