@@ -17,7 +17,7 @@ import {
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { secretService } from "../services/secrets.js";
-import { TOOL_CONNECTION_SYSTEM_AUDIT_WINDOW_MS } from "../services/tool-access.js";
+import { TOOL_CONNECTION_SYSTEM_AUDIT_WINDOW_MS } from "../services/system-audit-dedupe.js";
 
 // Callers that pass no `audit` argument read the credential as a system actor with
 // no run id. The audit trail must grow once per window, not once per read.

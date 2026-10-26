@@ -46,7 +46,7 @@ import { quotaCredentialRecovery, quotaCredentialHash } from "./quota-credential
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { secretService } from "./secrets.js";
-import { systemAuditDedupe } from "./tool-access.js";
+import { systemAuditDedupe } from "./system-audit-dedupe.js";
 import { probeAiConnectionUsage } from "./ai-connection-usage.js";
 import { checkAiCredential } from "./ai-credential-check.js";
 
