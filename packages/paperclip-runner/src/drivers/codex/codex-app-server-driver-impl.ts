@@ -680,6 +680,7 @@ export class CodexAppServerDriver implements HarnessDriver {
         environment: createSanitizedCodexEnvironment(this.#options.environment),
         onDiagnostic: this.#options.onDiagnostic,
         processGroup: true,
+        processIsolation: this.#options.processIsolation,
       })
     );
   }

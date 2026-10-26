@@ -4,6 +4,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { HarnessRuntimeRequestResolution } from "../../contracts/harness-driver.js";
 import { githubCredentialEnvironment } from "../../github-credential-environment.js";
 import { redactCodexDiagnostic } from "./diagnostic-redaction.js";
+import { confirmLaunchRootStopped, spawnLaunchRoot, type ProcessIsolationRequest } from "../../process-isolation.js";
 
 export { redactCodexDiagnostic } from "./diagnostic-redaction.js";
 
@@ -322,6 +323,8 @@ interface PendingRequest {
 }
 
 export interface ProcessCodexTransportOptions {
+  /** Put the app-server in its own agent process scope (in-process native runs only). */
+  processIsolation?: ProcessIsolationRequest;
   workingDirectory?: string;
   command?: string;
   args?: string[];
@@ -375,6 +378,8 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
   readonly #maxBufferedOutputBytes: number;
   readonly #stdoutDecoder: BoundedLineDecoder;
   readonly #stderrDecoder: BoundedLineDecoder;
+  readonly #processIsolation: ProcessIsolationRequest | undefined;
+  #closing: Promise<void> | undefined;
 
   constructor(options: ProcessCodexTransportOptions = {}) {
     this.#onDiagnostic = options.onDiagnostic;
@@ -412,7 +417,8 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
         DEFAULT_MAX_QUEUED_NOTIFICATION_BYTES,
       ),
     );
-    this.#process = spawn(
+    this.#processIsolation = options.processIsolation;
+    this.#process = spawnLaunchRoot<ChildProcessWithoutNullStreams>(
       options.command ?? "codex",
       options.args ?? ["app-server"],
       {
@@ -421,6 +427,8 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
         stdio: "pipe",
         detached: this.#processGroup,
       },
+      options.processIsolation,
+      spawn,
     );
     this.#stdoutDecoder = new BoundedLineDecoder(
       this.#maxLineBytes,
@@ -510,7 +518,20 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
     this.#serverRequestHandler = handler;
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    // In a scope, one close per transport: a concurrent or repeated close
+    // shares the first one's promise, so it resolves only once the app-server
+    // and whatever it left in its scope are stopped, with the same outcome.
+    // The caller collects provider files after this resolves.
+    if (this.#processIsolation) {
+      return (this.#closing ??= this.#stopProcess().then(() =>
+        confirmLaunchRootStopped(this.#processIsolation, this.#process),
+      ));
+    }
+    return this.#stopProcess();
+  }
+
+  async #stopProcess(): Promise<void> {
     const firstClose = !this.#closed;
     if (firstClose) {
       this.#closed = true;

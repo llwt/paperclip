@@ -15,6 +15,8 @@ import type { CodexQuestionResponseContext } from "./codex-question-adapter.js";
 
 export interface CodexAppServerDriverOptions {
   taskEnvelope: CodexTaskEnvelope;
+  /** Scope for the app-server this driver starts itself (not for `transportFactory`). */
+  processIsolation?: import("../../process-isolation.js").ProcessIsolationRequest;
   /** Explicit provider model selected by the persisted native execution. */
   model?: string;
   /** Per-run reasoning effort sent with each Codex turn, including resumed turns. */

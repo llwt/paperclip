@@ -1,4 +1,5 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { createNativeLaunchRoots } from "./native-process-isolation.js";
 import { createHash } from "node:crypto";
 import { accessSync, chmodSync, constants, mkdirSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
@@ -390,7 +391,7 @@ export async function executeNativeCodexRunner(input: {
     prepared.queueCommand("turn.start", { text: input.prompt }, `turn_${input.runId}`);
   }
 
-  const child = spawn(binary, buildNativeRunnerArguments({
+  const runnerArgs = buildNativeRunnerArguments({
     connectUrl: prepared.connectUrl,
     stateDirectory: runnerStateDirectory,
     runnerInstanceId: input.runnerInstanceId,
@@ -401,7 +402,8 @@ export async function executeNativeCodexRunner(input: {
     itemId: input.itemId,
     runnerDigest,
     maxRuntimeMs: input.timeoutMs,
-  }), {
+  });
+  const runnerOptions: SpawnOptions = {
     cwd: input.cwd,
     detached: process.platform !== "win32",
     env: {
@@ -410,7 +412,14 @@ export async function executeNativeCodexRunner(input: {
       PAPERCLIP_RUNNER_BOOTSTRAP_TICKET: prepared.bootstrapTicket,
     },
     stdio: ["ignore", "pipe", "pipe"],
-  });
+  };
+  // The runner is the launch root of its own scope; the providers it starts
+  // inherit it. Off mode is the plain spawn.
+  const launchRoots = createNativeLaunchRoots({ companyId: input.companyId, onLog: input.onLog });
+  const launcher = launchRoots.root("runner", input.runnerInstanceId);
+  const child: ChildProcess = launcher
+    ? launcher.spawn(binary, runnerArgs, runnerOptions)
+    : spawn(binary, runnerArgs, runnerOptions);
   const exit = waitForExit(child);
   child.stdout?.on("data", (chunk: Buffer) => {
     void input.onLog("stdout", chunk.toString("utf8"));
@@ -461,6 +470,11 @@ export async function executeNativeCodexRunner(input: {
     prepared.queueCommand("session.close", {}, `close_${input.runId}`);
     prepared.queueCommand("runner.shutdown", {}, `shutdown_${input.runId}`);
     await stopChild(child, exit, true);
+    // In a scope, the runner is stopped only once what it left there is gone.
+    const cleanup = await launcher?.reaped(child);
+    if (cleanup && !cleanup.confirmed) {
+      throw new Error(`paperclip_runner_scope_cleanup_unconfirmed: reason=${cleanup.reason}`);
+    }
 
     const succeeded = completed === null || completed.terminal.runTerminalState === "succeeded";
     if (goalControl && completed === null) {
@@ -524,6 +538,9 @@ export async function executeNativeCodexRunner(input: {
     throw error;
   } finally {
     await stopChild(child, exit).catch(() => undefined);
+    // Stop whatever the runner left in its scope, including setsid leftovers;
+    // a degraded launch or unconfirmed cleanup is already in the run log.
+    await launchRoots.settle().catch(() => undefined);
     await prepared.release();
   }
 }

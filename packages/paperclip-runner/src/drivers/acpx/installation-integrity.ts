@@ -1,6 +1,7 @@
 import { MAX_ACPX_RUNTIME_EXECUTABLE_BYTES, ACPX_PRIVATE_SNAPSHOT_ENV, createAcpxPrivateSnapshot, type AcpxPrivateSnapshot } from "./private-snapshot.js";
 import { createNativeAcpxDistributionSnapshot, NATIVE_ACPX_BOOTSTRAP_NAME, readNativeAcpxDistributionEntries, type NativeAcpxDistributionInput } from "./native-distribution-integrity.js";
 export type { NativeAcpxDistributionInput } from "./native-distribution-integrity.js";
+import { spawnLaunchRoot, type ProcessIsolationRequest } from "../../process-isolation.js";
 import { createHash } from "node:crypto";
 import {
   spawn as spawnChildProcess,
@@ -503,12 +504,12 @@ export async function verifyNativeAcpxInstallation(
         null, null, native.snapshot,
       );
       return {
-        spawn(args = [], options = {}, lifetime) {
+        spawn(args = [], options = {}, lifetime, isolation) {
           if (args.length !== 0) throw new Error("Native ACPX distribution accepts only its fixed profile arguments");
           return lease.spawn([], { ...options, env: {
             ...(options.env ?? process.env),
             PAPERCLIP_ACPX_NATIVE_GUARDED: lifetime === undefined ? "0" : "1",
-          } }, lifetime);
+          } }, lifetime, isolation);
         },
         close: () => lease.close(),
       };
@@ -526,6 +527,8 @@ export interface VerifiedAcpxCommandLease {
     args?: readonly string[],
     options?: SpawnOptionsWithoutStdio,
     lifetime?: VerifiedAcpxProviderLifetime,
+    /** Scope request for a guardian launched outside a contained runner. */
+    isolation?: ProcessIsolationRequest,
   ): ChildProcess;
   close(): Promise<void>;
 }
@@ -1506,6 +1509,7 @@ function commandLease(
       args: readonly string[] = [],
       options: SpawnOptionsWithoutStdio = {},
       lifetime?: VerifiedAcpxProviderLifetime,
+      isolation?: ProcessIsolationRequest,
     ): ChildProcess {
       if (consumed) throw new Error("Verified ACPX command lease is closed");
       consumed = true;
@@ -1568,7 +1572,10 @@ function commandLease(
           environment[VERIFIED_PROVIDER_RUNTIME_TARGET_ENV] =
             providerRuntimeEnvironmentVariable;
         }
-        child = spawnChildProcess(
+        // With a request, the outer guardian joins its own scope before it
+        // runs. The helper keeps the PID, the new process group and every
+        // descriptor number above, so the leases and fences are unchanged.
+        child = spawnLaunchRoot(
           runtimeHandoff.executable,
           guarded
             ? [
@@ -1643,6 +1650,8 @@ function commandLease(
                     : [runtimeHandoff.sourceFd]),
                 ],
           },
+          isolation,
+          spawnChildProcess,
         );
         spawnedChild = child;
         if (privateSnapshot !== null) {

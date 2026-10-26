@@ -6,7 +6,8 @@ import type { NativeExecutionInputV6 } from "../../contracts/native-execution.js
 import type { ExternalProviderPort } from "../../contracts/external-provider.js";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
 import { validatePrpStructuredRunResult } from "../../protocol/replay-contract.js";
-import { DurablePrpControlPlane, spawnRunner, type RunnerProcessHandle } from "../../control-plane/durable-prp-control-plane.js";
+import { DurablePrpControlPlane, spawnRunner, waitForProcess, type RunnerProcessHandle } from "../../control-plane/durable-prp-control-plane.js";
+import { confirmLaunchRootStopped } from "../../process-isolation.js";
 import type { DurableRecoveryIdentity } from "../../contracts/durable-recovery.js";
 import { authorizedToolSetForProvider, defaultCapabilityRunnerdBinary, readRunnerdArtifactBinding, type CapabilityRunnerdCodexTransportOptions } from "../../live/runnerd-codex-transport.js";
 import { codexSemanticToolSpecs } from "../codex/codex-driver-values.js";
@@ -29,6 +30,8 @@ export interface RunnerdDotDriverOptions {
   dynamicToolHandler?: CodexNativeSessionBackendOptions["dynamicToolHandler"];
   completionFeedback?: CodexNativeSessionBackendOptions["completionFeedback"];
   adoptExistingRunner?: CapabilityRunnerdCodexTransportOptions["adoptExistingRunner"];
+  /** Put the local runner in its own agent process scope. */
+  processIsolation?: CapabilityRunnerdCodexTransportOptions["processIsolation"];
 }
 
 const capabilities = {
@@ -91,6 +94,7 @@ class RunnerdDotSession implements HarnessSession {
   #release: (() => Promise<void> | void) | null = null;
   #detachPort: (() => Promise<void>) | null = null;
   #closed = false;
+  #closing: Promise<void> | undefined;
   #failure: Error | null = null;
   constructor(readonly options: RunnerdDotDriverOptions) {}
   ids() { return { driverSessionId: this.options.identity.normalizedSessionId, providerSessionId: null, displayId: "OpenAI Dot" }; }
@@ -148,6 +152,7 @@ class RunnerdDotSession implements HarnessSession {
         maxRuntimeMs: 0, reconnectGraceMs: o.runnerProcessLauncher ? 300_000 : 60_000,
         // No agent, OAuth, ChatGPT or provider API credentials are inherited.
         environment: { PATH: process.env.PATH },
+        processIsolation: o.processIsolation,
       });
       const pid = this.#process.child.pid;
       if (pid && !o.runnerProcessLauncher) await o.onSpawn?.({ pid, processGroupId: this.#process.processGroupId ?? null,
@@ -253,11 +258,25 @@ class RunnerdDotSession implements HarnessSession {
     await this.#core?.drainPendingConnectionProcessing();
     this.#core?.retireSemanticToolCallbacks();
   }
-  async close(input: { reason: string; force?: boolean }) {
+  close(input: { reason: string; force?: boolean }): Promise<void> {
+    // In a scope, one close per session: a concurrent or repeated close shares
+    // the first one's promise and outcome.
+    if (this.#scoped()) return (this.#closing ??= this.#close(input));
+    return this.#close(input);
+  }
+  #scoped() { return this.options.processIsolation !== undefined && !this.options.runnerProcessLauncher; }
+  async #close(input: { reason: string; force?: boolean }) {
     if (this.#closed) return;
     if (input.force) await this.interrupt();
     await this.#command("session.close", {}, "dot_close");
     await this.#command("runner.shutdown", {}, "dot_shutdown");
     await this.detachControllerForRestart();
+    // In a scope, the runner is stopped only once it exited and what it left
+    // there is gone; the caller collects provider files after this resolves.
+    // A runner that does not exit in time is killed, and the close fails.
+    if (this.#process && this.#scoped()) {
+      await waitForProcess(this.#process, 15_000);
+      await confirmLaunchRootStopped(this.options.processIsolation, this.#process.child);
+    }
   }
 }

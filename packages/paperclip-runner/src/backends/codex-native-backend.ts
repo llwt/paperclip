@@ -20,6 +20,8 @@ import {
 } from "./runtime-context.js";
 
 export interface CodexNativeSessionBackendOptions {
+  /** Scope for providers this backend starts in the calling process. */
+  processIsolation?: import("../process-isolation.js").ProcessIsolationRequest;
   /** Effective provider environment, including the assigned workspace boundary. */
   environment?: NodeJS.ProcessEnv;
   /** Filesystem that authoritatively admits the workspace path. */
@@ -189,6 +191,7 @@ function createTransportBackedNativeSessionBackend(
       completionFeedback: options.completionFeedback,
       environment: options.environment,
       workingDirectoryAuthority: options.workingDirectoryAuthority,
+      processIsolation: options.processIsolation,
       driverIdentity,
       capabilities: isCodex
         ? {}

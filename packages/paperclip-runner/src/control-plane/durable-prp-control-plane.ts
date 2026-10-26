@@ -33,6 +33,7 @@ import { NativeSessionProtocolIntegrityError } from "../contracts/native-session
 import { ACPX_CREDENTIAL_BINDING_ENV, ACPX_CREDENTIAL_NAMES, CLAUDE_ROUTING_ENV_KEYS, createAcpxSidecarHostEnvironment } from "../drivers/acpx/environment.js";
 import { piCredentialNames } from "../drivers/acpx/pi-provider-config.js";
 import { githubCredentialEnvironment } from "../github-credential-environment.js";
+import { spawnLaunchRoot, type ProcessIsolationRequest } from "../process-isolation.js";
 import {
   validatePrpEvent,
   type PrpEvent,
@@ -277,6 +278,8 @@ export interface RunnerProcessResult {
   signal: NodeJS.Signals | null;
   stdout: string;
   stderr: string;
+  /** Set when the runner ran in a scope and its cleanup was not confirmed. */
+  scopeCleanupUnconfirmed?: string;
 }
 
 export interface RunnerProcessHandle {
@@ -3512,6 +3515,12 @@ export function spawnRunner(options: {
   environment?: NodeJS.ProcessEnv;
   processLauncher?: (spec: RunnerProcessLaunchSpec) => RunnerProcessHandle;
   diagnosticsDirectory?: string;
+  /**
+   * Put the runner, and so every provider it hosts, in its own agent process
+   * scope. An object option: the runner environment allowlist never sees it,
+   * and nothing below the runner receives it.
+   */
+  processIsolation?: ProcessIsolationRequest;
 }): RunnerProcessHandle {
   const connection =
     options.connection ??
@@ -3658,12 +3667,12 @@ export function spawnRunner(options: {
     atomicPrivateWrite(stdoutPath, "");
     atomicPrivateWrite(stderrPath, "");
   }
-  const child = spawn(command, args, {
+  const child = spawnLaunchRoot(command, args, {
     cwd: packageRoot,
     env: environment,
     detached,
     stdio: diagnosticsDirectory ? "ignore" : "pipe",
-  });
+  }, options.processIsolation, spawn);
   child.unref();
   let stdout = "";
   let stderr = "";
@@ -3684,14 +3693,26 @@ export function spawnRunner(options: {
   const processCompletion = new Promise<RunnerProcessResult>(
     (resolveCompletion, rejectCompletion) => {
       child.once("error", rejectCompletion);
-      child.once("exit", (code, signal) =>
-        resolveCompletion({
+      child.once("exit", (code, signal) => {
+        const result = {
           code,
           signal,
           stdout: stdout || boundedDiagnostic(stdoutPath),
           stderr: stderr || boundedDiagnostic(stderrPath),
-        }),
-      );
+        };
+        // In a scope, the runner's end is reported only once what it left
+        // behind there (setsid leftovers included) has been stopped.
+        const reaped = options.processIsolation?.reaped?.(child);
+        if (reaped) {
+          void reaped.then((cleanup) =>
+            resolveCompletion(
+              cleanup.confirmed
+                ? result
+                : { ...result, scopeCleanupUnconfirmed: cleanup.reason },
+            ),
+          );
+        } else resolveCompletion(result);
+      });
     },
   );
   return withRestart({
