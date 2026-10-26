@@ -29,6 +29,12 @@ export type HotRestartIntentRun = {
   nativeSessionId?: string | null;
   runnerInstanceId?: string | null;
   processStartedAt?: string | null;
+  /**
+   * Agent process scope units recorded for this run (SX-2305). The adopting
+   * server checks them against the instance's scope registry; adoption never
+   * moves or restarts a scope, so an adopted provider stays where it runs.
+   */
+  agentScopeUnits?: string[];
 };
 
 export type HotRestartIntent = {
@@ -410,6 +416,7 @@ function parseRun(value: unknown): HotRestartIntentRun | null {
     nativeSessionId: asString(value.nativeSessionId),
     runnerInstanceId: asString(value.runnerInstanceId),
     processStartedAt: asDateString(value.processStartedAt),
+    ...(Array.isArray(value.agentScopeUnits) ? { agentScopeUnits: asStringArray(value.agentScopeUnits) } : {}),
   };
 }
 

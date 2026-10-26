@@ -56,6 +56,7 @@ import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { warnClaudeQuotaCardConfig } from "./services/claude-quota-card.js";
 import { startAgentProcessIsolation } from "./agent-process-isolation.js";
+import { closeAgentScopesForShutdown, reconcileAgentScopes } from "./services/agent-process-scopes.js";
 import { logger } from "./middleware/logger.js";
 import { runStartupHeartbeatRecoverySteps } from "./startup-heartbeat-recovery.js";
 import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
@@ -1168,6 +1169,7 @@ async function startServerWithDatabaseTeardown(
   ) => Promise<unknown>) | null = null;
   let drainHeartbeatExecutionFinalizers: (() => Promise<void>) | null = null;
   let prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<{
+    mode: string;
     skipDrain: boolean;
     drainRunIds?: string[];
   }>) | null = null;
@@ -1582,6 +1584,17 @@ async function startServerWithDatabaseTeardown(
           }
         }
 
+        // Decide the agent process scopes an earlier server left, after run
+        // recovery classified their owners and before queued runs start.
+        try {
+          await reconcileAgentScopes({ db: db as any, logger, reportUnmatched: true });
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup agent process scope reconciliation failed - the periodic reaper tick retries it",
+          );
+        }
+
         await runStartupHeartbeatRecoverySteps(heartbeat, logger);
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
@@ -1772,6 +1785,9 @@ async function startServerWithDatabaseTeardown(
           // persisted queued work is still being driven forward.
           trackHeartbeatSchedulerWork(heartbeat
             .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
+            .then(() => reconcileAgentScopes({ db: db as any, logger }).catch((err) => {
+              logger.error({ err }, "periodic agent process scope reconciliation failed");
+            }))
             .then(() => heartbeat.promoteDueScheduledRetries())
             .then(async (promotion) => {
               await heartbeat.resumeQueuedRuns();
@@ -2042,6 +2058,16 @@ async function startServerWithDatabaseTeardown(
       shutdownInstrumentation,
       shutdownSentry,
       log: logger,
+    });
+
+    // Last: what the drain and the application services left in agent
+    // process scopes. Runs handed to the next server keep theirs.
+    const handOffMode = heartbeatShutdown.hotRestart?.mode;
+    await closeAgentScopesForShutdown({
+      handOff: handOffMode === "hot_restart" || handOffMode === "acp_drain_required",
+      logger,
+    }).catch((err) => {
+      logger.error({ err, signal }, "agent process scope shutdown cleanup failed");
     });
 
     if (!exitProcess && server.listening) {

@@ -112,6 +112,7 @@ import {
   type BudgetEnforcementScope,
 } from "../budgets.js";
 import { terminateLocalService } from "../local-service-supervisor.js";
+import { terminateInheritedOwnerScopes } from "../agent-process-scopes.js";
 import { deriveCommentId } from "../../modules/run-dispatch/index.js";
 import { WakeQueueApplicationError } from "../../modules/wake-queue/index.js";
 import { isUuidLike } from "@paperclipai/shared";
@@ -1265,6 +1266,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         }
       : options.resultJson), cancellation };
 
+    // Set when an inherited scope could not be confirmed stopped; saved with the run.
+    let agentScopeCleanup: Record<string, unknown> | null = null;
     try {
       let releaseProcessCancellation: (() => void) | undefined;
       const processCancellationSettlement =
@@ -1335,6 +1338,24 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
                   options.terminationGraceMs,
                 ),
               });
+            } else if (!control && run.runtimeMode !== "native") {
+              // A run adopted after a hot restart has no in-memory process;
+              // its scope, launched by the earlier server, is the only handle
+              // on its processes. No record (isolation off) changes nothing.
+              const inherited = await terminateInheritedOwnerScopes({
+                ownerKinds: ["run"],
+                ownerId: run.id,
+                reason: "run_cancelled",
+                signal: agent?.adapterType === "codex_local" ? "SIGINT" : undefined,
+                graceMs: cancellationTerminationGraceMs(5, options.terminationGraceMs),
+              });
+              if (!inherited.settled) {
+                agentScopeCleanup = { confirmed: false, results: inherited.results };
+                logger.warn(
+                  { runId: run.id, results: inherited.results },
+                  "cancelled run's inherited process scope was not confirmed stopped; kept for reconciliation",
+                );
+              }
             }
             terminationSettled = true;
           } finally {
@@ -1392,6 +1413,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
                     resultJson: {
                       ...persistedCancellationResult,
                       ...(resultJson ?? {}),
+                      ...(agentScopeCleanup ? { agentScopeCleanup } : {}),
                       // A scheduler placeholder has no process to acknowledge.
                       // Preserve its normal release policy instead of treating
                       // it as an operator stop of provider work.
