@@ -81,6 +81,20 @@ export interface ScopeUnitNameInput {
  */
 export function buildScopeUnitName(input: ScopeUnitNameInput): string {
   if (!/^[0-9a-f]{16}$/.test(input.nonce)) throw new Error("Launch nonce must be 16 lowercase hex characters");
+  return `${scopeUnitOwnerPrefix(input)}${input.nonce}.scope`;
+}
+
+function scopeUnitOwnerPrefix(input: Omit<ScopeUnitNameInput, "nonce">): string {
   const owner = digest(`owner:${input.companyId ?? ""}:${input.ownerKind}:${input.ownerId}`, 16);
-  return `${scopeUnitNamespace(input.instanceId)}${owner}-${input.nonce}.scope`;
+  return `${scopeUnitNamespace(input.instanceId)}${owner}-`;
+}
+
+/**
+ * Whether a unit name was built for this owner. Only the hashed identity in
+ * the name is compared, so a record whose manifest cannot be read can still
+ * be attributed to its owner, or ruled out.
+ */
+export function isScopeUnitOfOwner(unit: string, owner: Omit<ScopeUnitNameInput, "nonce">): boolean {
+  const prefix = scopeUnitOwnerPrefix(owner);
+  return unit.startsWith(prefix) && /^[0-9a-f]{16}\.scope$/.test(unit.slice(prefix.length));
 }

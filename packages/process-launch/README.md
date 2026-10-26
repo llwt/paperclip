@@ -120,6 +120,9 @@ or stop (`server/src/services/agent-process-scopes.ts`):
   and start time).
 - `listUnmatchedScopeUnits(...)`: live units in the instance's namespace with
   no record. They are reported, never stopped.
+- `isScopeUnitOfOwner(unit, owner)`: whether a unit name was built for an
+  owner, from the hashed identity in the name. A record that cannot be read
+  can still be attributed to its owner, so its cleanup is reported as pending.
 
 Scopes carry no `BindsTo=` or `PartOf=` dependency on the Paperclip service,
 so a hot restart can adopt the processes in them.
