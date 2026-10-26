@@ -3,6 +3,7 @@ import {
   defaultExecutionWorkspaceModeForProject,
   defaultProjectWorkspaceIdForProject,
   issueExecutionWorkspaceModeForExistingWorkspace,
+  ownedProjectWorkspaceId,
 } from "./project-workspace-defaults";
 
 describe("project workspace defaults", () => {
@@ -38,5 +39,14 @@ describe("project workspace defaults", () => {
 
     expect(issueExecutionWorkspaceModeForExistingWorkspace("cloud_sandbox")).toBe("agent_default");
     expect(issueExecutionWorkspaceModeForExistingWorkspace("isolated_workspace")).toBe("isolated_workspace");
+  });
+
+  it("keeps only a workspace the project owns", () => {
+    const project = { workspaces: [{ id: "workspace-a", isPrimary: true }] };
+    expect(ownedProjectWorkspaceId(project, "workspace-a")).toBe("workspace-a");
+    expect(ownedProjectWorkspaceId(project, "workspace-b")).toBe("");
+    expect(ownedProjectWorkspaceId(project, "")).toBe("");
+    expect(ownedProjectWorkspaceId({}, "workspace-a")).toBe("");
+    expect(ownedProjectWorkspaceId(null, "workspace-a")).toBe("");
   });
 });

@@ -1245,6 +1245,80 @@ describe("NewIssueDialog", () => {
     act(() => root.unmount());
   });
 
+  describe("project workspace ownership", () => {
+    const projectsWithOwnWorkspaces = [
+      { id: "project-a", name: "Alpha", description: null, archivedAt: null, color: "#445566", workspaces: [{ id: "workspace-a", isPrimary: true }] },
+      { id: "project-b", name: "Beta", description: null, archivedAt: null, color: "#445566", workspaces: [{ id: "workspace-b", isPrimary: true }] },
+    ];
+
+    async function submitDraftTask(root: ReturnType<typeof renderDialog>["root"]) {
+      await typeTextareaValue(container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Describe a task…"]')!, "Ownership task");
+      act(() => container.querySelector<HTMLButtonElement>('[aria-label="Create task"]')!.click());
+      await waitForAssertion(() => expect(mockIssuesApi.create).toHaveBeenCalled());
+      const payload = mockIssuesApi.create.mock.calls[0][1];
+      act(() => root.unmount());
+      return payload;
+    }
+
+    it("sends the new project's workspace after switching from another project with its own workspace", async () => {
+      mockProjectsApi.list.mockResolvedValue(projectsWithOwnWorkspaces);
+      dialogState.newIssueDefaults = { projectId: "project-a" };
+      const { root } = renderDialog(container);
+      await waitForAssertion(() => expect(container.querySelector('[data-slot="new-issue-compact-control"]')?.textContent).toContain("project-a"));
+      act(() => container.querySelector<HTMLButtonElement>('[data-slot="new-issue-compact-control"]')!.click());
+      await waitForAssertion(() => expect(container.querySelector('[data-slot="new-issue-compact-control"]')?.textContent).toContain("project-b"));
+      const payload = await submitDraftTask(root);
+      expect(payload).toMatchObject({ projectId: "project-b", projectWorkspaceId: "workspace-b" });
+    });
+
+    it("replaces a restored draft workspace that belongs to a different project than the launch context", async () => {
+      mockProjectsApi.list.mockResolvedValue(projectsWithOwnWorkspaces);
+      dialogState.newIssueDefaults = { projectId: "project-b" };
+      localStorage.setItem("paperclip:issue-draft", JSON.stringify({
+        title: "Draft task", description: "", status: "todo", priority: "medium", assigneeValue: "",
+        reviewerValue: "", approverValue: "", projectId: "project-a", projectWorkspaceId: "workspace-a",
+        assigneeModelOverride: "", assigneeThinkingEffort: "", assigneeChrome: false, workMode: "standard",
+      }));
+      const { root } = renderDialog(container);
+      await flush();
+      const payload = await submitDraftTask(root);
+      expect(payload).toMatchObject({ projectId: "project-b", projectWorkspaceId: "workspace-b" });
+    });
+
+    it("drops a draft workspace that its project no longer owns", async () => {
+      mockProjectsApi.list.mockResolvedValue(projectsWithOwnWorkspaces);
+      localStorage.setItem("paperclip:issue-draft", JSON.stringify({
+        title: "Draft task", description: "", status: "todo", priority: "medium", assigneeValue: "",
+        reviewerValue: "", approverValue: "", projectId: "project-b", projectWorkspaceId: "workspace-a",
+        assigneeModelOverride: "", assigneeThinkingEffort: "", assigneeChrome: false, workMode: "standard",
+      }));
+      const { root } = renderDialog(container);
+      await flush();
+      const payload = await submitDraftTask(root);
+      expect(payload).toMatchObject({ projectId: "project-b", projectWorkspaceId: "workspace-b" });
+    });
+
+    it("does not send a reused worktree's source checkout from another project", async () => {
+      enableWorktrees();
+      mockProjectsApi.list.mockResolvedValue([
+        { id: "project-1", name: "Alpha", executionWorkspacePolicy: { enabled: true, defaultMode: "shared_workspace" }, workspaces: [{ id: "source-1", isPrimary: true }] },
+        { id: "project-2", name: "Beta", executionWorkspacePolicy: { enabled: true, defaultMode: "shared_workspace" }, workspaces: [{ id: "source-2", isPrimary: true }] },
+      ]);
+      mockExecutionWorkspacesApi.listSummaries.mockImplementation(async (_companyId: string, filters: { projectId?: string }) => filters.projectId === "project-1"
+        ? [{ id: "worktree-1", name: "Alpha fix", mode: "isolated_workspace", status: "active", branchName: "fix/alpha", cwd: "/tmp/worktree-1", projectWorkspaceId: "source-1", lastUsedAt: new Date() }]
+        : []);
+      const { root } = renderDialog(container);
+      await waitForAssertion(() => expect(container.querySelector('[cmdk-item][data-value="reuse:worktree-1"]')).not.toBeNull());
+      selectWorktree("reuse:worktree-1");
+      act(() => container.querySelector<HTMLButtonElement>('[data-slot="new-issue-compact-control"]')!.click());
+      await waitForAssertion(() => expect(container.querySelector('[data-slot="new-issue-compact-control"]')?.textContent).toContain("project-2"));
+      await flush();
+      const payload = await submitDraftTask(root);
+      expect(payload).toMatchObject({ projectId: "project-2", projectWorkspaceId: "source-2" });
+      expect(payload).not.toHaveProperty("executionWorkspaceId");
+    });
+  });
+
   it.each([false, true])("hides worktrees and skips reuse queries when the project has isolation disabled (instance: %s)", async (instanceEnabled) => {
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: instanceEnabled });
     dialogState.newIssueDefaults = { projectId: "project-1" };

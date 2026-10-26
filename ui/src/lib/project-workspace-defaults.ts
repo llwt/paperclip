@@ -40,3 +40,8 @@ export function issueExecutionWorkspaceModeForExistingWorkspace(
   }
   return "shared_workspace";
 }
+
+export function ownedProjectWorkspaceId(project: ProjectWorkspaceDefaultSource, projectWorkspaceId: string | null | undefined) {
+  if (!project || !projectWorkspaceId) return "";
+  return project.workspaces?.some((workspace) => workspace.id === projectWorkspaceId) ? projectWorkspaceId : "";
+}
