@@ -1,4 +1,4 @@
-import { execFile as execFileCallback } from "node:child_process";
+import { execFileAuxiliary } from "./scoped-process.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   constants as fsConstants,
@@ -8,7 +8,6 @@ import {
 import os from "node:os";
 import { workspacePaths, workspacePathMatcher, writeWorkspacePaths, isPathManifest, type WorkspacePaths } from "./workspace-manifest.js";
 import path from "node:path";
-import { promisify } from "node:util";
 import {
   buildRemoteGitDeltaBundleScript,
   isMissingGitPrerequisiteError,
@@ -55,7 +54,7 @@ import {
   type WorkspaceRestoreDiagnostic,
 } from "./workspace-restore-diagnostics.js";
 
-const execFile = promisify(execFileCallback);
+const execFile = execFileAuxiliary;
 const SANDBOX_WORKSPACE_HEAVY_DIR_NAMES = [
   "node_modules",
   "vendor",
