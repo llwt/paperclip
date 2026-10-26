@@ -340,8 +340,7 @@ import { agentInstructionWorkingCopyService, collectStoppedInstructionCopyWithRe
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { execFile as execFileCallback } from "node:child_process";
-import { promisify } from "node:util";
+import { execFileAuxiliary } from "@paperclipai/adapter-utils/scoped-process";
 import {
   createHash,
   randomUUID,
@@ -618,7 +617,7 @@ const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const ACCEPTED_PLAN_CONVERSION_SKILL_KEY =
   "paperclipai/paperclip/paperclip-converting-plans-to-tasks";
 
-const execFile = promisify(execFileCallback);
+const execFile = execFileAuxiliary;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = [
   "failed",
   "cancelled",

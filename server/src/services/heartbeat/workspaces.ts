@@ -17,8 +17,7 @@ import {
 } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { execFile as execFileCallback } from "node:child_process";
-import { promisify } from "node:util";
+import { execFileAuxiliary } from "@paperclipai/adapter-utils/scoped-process";
 import {
   createHash,
   randomUUID,
@@ -93,7 +92,7 @@ import {
   type EffectiveRunConfigSecretManifestEntry,
 } from "../effective-run-config-fingerprints.js";
 
-const execFile = promisify(execFileCallback);
+const execFile = execFileAuxiliary;
 
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 

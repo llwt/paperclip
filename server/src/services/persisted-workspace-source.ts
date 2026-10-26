@@ -1,12 +1,11 @@
-import { execFile } from "node:child_process";
+import { execFileAuxiliary } from "@paperclipai/adapter-utils/scoped-process";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
 import type { ExecutionWorkspace } from "@paperclipai/shared";
 import { inspectManagedGitWorktreeBranch, WorkspaceRuntimeValidationFailure } from "./workspace-runtime.js";
 import type { ManagedGitInspectionDiagnostic, PersistedWorkspaceSourceReasonCode } from "./workspace-validation-diagnostics.js";
 
-const exec = promisify(execFile);
+const exec = execFileAuxiliary;
 type SourceWorkspace = Pick<ExecutionWorkspace,
   "id" | "companyId" | "projectId" | "projectWorkspaceId" | "repoUrl" | "baseRef" | "cwd" | "providerRef"
 >;

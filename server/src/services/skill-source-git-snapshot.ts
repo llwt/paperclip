@@ -1,4 +1,6 @@
-import { spawn } from 'node:child_process';
+import type { ChildProcessByStdio } from 'node:child_process';
+import type { Readable } from 'node:stream';
+import { spawnScoped } from '@paperclipai/adapter-utils/scoped-process';
 import { chmod, mkdtemp, readdir, rm, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -72,9 +74,10 @@ async function directoryBytes(directory: string): Promise<number> {
 async function runGit(directory: string, args: string[], token: string, options: GitSkillSnapshotOptions & { download?: boolean; maxOutput?: number } = {}): Promise<Buffer> {
   options.signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
-    const child = spawn('git', ['-c', `core.hooksPath=${os.devNull}`, '-c', 'init.templateDir=', '-c', 'protocol.allow=never',
+    const scoped = spawnScoped({ command: 'git', args: ['-c', `core.hooksPath=${os.devNull}`, '-c', 'init.templateDir=', '-c', 'protocol.allow=never',
       '-c', 'protocol.https.allow=always', '-c', 'http.followRedirects=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', ...args],
-    { cwd: directory, env: gitEnvironment(token), stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
+    options: { cwd: directory, env: gitEnvironment(token), stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' }, owner: { kind: 'auxiliary' } });
+    const child = scoped.child as ChildProcessByStdio<null, Readable, Readable>;
     const chunks: Buffer[] = [];
     let bytes = 0, stderr = '', unfinishedLine = '';
     let failure: unknown;
@@ -86,6 +89,7 @@ async function runGit(directory: string, args: string[], token: string, options:
     const interrupted = new Promise<void>(resolve => { stopped = resolve; });
     const kill = (signal: NodeJS.Signals) => {
       try { if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, signal); else child.kill(signal); } catch { /* Already exited. */ }
+      if (signal === 'SIGKILL') void scoped.terminateScope({ signal, graceMs: 1 }).catch(() => undefined);
     };
     const stop = (error: unknown) => {
       if (failure) return;
@@ -135,6 +139,7 @@ async function runGit(directory: string, args: string[], token: string, options:
     child.on('close', async code => {
       closed = true;
       clearInterval(monitor); clearTimeout(killTimer);
+      await scoped.settled;
       // Git can exit while a progress consumer is still blocked. Keep cancellation
       // and the deadline live until that write finishes, and let either release
       // the download slot even if the consumer never settles its promise.

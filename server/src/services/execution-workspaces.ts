@@ -1,10 +1,9 @@
 import type { SQL } from "drizzle-orm";
 import { createWorkspaceGitInspectionCache } from "./workspace-git-inspection-cache.js";
-import { execFile } from "node:child_process";
+import { execFileAuxiliary } from "@paperclipai/adapter-utils/scoped-process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
 import { and, asc, desc, eq, gt, inArray, isNull, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -68,7 +67,7 @@ type ExecutionWorkspaceRow = typeof executionWorkspaces.$inferSelect;
 type WorkspaceRuntimeServiceRow = typeof workspaceRuntimeServices.$inferSelect;
 type RuntimeServiceReadDb = Pick<Db, "select">;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
-const execFileAsync = promisify(execFile);
+const execFileAsync = execFileAuxiliary;
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 
 // Return the timestamp when an issue became terminal. A `done` issue uses

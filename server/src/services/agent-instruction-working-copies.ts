@@ -1,7 +1,6 @@
 import { agentDirectoryWorkingCopyService, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
 import { createHash } from "node:crypto";
-import { execFile as execFileCallback } from "node:child_process";
-import { promisify } from "node:util";
+import { execFileAuxiliary } from "@paperclipai/adapter-utils/scoped-process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { and, asc, desc, eq, inArray, lte, or, isNull, isNotNull, sql } from "drizzle-orm";
@@ -22,7 +21,7 @@ import type { AuthorizationActor } from "./authorization.js";
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
 import { logger } from "../middleware/logger.js";
 
-const execFile = promisify(execFileCallback);
+const execFile = execFileAuxiliary;
 type Copy = typeof copies.$inferSelect;
 const hash = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 const quote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
