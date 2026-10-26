@@ -85,6 +85,7 @@ import {
   releaseMaterializedNativeRuntimeSkills,
 } from "../drivers/runtime-context-materializer.js";
 import { resolvePackagedRunnerBinary } from "./runner-binary.js";
+import { confirmLaunchRootStopped, type ProcessIsolationRequest } from "../process-isolation.js";
 import { RUNNERD_CANONICAL_ITEM } from "../drivers/codex/codex-driver-values.js";
 
 // URL directory conversion preserves a trailing separator while path-derived
@@ -1206,6 +1207,8 @@ export interface CapabilityRunnerdProcessEvidence {
 
 export interface CapabilityRunnerdCodexTransportOptions {
   provider?: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
+  /** Put each runner this transport starts in its own agent process scope. */
+  processIsolation?: ProcessIsolationRequest;
   opencodePermissionMode?: NativeOpenCodePermissionMode;
   acpxAgent?: QualifiedAcpxAgent;
   /** Explicit evaluation-only candidate selection, never derived from persisted session input. */
@@ -2323,6 +2326,8 @@ export function retainedRunnerdCleanupProofIsCurrent(
  * durable recovery lease, original-source proof, and atomic activation. */
 export interface RetainedRunnerdMaintenanceInput {
   requestId: string;
+  /** Put the maintenance runner in its own agent process scope. */
+  processIsolation?: ProcessIsolationRequest;
   binding: NativeRunIdentity;
   identity: DurableRecoveryIdentity;
   backend: { kind: string; name: string };
@@ -2690,6 +2695,7 @@ async function settleRetainedRunnerdSessionOwned(
         runnerBinaryPath: runnerBinary,
         runnerVersion: artifact.version,
         runnerDigest: artifact.digest,
+        processIsolation: input.processIsolation,
         environment: createCapabilityRunnerdProviderEnvironment({
           provider: "codex",
           options: { environment: input.environment },
@@ -3580,6 +3586,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #runAttachTemplate: Record<string, unknown> | null = null;
   #closed = false;
   #closePromise: Promise<void> | null = null;
+  readonly #scopedRunners = new Set<RunnerProcessHandle["child"]>();
   #controllerDetachedForRestart = false;
   #failure: Error | null = null;
   readonly #failureSignal: Promise<never>;
@@ -4640,6 +4647,17 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       }
       throw new NativeSessionCloseUnrecoverableError(settlement);
     }
+    // In a scope, every runner this transport started (restarts included) is
+    // stopped only once it exited and what it left there is gone; keep the
+    // root for inspection otherwise.
+    for (const child of this.#scopedRunners) {
+      try {
+        await confirmLaunchRootStopped(this.options.processIsolation, child);
+      } catch (error) {
+        this.#diagnostic(`runner ${error instanceof Error ? error.message : String(error)}`);
+        throw error;
+      }
+    }
     if (this.#ownsRoot && !adoptedRunner) {
       rmSync(this.#root, { recursive: true, force: true });
     }
@@ -5051,6 +5069,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       runnerDigest: runnerArtifact.digest,
       acpxLaunchProfile: runnerAcpxLaunchProfile,
       opencodeLaunchProfile: runnerOpenCodeLaunchProfile,
+      processIsolation: this.options.processIsolation,
       environment: withRunnerdProviderTrace(
         createCapabilityRunnerdProviderEnvironment({
           provider,
@@ -5675,6 +5694,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           runnerDigest: runnerArtifact.digest,
           acpxLaunchProfile: runnerAcpxLaunchProfile,
           opencodeLaunchProfile: runnerOpenCodeLaunchProfile,
+          processIsolation: this.options.processIsolation,
           environment: withRunnerdProviderTrace(
             createCapabilityRunnerdProviderEnvironment({
               provider,
@@ -6797,6 +6817,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   }
 
   #watchRunner(handle: RunnerProcessHandle): void {
+    // Every runner handle passes here; a scoped one is confirmed at close.
+    if (this.options.processIsolation && !this.options.runnerProcessLauncher)
+      this.#scopedRunners.add(handle.child);
     void handle.completion.then(
       (result) => {
         this.#evidence.runnerExited = true;

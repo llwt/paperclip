@@ -1,5 +1,6 @@
 import { createPiThinkingAdmission, resolvePiThinkingLevel } from "./pi-thinking.js";
 import type { ChildProcess } from "node:child_process";
+import { confirmLaunchRootStopped, LaunchRootCleanupUnconfirmedError, type ProcessIsolationRequest } from "../../process-isolation.js";
 
 import {
   createAcpRuntime,
@@ -205,6 +206,7 @@ export async function openQualifiedAcpxRuntime(
     retainCleanup,
     dependencies.awaitProviderOwnership,
     dependencies.awaitProviderExit,
+    options.processIsolation,
   );
   const baseStore = createStore({ stateDir: options.stateDirectory });
   let failedHandshakeHandle: AcpRuntimeHandle | null = null;
@@ -447,11 +449,14 @@ export async function openQualifiedAcpxRuntime(
       options.signal?.throwIfAborted();
       options.assertWorkspaceHeld?.();
       commandLaunches.count += 1;
+      const lifetime = {
+        credentialFenceFds,
+        activateCredentialFenceOwner: options.activateCredentialFenceOwner!,
+      };
       return children.add(
-        options.command.spawn(input.args, input.options, {
-          credentialFenceFds,
-          activateCredentialFenceOwner: options.activateCredentialFenceOwner!,
-        }) as ChildProcess,
+        (options.processIsolation === undefined
+          ? options.command.spawn(input.args, input.options, lifetime)
+          : options.command.spawn(input.args, input.options, lifetime, options.processIsolation)) as ChildProcess,
       );
     },
   };
@@ -824,8 +829,17 @@ class RuntimeAdmissionCleanup {
         runtimeTerminalError === null &&
         runtimeError !== undefined &&
         !this.#closedHandles.has(targetKey);
-      const processNeedsRetry = processErrors.length > 0;
+      // A scope cleanup that was not confirmed is final: retrying cannot
+      // confirm it, so it is reported to the owner instead.
+      const scopeErrors = processErrors.filter((error) => error instanceof LaunchRootCleanupUnconfirmedError);
+      const processNeedsRetry = processErrors.length > scopeErrors.length;
       if (!runtimeNeedsRetry && !processNeedsRetry) {
+        if (scopeErrors.length > 0) {
+          throw new AggregateError(
+            runtimeTerminalError === null ? scopeErrors : [runtimeTerminalError, ...scopeErrors],
+            "ACPX provider scope cleanup was not confirmed",
+          );
+        }
         if (runtimeTerminalError === null) return;
         throw runtimeTerminalError;
       }
@@ -1725,6 +1739,7 @@ class ProviderExitObservation {
 
 class SpawnedChildSet {
   readonly #children = new Set<ChildProcess>();
+  readonly #isolatedChildren = new Set<ChildProcess>();
   readonly #errors = new Set<unknown>();
   readonly #providerExits = new Map<ChildProcess, ProviderExitObservation>();
   readonly #terminations = new Map<ChildProcess, Promise<unknown[]>>();
@@ -1740,9 +1755,13 @@ class SpawnedChildSet {
     private readonly awaitProviderExit: (
       child: ChildProcess,
     ) => Promise<void> = awaitVerifiedAcpxProviderExit,
+    private readonly processIsolation?: ProcessIsolationRequest,
   ) {}
 
   add(child: ChildProcess): ChildProcess {
+    // Kept past the child's release: a guardian that already exited still
+    // has its scope cleanup confirmed by `terminate`.
+    if (this.processIsolation) this.#isolatedChildren.add(child);
     let exitProof: Promise<void>;
     try {
       exitProof = this.awaitProviderExit(child);
@@ -1856,6 +1875,20 @@ class SpawnedChildSet {
     for (const child of this.#children) this.#startTermination(child);
     const ownedTerminations = [...this.#terminations.values()];
     const errors = (await Promise.all(ownedTerminations)).flat();
+    // In a scope, a guardian is stopped only once what it left there is gone.
+    // Every terminate, concurrent or repeated, waits for the recorded cleanup
+    // of every exited guardian, so none claims a stopped provider early and an
+    // unconfirmed cleanup stays reported.
+    for (const child of this.#isolatedChildren) {
+      if (running(child)) {
+        // Retryable: the scope cleanup runs once this guardian exits.
+        errors.push(new Error("ACPX guardian still running; its scope cleanup is pending"));
+        continue;
+      }
+      await confirmLaunchRootStopped(this.processIsolation, child).catch(
+        (error: unknown) => errors.push(error),
+      );
+    }
     // A failed spawn or signal can emit `error` and then `close` before this
     // method snapshots the live children. Keep those errors independently of
     // child membership and report each object once after all owned attempts.

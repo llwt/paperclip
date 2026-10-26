@@ -13,7 +13,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { createServer as createHttpServer } from "node:http";
-import { execFile } from "node:child_process";
+import { execFile, spawn as spawnChild, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import { getCACertificates } from "node:tls";
 import { join, resolve } from "node:path";
@@ -34,6 +34,7 @@ import {
   OpenCodeServerDriver,
   openCodeServerDriverInternals,
 } from "./opencode-server-driver.js";
+import { LaunchRootCleanupUnconfirmedError, type ProcessIsolationRequest } from "../../process-isolation.js";
 
 const roots: string[] = [];
 const fixture = resolve("test/fixtures/fake-opencode-server.mjs");
@@ -2616,5 +2617,167 @@ describe("OpenCodeServerDriver", () => {
     }).then(() => "provider unexpectedly started", (cause: unknown) => String(cause));
     expect(error).toContain("Gateway rejected [REDACTED]");
     expect(error).not.toContain(key);
+  });
+});
+
+describe("OpenCode server close in an agent process scope", () => {
+  type Cleanup = { confirmed: true } | { confirmed: false; reason: string };
+  // A request that spawns plainly and lets the test settle each root's
+  // cleanup. Like the server's launcher, it returns one recorded outcome per
+  // root, however often it is asked.
+  function scopeRequest() {
+    const children: ChildProcess[] = [];
+    const outcomes = new Map<ChildProcess, { promise: Promise<Cleanup>; settle: (cleanup: Cleanup) => void }>();
+    const events: string[] = [];
+    const request: ProcessIsolationRequest = {
+      spawn: (command, args, options) => {
+        const child = spawnChild(command, [...args], options);
+        let settle!: (cleanup: Cleanup) => void;
+        outcomes.set(child, { promise: new Promise((resolve) => { settle = resolve; }), settle });
+        events.push(`spawn:${children.length}`);
+        children.push(child);
+        return child;
+      },
+      reaped: (child) => {
+        events.push(`reaped:${children.indexOf(child)}`);
+        return outcomes.get(child)!.promise;
+      },
+    };
+    const settle = (index: number, cleanup: Cleanup) => outcomes.get(children[index]!)!.settle(cleanup);
+    return { request, children, events, settle };
+  }
+
+  async function scopedDriver(name: string, request: ProcessIsolationRequest, failFirstSession = false) {
+    await chmod(fixture, 0o755);
+    const root = await mkdtemp(join(tmpdir(), `paperclip-opencode-scope-${name}-`));
+    const workspace = await mkdtemp(join(tmpdir(), `paperclip-opencode-scope-${name}-workspace-`));
+    roots.push(root, workspace);
+    let sessionRequests = 0;
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      runtimeDirectory: root,
+      command: fixture,
+      environment: { PATH: process.env.PATH, OPENROUTER_API_KEY: "fixture-key" },
+      processIsolation: request,
+      // The first startup's session request fails like a server that is not
+      // ready yet, which the driver retries with a new server.
+      fetch: async (url, init) => {
+        if (failFirstSession && init?.method === "POST" && new URL(String(url)).pathname === "/session" && sessionRequests++ === 0) {
+          return new Response("unavailable", { status: 503 });
+        }
+        return await globalThis.fetch(url, init);
+      },
+    });
+    return { driver, workspace };
+  }
+
+  it("confirms a failed startup's server stopped before it starts the retry, and the retry's at close", async () => {
+    const scope = scopeRequest();
+    const { driver, workspace } = await scopedDriver("retry", scope.request, true);
+    // Each root's cleanup is confirmed as soon as the root exits.
+    const confirmOnExit = setInterval(() => {
+      scope.children.forEach((child, index) => {
+        if (child.exitCode !== null || child.signalCode !== null) scope.settle(index, { confirmed: true });
+      });
+    }, 5);
+    try {
+      const session = await driver.openSession({ runId: "run-scope-retry", normalizedSessionId: "scope-retry", workingDirectory: workspace });
+      expect(scope.children).toHaveLength(2);
+      // The first server's stop was confirmed before the second one started.
+      expect(scope.events).toEqual(["spawn:0", "reaped:0", "spawn:1"]);
+      await session.close({ reason: "test" });
+      expect(scope.events).toEqual(["spawn:0", "reaped:0", "spawn:1", "reaped:1"]);
+    } finally {
+      clearInterval(confirmOnExit);
+    }
+  });
+
+  it("does not retry, and fails the open, when a failed startup's cleanup was not confirmed", async () => {
+    const scope = scopeRequest();
+    const { driver, workspace } = await scopedDriver("retry-unconfirmed", scope.request, true);
+    const settleFirst = setInterval(() => {
+      const first = scope.children[0];
+      if (first && (first.exitCode !== null || first.signalCode !== null)) {
+        scope.settle(0, { confirmed: false, reason: "scope_still_populated" });
+      }
+    }, 5);
+    try {
+      const error = await driver
+        .openSession({ runId: "run-scope-retry-unconfirmed", normalizedSessionId: "scope-retry-unconfirmed", workingDirectory: workspace })
+        .catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(LaunchRootCleanupUnconfirmedError);
+      expect(error).toMatchObject({ reason: "scope_still_populated" });
+      // No new server after a stop that was not confirmed.
+      expect(scope.events).toEqual(["spawn:0", "reaped:0"]);
+    } finally {
+      clearInterval(settleFirst);
+    }
+  });
+
+  it("confirms every server that fails during startup stopped before the next attempt", async () => {
+    const scope = scopeRequest();
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-scope-startup-"));
+    const workspace = await mkdtemp(join(tmpdir(), "paperclip-opencode-scope-startup-workspace-"));
+    roots.push(root, workspace);
+    // `node serve ...` exits at once: each attempt fails inside the startup.
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      runtimeDirectory: root,
+      command: process.execPath,
+      environment: { PATH: process.env.PATH, OPENROUTER_API_KEY: "fixture-key" },
+      processIsolation: scope.request,
+    });
+    const confirmOnExit = setInterval(() => {
+      scope.children.forEach((child, index) => {
+        if (child.exitCode !== null || child.signalCode !== null) scope.settle(index, { confirmed: true });
+      });
+    }, 5);
+    try {
+      await expect(driver.openSession({ runId: "run-scope-startup", normalizedSessionId: "scope-startup", workingDirectory: workspace }))
+        .rejects.toThrow();
+      expect(scope.events).toEqual(["spawn:0", "reaped:0", "spawn:1", "reaped:1", "spawn:2", "reaped:2"]);
+    } finally {
+      clearInterval(confirmOnExit);
+    }
+  });
+
+  it("shares one close between concurrent and repeated callers, resolving only after the cleanup", async () => {
+    const scope = scopeRequest();
+    const { driver, workspace } = await scopedDriver("concurrent", scope.request);
+    const session = await driver.openSession({ runId: "run-scope-concurrent", normalizedSessionId: "scope-concurrent", workingDirectory: workspace });
+    const results: string[] = [];
+    const record = (name: string) => (promise: Promise<void>) =>
+      promise.then(() => results.push(`${name}:resolved`), (error: unknown) => results.push(`${name}:${(error as Error).name}`));
+    const first = record("first")(session.close({ reason: "test" }));
+    const second = record("second")(session.close({ reason: "test" }));
+    const root = scope.children[0]!;
+    await new Promise<void>((resolveExit) => {
+      if (root.exitCode !== null || root.signalCode !== null) resolveExit();
+      else root.once("exit", () => resolveExit());
+    });
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+    // The root has exited, but its cleanup is pending: no close has resolved.
+    expect(scope.events).toContain("reaped:0");
+    expect(results).toEqual([]);
+    scope.settle(0, { confirmed: false, reason: "record_unreadable" });
+    await Promise.all([first, second]);
+    expect(results.sort()).toEqual(["first:LaunchRootCleanupUnconfirmedError", "second:LaunchRootCleanupUnconfirmedError"]);
+    await expect(session.close({ reason: "test" })).rejects.toMatchObject({ reason: "record_unreadable" });
+  });
+
+  it("closes as before without a request", async () => {
+    await chmod(fixture, 0o755);
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-scope-off-"));
+    const workspace = await mkdtemp(join(tmpdir(), "paperclip-opencode-scope-off-workspace-"));
+    roots.push(root, workspace);
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      runtimeDirectory: root,
+      command: fixture,
+      environment: { PATH: process.env.PATH, OPENROUTER_API_KEY: "fixture-key" },
+    });
+    const session = await driver.openSession({ runId: "run-scope-off", normalizedSessionId: "scope-off", workingDirectory: workspace });
+    await Promise.all([session.close({ reason: "test" }), session.close({ reason: "test" })]);
+    await expect(session.close({ reason: "test" })).resolves.toBeUndefined();
   });
 });

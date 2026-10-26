@@ -13,6 +13,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { VerifiedAcpxCommandLease } from "./installation-integrity.js";
 import { openCodexAcpxRuntime } from "./codex-runtime-adapter.js";
+import { LaunchRootCleanupUnconfirmedError, type LaunchRootCleanup } from "../../process-isolation.js";
 import { cursorInstructionBinding } from "./cursor-instructions.js";
 import { createAcpxCommandLeaseOwner } from "./command-lease-owner.js";
 import { resolveQualifiedAcpxProfile } from "./qualified-profiles.js";
@@ -596,6 +597,59 @@ describe("Codex ACPX runtime adapter", () => {
       handle: HANDLE,
       reason: "test complete",
       discardPersistentState: false,
+    });
+  });
+
+  describe("guardian in an agent process scope", () => {
+    const openScoped = async (reaped: () => Promise<LaunchRootCleanup>) => {
+      const runtime = fakeRuntime();
+      vi.mocked(runtime.close).mockResolvedValue(undefined);
+      const child = fakeChild();
+      const command = fakeCommand();
+      vi.mocked(command.spawn).mockReturnValue(child);
+      const processIsolation = { spawn: vi.fn(), reaped: vi.fn(reaped) };
+      const port = await openCodexAcpxRuntime({ ...openOptions(command), processIsolation }, {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        awaitProviderOwnership: providerOwnershipEstablished,
+        awaitProviderExit: providerOwnershipEstablished,
+        createRuntime: (options) => runtimeWithProvider(runtime, options),
+      });
+      return { port, child, command, processIsolation };
+    };
+
+    it("closes once the guardian's scope cleanup was confirmed", async () => {
+      const { port, child, command, processIsolation } = await openScoped(async () => ({ confirmed: true }));
+      expect(vi.mocked(command.spawn).mock.calls[0]![3]).toBe(processIsolation);
+      await expect(port.close({ reason: "test complete" })).resolves.toBeUndefined();
+      expect(processIsolation.reaped).toHaveBeenCalledWith(child);
+    });
+
+    it("fails the close, also when repeated, when the guardian's scope cleanup was not confirmed", async () => {
+      const { port } = await openScoped(async () => ({ confirmed: false, reason: "scope_still_populated" }));
+      for (const reason of ["test complete", "repeated close"]) {
+        const error = await port.close({ reason }).catch((caught: unknown) => caught);
+        expect(error).toBeInstanceOf(AggregateError);
+        expect((error as AggregateError).errors).toContainEqual(expect.any(LaunchRootCleanupUnconfirmedError));
+      }
+    });
+
+    it("resolves no concurrent close before the guardian's scope cleanup, and fails both on an unconfirmed one", async () => {
+      let finishCleanup!: (cleanup: LaunchRootCleanup) => void;
+      const cleanup = new Promise<LaunchRootCleanup>((resolve) => { finishCleanup = resolve; });
+      const { port, processIsolation } = await openScoped(() => cleanup);
+      const results: string[] = [];
+      const record = (name: string) => port.close({ reason: name }).then(
+        () => results.push(`${name}:resolved`),
+        () => results.push(`${name}:rejected`),
+      );
+      const closes = [record("first"), record("second")];
+      await vi.waitFor(() => expect(processIsolation.reaped).toHaveBeenCalled());
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(results).toEqual([]);
+      finishCleanup({ confirmed: false, reason: "record_unreadable" });
+      await Promise.all(closes);
+      expect(results.sort()).toEqual(["first:rejected", "second:rejected"]);
     });
   });
 

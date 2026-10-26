@@ -1,5 +1,8 @@
 import { createHash } from "node:crypto";
+import { spawn as spawnChild } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
+import { ProcessCodexAppServerTransport } from "./drivers/codex/app-server-transport.js";
+import { LaunchRootCleanupUnconfirmedError, type LaunchRootCleanup } from "./process-isolation.js";
 
 import type { ControlPlanePort } from "./contracts/control-plane-port.js";
 import type { NativeExecutionInputV1, NativeExecutionInputV5 } from "./contracts/native-execution.js";
@@ -4118,6 +4121,71 @@ describe("executeNativeSession recovery", () => {
     finishClose();
     await failed;
     expect(order).toEqual(["closing", "stopped", "collected"]);
+  });
+
+  describe("instruction collection after a provider in an agent process scope", () => {
+    // The real Codex app-server transport, closed by the session; only the
+    // scope's cleanup result is a seam.
+    const scopedRun = (name: string, reaped: () => Promise<LaunchRootCleanup>) => {
+      const scopedIdentity = { ...identity, companyId: `${name}-company`, runId: `${name}-run` };
+      const transport = new ProcessCodexAppServerTransport({
+        command: process.execPath,
+        args: ["-e", "setInterval(() => {}, 1000)"],
+        environment: { PATH: process.env.PATH },
+        processIsolation: { spawn: (command, args, options) => spawnChild(command, args, options), reaped },
+      });
+      const order: string[] = [];
+      const capabilities = { resume: true, typedEvents: true, steering: false, interruption: false, structuredResult: true };
+      const session: NativeSession = {
+        identity: () => scopedIdentity,
+        capabilities: async () => capabilities,
+        async *events() { throw new Error("provider failed after editing instructions"); },
+        startTurn: async () => ({ turnId: `${name}-turn` }),
+        result: async () => null,
+        snapshot: async () => ({ backendKind: "local", sessionId: `${name}-session`, identity: scopedIdentity,
+          providerSessionId: `${name}-provider`, cursor: null, activeTurnId: null, pendingRuntimeRequests: [], lineage: [] }),
+        close: async () => { order.push("closing"); await transport.close(); order.push("stopped"); },
+      };
+      const execution = executeNativeSession({
+        input: { ...input, binding: { ...input.binding, companyId: scopedIdentity.companyId, runId: scopedIdentity.runId } },
+        backend: {
+          descriptor: async () => ({ kind: "local", name: `${name}-test`, version: "1", capabilities }),
+          openSession: async () => session,
+        },
+        controlPlane: {
+          openRun: async () => {}, checkpointSession: async () => {},
+          appendEvent: async () => ({ cursor: 0, highestContiguousSourceSeq: 0, disposition: "committed" }),
+          replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }), completeRun: async () => {},
+        },
+        runnerInstanceId: `${name}-runner`, controlPlaneInstanceId: "control",
+        requireSessionCloseBeforeReturn: true,
+        onSessionClosed: async () => { order.push("collected"); },
+      });
+      return { execution, order, transport };
+    };
+
+    it("collects only after the provider's scope cleanup was confirmed", async () => {
+      let finishCleanup!: (cleanup: LaunchRootCleanup) => void;
+      const cleanup = new Promise<LaunchRootCleanup>((resolve) => { finishCleanup = resolve; });
+      const { execution, order, transport } = scopedRun("scope-confirmed", () => cleanup);
+      const failed = expect(execution).rejects.toThrow("provider failed after editing instructions");
+      await vi.waitFor(() => expect(transport.processInfo().exited).toBe(true));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      // The provider exited, but its scope is not yet known empty.
+      expect(order).toEqual(["closing"]);
+      finishCleanup({ confirmed: true });
+      await failed;
+      expect(order).toEqual(["closing", "stopped", "collected"]);
+    });
+
+    it("never collects when the provider's scope cleanup was not confirmed", async () => {
+      const { execution, order } = scopedRun("scope-unconfirmed", async () => ({ confirmed: false, reason: "scope_still_populated" }));
+      const error = await execution.catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ message: "provider failed after editing instructions" });
+      expect((error as { cleanupError?: unknown }).cleanupError).toBeInstanceOf(LaunchRootCleanupUnconfirmedError);
+      expect(order).not.toContain("stopped");
+      expect(order).not.toContain("collected");
+    }, 30_000);
   });
 
   it("retires only the terminated remote resource, including two sandboxes for one run", async () => {

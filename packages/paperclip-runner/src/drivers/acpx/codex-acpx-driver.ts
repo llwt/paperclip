@@ -141,6 +141,8 @@ export interface CodexAcpxDynamicToolCall {
 }
 
 export interface CodexAcpxDriverOptions {
+  /** Scope request for providers this driver starts in the server process. */
+  processIsolation?: import("../../process-isolation.js").ProcessIsolationRequest;
   /** Defaults to Codex for backward compatibility. */
   agent?: QualifiedAcpxAgent;
   runtimeDirectory: string;
@@ -469,6 +471,7 @@ export class CodexAcpxDriver implements HarnessDriver {
         environment: this.#options.environment,
         managedCodexCredentialSourcePath:
           this.#options.managedCodexCredentialSourcePath,
+        ...(this.#options.processIsolation === undefined ? {} : { processIsolation: this.#options.processIsolation }),
         ...(assertWorkspaceHeld === undefined ? {} : { assertWorkspaceHeld }),
         ...(snapshot?.providerIdentity?.kind === "acpx"
           ? { expectedIdentity: snapshot.providerIdentity }

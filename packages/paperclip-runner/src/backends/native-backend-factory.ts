@@ -77,6 +77,7 @@ export function createNativeSessionBackend(
       );
     }
     return createOpenCodeNativeSessionBackend(input, {
+      processIsolation: options.processIsolation,
       completionFeedback: options.completionFeedback,
       runtimeDirectory: options.opencodeRuntimeDirectory,
       environment: options.opencodeEnvironment,
@@ -92,6 +93,7 @@ export function createNativeSessionBackend(
       throw new Error("ACPX backend requires an instance runtime directory");
     }
     return createAcpxNativeSessionBackend(input, {
+      processIsolation: options.processIsolation,
       runtimeDirectory: options.acpxRuntimeDirectory,
       environment: options.acpxEnvironment,
       ...(input.provider.agent === "codex"
@@ -112,6 +114,7 @@ export function createNativeSessionBackend(
   }
 
   return createCodexNativeSessionBackend(input, {
+    processIsolation: options.processIsolation,
     completionFeedback: options.completionFeedback,
     runnerInstanceId: options.runnerInstanceId,
     onSpawn: options.onSpawn,

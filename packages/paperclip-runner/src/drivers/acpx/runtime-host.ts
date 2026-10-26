@@ -149,6 +149,8 @@ export interface AcpxRuntimePort {
 }
 
 export interface AcpxRuntimePortOpenOptions {
+  /** Scope request for the provider guardian (server-process hosts only). */
+  processIsolation?: import("../../process-isolation.js").ProcessIsolationRequest;
   /** A durable identity was admitted; restored native mode must already match. */
   restoringSession?: boolean;
   /** Ephemeral provider extension metadata; mandatory ACP caps remain host-owned. */
@@ -226,6 +228,11 @@ export interface AcpxRuntimeHostDependencies {
 }
 
 export interface OpenAcpxRuntimeHostOptions {
+  /**
+   * Scope request for the provider guardian. Only a host in the server
+   * process passes one; the runner sidecar's providers inherit its scope.
+   */
+  processIsolation?: import("../../process-isolation.js").ProcessIsolationRequest;
   /** Explicit task execution policy; never inferred from auto-approval. Required for Pi. */
   providerPolicy?: AcpxProviderRuntimePolicy;
   /** Never persisted as session options or recovery identity. */
@@ -572,6 +579,7 @@ export class AcpxRuntimeHost {
               clientCapabilities: structuredClone(options.clientCapabilities),
             }),
             command: command!,
+            ...(options.processIsolation === undefined ? {} : { processIsolation: options.processIsolation }),
             refreshConsumedCommand: commandOwner.refreshConsumedCommand,
             profile,
             cwd: binding.workspacePath,

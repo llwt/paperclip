@@ -44,6 +44,7 @@ import { NativeSessionCloseUnrecoverableError } from "../contracts/native-sessio
 import { parsePaperclipQuestionSet } from "../contracts/question-set.js";
 import { ACPX_CREDENTIAL_BINDING_ENV, createAcpxCredentialBinding, createAcpxSidecarHostEnvironment } from "../drivers/acpx/environment.js";
 import { DurablePrpControlPlane } from "../control-plane/durable-prp-control-plane.js";
+import { LaunchRootCleanupUnconfirmedError } from "../process-isolation.js";
 import * as durableControlPlane from "../control-plane/durable-prp-control-plane.js";
 import * as codexCommandRuntime from "../drivers/codex/codex-command.js";
 
@@ -374,6 +375,39 @@ it.each([99, 100])(
     }
   },
 );
+
+it.each([
+  ["confirmed", { confirmed: true }],
+  ["not confirmed", { confirmed: false, reason: "scope_still_populated" }],
+] as const)("closes a runner in an agent process scope only when its cleanup is %s", async (_label, cleanup) => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "runner-scope-close-"));
+  const reaped = vi.fn(async () => cleanup);
+  const bundle = createCapabilityRunnerdCodexTransport({
+    runnerBinary: defaultCapabilityRunnerdBinary(),
+    codexCommand: fakeCodex,
+    codexArgs: fakeCodexArgs(stateDirectory),
+    stateDirectory,
+    processIsolation: { spawn: (command, args, options) => spawn(command, args, options), reaped },
+    controlPlaneRegistration: async (authority) => {
+      await authority.start();
+      return { release: () => undefined };
+    },
+  });
+  try {
+    await bundle.transport.request("thread/start", { cwd: tmpdir(), dynamicTools: codexSemanticToolSpecs() });
+    const closing = bundle.transport.close();
+    if (cleanup.confirmed) await expect(closing).resolves.toBeUndefined();
+    else await expect(closing).rejects.toBeInstanceOf(LaunchRootCleanupUnconfirmedError);
+    // The runner's completion and the close both read the recorded outcome.
+    expect(reaped).toHaveBeenCalled();
+    // A repeated close reports the same outcome.
+    if (cleanup.confirmed) await expect(bundle.transport.close()).resolves.toBeUndefined();
+    else await expect(bundle.transport.close()).rejects.toBeInstanceOf(LaunchRootCleanupUnconfirmedError);
+  } finally {
+    await bundle.transport.close().catch(() => undefined);
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
 
 it("publishes spawned runner ownership before waiting for provider startup", async () => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "runner-spawn-ownership-"));

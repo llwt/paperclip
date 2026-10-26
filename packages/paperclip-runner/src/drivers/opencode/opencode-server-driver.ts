@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { confirmLaunchRootStopped, LaunchRootCleanupUnconfirmedError, spawnLaunchRoot, type ProcessIsolationRequest } from "../../process-isolation.js";
 import { randomBytes } from "node:crypto";
 import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -167,6 +168,11 @@ export type OpenCodeCompletionFeedback = (result: PrpStructuredRunResult, call: 
 
 export interface OpenCodeServerDriverOptions {
   model: string;
+  /**
+   * Put `opencode serve` in its own agent process scope. Only for a driver in
+   * the server process; the runner's proxy sidecar is already in the runner's.
+   */
+  processIsolation?: ProcessIsolationRequest;
   permissionMode?: "allow" | "ask" | "deny";
   taskEnvelope?: CodexTaskEnvelope;
   conversationMode?: "task" | "prepared";
@@ -435,8 +441,21 @@ export class OpenCodeServerDriver implements HarnessDriver {
         return session;
       } catch (error) {
         lastError = error;
-        await runtime?.close({ finalizeTrace: false });
-        if (attempt === 3 || !retryableOpenCodeStartupError(error)) {
+        // The failed attempt's server is stopped before any retry. A stop that
+        // cannot be confirmed ends the startup: no new root, no retry.
+        const closeFailure = await runtime?.close({ finalizeTrace: false }).then(
+          () => null,
+          (closeError: unknown) => closeError,
+        ) ?? null;
+        if (closeFailure !== null) {
+          await trace?.finish({ reason: "opencode_session_start_failed" });
+          throw closeFailure;
+        }
+        if (
+          attempt === 3 ||
+          !retryableOpenCodeStartupError(error) ||
+          error instanceof LaunchRootCleanupUnconfirmedError
+        ) {
           await trace?.finish({ reason: "opencode_session_start_failed" });
           throw error;
         }
@@ -520,6 +539,7 @@ class OpenCodeHarnessSession implements HarnessSession {
   readonly #conversationMode: "task" | "prepared";
   #sendFullContext: boolean;
   #closed = false;
+  #closing: Promise<void> | undefined;
   #completionSettlement: Promise<void> | null = null;
   #abort = new AbortController();
 
@@ -960,12 +980,17 @@ class OpenCodeHarnessSession implements HarnessSession {
     };
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) return;
+  close(): Promise<void> {
+    // One close per session: a concurrent or repeated close shares the first
+    // one's promise, so it never resolves before the provider is stopped and
+    // reports the same outcome.
+    return (this.#closing ??= this.#closeOnce());
+  }
+
+  async #closeOnce(): Promise<void> {
     // A controller response is authoritative. Settle its tool result before
     // closing the provider or the event stream, rather than reject after acceptance.
     await this.#completionSettlement;
-    if (this.#closed) return;
     this.#closed = true;
     this.#abort.abort();
     // Settle whatever is still pending, including a request whose turn
@@ -2377,7 +2402,8 @@ async function startRuntime(input: {
     }
     input.options.commandLifecycle?.beforeSpawn();
     launchPrepared = true;
-    child = spawn(
+    // The executable descriptor keeps its number through the scope helper.
+    child = spawnLaunchRoot(
       input.options.command ?? resolvePinnedOpenCodeCommand(),
       ["serve", "--hostname", "127.0.0.1", "--port", String(port)],
       {
@@ -2386,6 +2412,8 @@ async function startRuntime(input: {
         stdio,
         detached: globalThis.process.platform !== "win32" && isolateProcessGroup,
       },
+      input.options.processIsolation,
+      spawn,
     );
     child.once("exit", releaseExecutable);
     if (child.pid !== undefined) {
@@ -2454,6 +2482,7 @@ async function startRuntime(input: {
         `OpenCode ${version} is not the question-conformance-qualified ${QUALIFIED_OPENCODE_VERSION}`,
       );
     }
+    let closing: Promise<void> | undefined;
     return {
       baseUrl,
       authHeader,
@@ -2463,7 +2492,10 @@ async function startRuntime(input: {
       bridge,
       trace: input.trace,
       sensitiveValues,
-      close: async (closeInput = {}) => {
+      // One close per runtime, shared by every caller (the session, a startup
+      // retry): it resolves only once the server and, in a scope, whatever it
+      // left there are stopped, and a later close gets the same outcome.
+      close: (closeInput = {}) => (closing ??= (async () => {
         await providerProxy?.close();
         await bridge.close().catch(() => {});
         if (providerChild.exitCode === null && providerChild.signalCode === null && providerChild.pid) {
@@ -2486,6 +2518,10 @@ async function startRuntime(input: {
           }
           await waitForExit(providerChild, 2_000);
         }
+        const scopeFailure = await confirmLaunchRootStopped(
+          input.options.processIsolation,
+          providerChild,
+        ).then(() => null, (error: unknown) => error);
         await rm(join(configHome, "opencode", "opencode.json"), {
           force: true,
         }).catch(() => undefined);
@@ -2495,7 +2531,8 @@ async function startRuntime(input: {
         if (closeInput.finalizeTrace !== false) {
           await input.trace?.finish({ reason: closeInput.reason ?? null });
         }
-      },
+        if (scopeFailure !== null) throw scopeFailure;
+      })()),
     };
   } catch (error) {
     await providerProxy?.close();
@@ -2503,12 +2540,24 @@ async function startRuntime(input: {
     child?.kill("SIGKILL");
     if (child?.pid) await waitForExit(child, 2_000);
     if (!child?.pid || child.exitCode !== null || child.signalCode !== null) releaseExecutable();
+    // A failed start stops its root like a close does: in a scope, a root
+    // whose leftovers were not confirmed stopped fails the start for good.
+    const scopeFailure = child?.pid
+      ? await confirmLaunchRootStopped(input.options.processIsolation, child).then(
+          () => null,
+          (scopeError: unknown) => scopeError,
+        )
+      : null;
     await rm(join(configHome, "opencode", "opencode.json"), {
       force: true,
     }).catch(() => undefined);
     await rm(isolatedHome, { recursive: true, force: true }).catch(
       () => undefined,
     );
+    if (scopeFailure instanceof LaunchRootCleanupUnconfirmedError) {
+      throw new LaunchRootCleanupUnconfirmedError(scopeFailure.reason, { cause: error });
+    }
+    if (scopeFailure !== null) throw scopeFailure;
     throw error;
   }
 }

@@ -1,10 +1,11 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { expect, it, vi } from "vitest";
 import { RunnerdDotDriver, type RunnerdDotDriverOptions } from "./runnerd-dot-driver.js";
+import type { LaunchRootCleanup } from "../../process-isolation.js";
 import { describeRunnerdNativeSessionBackend } from "../../backends/codex-native-backend.js";
 import { createNativeSessionBackend } from "../../backends/native-backend-factory.js";
 import * as controlPlane from "../../control-plane/durable-prp-control-plane.js";
@@ -207,6 +208,58 @@ it.each(["local", "custom local directory", "external launcher"])("reattaches th
   } finally {
     await session.close({ reason: "Test cleanup", force: true }).catch(() => {});
     if (spawned) { try { process.kill(spawned.pid, "SIGTERM"); } catch {} }
+    await rm(root, { recursive: true, force: true });
+  }
+}, 45000);
+
+it.each(["confirmed", "unconfirmed"] as const)("closes a scoped real Rust runner only after its scope cleanup (%s), sharing one close", async (outcome) => {
+  const root = await mkdtemp(join(tmpdir(), "dot-driver-scope-"));
+  await writeFile(join(root, "AGENTS.md"), "Use only the synthetic counter.");
+  const input = execution(root);
+  let runner: ChildProcess | undefined;
+  let finishCleanup!: (cleanup: LaunchRootCleanup) => void;
+  const cleanup = new Promise<LaunchRootCleanup>((resolveCleanup) => { finishCleanup = resolveCleanup; });
+  let reapedCalls = 0;
+  const driver = new RunnerdDotDriver({
+    execution: input, stateDirectory: join(root, "state"),
+    identity: { runnerInstanceId: randomUUID(), environmentLeaseId: randomUUID(), runId: input.binding.runId,
+      normalizedSessionId: input.session.normalizedSessionId!, turnId: "turn-" + input.binding.runId, itemId: "item-" + input.binding.runId },
+    runnerBinary: resolve("runner/target/debug/paperclip-runnerd"),
+    port: { dispatch: async () => {}, settle: async () => {}, attach: async () => async () => {} },
+    // Spawns plainly; the test decides when and how the scope cleanup ends.
+    processIsolation: {
+      spawn: (command, args, options) => (runner = spawn(command, [...args], options)),
+      reaped: () => { reapedCalls += 1; return cleanup; },
+    },
+  });
+  const results: string[] = [];
+  const record = (name: string, promise: Promise<void>) =>
+    promise.then(() => results.push(`${name}:resolved`), (error: unknown) => results.push(`${name}:${(error as Error).name}`));
+  try {
+    const session = await driver.openSession({ runId: input.binding.runId, normalizedSessionId: input.session.normalizedSessionId! });
+    const first = record("first", session.close({ reason: "Test complete" }));
+    const second = record("second", session.close({ reason: "Test complete" }));
+    await new Promise<void>((resolveExit) => {
+      if (runner!.exitCode !== null || runner!.signalCode !== null) resolveExit();
+      else runner!.once("exit", () => resolveExit());
+    });
+    await vi.waitFor(() => expect(reapedCalls).toBeGreaterThan(0));
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    // The runner exited after the shutdown receipt, but its scope cleanup is
+    // pending: neither close may report the runner stopped yet.
+    expect(results).toEqual([]);
+    finishCleanup(outcome === "confirmed" ? { confirmed: true } : { confirmed: false, reason: "record_unreadable" });
+    await Promise.all([first, second]);
+    if (outcome === "confirmed") {
+      expect(results.sort()).toEqual(["first:resolved", "second:resolved"]);
+      await expect(session.close({ reason: "Test complete" })).resolves.toBeUndefined();
+    } else {
+      expect(results.sort()).toEqual(["first:LaunchRootCleanupUnconfirmedError", "second:LaunchRootCleanupUnconfirmedError"]);
+      await expect(session.close({ reason: "Test complete" })).rejects.toMatchObject({ reason: "record_unreadable" });
+    }
+  } finally {
+    finishCleanup({ confirmed: true });
+    if (runner && runner.exitCode === null && runner.signalCode === null) runner.kill("SIGTERM");
     await rm(root, { recursive: true, force: true });
   }
 }, 45000);
