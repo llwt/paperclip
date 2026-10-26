@@ -10,9 +10,13 @@ import {
   companyMemberships,
   createDb,
   heartbeatRuns,
+  connectionGrants,
   issueComments,
+  issueCreateIdempotencyKeys,
   issueThreadInteractions,
   issues,
+  toolApplications,
+  toolConnections,
 } from "@paperclipai/db";
 import { CLAUDE_QUOTA_INCIDENT_ORIGIN_KIND } from "@paperclipai/shared";
 import { resolveClaudeQuotaCardConfig, type ClaudeQuotaCardConfig } from "../config.js";
@@ -103,6 +107,9 @@ describeEmbeddedPostgres("claudeQuotaCardService", () => {
     await db.delete(issueThreadInteractions);
     await db.delete(activityLog);
     await db.delete(issueComments);
+    await db.delete(connectionGrants);
+    await db.delete(toolConnections);
+    await db.delete(toolApplications);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issues);
@@ -284,7 +291,9 @@ describeEmbeddedPostgres("claudeQuotaCardService", () => {
     const [card] = await cards(companyId);
 
     await db.update(issueThreadInteractions).set({ status: "accepted", resolvedAt: new Date(), resolvedByUserId: OPERATOR }).where(eq(issueThreadInteractions.id, card!.id));
-    await db.update(issues).set({ status: "done", idempotencyKey: null }).where(eq(issues.id, host!.id));
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, host!.id));
+    expect(await db.select().from(issueCreateIdempotencyKeys).where(eq(issueCreateIdempotencyKeys.companyId, companyId))).toHaveLength(1);
+    await db.delete(issueCreateIdempotencyKeys).where(eq(issueCreateIdempotencyKeys.companyId, companyId));
     await db.update(issueThreadInteractions).set({ idempotencyKey: null }).where(eq(issueThreadInteractions.id, card!.id));
 
     const differentReset = await seedRun({ companyId, agentId, offsetMinutes: 30, error: "limit reached, resets 9am (Europe/London)" });
@@ -292,6 +301,8 @@ describeEmbeddedPostgres("claudeQuotaCardService", () => {
     const restarted = newService(companyId);
     expect(await restarted.observeFailedRun({ id: differentReset, companyId })).toMatchObject({ status: "recorded", newEpisode: false });
     expect(await restarted.observeFailedRun({ id: unknownReset, companyId })).toMatchObject({ status: "recorded", newEpisode: false });
+    await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(result_json, '{}'::jsonb) - 'claudeQuotaCard'` }).where(eq(heartbeatRuns.id, first));
+    expect(await newService(companyId).observeFailedRun({ id: first, companyId })).toMatchObject({ status: "recorded", incidentId: host!.id, newEpisode: false });
 
     expect(await incidents(companyId)).toHaveLength(1);
     expect(await cards(companyId)).toHaveLength(1);
@@ -393,6 +404,24 @@ describeEmbeddedPostgres("claudeQuotaCardService", () => {
     expect(await receiptOf(withoutEvidence)).toBeNull();
   });
 
+  it("pages past receipt-less rows so they cannot starve newer missed runs", async () => {
+    const { companyId, agentId } = await seedCompany();
+    const poison: string[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      const id = await seedRun({ companyId, agentId, offsetMinutes: i });
+      await db.update(heartbeatRuns).set({ resultJson: { errorFamily: "transient_upstream" } }).where(eq(heartbeatRuns.id, id));
+      poison.push(id);
+    }
+    const missed = await seedRun({ companyId, agentId, offsetMinutes: 10 });
+    const service = newService(companyId);
+
+    expect(await service.reconcile({ limit: 2, now: new Date(T0 + 20 * MINUTE) })).toMatchObject({ recorded: 1 });
+    expect(await receiptOf(missed)).toMatchObject({ status: "recorded" });
+    for (const id of poison) expect(await receiptOf(id)).toBeNull();
+    expect(await incidents(companyId)).toHaveLength(1);
+    expect(await cards(companyId)).toHaveLength(1);
+  });
+
   it("produces no incident and no other side effect when disabled, not allowlisted, or the operator is missing", async () => {
     const { companyId, agentId } = await seedCompany();
     const other = await seedCompany({ operator: false });
@@ -462,21 +491,72 @@ describeEmbeddedPostgres("claudeQuotaCardService", () => {
     expect(evaluateClaudeQuotaEligibility({ ...base, effectiveConfig: { command: "/opt/claude-wrapper" } }).eligible).toBe(false);
   });
 
-  it("leaves agents, scheduled retry state and other run columns unchanged", async () => {
+  it("leaves agents, connection health, scheduled retry and monitor rows unchanged", async () => {
     const { companyId, agentId } = await seedCompany();
-    const runId = await seedRun({ companyId, agentId, offsetMinutes: 0 });
-    await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(T0 + 90 * MINUTE), scheduledRetryAttempt: 2, scheduledRetryReason: "provider_quota" }).where(eq(heartbeatRuns.id, runId));
-    const agentsBefore = await db.select().from(agents);
-    const wakeupsBefore = await db.select().from(agentWakeupRequests);
-    const [runBefore] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const connection = { connectionId: randomUUID(), grantId: randomUUID() };
+    const applicationId = randomUUID();
+    await db.insert(toolApplications).values({ id: applicationId, companyId, name: "Claude", type: "rest_api" });
+    await db.insert(toolConnections).values({
+      id: connection.connectionId,
+      companyId,
+      applicationId,
+      name: "Team Max",
+      uid: `claude-${randomUUID()}`,
+      connectionPurpose: "ai",
+      transport: "runtime_auth",
+      healthStatus: "healthy",
+      healthMessage: "ok",
+      healthCheckedAt: new Date(T0),
+      lastHealthAt: new Date(T0),
+    });
+    await db.insert(connectionGrants).values({ id: connection.grantId, companyId, connectionId: connection.connectionId, kind: "user", subjectUserId: OPERATOR });
+    const sourceIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      title: "Held source task",
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      monitorNextCheckAt: new Date(T0 + 120 * MINUTE),
+      monitorLastTriggeredAt: new Date(T0 - 30 * MINUTE),
+      monitorAttemptCount: 3,
+      monitorNotes: "waiting for the quota reset",
+      monitorScheduledBy: "agent",
+    });
+    const runId = await seedRun({ companyId, agentId, offsetMinutes: 0, connection });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        scheduledRetryAt: new Date(T0 + 90 * MINUTE),
+        scheduledRetryAttempt: 2,
+        scheduledRetryReason: "provider_quota",
+        contextSnapshot: sql`${heartbeatRuns.contextSnapshot} || ${JSON.stringify({ issueId: sourceIssueId })}::jsonb`,
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    const snapshot = async () => ({
+      agents: await db.select().from(agents),
+      wakeups: await db.select().from(agentWakeupRequests),
+      connections: await db.select().from(toolConnections),
+      grants: await db.select().from(connectionGrants),
+      sourceIssue: (await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0],
+      run: (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]!,
+    });
+    const before = await snapshot();
+    expect(before.connections).toHaveLength(1);
+    expect(before.grants).toHaveLength(1);
+    expect(before.sourceIssue?.monitorNextCheckAt).not.toBeNull();
 
-    await newService(companyId).observeFailedRun({ id: runId, companyId });
+    expect(await newService(companyId).observeFailedRun({ id: runId, companyId })).toMatchObject({ status: "recorded" });
 
-    expect(await db.select().from(agents)).toEqual(agentsBefore);
-    expect(await db.select().from(agentWakeupRequests)).toEqual(wakeupsBefore);
-    const [runAfter] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-    const { resultJson: _beforeResult, ...runBeforeRest } = runBefore!;
-    const { resultJson: afterResult, ...runAfterRest } = runAfter!;
+    const after = await snapshot();
+    expect(after.agents).toEqual(before.agents);
+    expect(after.wakeups).toEqual(before.wakeups);
+    expect(after.connections).toEqual(before.connections);
+    expect(after.grants).toEqual(before.grants);
+    expect(after.sourceIssue).toEqual(before.sourceIssue);
+    const { resultJson: _beforeResult, ...runBeforeRest } = before.run;
+    const { resultJson: afterResult, ...runAfterRest } = after.run;
     expect(runAfterRest).toEqual(runBeforeRest);
     expect(afterResult).toMatchObject({ errorFamily: "provider_quota", claudeQuotaCard: { status: "recorded" } });
   });

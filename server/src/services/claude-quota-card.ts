@@ -24,6 +24,7 @@ export const CLAUDE_QUOTA_RECEIPT_KEY = "claudeQuotaCard";
 const CARD_SYSTEM_ID = "claude-quota-card";
 const RECONCILE_LOOKBACK_MS = 48 * 60 * 60 * 1000;
 const RECONCILE_BATCH_LIMIT = 50;
+const RECONCILE_MAX_PAGES = 5;
 
 // Env keys that select a login, token, endpoint or custom routing for Claude.
 // Managed AI strips most of these, but an explicit choice still means the
@@ -294,13 +295,17 @@ export interface ClaudeQuotaCardServiceOptions {
 }
 
 const warnedConfig = new Set<string>();
-function defaultConfig(): ClaudeQuotaCardConfig {
-  const config = resolveClaudeQuotaCardConfig();
+export function warnClaudeQuotaCardConfig(config: ClaudeQuotaCardConfig) {
   for (const warning of config.warnings) {
     if (warnedConfig.has(warning)) continue;
     warnedConfig.add(warning);
     logger.warn({ feature: "claude_quota_card" }, warning);
   }
+}
+
+function defaultConfig(): ClaudeQuotaCardConfig {
+  const config = resolveClaudeQuotaCardConfig();
+  warnClaudeQuotaCardConfig(config);
   return config;
 }
 
@@ -359,7 +364,6 @@ export function claudeQuotaCardService(db: Db, options: ClaudeQuotaCardServiceOp
       .where(
         and(
           eq(heartbeatRuns.companyId, companyId),
-          gte(heartbeatRuns.createdAt, first.createdAt),
           sql`${heartbeatRuns.resultJson} -> ${CLAUDE_QUOTA_RECEIPT_KEY}::text ->> 'incidentId' = ${incidentId}`,
         ),
       );
@@ -581,18 +585,19 @@ export function claudeQuotaCardService(db: Db, options: ClaudeQuotaCardServiceOp
     });
   }
 
+  /** Best-effort observer for a finalized run. Never throws. */
+  async function observeFailedRun(run: Pick<RunRow, "id" | "companyId">): Promise<ClaudeQuotaObservation | null> {
+    try {
+      return await recordQuotaFailure(run.id, run.companyId);
+    } catch (err) {
+      logger.warn({ err, runId: run.id, companyId: run.companyId }, "Claude quota card observer failed");
+      return null;
+    }
+  }
+
   return {
     isEnabledForCompany,
-
-    /** Best-effort observer for a finalized run. Never throws. */
-    async observeFailedRun(run: Pick<RunRow, "id" | "companyId">): Promise<ClaudeQuotaObservation | null> {
-      try {
-        return await recordQuotaFailure(run.id, run.companyId);
-      } catch (err) {
-        logger.warn({ err, runId: run.id, companyId: run.companyId }, "Claude quota card observer failed");
-        return null;
-      }
-    },
+    observeFailedRun,
 
     /**
      * Bounded, company-scoped repair of missed observations. Only runs that
@@ -606,26 +611,41 @@ export function claudeQuotaCardService(db: Db, options: ClaudeQuotaCardServiceOp
       const since = new Date((options.now ?? new Date()).getTime() - RECONCILE_LOOKBACK_MS);
       for (const companyId of config.companyIds) {
         try {
-          const rows = await db
-            .select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId })
-            .from(heartbeatRuns)
-            .where(
-              and(
-                eq(heartbeatRuns.companyId, companyId),
-                eq(heartbeatRuns.status, "failed"),
-                gte(heartbeatRuns.createdAt, since),
-                sql`(${heartbeatRuns.errorCode} = 'provider_quota' or ${heartbeatRuns.resultJson} ->> 'errorFamily' = 'provider_quota')`,
-                sql`${heartbeatRuns.contextSnapshot} ? ${CLAUDE_QUOTA_ELIGIBILITY_KEY}::text`,
-                sql`not (coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? ${CLAUDE_QUOTA_RECEIPT_KEY}::text)`,
-              ),
-            )
-            .orderBy(asc(sql`coalesce(${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt})`), asc(heartbeatRuns.id))
-            .limit(limit);
-          for (const row of rows) {
-            result.scanned += 1;
-            const outcome = await this.observeFailedRun(row);
-            if (outcome?.status === "recorded") result.recorded += 1;
-            if (outcome?.status === "excluded") result.excluded += 1;
+          // Rows that stay receipt-less (ignored, operator unavailable, a throwing
+          // observation) are paged past with a keyset cursor so they cannot
+          // starve newer missed runs behind them.
+          let cursor: { at: string; id: string } | null = null;
+          let handled = 0;
+          for (let page = 0; page < RECONCILE_MAX_PAGES && handled < limit; page += 1) {
+            const sortKey = sql`coalesce(${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt})`;
+            const rows: Array<{ id: string; companyId: string; at: string }> = await db
+              .select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, at: sql<string>`${sortKey}::text` })
+              .from(heartbeatRuns)
+              .where(
+                and(
+                  eq(heartbeatRuns.companyId, companyId),
+                  eq(heartbeatRuns.status, "failed"),
+                  gte(heartbeatRuns.createdAt, since),
+                  sql`(${heartbeatRuns.errorCode} = 'provider_quota' or ${heartbeatRuns.resultJson} ->> 'errorFamily' = 'provider_quota')`,
+                  sql`${heartbeatRuns.contextSnapshot} ? ${CLAUDE_QUOTA_ELIGIBILITY_KEY}::text`,
+                  sql`not (coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? ${CLAUDE_QUOTA_RECEIPT_KEY}::text)`,
+                  cursor ? sql`(${sortKey}, ${heartbeatRuns.id}) > (${cursor.at}::timestamptz, ${cursor.id}::uuid)` : undefined,
+                ),
+              )
+              .orderBy(asc(sortKey), asc(heartbeatRuns.id))
+              .limit(limit);
+            for (const row of rows) {
+              result.scanned += 1;
+              const outcome = await observeFailedRun(row);
+              if (outcome?.status === "recorded") result.recorded += 1;
+              if (outcome?.status === "excluded") result.excluded += 1;
+              if (outcome?.status === "recorded" || outcome?.status === "excluded" || outcome?.status === "already_recorded") {
+                handled += 1;
+              }
+            }
+            if (rows.length < limit) break;
+            const last = rows[rows.length - 1]!;
+            cursor = { at: last.at, id: last.id };
           }
         } catch (err) {
           logger.warn({ err, companyId }, "Claude quota card reconciliation failed");

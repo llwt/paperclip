@@ -3314,6 +3314,8 @@ export function heartbeatService(
               routineEnv: routineEnvContext.env,
             })
           : null;
+        // Later whole-snapshot writes persist `context`, so the evidence must live on it too.
+        if (claudeQuotaCardEligibility) context[CLAUDE_QUOTA_ELIGIBILITY_KEY] = claudeQuotaCardEligibility;
         await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ aiConnection: context.aiConnection, ...(claudeQuotaCardEligibility ? { [CLAUDE_QUOTA_ELIGIBILITY_KEY]: claudeQuotaCardEligibility } : {}), ...(context.aiRouterTaskKey ? { aiRouterTaskKey: context.aiRouterTaskKey } : {}), ...(context.aiRouterSelection ? { aiRouterSelection: context.aiRouterSelection } : {}) })}::jsonb` }).where(eq(heartbeatRuns.id, run.id));
       }
       if (secretManifest.length > 0) {
