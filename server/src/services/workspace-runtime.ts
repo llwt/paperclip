@@ -6561,8 +6561,9 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
         stdio: ["ignore", serviceLog.handle.fd, serviceLog.handle.fd],
       },
       owner: { kind: "managed_service", id: record.id, companyId: record.companyId },
-      // A service that exits on its own keeps its scope until it is stopped,
-      // so descendants it left behind are still stoppable.
+      // The scope ends only when the service is stopped, matching today's keep-running
+      // policy. A service that exits on its own is dropped from the registry, so its scope
+      // is not ended here; startup reconciliation (SX-2305 step 5) picks it up.
       reapOnExit: false,
     });
     child = scopedService.child;
