@@ -68,6 +68,7 @@ import {
 } from "../services/agent-process-scopes.js";
 import { readHotRestartIntent, readProcessStartedAt, writeHotRestartIntent } from "../services/hot-restart.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { getRunLogStore } from "../services/run-log-store.js";
 import { claimNativeRestartRecoveries } from "../services/native-runtime/native-restart-recovery.js";
 import { prepareNativeHeartbeatRun } from "../services/native-runtime/prepare-native-run.js";
 
@@ -87,6 +88,7 @@ vi.mock("../adapters/index.ts", async () => {
 
 const serverRoot = fileURLToPath(new URL("../..", import.meta.url));
 const fixture = fileURLToPath(new URL("./fixtures/earlier-server-scope-launch.ts", import.meta.url));
+const relayFixture = fileURLToPath(new URL("./fixtures/earlier-server-relay-launch.ts", import.meta.url));
 
 function manifestFor(
   instanceId: string,
@@ -293,6 +295,70 @@ describeEmbeddedPostgres("agent process scope reconciliation", () => {
     owned.add(launched.pid);
     expect(launched.outcome).toBe(mode === "scope" ? "enrolled" : "degraded");
     return launched;
+  }
+
+  /**
+   * Launch a run's provider with piped output and hand its pipes to a real
+   * output relay, the way an earlier server does at a hot restart.
+   */
+  function launchEarlierWithRelay(
+    mode: "scope" | "degraded",
+    run: { runId: string; companyId: string },
+    script: string,
+  ): { pid: number; unit: string; relayPid: number; relayUnit: string; relayDir: string } {
+    const relayDir = path.resolve(resolvePaperclipInstanceRoot(), "data", "run-output-relay", run.runId);
+    const out = execFileSync(
+      process.execPath,
+      [
+        "--import",
+        "tsx",
+        relayFixture,
+        JSON.stringify({
+          registryDir,
+          instanceId,
+          slice: systemd.slice,
+          userBusAddress: systemd.userBusAddress,
+          helperPath: mode === "scope" ? systemd.helper : "/nonexistent/paperclip-scope-exec",
+          runId: run.runId,
+          companyId: run.companyId,
+          relayDir,
+          script,
+        }),
+      ],
+      { cwd: serverRoot, encoding: "utf8", timeout: 30_000 },
+    );
+    const launched = JSON.parse(out.trim().split("\n").pop()!) as {
+      pid: number;
+      unit: string;
+      outcome: string;
+      relayPid: number;
+      relayUnit: string;
+      relayOutcome: string;
+    };
+    owned.add(launched.pid);
+    owned.add(launched.relayPid);
+    expect(launched.outcome).toBe(mode === "scope" ? "enrolled" : "degraded");
+    expect(launched.relayOutcome).toBe(mode === "scope" ? "enrolled" : "degraded");
+    return { ...launched, relayDir };
+  }
+
+  /** A provider that writes `payload` once `go` exists, then keeps its output pipes open. */
+  function writesOnSignal(go: string, payload: string): string {
+    return `while [ ! -e ${go} ]; do /bin/sleep 0.05; done; printf '${payload}'; exec /bin/sleep 300`;
+  }
+
+  /** Whether the provider got past its write (it then runs `sleep`). */
+  function providerWrote(pid: number): boolean {
+    try {
+      return readFileSync(`/proc/${pid}/cmdline`, "utf8").startsWith("/bin/sleep");
+    } catch {
+      return false;
+    }
+  }
+
+  async function readRunLog(run: { companyId: string; agentId: string; runId: string }): Promise<string> {
+    const store = getRunLogStore();
+    return (await store.read(await store.begin(run))).content;
   }
 
   async function readPid(file: string): Promise<number> {
@@ -557,6 +623,88 @@ describeEmbeddedPostgres("agent process scope reconciliation", () => {
       if (mode === "scope") expect(inScope(launched.pid, launched.unit)).toBe(true);
     });
 
+    it("hot restart with an output relay: adoption keeps it; after the run ends its buffered output drains before its scope closes", async () => {
+      const go = path.join(home, `go-${randomBytes(4).toString("hex")}`);
+      const payload = "final-output-of-the-provider-30";
+      const { runId, companyId, agentId } = await seedRun();
+      const launched = launchEarlierWithRelay(mode, { runId, companyId }, writesOnSignal(go, payload));
+      await db.update(heartbeatRuns).set({ processPid: launched.pid, processGroupId: launched.pid }).where(eq(heartbeatRuns.id, runId));
+
+      // Planned hot restart: the old server hands the run, its scope and its relay over.
+      const oldServer = heartbeatService(db);
+      await writeHotRestartIntent({ previousServerPid: process.pid, previousServerVersion: "old-version" });
+      await oldServer.prepareHotRestartShutdown("SIGTERM");
+      expect((await closeAgentScopesForShutdown({ handOff: true })).stopped).toEqual([]);
+      const newServer = heartbeatService(db);
+      expect(await newServer.reconcileHotRestartAdoption()).toMatchObject({ adoptedRunIds: [runId] });
+      const adoptedRun = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]!);
+      expect(((adoptedRun.resultJson as Record<string, any>).hotRestart).outputCapture).toMatchObject({ mode: "relay" });
+      expect((await reconcileAgentScopes({ db })).kept.map((entry) => entry.unit).sort())
+        .toEqual([launched.unit, launched.relayUnit].sort());
+
+      // The relay falls behind: the provider's last bytes wait in the pipe.
+      process.kill(launched.relayPid, "SIGSTOP");
+      try {
+        writeFileSync(go, "");
+        expect(await waitUntil(() => providerWrote(launched.pid))).toBe(true);
+        expect((await newServer.cancelRun(runId, "Stopped by the operator"))?.status).toBe("cancelled");
+        expect(await waitUntil(() => !alive(launched.pid))).toBe(true);
+
+        // The run ended, but its relay has not drained: it is left running and reported, not killed.
+        setAgentScopeRegistryForTests({ instanceId, registryDir, graceMs: 300, killWaitMs: 3_000, relayDrainMs: 300 });
+        const draining = await reconcileAgentScopes({ db });
+        expect(draining.stopped).toEqual([]);
+        expect(draining.pending).toEqual([
+          expect.objectContaining({ unit: launched.relayUnit, ownerKind: "relay", reason: "owner_run_cancelled:relay_draining" }),
+        ]);
+        expect(alive(launched.relayPid)).toBe(true);
+        expect(recorded(launched.relayUnit)).toBe(true);
+      } finally {
+        process.kill(launched.relayPid, "SIGCONT");
+      }
+
+      // Once it drained, its scope is closed and its record removed.
+      const drained = await reconcileAgentScopes({ db });
+      expect(drained.pending).toEqual([]);
+      expect(drained.stopped).toEqual([
+        expect.objectContaining({ unit: launched.relayUnit, ownerKind: "relay", reason: "owner_run_cancelled" }),
+      ]);
+      expect(recorded(launched.relayUnit)).toBe(false);
+      // Every byte reached the run log, and the relay wrote its end marker.
+      expect(await waitUntil(() => !existsSync(launched.relayDir), 15_000)).toBe(true);
+      const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
+      expect(events.map((event) => event.message)).toContain("Child output relay reached the end of the child's output");
+      expect(await readRunLog({ companyId, agentId, runId })).toContain(payload);
+    }, 30_000);
+
+    it("a relay that never drains is stopped only after the drain deadline, and reported as undrained", async () => {
+      const { runId, companyId } = await seedRun();
+      const launched = launchEarlierWithRelay(mode, { runId, companyId }, "exec /bin/sleep 300");
+      process.kill(launched.relayPid, "SIGSTOP");
+      await setRunStatus(runId, "failed");
+      setAgentScopeRegistryForTests({
+        instanceId,
+        registryDir,
+        graceMs: 300,
+        killWaitMs: 3_000,
+        relayDrainMs: 200,
+        relayDrainDeadlineMs: 1_000,
+      });
+
+      const first = await reconcileAgentScopes({ db });
+      expect(first.stopped).toEqual([expect.objectContaining({ unit: launched.unit, reason: "owner_run_failed" })]);
+      expect(first.pending).toEqual([expect.objectContaining({ unit: launched.relayUnit, reason: "owner_run_failed:relay_draining" })]);
+      expect(alive(launched.relayPid)).toBe(true);
+
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      const later = await reconcileAgentScopes({ db });
+      expect(later.stopped).toEqual([
+        expect.objectContaining({ unit: launched.relayUnit, reason: "owner_run_failed:relay_undrained", outcome: "terminated" }),
+      ]);
+      expect(await waitUntil(() => !alive(launched.relayPid))).toBe(true);
+      expect(recorded(launched.relayUnit)).toBe(false);
+    }, 30_000);
+
     it("two instances on one manager never touch each other's scopes", async () => {
       const otherInstance = `pcrecon-${randomBytes(4).toString("hex")}`;
       const otherRegistry = path.join(home, "other-instance", "runtime", "agent-scopes");
@@ -685,6 +833,18 @@ describeEmbeddedPostgres("agent process scope reconciliation", () => {
         .where(eq(heartbeatRuns.id, next.runId));
       const report = await reconcileAgentScopes({ db });
       expect(report.stopped).toEqual([expect.objectContaining({ unit: runner.unit, reason: "native_owner_run_cancelled" })]);
+      expect(await waitUntil(() => !alive(runner.pid))).toBe(true);
+    });
+
+    it("native runner whose run belongs to another company than its record names is stopped", async () => {
+      const native = await seedNativeRun();
+      await setRunStatus(native.runId, "failed");
+      const runner = launchEarlier(mode, { kind: "runner", id: native.runnerInstanceId, companyId: randomUUID() }, "exec /bin/sleep 300");
+      const report = await reconcileAgentScopes({ db });
+      expect(report.pending).toEqual([]);
+      expect(report.stopped).toEqual([
+        expect.objectContaining({ unit: runner.unit, ownerKind: "runner", reason: "native_owner_company_mismatch" }),
+      ]);
       expect(await waitUntil(() => !alive(runner.pid))).toBe(true);
     });
 

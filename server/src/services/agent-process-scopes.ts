@@ -14,7 +14,7 @@
 //
 // Reading the registry does not depend on the isolation mode: after a rollback
 // to `off`, scopes started earlier are still reconciled until none remain.
-import { and, desc, inArray } from "drizzle-orm";
+import { desc, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, workspaceRuntimeServices } from "@paperclipai/db";
 import { getAgentProcessIsolation, isAcpWarmProviderOwnerId } from "@paperclipai/adapter-utils/server-utils";
@@ -39,6 +39,13 @@ export interface AgentScopeRegistry {
   /** Time between the first signal and SIGKILL. */
   graceMs?: number;
   killWaitMs?: number;
+  /** How long one pass waits for an output relay to drain and exit by itself. */
+  relayDrainMs?: number;
+  /**
+   * How long reconciliation keeps waiting, over later passes, for a relay of
+   * an ended run that does not drain before it stops it anyway.
+   */
+  relayDrainDeadlineMs?: number;
   /** Test seams for `terminateOwnedProcessTree` and the unmatched-unit scan. */
   cgroupRoot?: string;
   procRoot?: string;
@@ -66,6 +73,8 @@ function currentRegistry(): AgentScopeRegistry {
 const TERMINAL_RUN_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
 // Runtime service rows whose process is meant to be running.
 const LIVE_SERVICE_STATUSES = new Set(["provisioning", "starting", "running"]);
+const DEFAULT_RELAY_DRAIN_MS = 5_000;
+const DEFAULT_RELAY_DRAIN_DEADLINE_MS = 10 * 60_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface ScopeOwnerFacts {
@@ -106,7 +115,8 @@ function companyMatches(record: ScopeRecord, companyId: string): boolean {
  *   scope of a native run is a server-side tool command, which no later
  *   server can adopt.
  * - `relay`: kept while its run is not terminal, so adopted output still
- *   drains; stopped once the run has ended.
+ *   drains; once the run has ended it is stopped only after it drained (see
+ *   `stopRelayAfterDrain`).
  * - `runner` and native `warm_provider` (owned by the runner instance id):
  *   once the root is gone, what remains is leftovers. A live root is
  *   resolved against the latest run bound to that runner, after native
@@ -219,23 +229,87 @@ async function stopRecord(
   return result;
 }
 
+// Relays that did not drain, by unit, with the time this process first found one so.
+const relayDrainSince = new Map<string, number>();
+
+async function waitForRootExit(record: ScopeRecord, procRoot: string | undefined, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (isScopeRootAlive(record, procRoot)) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return true;
+}
+
+/**
+ * Stop an output relay whose run has ended. A relay outlives its provider on
+ * purpose: bytes the provider wrote can still be in its pipes when the
+ * provider exits. It ignores SIGTERM and exits by itself, after it wrote its
+ * end marker, once both pipes reach EOF, which is when every process of the
+ * run's scope that held them is gone. So the run's own scopes are stopped
+ * first, and the relay is given time to drain and exit; only then is its
+ * (empty) scope closed and its record removed. A relay that has not drained
+ * stays running and is reported as pending (`relay_draining`). Only
+ * reconciliation, after `relayDrainDeadlineMs`, stops a relay that never
+ * drains, and reports that its output may be incomplete (`relay_undrained`).
+ */
+async function stopRelayAfterDrain(
+  registry: AgentScopeRegistry,
+  record: ScopeRecord,
+  reason: string,
+  report: AgentScopeReconciliation,
+  options: { drainMs?: number; abandonUndrained?: boolean; logger?: ScopeLogger } = {},
+): Promise<void> {
+  const { unit } = record.manifest;
+  const drainMs = options.drainMs ?? registry.relayDrainMs ?? DEFAULT_RELAY_DRAIN_MS;
+  if (await waitForRootExit(record, registry.procRoot, drainMs)) {
+    relayDrainSince.delete(unit);
+    await stopRecord(registry, record, reason, report);
+    return;
+  }
+  const since = relayDrainSince.get(unit) ?? Date.now();
+  relayDrainSince.set(unit, since);
+  const deadlineMs = registry.relayDrainDeadlineMs ?? DEFAULT_RELAY_DRAIN_DEADLINE_MS;
+  if (options.abandonUndrained && Date.now() - since >= deadlineMs) {
+    relayDrainSince.delete(unit);
+    (options.logger ?? defaultLogger).warn(
+      { unit, ownerId: record.manifest.owner.id, drainingSince: new Date(since).toISOString() },
+      "run output relay did not drain after its run ended; stopping it, its output may be incomplete",
+    );
+    await stopRecord(registry, record, `${reason}:relay_undrained`, report);
+    return;
+  }
+  report.pending.push({ unit, ownerKind: "relay", reason: `${reason}:relay_draining` });
+}
+
+/** Stop the given records: every other kind first, then relays once they drained. */
+async function stopRecordsRelaysLast(
+  registry: AgentScopeRegistry,
+  stops: Array<{ record: ScopeRecord; reason: string }>,
+  report: AgentScopeReconciliation,
+  options: { graceMs?: number; signal?: NodeJS.Signals; relayDrainMs?: number; abandonUndrained?: boolean; logger?: ScopeLogger } = {},
+): Promise<void> {
+  const isRelay = (entry: { record: ScopeRecord }) => entry.record.manifest.owner.kind === "relay";
+  await Promise.all(stops.filter((entry) => !isRelay(entry)).map(({ record, reason }) =>
+    stopRecord(registry, record, reason, report, { graceMs: options.graceMs, signal: options.signal })));
+  await Promise.all(stops.filter(isRelay).map(({ record, reason }) =>
+    stopRelayAfterDrain(registry, record, reason, report, {
+      drainMs: options.relayDrainMs,
+      abandonUndrained: options.abandonUndrained,
+      logger: options.logger,
+    })));
+}
+
 async function loadOwnerFacts(db: Db, records: ScopeRecord[]) {
   const runIds = new Set<string>();
   const serviceIds = new Set<string>();
   const runnerIds = new Set<string>();
-  const runnerCompanyIds = new Set<string>();
   for (const { manifest } of records) {
     const { kind, id } = manifest.owner;
     if (!UUID.test(id)) continue;
     if (kind === "run" || kind === "relay") runIds.add(id);
     else if (kind === "managed_service") serviceIds.add(id);
-    else if (
-      (kind === "runner" || (kind === "warm_provider" && !isAcpWarmProviderOwnerId(id)))
-      && manifest.owner.companyId && UUID.test(manifest.owner.companyId)
-    ) {
-      runnerIds.add(id);
-      runnerCompanyIds.add(manifest.owner.companyId);
-    }
+    else if (kind === "runner" || (kind === "warm_provider" && !isAcpWarmProviderOwnerId(id))) runnerIds.add(id);
   }
   const runs = runIds.size === 0
     ? []
@@ -267,12 +341,11 @@ async function loadOwnerFacts(db: Db, records: ScopeRecord[]) {
           companyId: heartbeatRuns.companyId,
         })
         .from(heartbeatRuns)
-        // The company narrows the scan to that company's runs; the runner
-        // instance id has no index of its own.
-        .where(and(
-          inArray(heartbeatRuns.companyId, [...runnerCompanyIds]),
-          inArray(heartbeatRuns.runnerInstanceId, [...runnerIds]),
-        ))
+        // Not narrowed by the company the manifest names: the run that owns
+        // the runner decides, and a company that differs from the manifest's
+        // stops the scope. The runner instance id has no index; this query
+        // runs only while inherited native scopes exist.
+        .where(inArray(heartbeatRuns.runnerInstanceId, [...runnerIds]))
         .orderBy(desc(heartbeatRuns.createdAt));
   // Newest first: a retained runner is bound to the latest run that used it.
   const nativeRuns = new Map<string, { status: string; companyId: string }>();
@@ -388,7 +461,8 @@ async function reconcileOnce(input: {
   const inherited = records.filter((record) => !isScopeLaunchedByThisProcess(record.ref));
   if (inherited.length > 0) {
     const facts = await loadOwnerFacts(input.db, inherited);
-    await Promise.all(inherited.map(async (record) => {
+    const stops: Array<{ record: ScopeRecord; reason: string }> = [];
+    for (const record of inherited) {
       const { owner } = record.manifest;
       const run = owner.kind === "run" || owner.kind === "relay" ? facts.runs.get(owner.id) ?? null : null;
       const service = owner.kind === "managed_service" ? facts.services.get(owner.id) ?? null : null;
@@ -400,14 +474,13 @@ async function reconcileOnce(input: {
       });
       if (decision.action === "keep") {
         report.kept.push({ unit: record.manifest.unit, ownerKind: owner.kind, reason: decision.reason });
-        return;
-      }
-      if (decision.action === "hold") {
+      } else if (decision.action === "hold") {
         report.pending.push({ unit: record.manifest.unit, ownerKind: owner.kind, reason: decision.reason });
-        return;
+      } else {
+        stops.push({ record, reason: decision.reason });
       }
-      await stopRecord(registry, record, decision.reason, report);
-    }));
+    }
+    await stopRecordsRelaysLast(registry, stops, report, { abandonUndrained: true, logger: log });
   }
 
   if (input.reportUnmatched) {
@@ -467,6 +540,8 @@ export async function terminateInheritedOwnerScopes(input: {
   reason: string;
   graceMs?: number;
   signal?: NodeJS.Signals;
+  /** How long to wait for the owner's output relay to drain once its run scopes stopped. */
+  relayDrainMs?: number;
 }): Promise<OwnerScopeTermination> {
   const registry = currentRegistry();
   const report = emptyReconciliation();
@@ -489,8 +564,12 @@ export async function terminateInheritedOwnerScopes(input: {
       companyId,
     }))));
   for (const ref of unreadable) report.pending.push({ unit: ref.unit, ownerKind: null, reason: "record_unreadable" });
-  await Promise.all(owned.map((record) =>
-    stopRecord(registry, record, input.reason, report, { graceMs: input.graceMs, signal: input.signal })));
+  await stopRecordsRelaysLast(
+    registry,
+    owned.map((record) => ({ record, reason: input.reason })),
+    report,
+    { graceMs: input.graceMs, signal: input.signal, relayDrainMs: input.relayDrainMs },
+  );
   return {
     found: owned.length + unreadable.length,
     settled: report.pending.length === 0,
@@ -519,7 +598,8 @@ export function isRunScopeRecorded(runId: string, unit: string): boolean {
  * The last step of a server shutdown, after the run drain and the
  * application services stopped. Auxiliary helpers and legacy ACP warm
  * providers end with this process in every case. On an ordinary shutdown,
- * run and relay scopes end too: the drain has already settled what it could.
+ * run scopes end too, as the drain has already settled what it could, and
+ * then their relays once they drained.
  * When runs are handed to the next server (hot restart), their scopes and
  * relays stay for adoption. Native runner scopes follow native restart
  * ownership and managed services their keep-running policy, so neither is
@@ -550,14 +630,15 @@ export async function closeAgentScopesForShutdown(input: {
     if (!input.handOff && (kind === "run" || kind === "relay")) return "server_shutdown";
     return null;
   };
-  await Promise.all(listing.records.map(async (record) => {
+  const stops: Array<{ record: ScopeRecord; reason: string }> = [];
+  for (const record of listing.records) {
     const reason = ends(record);
-    if (!reason) {
-      report.kept.push({ unit: record.manifest.unit, ownerKind: record.manifest.owner.kind, reason: "retained_owner" });
-      return;
-    }
-    await stopRecord(registry, record, reason, report, { graceMs: input.graceMs ?? 2_000 });
-  }));
+    if (reason) stops.push({ record, reason });
+    else report.kept.push({ unit: record.manifest.unit, ownerKind: record.manifest.owner.kind, reason: "retained_owner" });
+  }
+  // A relay that has not drained by then stays for startup reconciliation.
+  const graceMs = input.graceMs ?? 2_000;
+  await stopRecordsRelaysLast(registry, stops, report, { graceMs, relayDrainMs: graceMs, logger: log });
   if (report.stopped.length > 0) log.info({ stopped: report.stopped }, "stopped agent process scopes at shutdown");
   if (report.pending.length > 0) {
     log.warn({ pending: report.pending }, "agent process scope cleanup at shutdown not confirmed; left for startup reconciliation");
