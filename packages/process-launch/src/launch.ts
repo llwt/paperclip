@@ -5,6 +5,7 @@ import { PROCESS_OWNER_KINDS } from "./policy.js";
 import { readBootId, readProcCgroup, readProcStat, userManagerCgroup } from "./proc.js";
 import {
   ensureRegistryDir,
+  markLaunchedByThisProcess,
   readScopeRecord,
   readScopeStatus,
   removeScopeRecord,
@@ -161,6 +162,7 @@ function prepareInternal(target: LaunchTarget, request: IsolationRequest, deps: 
   try {
     ensureRegistryDir(policy.registryDir);
     ref = writeScopeManifest(policy.registryDir, manifest);
+    markLaunchedByThisProcess(ref);
   } catch {
     return {
       ...unchanged(target, { state: "degraded", reason: "registry_unavailable", unit: null, record: null }),
