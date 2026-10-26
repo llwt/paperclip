@@ -39,6 +39,8 @@ import {
   type SandboxAdditionalSource,
 } from "@paperclipai/adapter-utils/execution-target";
 import { captureLocalProcess, capturedProcessExited, killCapturedLocalProcess } from "./local-process-control.js";
+import { createAcpxAgentScopeOwner, describeAcpxAgentScope } from "./agent-process-scope.js";
+import { getAgentProcessIsolation } from "../process-isolation.js";
 import type { DuplexLossReason } from "../duplex-observability.js";
 import { DUPLEX_CHANNEL_LOST_ERROR_CODE } from "../bridge-transport-contract.js";
 import {
@@ -882,6 +884,9 @@ const execFileAsync = promisify(execFile);
 // command from acpx's detection, so the engine must downgrade it here.
 const GEMINI_NATIVE_ACP_FLAG_MIN_VERSION = [0, 33, 0] as const;
 const GEMINI_VERSION_PROBE_TIMEOUT_MS = 2000;
+// How long settlement waits for a stopped provider to exit, so that its
+// scope cleanup is awaited before the run claims the provider stopped.
+const PROVIDER_SCOPE_EXIT_WAIT_MS = 5_000;
 
 export function parseGeminiVersionParts(output: string | null | undefined): number[] | null {
   const match = output?.match(/(\d+)\.(\d+)\.(\d+)/);
@@ -4136,6 +4141,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // sanitize) still cannot put a raw `Error.message` — and the host path
       // or process id it can carry — on the run log.
       const SYNC_BACK_SETTLEMENT_STEP = "settlement-sync_back";
+      // Set only when the provider's scope cleanup was not confirmed; merged
+      // into `resultJson` like the restore failure, so a clean run adds no key.
+      let agentScopeCleanupField:
+        | { agentProcessScopeCleanup: { outcome: "unconfirmed"; reason: string } }
+        | Record<string, never> = {};
       const recordTeardownError = async (step: string, teardownErr: unknown) => {
         const reason =
           step === SYNC_BACK_SETTLEMENT_STEP
@@ -4305,11 +4315,26 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         processIdentitySink = cached?.processIdentitySink ?? {
           current: ctx.onSpawn,
           latest: null,
+          // The provider's scope owner (null in off mode). The host lane owns it
+          // by provider, so it outlives this run on warm reuse; the relay lane's
+          // runtime ends with the run.
+          scope: createAcpxAgentScopeOwner({
+            // The server's own policy, set once at startup.
+            policy: getAgentProcessIsolation().policy,
+            kind: prepared.processSessionBridge ? "run" : "warm_provider",
+            ownerId: ctx.runId,
+            companyId: ctx.agent.companyId ?? null,
+            runId: ctx.runId,
+          }),
         };
         // ACPX runtimes can stay warm across heartbeat runs. Keep the callback
         // target mutable so a later agent respawn records identity on the current
         // heartbeat instead of the run that originally created the runtime.
         processIdentitySink.current = ctx.onSpawn;
+        // The scope moves with the provider: from now on this run is the one
+        // whose cleanup may stop it.
+        processIdentitySink.scope?.associate(ctx.runId);
+        const agentScope = processIdentitySink.scope ?? null;
         flushChildStderr(childStderrState);
         childStderrState.logPath = prepared.childStderrLogPath;
         const persistedRuntimeStore = createRuntimeStore({ stateDir: prepared.stateDir });
@@ -4338,6 +4363,8 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // must not merge the Paperclip server's ambient environment back in
           // when it spawns the provider child.
           inheritProcessEnv: false,
+          // With isolation on, the provider joins its own scope before it runs.
+          ...(agentScope ? { spawnAgent: (input) => agentScope.spawnAgent(input) } : {}),
           onAgentStderr: prepared.childStderrLogPath
             ? (chunk) => routeChildStderr(childStderrState, chunk)
             : undefined,
@@ -4907,7 +4934,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             if (providerPid && !prepared.processSessionBridge) {
               // Escalate the owned local process directly. A second ACP close
               // can wait behind the same hung cleanup (or open a new client).
-              killCapturedLocalProcess(processIdentitySink.localProcess);
+              // With a scope, stop the provider's whole scope, but only while
+              // this run still owns it: a stale run never stops a provider that
+              // another run reuses.
+              const scope = processIdentitySink.scope;
+              const scoped = scope?.forceStop(ctx.runId) ?? null;
+              if (!scoped && (!scope || scope.currentRunId === ctx.runId)) {
+                killCapturedLocalProcess(processIdentitySink.localProcess);
+              }
             } else {
               void runtime.close({ handle: sessionHandle, reason: "operator stop deadline", discardPersistentState: true })
                 .catch(() => {});
@@ -5474,7 +5508,20 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         syncBack: () => timedPhase("sync_back", async () => {
           // A transport error or terminal narrative cannot authorize collecting
           // mutable provider files. Require the owned close or local OS handle.
-          const stopped = runtimeStopConfirmed || (!prepared.processSessionBridge && capturedProcessExited(processIdentitySink?.localProcess));
+          let stopped = runtimeStopConfirmed || (!prepared.processSessionBridge && capturedProcessExited(processIdentitySink?.localProcess));
+          // With isolation on, a provider that exited may have left processes
+          // in its scope. Wait for that cleanup before anything treats the
+          // provider as stopped; a warm provider that stays retained is not
+          // touched. Unconfirmed cleanup claims no stop.
+          const scopeCleanup = await processIdentitySink?.scope?.reap({ waitForExitMs: stopped ? PROVIDER_SCOPE_EXIT_WAIT_MS : 0 });
+          if (scopeCleanup?.outcome === "unconfirmed") {
+            stopped = false;
+            agentScopeCleanupField = { agentProcessScopeCleanup: { outcome: "unconfirmed", reason: scopeCleanup.reason } };
+            await recordTeardownError(
+              "agent-process-scope",
+              new Error(`Agent process scope cleanup was not confirmed (${scopeCleanup.reason}). No provider stop is claimed.`),
+            );
+          }
           try {
             if (stopped) await withAdapterExecutionPhase(ctx, "instruction_collection", () => ctx.onProviderStopped?.());
           } catch {
@@ -5529,6 +5576,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                 : reason.completion.cause;
           const report = await settleAcpRun(runResourceLedger, cause, settlementSteps);
           recordDispositionReport(report);
+          // One line on where this run's provider ran (none in off mode).
+          const scopeState = describeAcpxAgentScope(processIdentitySink?.scope);
+          if (scopeState) await ctx.onLog("stderr", `[paperclip] Agent process scope: ${scopeState}.\n`).catch(() => {});
           if (childStderrState) flushChildStderr(childStderrState);
         },
         reproduceResult: async (): Promise<AdapterExecutionResult> => {
@@ -5572,7 +5622,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // (settlement precedes reproduction), so a failed workspace restore is
           // already recorded by the time we get here. Merge it into `resultJson`
           // only on a failure — a clean restore adds no new key.
-          if (!("workspaceRestoreFailure" in workspaceRestoreFailureField)) {
+          if (!("workspaceRestoreFailure" in workspaceRestoreFailureField) && !("agentProcessScopeCleanup" in agentScopeCleanupField)) {
             return capturedResult;
           }
           return {
@@ -5580,6 +5630,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             resultJson: {
               ...(capturedResult.resultJson ?? {}),
               ...workspaceRestoreFailureField,
+              ...agentScopeCleanupField,
             },
           };
         },

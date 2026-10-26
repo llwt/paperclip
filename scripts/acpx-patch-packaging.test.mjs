@@ -97,6 +97,10 @@ const acpxRuntimePatch = await readFile(
   new URL("../patches/acpx@0.13.1.patch", import.meta.url),
   "utf8",
 );
+const legacyAcpxRuntimePatch = await readFile(
+  new URL("../patches/acpx@0.12.0.patch", import.meta.url),
+  "utf8",
+);
 const claudeAcpPatch = await readFile(
   new URL("../patches/@agentclientprotocol__claude-agent-acp@0.73.0.patch", import.meta.url),
   "utf8",
@@ -336,6 +340,14 @@ test("Paperclip Runner pins the qualified ACPX host callbacks", () => {
   ]) assert.match(acpxRuntimePatch, new RegExp(callback));
   assert.match(claudeAcpPatch, /usage: \{/);
   assert.match(claudeAcpPatch, /cache_creation_input_tokens/);
+});
+
+test("legacy ACPX runtime exposes the host-owned pre-spawn agent launch", () => {
+  // The scope helper must wrap the provider before it runs; an after-spawn
+  // hook would let an unblocked provider start work in the server cgroup.
+  assert.match(legacyAcpxRuntimePatch, /this\.options\.spawnAgent \? this\.options\.spawnAgent\(\{/);
+  assert.match(legacyAcpxRuntimePatch, /spawnAgent: this\.options\.spawnAgent/);
+  assert.equal(legacyAcpxRuntimePatch.match(/^\+  spawnAgent\?: \(input: \{$/gm)?.length, 2);
 });
 
 test("published packages preserve the patched embedded-postgres runtime", () => {

@@ -1,7 +1,8 @@
 diff --git a/dist/live-checkpoint-ClPCSdrW.js b/dist/live-checkpoint-ClPCSdrW.js
+index 243c9d13bcba520923b63adfddad75cf2d94362d..0ad41f3567015bb67f6778803f703340bee2ca7b 100644
 --- a/dist/live-checkpoint-ClPCSdrW.js
 +++ b/dist/live-checkpoint-ClPCSdrW.js
-@@ -1532,7 +1532,7 @@
+@@ -1532,7 +1532,7 @@ const ZED_TAG_KEYS = /* @__PURE__ */ new Set([
  	"RedactedThinking",
  	"ToolUse"
  ]);
@@ -10,7 +11,7 @@ diff --git a/dist/live-checkpoint-ClPCSdrW.js b/dist/live-checkpoint-ClPCSdrW.js
  const OPAQUE_VALUE_PATHS = /* @__PURE__ */ new Set([
  	"agent_capabilities",
  	"messages.Agent.content.ToolUse.input",
-@@ -2557,7 +2557,7 @@
+@@ -2557,7 +2557,7 @@ function readCommandLineChar(state) {
  		escaping: false,
  		hasPart: true
  	};
@@ -19,7 +20,7 @@ diff --git a/dist/live-checkpoint-ClPCSdrW.js b/dist/live-checkpoint-ClPCSdrW.js
  		current: state.current,
  		quote: state.quote,
  		escaping: true,
-@@ -2912,8 +2912,8 @@
+@@ -2912,8 +2912,8 @@ function promotePrefixedAuthEnvironment(env) {
  	}
  	return protectedKeys;
  }
@@ -30,7 +31,7 @@ diff --git a/dist/live-checkpoint-ClPCSdrW.js b/dist/live-checkpoint-ClPCSdrW.js
  	const protectedAuthEnvKeys = promotePrefixedAuthEnvironment(env);
  	if (authCredentials) for (const [methodId, credential] of Object.entries(authCredentials)) {
  		addAuthCredentialEnvKeys(protectedAuthEnvKeys, methodId, credential);
-@@ -2955,10 +2955,10 @@
+@@ -2955,10 +2955,10 @@ function resolveConfiguredAuthCredential(methodId, authCredentials) {
  	const configCredentials = authCredentials ?? {};
  	return configCredentials[methodId] ?? configCredentials[toEnvToken(methodId)];
  }
@@ -43,7 +44,7 @@ diff --git a/dist/live-checkpoint-ClPCSdrW.js b/dist/live-checkpoint-ClPCSdrW.js
  		stdio: [
  			"pipe",
  			"pipe",
-@@ -3724,10 +3724,13 @@
+@@ -3724,10 +3724,13 @@ function resolveClientCapabilities(params) {
  		},
  		terminal: params.terminal
  	};
@@ -59,7 +60,7 @@ diff --git a/dist/live-checkpoint-ClPCSdrW.js b/dist/live-checkpoint-ClPCSdrW.js
  	};
  }
  function isDevinRequestDiagnosticsMethod(method) {
-@@ -3957,9 +3960,26 @@
+@@ -3957,9 +3960,26 @@ var AcpClient = class {
  		this.lastAgentExit = void 0;
  		this.lastKnownPid = child.pid ?? void 0;
  		this.attachAgentLifecycleObservers(child);
@@ -86,7 +87,7 @@ diff --git a/dist/live-checkpoint-ClPCSdrW.js b/dist/live-checkpoint-ClPCSdrW.js
  			if (!this.options.verbose) return;
  			process.stderr.write(chunk);
  		});
-@@ -3994,7 +4014,7 @@
+@@ -3994,7 +4014,7 @@ var AcpClient = class {
  			geminiAcp: isGeminiAcpCommand(spawnCommand, args),
  			copilotAcp: isCopilotAcpCommand(spawnCommand, args),
  			claudeAcp: isClaudeAcpCommand(spawnCommand, args),
@@ -95,7 +96,21 @@ diff --git a/dist/live-checkpoint-ClPCSdrW.js b/dist/live-checkpoint-ClPCSdrW.js
  		};
  	}
  	logAgentLaunch(plan) {
-@@ -4729,6 +4749,9 @@
+@@ -4019,7 +4039,12 @@ var AcpClient = class {
+ 		}
+ 	}
+ 	async spawnAgentProcess(plan) {
+-		const spawnedChild = spawn(plan.spawnCommand, plan.args, buildSpawnCommandOptions(plan.spawnCommand, plan.spawnOptions));
++		const options = buildSpawnCommandOptions(plan.spawnCommand, plan.spawnOptions);
++		const spawnedChild = this.options.spawnAgent ? this.options.spawnAgent({
++			command: plan.spawnCommand,
++			args: plan.args,
++			options
++		}) : spawn(plan.spawnCommand, plan.args, options);
+ 		try {
+ 			await waitForSpawn$1(spawnedChild);
+ 		} catch (error) {
+@@ -4729,6 +4754,9 @@ var AcpClient = class {
  			return await this.filesystem.readTextFile(params);
  		} catch (error) {
  			this.recordPermissionError(params.sessionId, error);
@@ -105,7 +120,7 @@ diff --git a/dist/live-checkpoint-ClPCSdrW.js b/dist/live-checkpoint-ClPCSdrW.js
  			throw error;
  		}
  	}
-@@ -6070,6 +6093,27 @@
+@@ -6070,6 +6098,27 @@ async function withConnectedSession(options) {
  //#region src/runtime/engine/prompt-turn.ts
  const SESSION_REPLY_IDLE_MS = 1e3;
  const SESSION_REPLY_DRAIN_TIMEOUT_MS = 5e3;
@@ -133,7 +148,7 @@ diff --git a/dist/live-checkpoint-ClPCSdrW.js b/dist/live-checkpoint-ClPCSdrW.js
  async function runPromptTurn(params) {
  	try {
  		const promptPromise = params.client.prompt(params.sessionId, params.prompt);
-@@ -6079,6 +6123,20 @@
+@@ -6079,6 +6128,20 @@ async function runPromptTurn(params) {
  			idleMs: SESSION_REPLY_IDLE_MS,
  			timeoutMs: SESSION_REPLY_DRAIN_TIMEOUT_MS
  		}).catch(() => {});
@@ -155,7 +170,7 @@ diff --git a/dist/live-checkpoint-ClPCSdrW.js b/dist/live-checkpoint-ClPCSdrW.js
  		return {
  			stopReason: response.stopReason,
 diff --git a/dist/runtime.d.ts b/dist/runtime.d.ts
-index ccdbe5b032521518022223733049b8b38793473b..416bdaae1450c6e85b34afd154349770f9f7b0a9 100644
+index ccdbe5b032521518022223733049b8b38793473b..2801334d7290b6f19bef13c4c8f77696ae493653 100644
 --- a/dist/runtime.d.ts
 +++ b/dist/runtime.d.ts
 @@ -45,6 +45,7 @@ type AcpRuntimeTurnAttachment = {
@@ -166,7 +181,7 @@ index ccdbe5b032521518022223733049b8b38793473b..416bdaae1450c6e85b34afd154349770
    handle: AcpRuntimeHandle;
    text: string;
    attachments?: AcpRuntimeTurnAttachment[];
-@@ -266,6 +267,10 @@ type AcpRuntimeOptions = {
+@@ -266,6 +267,16 @@ type AcpRuntimeOptions = {
    timeoutMs?: number;
    probeAgent?: string;
    verbose?: boolean;
@@ -174,10 +189,16 @@ index ccdbe5b032521518022223733049b8b38793473b..416bdaae1450c6e85b34afd154349770
 +  onAgentSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
 +  spawnCwd?: string;
 +  inheritProcessEnv?: boolean;
++  /** Host-owned agent launch, called in place of spawn() with the resolved command, args and options. */
++  spawnAgent?: (input: {
++    command: string;
++    args: readonly string[];
++    options: import("node:child_process").SpawnOptions;
++  }) => import("node:child_process").ChildProcess;
    onPermissionRequest?: (req: AcpPermissionRequest, ctx: {
      signal: AbortSignal;
    }) => Promise<AcpPermissionDecision | undefined>;
-@@ -302,6 +307,7 @@ declare class AcpRuntimeManager {
+@@ -302,6 +313,7 @@ declare class AcpRuntimeManager {
    private createAndSaveRuntimeRecord;
    private keepPersistentClient;
    startTurn(input: {
@@ -185,7 +206,7 @@ index ccdbe5b032521518022223733049b8b38793473b..416bdaae1450c6e85b34afd154349770
      handle: AcpRuntimeHandle;
      text: string;
      attachments?: AcpRuntimeTurnAttachment[];
-@@ -334,6 +340,7 @@ declare class AcpRuntimeManager {
+@@ -334,6 +346,7 @@ declare class AcpRuntimeManager {
    private finalizeRuntimeTurn;
    private finalizeRuntimeTurnRecord;
    runTurn(input: {
@@ -194,7 +215,7 @@ index ccdbe5b032521518022223733049b8b38793473b..416bdaae1450c6e85b34afd154349770
      text: string;
      attachments?: AcpRuntimeTurnAttachment[];
 diff --git a/dist/runtime.js b/dist/runtime.js
-index 6c9cc999e50a11c399c68b3a0f1b7af4bc2317c0..e06bf4fdee534f3ef56be0387a2f5f8626e697ad 100644
+index 6c9cc999e50a11c399c68b3a0f1b7af4bc2317c0..b4850d5ea70857480722390c80fb8b1eb269e17e 100644
 --- a/dist/runtime.js
 +++ b/dist/runtime.js
 @@ -744,7 +744,8 @@ var AcpRuntimeManager = class {
@@ -202,7 +223,7 @@ index 6c9cc999e50a11c399c68b3a0f1b7af4bc2317c0..e06bf4fdee534f3ef56be0387a2f5f86
  	}
  	createClient(options) {
 -		return this.deps.clientFactory?.(options) ?? new AcpClient(options);
-+		const clientOptions = { ...options, onAgentStderr: this.options.onAgentStderr, onAgentSpawn: this.options.onAgentSpawn, spawnCwd: this.options.spawnCwd, inheritProcessEnv: this.options.inheritProcessEnv };
++		const clientOptions = { ...options, onAgentStderr: this.options.onAgentStderr, onAgentSpawn: this.options.onAgentSpawn, spawnCwd: this.options.spawnCwd, inheritProcessEnv: this.options.inheritProcessEnv, spawnAgent: this.options.spawnAgent };
 +		return this.deps.clientFactory?.(clientOptions) ?? new AcpClient(clientOptions);
  	}
  	async readPendingPersistentClient(record, options) {
@@ -232,10 +253,10 @@ index 6c9cc999e50a11c399c68b3a0f1b7af4bc2317c0..e06bf4fdee534f3ef56be0387a2f5f86
  			mode: input.mode,
  			sessionMode: state.mode,
 diff --git a/dist/session-options-jkYbBxGE.d.ts b/dist/session-options-jkYbBxGE.d.ts
-index 9d37f377fb6a0828e0d2bc5a48754f3aa71509a4..22dda59e0b7616a20ad45218913e5d8f884bae49 100644
+index 9d37f377fb6a0828e0d2bc5a48754f3aa71509a4..3b62e4278f78231177b95c130f3ef5f90f73cca3 100644
 --- a/dist/session-options-jkYbBxGE.d.ts
 +++ b/dist/session-options-jkYbBxGE.d.ts
-@@ -84,6 +84,10 @@ type AcpClientOptions = {
+@@ -84,6 +84,16 @@ type AcpClientOptions = {
    terminal?: boolean;
    suppressSdkConsoleErrors?: boolean;
    verbose?: boolean;
@@ -243,6 +264,12 @@ index 9d37f377fb6a0828e0d2bc5a48754f3aa71509a4..22dda59e0b7616a20ad45218913e5d8f
 +  onAgentSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
 +  spawnCwd?: string;
 +  inheritProcessEnv?: boolean;
++  /** Host-owned agent launch, called in place of spawn() with the resolved command, args and options. */
++  spawnAgent?: (input: {
++    command: string;
++    args: readonly string[];
++    options: import("node:child_process").SpawnOptions;
++  }) => import("node:child_process").ChildProcess;
    sessionOptions?: {
      model?: string;
      allowedTools?: string[];
