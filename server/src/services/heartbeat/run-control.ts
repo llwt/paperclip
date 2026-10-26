@@ -1345,6 +1345,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
               const inherited = await terminateInheritedOwnerScopes({
                 ownerKinds: ["run"],
                 ownerId: run.id,
+                companyId: run.companyId,
                 reason: "run_cancelled",
                 signal: agent?.adapterType === "codex_local" ? "SIGINT" : undefined,
                 graceMs: cancellationTerminationGraceMs(5, options.terminationGraceMs),

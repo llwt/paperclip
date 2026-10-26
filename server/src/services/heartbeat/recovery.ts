@@ -1149,6 +1149,31 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       .where(eq(heartbeatRuns.id, run.id));
   }
 
+  /**
+   * A reaped run's inherited scopes (run and output relay) end with it, before
+   * the agent's next queued run starts. Scopes this server launched keep
+   * their in-memory owners. An unconfirmed stop stays pending for
+   * reconciliation; it does not hold the next run.
+   */
+  async function stopReapedRunScopes(run: { id: string; companyId: string }) {
+    const scopes = await terminateInheritedOwnerScopes({
+      ownerKinds: ["run", "relay"],
+      ownerId: run.id,
+      companyId: run.companyId,
+      reason: "owner_run_reaped",
+    }).catch((err: unknown) => ({
+      found: 0,
+      settled: false,
+      results: [{ unit: "", ownerKind: null, reason: err instanceof Error ? err.message : "terminate_failed" }],
+    }));
+    if (!scopes.settled) {
+      logger.warn(
+        { runId: run.id, results: scopes.results },
+        "reaped run's process scope was not confirmed stopped; kept for reconciliation",
+      );
+    }
+  }
+
   function sweepAdoptedRunLeftovers(run: {
     id: string;
     companyId: string;
@@ -1165,6 +1190,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         const scopes = await terminateInheritedOwnerScopes({
           ownerKinds: ["run"],
           ownerId: run.id,
+          companyId: run.companyId,
           reason: "adopted_run_ended",
           ...(graceMs === undefined ? {} : { graceMs }),
         });
@@ -1842,6 +1868,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           const scopes = await terminateInheritedOwnerScopes({
             ownerKinds: ["run"],
             ownerId: run.id,
+            companyId: run.companyId,
             reason: "server_shutdown",
           });
           if (!scopes.settled) {
@@ -3018,6 +3045,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
               status: recovered.run.status,
               failureReason: recovered.run.error ?? undefined,
             });
+            await stopReapedRunScopes(recovered.run);
             void sweepAdoptedRunLeftovers(recovered.run);
             await startNextQueuedRunForAgent(run.agentId);
           } catch (err) {
@@ -3142,6 +3170,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       await finalizeAgentStatus(run.agentId, "failed", baseMessage, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       });
+      await stopReapedRunScopes(run);
       await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
       reaped.push(run.id);

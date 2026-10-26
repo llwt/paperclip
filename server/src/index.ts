@@ -56,7 +56,11 @@ import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { warnClaudeQuotaCardConfig } from "./services/claude-quota-card.js";
 import { startAgentProcessIsolation } from "./agent-process-isolation.js";
-import { closeAgentScopesForShutdown, reconcileAgentScopes } from "./services/agent-process-scopes.js";
+import {
+  closeAgentScopesForShutdown,
+  holdAgentRunAdmission,
+  reconcileAgentScopes,
+} from "./services/agent-process-scopes.js";
 import { logger } from "./middleware/logger.js";
 import { runStartupHeartbeatRecoverySteps } from "./startup-heartbeat-recovery.js";
 import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
@@ -1512,6 +1516,12 @@ async function startServerWithDatabaseTeardown(
     await accountingHeartbeat.reconcileCostAccounting().catch((err) => logger.error({ err }, "Cost accounting recovery failed; pending receipts will retry"));
     const heartbeatSchedulingSuppression = await heartbeat.resolveSchedulingSuppression();
 
+    // No provider starts until the agent process scopes an earlier server
+    // left are classified: restart recovery below may dispatch runs (native
+    // reattach, the reaper's next queued run) before that pass. Under
+    // suppression the first periodic pass after it lifts opens admission.
+    holdAgentRunAdmission();
+
     // Reap orphaned runs before timer ticks start so wakeups cannot coalesce
     // into a dead "running" row during startup recovery.
     if (heartbeatSchedulingSuppression.suppressed) {
@@ -1585,13 +1595,15 @@ async function startServerWithDatabaseTeardown(
         }
 
         // Decide the agent process scopes an earlier server left, after run
-        // recovery classified their owners and before queued runs start.
+        // recovery classified their owners and before queued runs start. The
+        // pass opens run admission; if it fails, admission stays held (queued
+        // runs stay queued) until a periodic pass completes.
         try {
           await reconcileAgentScopes({ db: db as any, logger, reportUnmatched: true });
         } catch (err) {
           logger.error(
             { err },
-            "startup agent process scope reconciliation failed - the periodic reaper tick retries it",
+            "startup agent process scope reconciliation failed - run admission held until the periodic reaper tick completes it",
           );
         }
 

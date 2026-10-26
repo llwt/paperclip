@@ -27,6 +27,8 @@ import {
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
+  issues,
+  nativeRunFinalizations,
   workspaceRuntimeServices,
 } from "@paperclipai/db";
 import {
@@ -52,23 +54,33 @@ import { prepareSystemdTestEnv } from "@paperclipai/process-launch/systemd-test-
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import {
+  abandonHeldAgentRunAdmission,
   closeAgentScopesForShutdown,
   decideInheritedScope,
+  holdAgentRunAdmission,
+  isAgentRunAdmissionOpen,
   reconcileAgentScopes,
+  resetAgentRunAdmissionForTests,
   setAgentScopeRegistryForTests,
+  terminateInheritedOwnerScopes,
+  waitForAgentRunAdmission,
   type ScopeOwnerFacts,
 } from "../services/agent-process-scopes.js";
-import { readHotRestartIntent, writeHotRestartIntent } from "../services/hot-restart.js";
+import { readHotRestartIntent, readProcessStartedAt, writeHotRestartIntent } from "../services/hot-restart.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { claimNativeRestartRecoveries } from "../services/native-runtime/native-restart-recovery.js";
+import { prepareNativeHeartbeatRun } from "../services/native-runtime/prepare-native-run.js";
 
-// A process-loss retry is queued as a real run; it must never reach a provider.
+// Every provider start in these tests is recorded here and never runs a real
+// provider (a process-loss retry is queued as a real run).
+const providerExecute = vi.hoisted(() => vi.fn(async () => ({ exitCode: 0, signal: null, timedOut: false, errorMessage: null })));
 vi.mock("../adapters/index.ts", async () => {
   const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
   return {
     ...actual,
     getServerAdapter: vi.fn(() => ({
       supportsLocalAgentJwt: false,
-      execute: vi.fn(async () => ({ exitCode: 0, signal: null, timedOut: false, errorMessage: null })),
+      execute: providerExecute,
     })),
   };
 });
@@ -119,9 +131,14 @@ describe("decideInheritedScope", () => {
     ["server tool of a native run", recordOf({ kind: "run", id: "r" }), { ...noFacts, run: { ...activeRun, runtimeMode: "native" } }, "stop", "server_tool_unadoptable"],
     ["relay of a live run", recordOf({ kind: "relay", id: "r" }), { ...noFacts, run: activeRun }, "keep", "owner_run_active"],
     ["relay of an ended run", recordOf({ kind: "relay", id: "r" }), { ...noFacts, run: { ...activeRun, status: "succeeded" } }, "stop", "owner_run_succeeded"],
-    ["native runner with live root", recordOf({ kind: "runner", id: "x" }), { ...noFacts, rootAlive: true }, "keep", "native_root_alive"],
-    ["native runner whose root is gone", recordOf({ kind: "runner", id: "x" }), noFacts, "stop", "native_root_gone"],
-    ["native warm provider with live root", recordOf({ kind: "warm_provider", id: "x" }), { ...noFacts, rootAlive: true }, "keep", "native_root_alive"],
+    ["native runner whose root is gone", recordOf({ kind: "runner", id: "x" }), { ...noFacts, nativeRun: activeRun }, "stop", "native_root_gone"],
+    ["native runner of an active run", recordOf({ kind: "runner", id: "x" }), { ...noFacts, rootAlive: true, nativeRun: activeRun }, "keep", "native_owner_run_active"],
+    ["warm runner retained after a successful run", recordOf({ kind: "runner", id: "x" }), { ...noFacts, rootAlive: true, nativeRun: { ...activeRun, status: "succeeded" } }, "keep", "native_runner_retained"],
+    ["native runner whose run recovery failed", recordOf({ kind: "runner", id: "x" }), { ...noFacts, rootAlive: true, nativeRun: { ...activeRun, status: "failed" } }, "stop", "native_owner_run_failed"],
+    ["native runner of a cancelled run", recordOf({ kind: "runner", id: "x" }), { ...noFacts, rootAlive: true, nativeRun: { ...activeRun, status: "cancelled" } }, "stop", "native_owner_run_cancelled"],
+    ["native runner of another company", recordOf({ kind: "runner", id: "x", companyId: "company-b" }), { ...noFacts, rootAlive: true, nativeRun: activeRun }, "stop", "native_owner_company_mismatch"],
+    ["live native runner no run names", recordOf({ kind: "runner", id: "x" }), { ...noFacts, rootAlive: true }, "hold", "native_owner_unresolved"],
+    ["native warm provider of an active run", recordOf({ kind: "warm_provider", id: "x" }), { ...noFacts, rootAlive: true, nativeRun: activeRun }, "keep", "native_owner_run_active"],
     ["ACP warm provider", recordOf({ kind: "warm_provider", id: "acp-1" }), { ...noFacts, rootAlive: true }, "stop", "server_stdio_provider"],
     ["auxiliary helper", recordOf({ kind: "auxiliary", id: "a" }), { ...noFacts, rootAlive: true }, "stop", "auxiliary_owner_ended"],
     ["running managed service", recordOf({ kind: "managed_service", id: "s" }), { ...noFacts, service: { status: "running", companyId: "company-a" } }, "keep", "owner_service_active"],
@@ -204,6 +221,8 @@ describeEmbeddedPostgres("agent process scope reconciliation", () => {
 
   afterEach(async () => {
     setAgentScopeRegistryForTests(null);
+    resetAgentRunAdmissionForTests();
+    providerExecute.mockClear();
     // Each test sees only its own live runs.
     const active = await db
       .select({ id: heartbeatRuns.id })
@@ -304,29 +323,37 @@ describeEmbeddedPostgres("agent process scope reconciliation", () => {
     }
   }
 
-  async function seedRun(input: { status?: string; processPid?: number | null; runtimeMode?: "legacy" | "native" } = {}) {
-    const companyId = randomUUID();
-    const agentId = randomUUID();
+  async function seedRun(input: {
+    status?: string;
+    processPid?: number | null;
+    runtimeMode?: "legacy" | "native";
+    /** Add the run to an agent seeded earlier. */
+    agent?: { companyId: string; agentId: string };
+  } = {}) {
+    const companyId = input.agent?.companyId ?? randomUUID();
+    const agentId = input.agent?.agentId ?? randomUUID();
     const runId = randomUUID();
     const wakeupRequestId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      defaultResponsibleUserId: "responsible-user",
-      requireBoardApprovalForNewAgents: false,
-    });
-    await db.insert(agents).values({
-      id: agentId,
-      companyId,
-      name: "Coder",
-      role: "engineer",
-      status: "running",
-      adapterType: "claude_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
+    if (!input.agent) {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        defaultResponsibleUserId: "responsible-user",
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Coder",
+        role: "engineer",
+        status: "running",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+    }
     await db.insert(agentWakeupRequests).values({
       id: wakeupRequestId,
       companyId,
@@ -335,9 +362,9 @@ describeEmbeddedPostgres("agent process scope reconciliation", () => {
       triggerDetail: "system",
       reason: "issue_assigned",
       payload: {},
-      status: "claimed",
+      status: input.status === "queued" ? "queued" : "claimed",
       runId,
-      claimedAt: new Date(),
+      claimedAt: input.status === "queued" ? null : new Date(),
     });
     await db.insert(heartbeatRuns).values({
       id: runId,
@@ -359,6 +386,63 @@ describeEmbeddedPostgres("agent process scope reconciliation", () => {
       updatedAt: new Date(),
     });
     return { companyId, agentId, runId };
+  }
+
+  /** A native run as the native runtime prepares it, with its runner instance id. */
+  async function seedNativeRun(input: { issueStatus?: string } = {}) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const prefix = `N${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Native",
+      issuePrefix: prefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Native runner",
+      role: "engineer",
+      status: "active",
+      adapterType: "paperclip_runner",
+      adapterConfig: { provider: "codex" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      identifier: `${prefix}-1`,
+      title: "Native task",
+      status: input.issueStatus ?? "in_progress",
+      priority: "medium",
+      workMode: "standard",
+      assigneeAgentId: agentId,
+    });
+    const [run] = await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      runtimeMode: "native",
+      nativeIssueId: issueId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      contextSnapshot: { issueId },
+    }).returning();
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    const native = await prepareNativeHeartbeatRun({
+      db,
+      run: run!,
+      issue: { id: issueId, title: "Native task", description: null, reviewPolicy: null },
+      environmentLeaseId: `lease-${runId}`,
+    });
+    await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId, phase: "observed" });
+    return { companyId, agentId, runId, issueId, runnerInstanceId: native.runnerInstanceId };
   }
 
   async function setRunStatus(runId: string, status: string) {
@@ -409,9 +493,10 @@ describeEmbeddedPostgres("agent process scope reconciliation", () => {
 
       const report = await reconcileAgentScopes({ db });
       if (mode === "scope") {
-        expect(report.stopped).toEqual([expect.objectContaining({ unit: launched.unit, outcome: "terminated" })]);
-        expect(await waitUntil(() => !alive(leftover))).toBe(true);
+        // The reaper stopped the run's scope as it ended the run; nothing is left to decide.
+        expect(alive(leftover)).toBe(false);
         expect(recorded(launched.unit)).toBe(false);
+        expect(report).toEqual({ kept: [], stopped: [], pending: [], unmatchedUnits: [] });
       } else {
         // The root was reaped, so the group id can no longer be tied to the
         // record: nothing is signalled, the record stays, and the result is
@@ -535,25 +620,72 @@ describeEmbeddedPostgres("agent process scope reconciliation", () => {
       expect(ordinary.kept.map((entry) => entry.unit).sort()).toEqual([runner.unit, service.unit].sort());
     });
 
-    it("native runner recovery: a live runner is kept, the leftovers of a dead one are stopped", async () => {
+    it("native runner recovery: native restart recovery decides a live runner, the leftovers of a dead one are stopped", async () => {
+      // Recovery reattaches the runner it can verify; the run stays live.
+      const reattached = await seedNativeRun();
+      const live = launchEarlier(mode, { kind: "runner", id: reattached.runnerInstanceId, companyId: reattached.companyId }, "exec /bin/sleep 300");
+      const startedAt = await readProcessStartedAt(live.pid);
+      await db.update(heartbeatRuns)
+        .set({ processPid: live.pid, processGroupId: live.pid, processStartedAt: startedAt ? new Date(startedAt) : null })
+        .where(eq(heartbeatRuns.id, reattached.runId));
+      // The task changed hands while the server was down: recovery ends the run.
+      const ended = await seedNativeRun({ issueStatus: "done" });
+      const orphan = launchEarlier(mode, { kind: "runner", id: ended.runnerInstanceId, companyId: ended.companyId }, "exec /bin/sleep 300");
+      // A live runner no run names: its owner cannot be resolved.
+      const unnamed = launchEarlier(mode, { kind: "runner", id: randomUUID(), companyId: reattached.companyId }, "exec /bin/sleep 300");
+      // A runner whose root died: what it left is leftovers.
       const file = pidFile();
-      const runnerId = randomUUID();
-      const live = launchEarlier(mode, { kind: "runner", id: runnerId, companyId: randomUUID() }, "exec /bin/sleep 300");
-      const dead = launchEarlier(mode, { kind: "runner", id: runnerId, companyId: null }, workload(mode, file, true));
+      const dead = launchEarlier(mode, { kind: "runner", id: reattached.runnerInstanceId, companyId: reattached.companyId }, workload(mode, file, true));
       const leftover = await readPid(file);
       expect(await waitUntil(() => !alive(dead.pid))).toBe(true);
 
+      const dispositions = await claimNativeRestartRecoveries({
+        db,
+        restartKind: "hard",
+        runIds: [reattached.runId, ended.runId],
+      });
+      expect(dispositions).toEqual(expect.arrayContaining([
+        expect.objectContaining({ runId: reattached.runId, kind: "reattach_existing_runner" }),
+        expect.objectContaining({ runId: ended.runId, kind: "blocked", reason: "task_ownership_or_status_changed" }),
+      ]));
+
       const report = await reconcileAgentScopes({ db });
-      expect(report.kept).toEqual([expect.objectContaining({ unit: live.unit, reason: "native_root_alive" })]);
+      expect(report.kept).toEqual([expect.objectContaining({ unit: live.unit, reason: "native_owner_run_active" })]);
       expect(alive(live.pid)).toBe(true);
+      expect(report.stopped).toEqual(expect.arrayContaining([
+        expect.objectContaining({ unit: orphan.unit, reason: "native_owner_run_failed", outcome: "terminated" }),
+      ]));
+      expect(await waitUntil(() => !alive(orphan.pid))).toBe(true);
+      expect(report.pending).toEqual(expect.arrayContaining([
+        { unit: unnamed.unit, ownerKind: "runner", reason: "native_owner_unresolved" },
+      ]));
+      expect(alive(unnamed.pid)).toBe(true);
+      expect(recorded(unnamed.unit)).toBe(true);
       if (mode === "scope") {
-        expect(report.stopped).toEqual([expect.objectContaining({ unit: dead.unit, reason: "native_root_gone" })]);
+        expect(report.stopped).toEqual(expect.arrayContaining([expect.objectContaining({ unit: dead.unit, reason: "native_root_gone" })]));
         expect(await waitUntil(() => !alive(leftover))).toBe(true);
       } else {
-        expect(report.pending).toEqual([
+        expect(report.pending).toEqual(expect.arrayContaining([
           expect.objectContaining({ unit: dead.unit, reason: "native_root_gone:group_ownership_unprovable" }),
-        ]);
+        ]));
       }
+    });
+
+    it("native warm runner retained after a successful run is kept until a later run of it ends otherwise", async () => {
+      const native = await seedNativeRun();
+      const runner = launchEarlier(mode, { kind: "runner", id: native.runnerInstanceId, companyId: native.companyId }, "exec /bin/sleep 300");
+      await setRunStatus(native.runId, "succeeded");
+      expect((await reconcileAgentScopes({ db })).kept).toEqual([
+        expect.objectContaining({ unit: runner.unit, reason: "native_runner_retained" }),
+      ]);
+      // The next run reuses the retained runner and is cancelled.
+      const next = await seedRun({ status: "cancelled", runtimeMode: "native", agent: native });
+      await db.update(heartbeatRuns)
+        .set({ runnerInstanceId: native.runnerInstanceId, createdAt: new Date(Date.now() + 1_000) })
+        .where(eq(heartbeatRuns.id, next.runId));
+      const report = await reconcileAgentScopes({ db });
+      expect(report.stopped).toEqual([expect.objectContaining({ unit: runner.unit, reason: "native_owner_run_cancelled" })]);
+      expect(await waitUntil(() => !alive(runner.pid))).toBe(true);
     });
 
     it("warm ACP provider: an earlier server's is stopped, this server's own is left to its owner", async () => {
@@ -603,6 +735,29 @@ describeEmbeddedPostgres("agent process scope reconciliation", () => {
   });
 
   describe.skipIf(systemd.skipReason !== null)(`real scope only${systemd.skipReason ? ` (skipped: ${systemd.skipReason})` : ""}`, () => {
+    it("crash restart: the reaper stops a dead run's surviving grandchild before the next queued run, which waits for admission", async () => {
+      const file = pidFile();
+      const first = await seedRun();
+      const launched = launchEarlier("scope", { kind: "run", id: first.runId, companyId: first.companyId }, workload("scope", file, true));
+      const leftover = await readPid(file);
+      expect(await waitUntil(() => !alive(launched.pid))).toBe(true);
+      await db.update(heartbeatRuns).set({ processPid: launched.pid, processGroupId: launched.pid }).where(eq(heartbeatRuns.id, first.runId));
+      const next = await seedRun({ status: "queued", agent: first });
+
+      holdAgentRunAdmission();
+      const heartbeat = heartbeatService(db);
+      const reaped = await heartbeat.reapOrphanedRuns();
+      expect(reaped.runIds).toContain(first.runId);
+      expect(alive(leftover)).toBe(false);
+      expect(recorded(launched.unit)).toBe(false);
+      const waiting = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.runId)).then((rows) => rows[0]!);
+      expect(waiting.status).toBe("queued");
+      expect(providerExecute).not.toHaveBeenCalled();
+
+      await reconcileAgentScopes({ db });
+      expect(isAgentRunAdmissionOpen()).toBe(true);
+    });
+
     it("server killed after the intent, before the spawn callback: the enrolled scope is stopped", async () => {
       const file = pidFile();
       const { runId, companyId } = await seedRun();
@@ -684,5 +839,105 @@ describeEmbeddedPostgres("agent process scope reconciliation", () => {
     const report = await reconcileAgentScopes({ db });
     expect(report.pending).toEqual([{ unit: manifest.unit, ownerKind: null, reason: "record_unreadable" }]);
     await fs.rm(path.join(registryDir, `${manifest.unit}.json`), { force: true });
+  });
+
+  /** Write a record whose manifest cannot be read, for this owner. */
+  function writeUnreadableRecord(owner: { kind: ProcessOwnerKind; id: string; companyId: string | null }): string {
+    const manifest = manifestFor(instanceId, owner);
+    writeScopeManifest(registryDir, manifest);
+    writeFileSync(path.join(registryDir, `${manifest.unit}.json`), "{broken");
+    return manifest.unit;
+  }
+
+  it("cancel with an unreadable record of the run reports cleanup unconfirmed; another owner's is not counted", async () => {
+    const file = pidFile();
+    const { runId, companyId } = await seedRun();
+    const launched = launchEarlier("degraded", { kind: "run", id: runId, companyId }, workload("degraded", file));
+    const leftover = await readPid(file);
+    await db.update(heartbeatRuns).set({ processPid: launched.pid, processGroupId: launched.pid }).where(eq(heartbeatRuns.id, runId));
+    const mine = writeUnreadableRecord({ kind: "run", id: runId, companyId });
+    const mineWithoutCompany = writeUnreadableRecord({ kind: "run", id: runId, companyId: null });
+    const theirs = writeUnreadableRecord({ kind: "run", id: randomUUID(), companyId });
+
+    const cancelled = await heartbeatService(db).cancelRun(runId, "Stopped by the operator");
+    expect(cancelled?.status).toBe("cancelled");
+    expect(await waitUntil(() => !alive(leftover) && !alive(launched.pid))).toBe(true);
+    const cleanup = (cancelled?.resultJson as Record<string, unknown> | null)?.agentScopeCleanup as
+      | { confirmed: boolean; results: Array<{ unit: string; reason: string }> }
+      | undefined;
+    expect(cleanup?.confirmed).toBe(false);
+    expect(cleanup?.results).toEqual(expect.arrayContaining([
+      { unit: mine, ownerKind: null, reason: "record_unreadable" },
+      { unit: mineWithoutCompany, ownerKind: null, reason: "record_unreadable" },
+    ]));
+    expect(cleanup?.results.map((entry) => entry.unit)).not.toContain(theirs);
+
+    // Only another owner's unreadable record: this owner's cleanup is settled.
+    const other = await terminateInheritedOwnerScopes({ ownerKinds: ["run"], ownerId: randomUUID(), companyId, reason: "test" });
+    expect(other).toEqual({ found: 0, settled: true, results: [] });
+  });
+
+  it("shutdown reports unreadable records as pending, never as closed", async () => {
+    const unit = writeUnreadableRecord({ kind: "auxiliary", id: randomUUID(), companyId: null });
+    for (const handOff of [true, false]) {
+      const report = await closeAgentScopesForShutdown({ handOff, graceMs: 100 });
+      expect(report.pending).toEqual([{ unit, ownerKind: null, reason: "record_unreadable" }]);
+      expect(report.stopped).toEqual([]);
+    }
+  });
+
+  describe("run admission", () => {
+    it("waits for scope classification; a failed pass keeps it held and no provider starts", async () => {
+      const { companyId, agentId, runId } = await seedRun({ status: "queued" });
+      const heartbeat = heartbeatService(db);
+      holdAgentRunAdmission();
+      expect(isAgentRunAdmissionOpen()).toBe(false);
+      expect(await heartbeat.resumeQueuedRunsForAgent(companyId, agentId)).toEqual([]);
+      await heartbeat.resumeQueuedRuns();
+
+      // The registry cannot be listed: the pass fails and admission stays held.
+      const notADirectory = path.join(home, "not-a-directory");
+      writeFileSync(notADirectory, "");
+      setAgentScopeRegistryForTests({ instanceId, registryDir: notADirectory });
+      await expect(reconcileAgentScopes({ db })).rejects.toThrow();
+      expect(isAgentRunAdmissionOpen()).toBe(false);
+      expect(await heartbeat.resumeQueuedRunsForAgent(companyId, agentId)).toEqual([]);
+      const held = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]!);
+      expect(held.status).toBe("queued");
+      expect(providerExecute).not.toHaveBeenCalled();
+
+      setAgentScopeRegistryForTests({ instanceId, registryDir });
+      await reconcileAgentScopes({ db });
+      expect(isAgentRunAdmissionOpen()).toBe(true);
+      await heartbeat.resumeQueuedRunsForAgent(companyId, agentId);
+      await heartbeat.drainActiveRunExecutions();
+      const started = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]!);
+      expect(started.status).not.toBe("queued");
+      expect(providerExecute).toHaveBeenCalled();
+    });
+
+    it("a run already claimed by restart recovery waits; shutdown releases it without admitting it", async () => {
+      holdAgentRunAdmission();
+      const opened = waitForAgentRunAdmission();
+      await reconcileAgentScopes({ db });
+      expect(await opened).toBe(true);
+
+      resetAgentRunAdmissionForTests();
+      holdAgentRunAdmission();
+      const released = waitForAgentRunAdmission();
+      abandonHeldAgentRunAdmission();
+      expect(await released).toBe(false);
+      expect(isAgentRunAdmissionOpen()).toBe(false);
+    });
+
+    it("a pass that started before admission was held does not open it", async () => {
+      const slow = reconcileAgentScopes({ db });
+      holdAgentRunAdmission();
+      await slow;
+      const second = reconcileAgentScopes({ db });
+      expect(second).not.toBe(slow);
+      await second;
+      expect(isAgentRunAdmissionOpen()).toBe(true);
+    });
   });
 });

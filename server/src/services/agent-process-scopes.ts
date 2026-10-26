@@ -14,7 +14,7 @@
 //
 // Reading the registry does not depend on the isolation mode: after a rollback
 // to `off`, scopes started earlier are still reconciled until none remain.
-import { inArray } from "drizzle-orm";
+import { and, desc, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, workspaceRuntimeServices } from "@paperclipai/db";
 import { getAgentProcessIsolation, isAcpWarmProviderOwnerId } from "@paperclipai/adapter-utils/server-utils";
@@ -22,6 +22,7 @@ import {
   agentScopeRegistryDir,
   isScopeLaunchedByThisProcess,
   isScopeRootAlive,
+  isScopeUnitOfOwner,
   listOwnedScopeRecords,
   listUnmatchedScopeUnits,
   terminateOwnedProcessTree,
@@ -70,6 +71,12 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export interface ScopeOwnerFacts {
   /** The run row of a `run` or `relay` owner; null when there is none. */
   run: { status: string; companyId: string; runtimeMode: string | null } | null;
+  /**
+   * For a native `runner` or `warm_provider` owner: the latest run bound to
+   * that runner instance, as native restart recovery left it; null when no
+   * run names it.
+   */
+  nativeRun?: { status: string; companyId: string } | null;
   /** The runtime service row of a `managed_service` owner; null when there is none. */
   service: { status: string; companyId: string } | null;
   /** Whether the record's root process still runs (same boot, PID and start time). */
@@ -77,7 +84,8 @@ export interface ScopeOwnerFacts {
 }
 
 export interface ScopeDecision {
-  action: "keep" | "stop";
+  /** `hold`: the owner cannot be resolved; the scope is left running and reported as pending. */
+  action: "keep" | "stop" | "hold";
   reason: string;
 }
 
@@ -99,9 +107,15 @@ function companyMatches(record: ScopeRecord, companyId: string): boolean {
  *   server can adopt.
  * - `relay`: kept while its run is not terminal, so adopted output still
  *   drains; stopped once the run has ended.
- * - `runner` and native `warm_provider`: kept while the recorded root
- *   process runs, for native restart recovery to reattach or retire it; once
- *   the root is gone, what remains is leftovers.
+ * - `runner` and native `warm_provider` (owned by the runner instance id):
+ *   once the root is gone, what remains is leftovers. A live root is
+ *   resolved against the latest run bound to that runner, after native
+ *   restart recovery classified it: kept while that run is active (native
+ *   recovery reattaches it, or holds it while ownership is unproven) or
+ *   succeeded (a warm runner is retained only after a successful turn);
+ *   stopped when recovery or the run ended it otherwise, or the company does
+ *   not match. A live root that no run names is held and reported, never
+ *   stopped on a guess.
  * - legacy ACP `warm_provider` and `auxiliary`: their owner was the earlier
  *   server process itself (ACP talks over the server's stdio), so they end
  *   with it.
@@ -125,7 +139,7 @@ export function decideInheritedScope(record: ScopeRecord, facts: ScopeOwnerFacts
       if (owner.kind === "warm_provider" && isAcpWarmProviderOwnerId(owner.id)) {
         return { action: "stop", reason: "server_stdio_provider" };
       }
-      return facts.rootAlive ? { action: "keep", reason: "native_root_alive" } : { action: "stop", reason: "native_root_gone" };
+      return decideNativeScope(record, facts);
     case "auxiliary":
       return { action: "stop", reason: "auxiliary_owner_ended" };
     case "managed_service": {
@@ -137,6 +151,16 @@ export function decideInheritedScope(record: ScopeRecord, facts: ScopeOwnerFacts
     default:
       return { action: "stop", reason: "unknown_owner_kind" };
   }
+}
+
+function decideNativeScope(record: ScopeRecord, facts: ScopeOwnerFacts): ScopeDecision {
+  if (!facts.rootAlive) return { action: "stop", reason: "native_root_gone" };
+  const run = facts.nativeRun ?? null;
+  if (!run) return { action: "hold", reason: "native_owner_unresolved" };
+  if (!companyMatches(record, run.companyId)) return { action: "stop", reason: "native_owner_company_mismatch" };
+  if (run.status === "succeeded") return { action: "keep", reason: "native_runner_retained" };
+  if (TERMINAL_RUN_STATUSES.has(run.status)) return { action: "stop", reason: `native_owner_run_${run.status}` };
+  return { action: "keep", reason: "native_owner_run_active" };
 }
 
 export interface ScopeOutcome {
@@ -198,11 +222,20 @@ async function stopRecord(
 async function loadOwnerFacts(db: Db, records: ScopeRecord[]) {
   const runIds = new Set<string>();
   const serviceIds = new Set<string>();
+  const runnerIds = new Set<string>();
+  const runnerCompanyIds = new Set<string>();
   for (const { manifest } of records) {
     const { kind, id } = manifest.owner;
     if (!UUID.test(id)) continue;
     if (kind === "run" || kind === "relay") runIds.add(id);
     else if (kind === "managed_service") serviceIds.add(id);
+    else if (
+      (kind === "runner" || (kind === "warm_provider" && !isAcpWarmProviderOwnerId(id)))
+      && manifest.owner.companyId && UUID.test(manifest.owner.companyId)
+    ) {
+      runnerIds.add(id);
+      runnerCompanyIds.add(manifest.owner.companyId);
+    }
   }
   const runs = runIds.size === 0
     ? []
@@ -225,13 +258,88 @@ async function loadOwnerFacts(db: Db, records: ScopeRecord[]) {
         })
         .from(workspaceRuntimeServices)
         .where(inArray(workspaceRuntimeServices.id, [...serviceIds]));
+  const runnerRuns = runnerIds.size === 0
+    ? []
+    : await db
+        .select({
+          runnerInstanceId: heartbeatRuns.runnerInstanceId,
+          status: heartbeatRuns.status,
+          companyId: heartbeatRuns.companyId,
+        })
+        .from(heartbeatRuns)
+        // The company narrows the scan to that company's runs; the runner
+        // instance id has no index of its own.
+        .where(and(
+          inArray(heartbeatRuns.companyId, [...runnerCompanyIds]),
+          inArray(heartbeatRuns.runnerInstanceId, [...runnerIds]),
+        ))
+        .orderBy(desc(heartbeatRuns.createdAt));
+  // Newest first: a retained runner is bound to the latest run that used it.
+  const nativeRuns = new Map<string, { status: string; companyId: string }>();
+  for (const run of runnerRuns) {
+    if (run.runnerInstanceId && !nativeRuns.has(run.runnerInstanceId)) nativeRuns.set(run.runnerInstanceId, run);
+  }
   return {
     runs: new Map(runs.map((run) => [run.id, run])),
     services: new Map(services.map((service) => [service.id, service])),
+    nativeRuns,
   };
 }
 
-let inFlight: Promise<AgentScopeReconciliation> | null = null;
+// Run admission waits for the first classification of inherited scopes (plan
+// SX-2306: "New admission waits for a classification of owned scopes"). The
+// server holds admission at startup, before restart recovery; the first
+// reconciliation pass that completes opens it, and a pass that throws leaves
+// it held until a later pass completes. Records left pending (cleanup not
+// confirmed, unreadable, owner unresolved) are classified and reported; they
+// do not hold admission. Admission is open unless held, so code that never
+// holds it (tests, tools) is unaffected.
+type AdmissionState =
+  | { state: "open" }
+  | { state: "held"; waiters: Array<(admitted: boolean) => void> }
+  | { state: "abandoned" };
+
+let admission: AdmissionState = { state: "open" };
+
+/** Hold run admission until the next reconciliation pass completes. */
+export function holdAgentRunAdmission(): void {
+  if (admission.state !== "held") admission = { state: "held", waiters: [] };
+}
+
+export function isAgentRunAdmissionOpen(): boolean {
+  return admission.state === "open";
+}
+
+function settleAdmission(next: { state: "open" } | { state: "abandoned" }): void {
+  if (admission.state !== "held") return;
+  const { waiters } = admission;
+  admission = next;
+  for (const resolve of waiters) resolve(next.state === "open");
+}
+
+/**
+ * Resolves true once admission is open, or false when the server stops
+ * before it opened; the caller then starts nothing.
+ */
+export function waitForAgentRunAdmission(): Promise<boolean> {
+  if (admission.state === "open") return Promise.resolve(true);
+  if (admission.state === "abandoned") return Promise.resolve(false);
+  const { waiters } = admission;
+  return new Promise((resolve) => waiters.push(resolve));
+}
+
+/** Shutdown: release waiters without admitting them, so the run drain cannot hang. */
+export function abandonHeldAgentRunAdmission(): void {
+  settleAdmission({ state: "abandoned" });
+}
+
+/** Test hook. */
+export function resetAgentRunAdmissionForTests(): void {
+  settleAdmission({ state: "abandoned" });
+  admission = { state: "open" };
+}
+
+let inFlight: { pass: Promise<AgentScopeReconciliation>; admission: AdmissionState } | null = null;
 let lastPendingSignature = "";
 
 /**
@@ -240,7 +348,8 @@ let lastPendingSignature = "";
  * startup after native recovery, hot-restart adoption and the orphan reaper,
  * before queued runs are admitted, and again on the periodic reaper tick so a
  * run that ends later does not leave its scope behind. Concurrent calls share
- * one pass.
+ * one pass. A pass that completes opens held run admission, if it was held
+ * when the pass started.
  */
 export function reconcileAgentScopes(input: {
   db: Db;
@@ -248,11 +357,20 @@ export function reconcileAgentScopes(input: {
   /** Also report live namespace units that have no record (startup). */
   reportUnmatched?: boolean;
 }): Promise<AgentScopeReconciliation> {
-  if (inFlight) return inFlight;
-  const pass = reconcileOnce(input).finally(() => {
-    if (inFlight === pass) inFlight = null;
-  });
-  inFlight = pass;
+  if (inFlight?.admission === admission) return inFlight.pass;
+  // A pass that started before admission was held cannot open it; run a new one after it.
+  const previous = inFlight?.pass.catch(() => undefined) ?? Promise.resolve();
+  const admissionAtStart = admission;
+  const pass = previous
+    .then(() => reconcileOnce(input))
+    .then((report) => {
+      if (admission === admissionAtStart) settleAdmission({ state: "open" });
+      return report;
+    })
+    .finally(() => {
+      if (inFlight?.pass === pass) inFlight = null;
+    });
+  inFlight = { pass, admission };
   return pass;
 }
 
@@ -277,10 +395,15 @@ async function reconcileOnce(input: {
       const decision = decideInheritedScope(record, {
         run,
         service,
+        nativeRun: owner.kind === "runner" || owner.kind === "warm_provider" ? facts.nativeRuns.get(owner.id) ?? null : null,
         rootAlive: isScopeRootAlive(record, registry.procRoot),
       });
       if (decision.action === "keep") {
         report.kept.push({ unit: record.manifest.unit, ownerKind: owner.kind, reason: decision.reason });
+        return;
+      }
+      if (decision.action === "hold") {
+        report.pending.push({ unit: record.manifest.unit, ownerKind: owner.kind, reason: decision.reason });
         return;
       }
       await stopRecord(registry, record, decision.reason, report);
@@ -332,30 +455,47 @@ export interface OwnerScopeTermination {
  * Stop the scopes an earlier server process launched for one owner, such as
  * a run adopted after a hot restart. Scopes this process launched are left
  * to their in-memory owners. An unconfirmed stop keeps its record, and the
- * result says so; it is never reported as settled.
+ * result says so; it is never reported as settled. A record whose manifest
+ * cannot be read but whose unit name was built for this owner is reported
+ * as pending too: its scope cannot be checked.
  */
 export async function terminateInheritedOwnerScopes(input: {
   ownerKinds: readonly ProcessOwnerKind[];
   ownerId: string;
+  /** The owner's company, as its launches recorded it. */
+  companyId: string | null;
   reason: string;
   graceMs?: number;
   signal?: NodeJS.Signals;
 }): Promise<OwnerScopeTermination> {
   const registry = currentRegistry();
   const report = emptyReconciliation();
-  let records: ScopeRecord[];
+  let listing: ReturnType<typeof listOwnedScopeRecords>;
   try {
-    records = listOwnedScopeRecords(registry.registryDir, registry.instanceId).records;
+    listing = listOwnedScopeRecords(registry.registryDir, registry.instanceId);
   } catch {
     return { found: 0, settled: false, results: [{ unit: "", ownerKind: null, reason: "registry_unreadable" }] };
   }
-  const owned = records.filter((record) =>
+  const owned = listing.records.filter((record) =>
     input.ownerKinds.includes(record.manifest.owner.kind)
     && record.manifest.owner.id === input.ownerId
     && !isScopeLaunchedByThisProcess(record.ref));
+  // Launches record the company or none; either name may be the owner's.
+  const unreadable = listing.unreadable.filter((ref) => input.ownerKinds.some((ownerKind) =>
+    [input.companyId, null].some((companyId) => isScopeUnitOfOwner(ref.unit, {
+      instanceId: registry.instanceId,
+      ownerKind,
+      ownerId: input.ownerId,
+      companyId,
+    }))));
+  for (const ref of unreadable) report.pending.push({ unit: ref.unit, ownerKind: null, reason: "record_unreadable" });
   await Promise.all(owned.map((record) =>
     stopRecord(registry, record, input.reason, report, { graceMs: input.graceMs, signal: input.signal })));
-  return { found: owned.length, settled: report.pending.length === 0, results: [...report.stopped, ...report.pending] };
+  return {
+    found: owned.length + unreadable.length,
+    settled: report.pending.length === 0,
+    results: [...report.stopped, ...report.pending],
+  };
 }
 
 /** Units of the scopes recorded for one run (any origin), for the hot-restart handoff. */
@@ -398,8 +538,11 @@ export async function closeAgentScopesForShutdown(input: {
     listing = listOwnedScopeRecords(registry.registryDir, registry.instanceId);
   } catch (error) {
     log.warn({ err: error }, "agent process scope registry unreadable at shutdown; scopes left for startup reconciliation");
+    report.pending.push({ unit: "", ownerKind: null, reason: "registry_unreadable" });
     return report;
   }
+  // Their owner is unknown, so whether this shutdown ends them is too.
+  for (const ref of listing.unreadable) report.pending.push({ unit: ref.unit, ownerKind: null, reason: "record_unreadable" });
   const ends = (record: ScopeRecord): string | null => {
     const { kind, id } = record.manifest.owner;
     if (kind === "auxiliary") return "server_shutdown_auxiliary";

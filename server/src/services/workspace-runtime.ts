@@ -6391,7 +6391,7 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
       companyId: input.agent.companyId,
     }))) {
       await terminateLocalService(adoptedRecord);
-      await stopInheritedServiceScopes(adoptedRecord.runtimeServiceId);
+      await stopInheritedServiceScopes(adoptedRecord.runtimeServiceId, input.agent.companyId);
       await removeLocalServiceRegistryRecord(adoptedRecord.serviceKey);
     } else {
       releasePortReservation(reservedPort);
@@ -7048,11 +7048,12 @@ async function cleanupRecordExposure(
  * scope, launched by that server, still holds whatever the service started.
  * Stop it with the service. No record (isolation off) changes nothing.
  */
-async function stopInheritedServiceScopes(runtimeServiceId: string | null | undefined) {
+async function stopInheritedServiceScopes(runtimeServiceId: string | null | undefined, companyId: string) {
   if (!runtimeServiceId) return;
   const result = await terminateInheritedOwnerScopes({
     ownerKinds: ["managed_service"],
     ownerId: runtimeServiceId,
+    companyId,
     reason: "service_stopped",
   }).catch(() => null);
   if (result && !result.settled) {
@@ -7086,7 +7087,7 @@ async function stopRuntimeService(serviceId: string) {
     }
   }
   if (record.scopedProcess) await record.scopedProcess.terminateScope().catch(() => undefined);
-  else await stopInheritedServiceScopes(record.id);
+  else await stopInheritedServiceScopes(record.id, record.companyId);
   record.status = "stopped";
   record.healthStatus = "unknown";
   record.lastUsedAt = new Date().toISOString();
@@ -8652,7 +8653,7 @@ export async function reconcilePersistedRuntimeServicesOnStartup(db: Db) {
       ) {
         if (backfillDecision.action === "reprovision") backfilled += 1;
         await terminateLocalService(adoptedRecord);
-        await stopInheritedServiceScopes(adoptedRecord.runtimeServiceId);
+        await stopInheritedServiceScopes(adoptedRecord.runtimeServiceId, row.companyId);
         await removeLocalServiceRegistryRecord(adoptedRecord.serviceKey);
       } else {
         const record: RuntimeServiceRecord = {
