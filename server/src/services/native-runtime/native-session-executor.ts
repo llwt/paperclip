@@ -50,7 +50,7 @@ import {
   EXECUTION_CONTROL_DEADLINE_MS,
 } from "../execution-control-deadline.js";
 import { createHash, randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSyncAuxiliary as execFileSync } from "@paperclipai/adapter-utils/scoped-process";
 import {
   chmodSync,
   copyFileSync,

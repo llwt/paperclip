@@ -1,4 +1,5 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { spawnAuxiliary as spawn } from "./scoped-process.js";
 import { WORKSPACE_STREAM_CHUNK_BYTES } from "./workspace-manifest.js";
 
 export interface WorkspaceGitProcessInput {

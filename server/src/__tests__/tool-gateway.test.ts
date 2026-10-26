@@ -1,8 +1,17 @@
-import { createHash, randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { createHash, randomInt, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage } from "node:http";
 import express from "express";
 import { and, eq, sql } from "drizzle-orm";
 import request from "supertest";
+import { resetAgentProcessIsolation } from "@paperclipai/adapter-utils/process-isolation";
+import {
+  configureTestIsolation,
+  prepareLiveIsolation,
+} from "@paperclipai/adapter-utils/test-support/isolation-fixture";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -6071,6 +6080,62 @@ rl.on("line", (line) => {
     expect(bridge).toHaveBeenCalledTimes(2);
     expect(await db.select().from(toolRuntimeSlots).where(eq(toolRuntimeSlots.connectionId, local.connection.id))).toHaveLength(0);
     bridge.mockRestore();
+  });
+
+  it("stops a timed out local stdio tool and its descendants when run in a scope", async (ctx) => {
+    const live = await prepareLiveIsolation();
+    if (live.skip) {
+      live.cleanup();
+      ctx.skip(`skipped, ${live.skip}`);
+    }
+    const registryDir = await mkdtemp(join(tmpdir(), "tg-iso-"));
+    const configured = configureTestIsolation({ registryDir, helperPath: live.helper, slice: live.slice });
+    const marker = `303.${randomInt(100000, 999999)}`;
+    const pgrep = () => spawnSync("pgrep", ["-f", `sleep ${marker}`], { encoding: "utf8" }).stdout.trim();
+    try {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const local = await createLocalStdioMcpTool(db, company.id, {
+        stdioScript: `
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    require("node:child_process").spawn("/bin/sleep", ["${marker}"], { stdio: "ignore" });
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "hang", version: "0.0.0" } } }) + "\\n");
+  }
+});
+`,
+      });
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const tool = (await gateway.listToolsForSession(session.token)).find((t) => t.connectionId === local.connection.id)!;
+      const call = gateway.executeTool({
+        sessionToken: session.token,
+        tool: tool.name,
+        parameters: { message: "hang" },
+        timeoutMs: 3000,
+      });
+      let sawDescendant = false;
+      const watcher = setInterval(() => { if (pgrep() !== "") sawDescendant = true; }, 50);
+      await call.then(
+        () => { throw new Error("Expected the stdio call to time out"); },
+        (error) => expectGatewayError(error, 504, "tool_timeout"),
+      );
+      clearInterval(watcher);
+      expect(sawDescendant).toBe(true);
+      const deadline = Date.now() + 8000;
+      while (pgrep() !== "" && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(pgrep()).toBe("");
+    } finally {
+      configured.health.stop();
+      resetAgentProcessIsolation();
+      live.cleanup();
+      await rm(registryDir, { recursive: true, force: true });
+    }
   });
 
   it("fails closed for hosted public local stdio unless a trusted runtime host is configured", async () => {

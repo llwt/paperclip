@@ -1,16 +1,15 @@
-import { execFile } from "node:child_process";
+import { execFileAuxiliary } from "@paperclipai/adapter-utils/scoped-process";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { promisify } from "node:util";
 import { parse as parseEnvContents } from "dotenv";
 import { expandHomePrefix } from "../home-paths.js";
 import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
 
-const execFileAsync = promisify(execFile);
+const execFileAsync = execFileAuxiliary;
 const INSTANCE_ID_RE = /^[A-Za-z0-9_-]+$/;
 const POSTGRES_STOP_TIMEOUT_MS = 10_000;
 export const WORKTREE_INSTANCE_ROOT_METADATA_KEY = "worktreeInstanceRoot";

@@ -1,4 +1,5 @@
-import { execFile, spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { execFileScoped, spawnScoped, type ScopedProcess } from "@paperclipai/adapter-utils/scoped-process";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import fs from "node:fs/promises";
 import net from "node:net";
@@ -228,6 +229,8 @@ export interface RuntimeServiceRef {
 interface RuntimeServiceRecord extends RuntimeServiceRef {
   db?: Db;
   child: ChildProcess | null;
+  /** Scope of the service process; ended only when the service is stopped. */
+  scopedProcess?: ScopedProcess | null;
   leaseRunIds: Set<string>;
   idleTimer: ReturnType<typeof globalThis.setTimeout> | null;
   envFingerprint: string;
@@ -887,11 +890,17 @@ async function executeProcess(input: {
     stderr: ProcessOutputAccumulator;
     code: number | null;
   }>((resolve, reject) => {
-    const child = spawn(input.command, input.args, {
-      cwd: input.cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: input.env ?? process.env,
+    const scoped = spawnScoped({
+      command: input.command,
+      args: input.args,
+      options: {
+        cwd: input.cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: input.env ?? process.env,
+      },
+      owner: { kind: "auxiliary" },
     });
+    const child = scoped.child;
     const stdout = createProcessOutputCapture(input.maxStdoutBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
     const stderr = createProcessOutputCapture(input.maxStderrBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES);
     child.stdout?.on("data", (chunk) => {
@@ -901,7 +910,7 @@ async function executeProcess(input: {
       stderr.append(String(chunk));
     });
     child.on("error", reject);
-    child.on("close", (code) => resolve({ stdout, stderr, code }));
+    child.on("close", (code) => void scoped.settled.then(() => resolve({ stdout, stderr, code })));
   });
   const stdout = proc.stdout.finish();
   const stderr = proc.stderr.finish();
@@ -2759,12 +2768,10 @@ async function readAdvertisedDefaultBranch(repoRoot: string, resolveGitAuth?: Gi
   try {
     const remoteUrl = await runGit(["remote", "get-url", "origin"], repoRoot);
     const auth = resolveGitAuth ? await resolveGitAuth(remoteUrl) : null;
-    const output = await new Promise<string>((resolve, reject) => {
-      execFile("git", [...(auth?.configArgs ?? []), "ls-remote", "--symref", "origin", "HEAD"], {
-        cwd: repoRoot, timeout: 10_000, maxBuffer: 64 * 1024,
-        env: { ...process.env, ...auth?.env, GIT_TERMINAL_PROMPT: "0" },
-      }, (error, stdout) => error ? reject(error) : resolve(stdout));
-    });
+    const output = String((await execFileScoped("git", [...(auth?.configArgs ?? []), "ls-remote", "--symref", "origin", "HEAD"], {
+      cwd: repoRoot, timeout: 10_000, maxBuffer: 64 * 1024,
+      env: { ...process.env, ...auth?.env, GIT_TERMINAL_PROMPT: "0" },
+    }, { kind: "auxiliary" })).stdout);
     return /^ref: refs\/heads\/(.+)\tHEAD$/m.exec(output)?.[1] ?? null;
   } catch {
     return null;
@@ -6539,19 +6546,31 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
   const shell = resolveShell();
   const serviceLog = await openLocalServiceLogFile(serviceKey);
   let child: ChildProcess;
+  let scopedService: ScopedProcess;
   try {
-    child = spawn(shell, ["-lc", command], {
-      cwd: serviceCwd,
-      env,
-      detached: process.platform !== "win32",
-      // The service receives duplicate append-only file descriptors. Closing
-      // Paperclip (or this parent handle below) cannot strand a request logger
-      // on an orphaned socketpair during startup reconciliation.
-      stdio: ["ignore", serviceLog.handle.fd, serviceLog.handle.fd],
+    scopedService = spawnScoped({
+      command: shell,
+      args: ["-lc", command],
+      options: {
+        cwd: serviceCwd,
+        env,
+        detached: process.platform !== "win32",
+        // The service receives duplicate append-only file descriptors. Closing
+        // Paperclip (or this parent handle below) cannot strand a request logger
+        // on an orphaned socketpair during startup reconciliation.
+        stdio: ["ignore", serviceLog.handle.fd, serviceLog.handle.fd],
+      },
+      owner: { kind: "managed_service", id: record.id, companyId: record.companyId },
+      // The scope ends only when the service is stopped, matching today's keep-running
+      // policy. A service that exits on its own is dropped from the registry, so its scope
+      // is not ended here; startup reconciliation (SX-2305 step 5) picks it up.
+      reapOnExit: false,
     });
+    child = scopedService.child;
   } finally {
     await serviceLog.handle.close();
   }
+  record.scopedProcess = scopedService;
   record.child = child;
   record.providerRef = child.pid ? String(child.pid) : null;
   record.processGroupId = child.pid ?? null;
@@ -6792,6 +6811,7 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
         port,
       });
     }
+    await scopedService.terminateScope().catch(() => undefined);
     await cleanupRecordExposure(record, { preserveFailure: true });
     record.status = "stopped";
     record.healthStatus = "unhealthy";
@@ -7044,6 +7064,7 @@ async function stopRuntimeService(serviceId: string) {
       });
     }
   }
+  await record.scopedProcess?.terminateScope().catch(() => undefined);
   record.status = "stopped";
   record.healthStatus = "unknown";
   record.lastUsedAt = new Date().toISOString();

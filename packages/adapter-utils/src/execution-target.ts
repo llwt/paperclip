@@ -1,6 +1,5 @@
 import fs from "node:fs/promises";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { execFileAuxiliary } from "./scoped-process.js";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -1716,7 +1715,7 @@ printf '\0PAPERCLIP_GIT_CONTEXT_END\0'
     discovered.PAPERCLIP_GIT_METADATA_ROOTS = JSON.stringify([...new Set(roots)]);
     discovered.PAPERCLIP_RUNNER_NETWORK_ROOTS = JSON.stringify([...new Set(networkRoots)]);
   } else {
-    const result = await promisify(execFile)(process.execPath, args, { cwd: input.cwd, timeout: 15_000, maxBuffer: 1024 * 1024 });
+    const result = await execFileAuxiliary(process.execPath, args, { cwd: input.cwd, timeout: 15_000, maxBuffer: 1024 * 1024 });
     try { discovered = JSON.parse(result.stdout.split("\0")[1] ?? ""); }
     catch { throw new Error("Could not read execution-target Git context"); }
   }

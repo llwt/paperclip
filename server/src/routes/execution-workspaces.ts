@@ -1,6 +1,6 @@
 import { canActorReadWorkspaceOperation } from "../services/heartbeat-run-privacy.js";
 import { canActorReadExecutionWorkspace, executionWorkspaceReadSqlCondition } from "../services/authorization.js";
-import { spawn } from "node:child_process";
+import { spawnScoped } from "@paperclipai/adapter-utils/scoped-process";
 import { accessSync, constants as fsConstants, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
@@ -700,7 +700,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
             const baseWorkspaceCwd = repairSeedSource.baseWorkspaceCwd;
 
             await reportRepairPhase("target_backup", "started");
-            const child = spawn(process.execPath, [
+            const scopedRepair = spawnScoped({ command: process.execPath, args: [
               ...repairCliArgs,
               "worktree",
               "reseed",
@@ -712,7 +712,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
               "full",
               "--yes",
               "--backup-target",
-            ], {
+            ], options: {
               cwd: baseWorkspaceCwd,
               env: {
                 ...process.env,
@@ -721,7 +721,8 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
                 PAPERCLIP_PROJECT_WORKSPACE_ID: existing.projectWorkspaceId ?? "",
               },
               stdio: ["ignore", "pipe", "pipe"],
-            });
+            }, owner: { kind: "auxiliary", companyId: existing.companyId } });
+            const child = scopedRepair.child;
             child.stdout?.on("data", (chunk: Buffer) => {
               void onLog("stdout", chunk.toString("utf8"));
             });
@@ -732,8 +733,8 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
             let repairCommandForceTimeout: NodeJS.Timeout | null = null;
             const repairCommandTimeout = setTimeout(() => {
               repairCommandTimedOut = true;
-              child.kill("SIGTERM");
-              repairCommandForceTimeout = setTimeout(() => child.kill("SIGKILL"), 5_000);
+              scopedRepair.kill("SIGTERM", 5_000);
+              repairCommandForceTimeout = setTimeout(() => scopedRepair.kill("SIGKILL", 1), 5_000);
               repairCommandForceTimeout.unref?.();
             }, 20 * 60_000);
             repairCommandTimeout.unref?.();
@@ -761,7 +762,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
             manifestPoll.unref?.();
             const exitCode = await new Promise<number>((resolve, reject) => {
               child.once("error", reject);
-              child.once("exit", (code) => resolve(code ?? 1));
+              child.once("exit", (code) => void scopedRepair.settled.then(() => resolve(code ?? 1)));
             }).finally(() => {
               clearInterval(manifestPoll);
               clearTimeout(repairCommandTimeout);

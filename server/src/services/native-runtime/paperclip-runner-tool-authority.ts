@@ -334,7 +334,7 @@ export class PaperclipRunnerToolAuthority {
           if (["workspace_write", "workspace_run"].includes(call.tool) && current.issue.workMode !== "standard") throw forbidden("This work mode cannot change files or run commands");
         };
         await authorize();
-        const execute = () => executeWorkspaceTool(this.binding.workspaceRoot!, call.tool, input, authorize);
+        const execute = () => executeWorkspaceTool(this.binding.workspaceRoot!, call.tool, input, authorize, { runId: this.binding.runId, companyId: this.binding.companyId });
         return ["workspace_write", "workspace_run"].includes(call.tool) ? this.#bridgeMutation(call, execute) : settleRunnerBridgeRead(execute);
       }
       if (call.tool === "get_identity") {

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { execFile, spawn } from "node:child_process";
+import { execFileAuxiliary, spawnAuxiliary as spawn } from "./scoped-process.js";
 import { constants as fsConstants, createReadStream, createWriteStream, promises as fs } from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -198,26 +198,11 @@ async function execFileText(
     maxBuffer?: number;
   } = {},
 ): Promise<SshCommandResult> {
-  return await new Promise<SshCommandResult>((resolve, reject) => {
-    execFile(
-      file,
-      args,
-      {
-        timeout: options.timeout ?? 15_000,
-        maxBuffer: options.maxBuffer ?? 1024 * 128,
-      },
-      (error, stdout, stderr) => {
-        if (error) {
-          reject(Object.assign(error, { stdout: stdout ?? "", stderr: stderr ?? "" }));
-          return;
-        }
-        resolve({
-          stdout: stdout ?? "",
-          stderr: stderr ?? "",
-        });
-      },
-    );
+  const result = await execFileAuxiliary(file, args, {
+    timeout: options.timeout ?? 15_000,
+    maxBuffer: options.maxBuffer ?? 1024 * 128,
   });
+  return { stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
 async function spawnText(

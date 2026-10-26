@@ -51,6 +51,22 @@ vi.mock("node:child_process", async () => ({
   spawn: mockSpawn,
 }));
 
+// The route launches the reseed CLI through spawnScoped, which lives in the built adapter-utils
+// package and so never sees the node:child_process mock above. Stand in for it at its own seam.
+vi.mock("@paperclipai/adapter-utils/scoped-process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@paperclipai/adapter-utils/scoped-process")>()),
+  spawnScoped: (input: { command: string; args?: string[]; options?: unknown }) => {
+    const child = mockSpawn(input.command, input.args ?? [], input.options);
+    return {
+      child,
+      scope: null,
+      settled: Promise.resolve({ confirmed: true }),
+      kill: (signal?: NodeJS.Signals) => child.kill(signal),
+      terminateScope: async () => ({ outcome: "not_scoped" }),
+    };
+  },
+}));
+
 vi.mock("../telemetry.js", () => ({ getTelemetryClient: mockGetTelemetryClient }));
 
 vi.mock("../services/index.js", () => ({

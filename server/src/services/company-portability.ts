@@ -2,9 +2,8 @@ import { createAgentLifecycle } from "./agent-lifecycle.js";
 import { agentAppearanceSchema } from "@paperclipai/shared";
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
-import { execFile } from "node:child_process";
+import { execFileAuxiliary } from "@paperclipai/adapter-utils/scoped-process";
 import path from "node:path";
-import { promisify } from "node:util";
 import { and, eq, inArray } from "drizzle-orm";
 import {
   builtInManagedResources,
@@ -207,7 +206,7 @@ const DEFAULT_IMPORTED_LABEL_COLOR = "#6366f1";
 // each attachment entry carries the real content type.
 const PORTABLE_BLOB_CONTENT_TYPE = "application/octet-stream";
 const IMPORT_FORBIDDEN_ADAPTER_TYPES = new Set(["process", "http"]);
-const execFileAsync = promisify(execFile);
+const execFileAsync = execFileAuxiliary;
 let bundledSkillsCommitPromise: Promise<string | null> | null = null;
 
 function resolveImportMode(options?: ImportBehaviorOptions): ImportMode {

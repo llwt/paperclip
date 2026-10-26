@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
+import { execFileAuxiliary, execFileCallbackScoped } from "./scoped-process.js";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -103,27 +103,12 @@ export async function runLocalGit(
     env?: NodeJS.ProcessEnv;
   } = {},
 ): Promise<GitCommandResult> {
-  return await new Promise<GitCommandResult>((resolve, reject) => {
-    execFile(
-      "git",
-      ["-C", localDir, ...args],
-      {
-        timeout: options.timeout ?? 15_000,
-        maxBuffer: options.maxBuffer ?? 1024 * 128,
-        env: options.env ?? process.env,
-      },
-      (error, stdout, stderr) => {
-        if (error) {
-          reject(Object.assign(error, { stdout: stdout ?? "", stderr: stderr ?? "" }));
-          return;
-        }
-        resolve({
-          stdout: stdout ?? "",
-          stderr: stderr ?? "",
-        });
-      },
-    );
+  const result = await execFileAuxiliary("git", ["-C", localDir, ...args], {
+    timeout: options.timeout ?? 15_000,
+    maxBuffer: options.maxBuffer ?? 1024 * 128,
+    env: options.env ?? process.env,
   });
+  return { stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
 async function runExpensiveWorkspaceGit(
@@ -877,10 +862,10 @@ async function updateLocalGitHead(input: {
     let identityError: unknown;
     let prepared = false;
     let output = "";
-    const child = execFile("git", ["-C", input.localDir, "update-ref", "--stdin"], {
+    const child = execFileCallbackScoped("git", ["-C", input.localDir, "update-ref", "--stdin"], {
       timeout: 15_000,
       maxBuffer: 64 * 1024,
-    }, (error, stdout, stderr) => {
+    }, { kind: "auxiliary" }, (error, stdout, stderr) => {
       if (identityError) reject(identityError);
       else if (error) reject(Object.assign(error, { stdout, stderr }));
       else if (!stdout.includes("commit: ok\n")) reject(new Error("Git HEAD transaction did not commit."));

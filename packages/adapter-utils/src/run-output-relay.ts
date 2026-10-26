@@ -1,4 +1,5 @@
-import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
+import type { ChildProcess, StdioOptions } from "node:child_process";
+import { spawnScoped } from "./scoped-process.js";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
@@ -108,11 +109,18 @@ export async function spawnRunOutputRelay(input: {
     input.stdout ?? "ignore",
     input.stderr ?? "ignore",
   ];
-  const relay: ChildProcess = spawn(process.execPath, ["-e", RELAY_SCRIPT], {
-    detached: process.platform !== "win32",
-    env: { PAPERCLIP_RUN_OUTPUT_RELAY_DIR: input.dir },
-    stdio,
-  });
+  // The relay is its own scope owner: stopping or finishing the provider's
+  // scope never reaches it, so it keeps draining output to the end.
+  const relay: ChildProcess = spawnScoped({
+    command: process.execPath,
+    args: ["-e", RELAY_SCRIPT],
+    options: {
+      detached: process.platform !== "win32",
+      env: { PAPERCLIP_RUN_OUTPUT_RELAY_DIR: input.dir },
+      stdio,
+    },
+    owner: { kind: "relay" },
+  }).child;
   if (typeof relay.pid !== "number" || relay.pid <= 0) {
     const error = await new Promise<Error>((resolve) => {
       relay.once("error", resolve);

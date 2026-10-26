@@ -13,11 +13,10 @@
  * @module server/routes/adapters
  */
 
-import { execFile } from "node:child_process";
+import { execFileAuxiliary } from "@paperclipai/adapter-utils/scoped-process";
 import fs from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
 import { Router } from "express";
 import {
   listServerAdapters,
@@ -53,7 +52,7 @@ import { getHiddenSettings } from "../services/settings-visibility.js";
 import { assertBoardOrgAccess, assertInstanceAdmin } from "./authz.js";
 import { BUILTIN_ADAPTER_TYPES } from "../adapters/builtin-adapter-types.js";
 
-const execFileAsync = promisify(execFile);
+const execFileAsync = execFileAuxiliary;
 
 /**
  * Floor: on cloud-managed instances adapter code is bundled into the platform
