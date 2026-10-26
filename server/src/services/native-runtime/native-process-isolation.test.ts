@@ -12,12 +12,15 @@ import {
 } from "@paperclipai/process-launch";
 import { prepareSystemdTestEnv } from "@paperclipai/process-launch/systemd-test-env";
 import { configureAgentProcessIsolation, resetAgentProcessIsolation } from "@paperclipai/adapter-utils/server-utils";
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { ProcessCodexAppServerTransport } from "@paperclipai/paperclip-runner";
 import { createNativeLaunchRoots, type NativeLaunchRoot } from "./native-process-isolation.js";
 
 const roots: string[] = [];
+// Leftovers a test made, by validated PID: stopped also when an assertion fails.
+const owned: number[] = [];
 afterEach(async () => {
+  owned.splice(0).forEach(killOwned);
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -28,6 +31,35 @@ function alive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * The PID a fixture wrote, only when it names one other process. 0, negative
+ * numbers and 1 would signal a process group, every process or init.
+ */
+function ownedPid(text: string): number | undefined {
+  const trimmed = text.trim();
+  if (!/^[0-9]+$/.test(trimmed)) return undefined;
+  const pid = Number(trimmed);
+  return Number.isSafeInteger(pid) && pid > 1 && pid !== process.pid ? pid : undefined;
+}
+
+/** Waits for a fixture's PID file; fails, without a signal, if no valid PID comes. */
+async function waitForOwnedPid(file: string, attempts = 500): Promise<number> {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const pid = ownedPid(await readFile(file, "utf8").catch(() => ""));
+    if (pid !== undefined) {
+      owned.push(pid);
+      return pid;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`leftover PID file not written in time: ${file}`);
+}
+
+function killOwned(pid: number | undefined): void {
+  if (pid === undefined || ownedPid(String(pid)) !== pid) return;
+  if (alive(pid)) process.kill(pid, "SIGKILL");
 }
 
 const anyPolicy = (registryDir = join(tmpdir(), "unused-registry")) => createSystemdIsolationPolicy({
@@ -44,6 +76,51 @@ async function countedRoot(launcher: NativeLaunchRoot, counter: string) {
   await launcher.reaped(child);
   return (await readFile(counter, "utf8")).split("\n").filter(Boolean).length;
 }
+
+describe("owned leftover PIDs", () => {
+  // Above any pid_max, so even an unmocked signal could reach no process.
+  const validPid = 4_194_304;
+
+  it("accepts only a PID that names one other process", () => {
+    expect(ownedPid(String(validPid))).toBe(validPid);
+    expect(ownedPid(` ${validPid}\n`)).toBe(validPid);
+    for (const text of ["", "0", "-5", "1", "abc", "12abc", "1e3", String(process.pid), "9007199254740993"]) {
+      expect(ownedPid(text)).toBeUndefined();
+    }
+  });
+
+  it("sends no signal for invalid PID file content, and only a probe then SIGKILL to a valid one", async () => {
+    const live = new Set<number>();
+    const kill = vi.spyOn(process, "kill").mockImplementation((pid: number) => {
+      if (!live.has(pid)) throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+      return true;
+    });
+    try {
+      for (const text of ["", "0", "-5", "1", "abc", String(process.pid)]) killOwned(ownedPid(text));
+      expect(kill).not.toHaveBeenCalled();
+
+      killOwned(ownedPid(String(validPid)));
+      expect(kill.mock.calls).toEqual([[validPid, 0]]);
+      kill.mockClear();
+      live.add(validPid);
+      killOwned(ownedPid(String(validPid)));
+      expect(kill.mock.calls).toEqual([[validPid, 0], [validPid, "SIGKILL"]]);
+
+      // A wait that never sees a valid PID fails and signals nothing.
+      kill.mockClear();
+      const root = await mkdtemp(join(tmpdir(), "paperclip-native-scope-pid-"));
+      roots.push(root);
+      for (const text of ["", "0", "-5", "1", "abc", String(process.pid)]) {
+        await writeFile(join(root, "leftover"), text);
+        await expect(waitForOwnedPid(join(root, "leftover"), 2)).rejects.toThrow("leftover PID file not written in time");
+      }
+      expect(owned).toEqual([]);
+      expect(kill).not.toHaveBeenCalled();
+    } finally {
+      kill.mockRestore();
+    }
+  });
+});
 
 describe("createNativeLaunchRoots", () => {
   it("gives no launcher when isolation is absent or off", () => {
@@ -133,7 +210,7 @@ describe.skipIf(systemd.skipReason !== null)(
       const child = launcher.spawn(process.execPath, [script], { detached: true, stdio: "ignore" });
       await new Promise((resolve) => child.once("exit", resolve));
       const exitedAt = Date.now();
-      const leftover = Number(await readFile(leftoverFile, "utf8"));
+      const leftover = await waitForOwnedPid(leftoverFile);
       expect(alive(leftover)).toBe(true);
       // The completion boundary: once reaped, nothing the root left is alive.
       expect(await launcher.reaped(child)).toEqual({ confirmed: true });
@@ -177,11 +254,7 @@ describe.skipIf(systemd.skipReason !== null)(
         processGroup: true,
         processIsolation: launchRoots.root("warm_provider", "provider-scope-test"),
       });
-      let leftover = 0;
-      for (let attempt = 0; attempt < 500 && leftover === 0; attempt += 1) {
-        leftover = Number(await readFile(leftoverFile, "utf8").catch(() => "0"));
-        if (leftover === 0) await new Promise((resolve) => setTimeout(resolve, 10));
-      }
+      const leftover = await waitForOwnedPid(leftoverFile);
       expect(alive(leftover)).toBe(true);
       // The collection boundary: when close resolves, nothing the provider
       // left can still write its files.
@@ -256,7 +329,12 @@ describe.skipIf(systemd.skipReason !== null)(
         `spawn(process.execPath, ["-e", ${JSON.stringify(leftoverSource)}], { detached: true, env: {}, stdio: "ignore" }).unref();`,
         "setInterval(() => {}, 1000);",
       ].join("\n"));
-      const launchRoots = createNativeLaunchRoots({ companyId: "company-1", runtime: { policy, health: null } });
+      const logs: string[] = [];
+      const launchRoots = createNativeLaunchRoots({
+        companyId: "company-1",
+        runtime: { policy, health: null },
+        onLog: async (_stream, line) => { logs.push(line); },
+      });
       const launcher = launchRoots.root("warm_provider", "provider-missing-test")!;
       let provider: ChildProcess | undefined;
       const transport = new ProcessCodexAppServerTransport({
@@ -269,27 +347,21 @@ describe.skipIf(systemd.skipReason !== null)(
           reaped: (child) => launcher.reaped(child),
         },
       });
-      let leftover = 0;
-      for (let attempt = 0; attempt < 500 && leftover === 0; attempt += 1) {
-        leftover = Number(await readFile(leftoverFile, "utf8").catch(() => "0"));
-        if (leftover === 0) await new Promise((resolve) => setTimeout(resolve, 10));
-      }
+      const leftover = await waitForOwnedPid(leftoverFile);
       expect(alive(leftover)).toBe(true);
       // Only this test's scratch record is removed: the cleanup can no longer
       // check the scope, so it must not report it empty.
       const refs = listScopeRecordRefs(registryDir, scopeUnitNamespace("nativescopetest"));
       expect(refs).toHaveLength(1);
       await rm(join(registryDir, `${refs[0]!.unit}.json`));
-      try {
-        await expect(transport.close()).rejects.toMatchObject({ name: "LaunchRootCleanupUnconfirmedError", reason: "missing_record" });
-        expect(alive(leftover)).toBe(true);
-        expect(await launchRoots.settle()).toMatchObject({ cleanupUnconfirmed: "missing_record" });
-        expect(await launcher.reaped(provider!)).toEqual({ confirmed: false, reason: "missing_record" });
-        await expect(transport.close()).rejects.toMatchObject({ reason: "missing_record" });
-      } finally {
-        // The leftover this test made, by its recorded PID; its scope then empties.
-        if (alive(leftover)) process.kill(leftover, "SIGKILL");
-      }
+      // The leftover is stopped by afterEach, by its validated PID; its scope then empties.
+      await expect(transport.close()).rejects.toMatchObject({ name: "LaunchRootCleanupUnconfirmedError", reason: "missing_record" });
+      expect(alive(leftover)).toBe(true);
+      expect(await launchRoots.settle()).toMatchObject({ cleanupUnconfirmed: "missing_record" });
+      expect(await launcher.reaped(provider!)).toEqual({ confirmed: false, reason: "missing_record" });
+      await expect(transport.close()).rejects.toMatchObject({ reason: "missing_record" });
+      expect(await launchRoots.settle()).toMatchObject({ cleanupUnconfirmed: "missing_record" });
+      expect(logs.filter((line) => line.includes("cleanup was not confirmed (reason=missing_record)"))).toHaveLength(1);
     }, 30_000);
 
     it("runs the root once outside the slice when enrollment fails, and logs the degraded marker", async () => {
