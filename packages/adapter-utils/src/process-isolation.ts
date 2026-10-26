@@ -9,6 +9,7 @@ import {
   type IsolationHealth,
   type LaunchExit,
   type LaunchHandle,
+  type ProcessOwnerKind,
   type ScopeEnrollmentStatus,
   type ScopeRecordRef,
   type TerminateResult,
@@ -210,7 +211,10 @@ export interface RunProcessSpawn {
 }
 
 export interface SpawnRunProcessInput {
+  /** The opaque id of the owner; a run id unless `ownerKind` says otherwise. */
   runId: string;
+  /** Defaults to `run`. */
+  ownerKind?: ProcessOwnerKind;
   companyId: string | null | undefined;
   command: string;
   args: string[];
@@ -242,7 +246,7 @@ export function spawnRunProcess(input: SpawnRunProcessInput): RunProcessSpawn {
 
   const { child, launch } = spawnIsolated(
     { command: input.command, args: input.args, options: input.options },
-    { policy, owner: { kind: "run", id: input.runId, companyId } },
+    { policy, owner: { kind: input.ownerKind ?? "run", id: input.runId, companyId } },
   );
   const isolation = launch.isolation;
   if (isolation.state === "off") return { child, ownedScope: null, tracker: null };
