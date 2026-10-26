@@ -256,6 +256,143 @@ git merge --no-ff <tag>
 - Exception: merge a specific upstream `master` commit only when one upstream
   fix is needed early, and record the reason in the PR.
 
+## Agent process isolation
+
+Agent workloads can start inside their own transient systemd user scopes under
+a low-weight slice, so a runaway agent cannot starve the server, Postgres or
+the operator's shell of CPU. This is the SX-2305 change (plan SX-2306). This
+section is the operator reference for it: the setting, the environment
+overrides, the host setup, the rollback and the coverage gate. The page for
+deployers is `docs/deploy/agent-process-isolation.md`.
+
+The setting is `server.agentProcessIsolation` in the instance config file:
+
+```json
+{ "server": { "agentProcessIsolation": { "mode": "systemd", "slice": "app-agents.slice" } } }
+```
+
+- `mode` is `off` (the default) or `systemd`. In `off` mode nothing changes:
+  agent processes are started the way they always were.
+- `slice` defaults to `app-agents.slice`. It is validated only in `systemd`
+  mode, where an invalid name stops startup.
+- `PAPERCLIP_AGENT_PROCESS_ISOLATION` overrides `mode` and
+  `PAPERCLIP_AGENT_SYSTEMD_SLICE` overrides `slice`. An invalid mode value
+  stops startup in every mode.
+- If the helper (`paperclip-scope-exec`), `busctl` or the systemd user manager
+  is unavailable, the process is executed once in the original cgroup. The
+  server logs one warning per episode, and the run log gets a line starting
+  `[paperclip] agent process isolation degraded`. A degraded launch is never
+  retried and never starts twice.
+
+### Host setup
+
+CPU weights are relative among sibling cgroups; they do not reserve cores. The
+slice gets a low weight and the service a high one. `MemoryHigh` is left unset.
+Do not change `KillMode` on `paperclipai.service` as part of this: the trial
+under "Restarts end running agent runs" is separate and still open.
+
+1. `~/.config/systemd/user/app-agents.slice`:
+
+   ```ini
+   [Unit]
+   Description=Paperclip agent workloads
+
+   [Slice]
+   CPUWeight=20
+   ```
+
+2. `~/.config/systemd/user/paperclipai.service.d/50-agent-process-isolation.conf`:
+
+   ```ini
+   [Service]
+   CPUWeight=1000
+   Environment=PAPERCLIP_AGENT_PROCESS_ISOLATION=systemd
+   Environment=PAPERCLIP_AGENT_SYSTEMD_SLICE=app-agents.slice
+   ```
+
+3. Apply and check:
+
+   ```sh
+   systemd-analyze --user verify ~/.config/systemd/user/app-agents.slice
+   systemctl --user daemon-reload
+   systemctl --user start app-agents.slice
+   paperclipai service restart
+   systemctl --user show app-agents.slice -p CPUWeight
+   systemctl --user show paperclipai.service -p CPUWeight
+   systemd-cgls --user-unit app-agents.slice
+   ```
+
+   `paperclipai service restart` ends running agent runs (see "Restarts end
+   running agent runs"), so pick the moment. Agent processes that were already
+   running before the restart stay where they are and are out of scope.
+
+This change adds the code and documents the setup. The drop-ins above are not
+installed by it, and this change did not apply them to any host.
+
+### Rollback
+
+1. Stop starting new managed workloads and let running ones drain, or stop
+   them through the product.
+2. Set `PAPERCLIP_AGENT_PROCESS_ISOLATION=off` (or remove the drop-in line)
+   and restart through the approved path, `paperclipai service restart`.
+3. Check that `systemd-cgls --user-unit app-agents.slice` shows no scope owned
+   by this instance.
+4. Remove only `50-agent-process-isolation.conf` and `app-agents.slice`, run
+   `systemctl --user daemon-reload`, and restart once more.
+5. If the binary is rolled back as well (see "Rollback" above), do that after
+   step 3, so the new code has cleaned up its own scopes first.
+
+Do not remove other drop-ins, do not change `KillMode`, do not stop scopes this
+instance does not own, and do not restart Postgres separately.
+
+### Coverage gate
+
+`pnpm check:process-launches` (script `scripts/check-process-launch-coverage.mjs`)
+fails when a new OS-process launch is not classified in
+`scripts/process-launch-coverage/manifest.json`. It runs in `somnex-ci`
+(`typecheck_build`), and its tests (`pnpm test:process-launch-coverage`) run
+there too. It has no directory exemptions: every production file with a launch
+site needs a class, an owner and a reason, and the site counts per file are
+pinned, so a second launch added to a classified file also fails.
+
+What it checks:
+
+- Every Node production file under `server/src`, `cli/src` and `packages/*/src`,
+  by parsing it: aliased and namespace imports, promisified `execFile`,
+  `execFileSync`, `spawnSync`, `fork`, dynamic `import` and `require`,
+  `process.getBuiltinModule`, `execa`-style libraries and SDK launch hooks.
+- The generated launchers (`github-launcher.ts`, `local-process-sandbox.ts`,
+  `execution-target.ts`, `installation-integrity.ts`,
+  `native-distribution-integrity.ts` and `providers/grok/launcher.cjs`):
+  the embedded program text is parsed and pinned, and `detached: true`,
+  `setsid`, `systemd-run`, `unshare` and `nohup` fail the gate.
+- The patched acpx (`patches/acpx@*.patch` and the installed dist) and the
+  other patches that add a launch.
+- Rust `Command`, `exec` and `fork` in the runner and helper crates.
+- A matrix row for every registered adapter (`registry.ts`,
+  `BUILTIN_ADAPTER_TYPES`), every adapter package, every runner driver and
+  provider. A row is `shared-launch`, `launch-root`, `remote-only`, `tombstone`
+  or `none`, and names the test that proves it.
+- The documents and the CI step named in the manifest `docs` and `wiring` keys.
+
+Known exemptions are `control-plane-exempt` entries with a kind and a reason:
+database processes, service-manager notifications, the server's own restart
+path, fixed host lookups, operator CLI commands, one bounded host helper and
+developer tooling. The experimental smoke lab
+(`server/src/services/smoke-lab.ts`, setting `enableSmokeLab`, private
+deployments only) is exempt as `dev-support` because it runs no agent code.
+
+To add a launch: use `spawnScoped`, `execFileScoped`, `execFileAuxiliary`,
+`spawnAuxiliary` or `runChildProcess` from `@paperclipai/adapter-utils`, then
+run `pnpm check:process-launches --write` to list the new files, fill in the
+class, owner, reason and test, and run the gate again.
+
+External adapters are covered only if they use the shared launch contract: an
+adapter loaded from outside this repository that starts its provider with
+`child_process` directly stays in the server cgroup and can leave descendants
+behind. `pnpm check:process-launches --external <dir>` checks such a package.
+The contract is written down in `packages/adapters/AUTHORING.md`.
+
 ## CI gate
 
 `.github/workflows/somnex-ci.yml` runs on every pull request into `somnex-main` and on every push to `somnex-main` (each merge), so the exact SHA to install has its own run, on
@@ -270,8 +407,9 @@ collection minus the shards' dry-run selection; `--list` prints it. The
 test and runs its `install --repo llwt/paperclip --ref <sha> -y` with the node
 major of `.nvmrc`, `npm_config_ignore_scripts=true` and a scratch `HOME` and
 `PAPERCLIP_HOME`, then checks that the installed `paperclipai --version` runs and
-reports the CLI version (SX-1495). The `somnex-ci` check is green only when
-every lane passed.
+reports the CLI version (SX-1495). The `typecheck_build` job also runs the
+process-launch coverage gate (`pnpm check:process-launches`, see "Agent process
+isolation"). The `somnex-ci` check is green only when every lane passed.
 
 Until 2026-10-21 the mainline was named `nrwl-main` and the required check `nrwl-ci` (renamed on SX-1119 Step 3). Older PRs, tasks and install notes use those names.
 
