@@ -352,6 +352,7 @@ import {
   type IssueThreadInteractionResolverAudienceDecision,
   type IssueThreadInteractionResolverRestriction,
 } from "../services/issue-thread-interaction-resolution.js";
+import { claudeQuotaCardService } from "../services/claude-quota-card.js";
 import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
 import {
   crossIssueInfluenceLimitError,
@@ -16846,6 +16847,14 @@ export function issueRoutes(
           "payload.secretProposal is server-owned metadata and cannot be supplied when creating an interaction",
         );
       }
+      if (
+        req.body.kind === "request_checkbox_confirmation" &&
+        req.body.payload?.claudeQuotaSwitch !== undefined
+      ) {
+        throw unprocessable(
+          "payload.claudeQuotaSwitch is server-owned metadata and cannot be supplied when creating an interaction",
+        );
+      }
 
       // Plan-document confirmation targets are validated authoritatively inside
       // issueThreadInteractionService.create, which re-reads the plan document's
@@ -17041,15 +17050,46 @@ export function issueRoutes(
         throw unprocessable(
           "Remembered permission is only supported for tool reviews",
         );
+      let quotaSwitchOptions: Parameters<typeof interactionSvc.acceptInteraction>[4];
+      if (current.kind === "request_checkbox_confirmation" && current.payload.claudeQuotaSwitch) {
+        // Fork (SX-2923): the account switch is a board-user action. Agent
+        // callers never reach the handler, and each listed agent needs the
+        // caller's own agent-config permission. Decisions are read before the
+        // acceptance transaction so no authorization query runs under its locks.
+        if (req.actor.type !== "board" || !req.actor.userId || actor.actorType !== "user") {
+          throw forbidden("Only the addressed board user can switch Claude accounts");
+        }
+        const resolverUserId = req.actor.userId;
+        const allowedAgentIds = new Set<string>();
+        for (const entry of current.payload.claudeQuotaSwitch.agents) {
+          const decision = await access.decide({
+            actor: req.actor,
+            action: "agent_config:update",
+            resource: { type: "agent", companyId: issue.companyId, agentId: entry.agentId },
+          });
+          if (decision.allowed) allowedAgentIds.add(entry.agentId);
+        }
+        const quotaCards = claudeQuotaCardService(db);
+        quotaSwitchOptions = {
+          claudeQuotaSwitch: (tx, context) =>
+            quotaCards.applyAccountSwitch(tx, context, { userId: resolverUserId, allowedAgentIds }),
+        };
+      }
       const { interaction, createdIssues, continuationIssue } =
-        await interactionSvc.acceptInteraction(issue, interactionId, req.body, {
-          agentId: actor.agentId,
-          runId: actor.runId,
-          userId: actor.actorType === "user" ? actor.actorId : null,
-          resolverPolicyRestriction:
-            resolutionAuthorization.resolverPolicyRestriction,
-          suggestedTaskEffectsAuthorized,
-        });
+        await interactionSvc.acceptInteraction(
+          issue,
+          interactionId,
+          req.body,
+          {
+            agentId: actor.agentId,
+            runId: actor.runId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+            resolverPolicyRestriction:
+              resolutionAuthorization.resolverPolicyRestriction,
+            suggestedTaskEffectsAuthorized,
+          },
+          ...(quotaSwitchOptions ? [quotaSwitchOptions] : []),
+        );
       const toolAction =
         interaction.payload && typeof interaction.payload === "object"
           ? (
