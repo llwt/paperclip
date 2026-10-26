@@ -20,7 +20,8 @@ import { emitConnectionInvoked } from "./connector-telemetry.js";
 import { resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
 import { extractRemoteMcpPending } from "./remote-mcp-pending.js";
 import { logger } from "../middleware/logger.js";
-import { spawn } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawnScoped } from "@paperclipai/adapter-utils/scoped-process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   and,
@@ -5138,6 +5139,7 @@ export function createToolGatewayService(
     protocolMethod?: string;
     protocolParams?: Record<string, unknown>;
     timeoutMs: number;
+    session?: Pick<ToolGatewaySession, "runId" | "companyId">;
   }): Promise<unknown> {
     if (input.template.templateId === "paperclip.cognee-cloud") {
       if (input.protocolMethod === "resources/list") return { resources: [] };
@@ -5171,10 +5173,17 @@ export function createToolGatewayService(
         },
       );
     }
-    const child = spawn(input.template.command, input.template.args, {
-      env: input.env,
-      stdio: ["pipe", "pipe", "pipe"],
+    const scoped = spawnScoped({
+      command: input.template.command,
+      args: input.template.args,
+      options: { env: input.env, stdio: ["pipe", "pipe", "pipe"] },
+      owner: {
+        kind: input.session?.runId ? "run" : "auxiliary",
+        id: input.session?.runId ?? null,
+        companyId: input.session?.companyId ?? input.connection.companyId,
+      },
     });
+    const child = scoped.child as ChildProcessWithoutNullStreams;
     let stdout = "";
     let stderr = "";
     let nextId = 1;
@@ -5186,7 +5195,7 @@ export function createToolGatewayService(
       }
     >();
     const timer = setTimeout(() => {
-      child.kill("SIGTERM");
+      scoped.kill("SIGTERM");
       for (const { reject } of pending.values()) {
         reject(
           new ToolGatewayHttpError(
@@ -5327,8 +5336,9 @@ export function createToolGatewayService(
     } finally {
       clearTimeout(timer);
       child.stdin.end();
-      child.kill("SIGTERM");
+      scoped.kill("SIGTERM");
       await exitPromise.catch(() => undefined);
+      await scoped.settled;
     }
   }
 
@@ -5512,6 +5522,7 @@ export function createToolGatewayService(
           protocolMethod: input.method,
           protocolParams: input.params ?? {},
           timeoutMs: DEFAULT_TOOL_TIMEOUT_MS,
+          session: input.session,
         }),
     );
   }
@@ -6504,7 +6515,7 @@ export function createToolGatewayService(
       template,
       grant,
     );
-    const invoke = () => callLocalStdioMcp({ connection, entry, template, env, parameters,
+    const invoke = () => callLocalStdioMcp({ connection, entry, template, env, parameters, session,
       timeoutMs: useProviderDefaultTimeout && template.templateId === "paperclip.cognee-cloud" ? 60_000 : ms });
     // Cognee is a bundled HTTP client. Provider failures are tool failures, not
     // crashed local processes, and must never consume slots or restart budgets.
