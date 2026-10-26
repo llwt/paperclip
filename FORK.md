@@ -368,7 +368,7 @@ What it checks:
 - Every Node production file under `server/src`, `cli/src` and `packages/*/src`,
   by parsing it: aliased and namespace imports, promisified `execFile`,
   `execFileSync`, `spawnSync`, `fork`, dynamic `import` and `require` (also
-  through a `createRequire(...)` binding of any name), `process.getBuiltinModule`, `execa`-style libraries and SDK launch hooks.
+  through a `createRequire(...)` binding or assignment of any name), `process.getBuiltinModule`, `execa`-style libraries and SDK launch hooks.
 - The generated launchers (`github-launcher.ts`, `local-process-sandbox.ts`,
   `execution-target.ts`, `installation-integrity.ts`,
   `native-distribution-integrity.ts` and `providers/grok/launcher.cjs`):

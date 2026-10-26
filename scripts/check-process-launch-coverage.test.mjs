@@ -147,6 +147,11 @@ const BYPASSES = {
     code: "unclassified",
     file: "server/src/services/require-bypass2.ts",
   },
+  "createRequire set by assignment": {
+    overlay: { "server/src/services/require-bypass3.ts": `import { createRequire } from "node:module";\nlet r;\nr = createRequire(import.meta.url);\nexport const go = () => r("child_process").spawn("x");\n` },
+    code: "unclassified",
+    file: "server/src/services/require-bypass3.ts",
+  },
   "execFileSync in a new production file": {
     overlay: { "server/src/new-bypass.ts": `import { execFileSync } from "node:child_process";\nexport const go = () => execFileSync("sh");\n` },
     code: "unclassified",

@@ -508,7 +508,7 @@ export function scanSource(source, file) {
 
 // Names bound to a require function: const r = createRequire(import.meta.url),
 // import { createRequire as make } from "node:module" then make(...), and
-// aliases of those (const r2 = r).
+// aliases of those (const r2 = r), by declaration or by assignment (r = ...).
 function collectRequireAliases(records) {
   const factories = new Set(["createRequire"]);
   const aliases = new Set();
@@ -533,11 +533,19 @@ function collectRequireAliases(records) {
   while (changed) {
     changed = false;
     for (const { node } of records) {
-      if (node.type !== "VariableDeclarator" || !node.init || node.id.type !== "Identifier") continue;
-      if (aliases.has(node.id.name)) continue;
-      const init = unwrap(node.init);
+      let target = null;
+      let source = null;
+      if (node.type === "VariableDeclarator" && node.init && node.id.type === "Identifier") {
+        target = node.id.name;
+        source = node.init;
+      } else if (node.type === "AssignmentExpression" && node.operator === "=" && node.left.type === "Identifier") {
+        target = node.left.name;
+        source = node.right;
+      }
+      if (target === null || aliases.has(target)) continue;
+      const init = unwrap(source);
       if (isFactoryCall(init) || (init.type === "Identifier" && aliases.has(init.name))) {
-        aliases.add(node.id.name);
+        aliases.add(target);
         changed = true;
       }
     }
