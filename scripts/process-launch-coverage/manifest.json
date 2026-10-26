@@ -1,0 +1,1323 @@
+{
+  "version": 1,
+  "description": "Process-launch coverage manifest (SX-2476). Every OS-process launch in production code is listed here with how it stays in an agent scope, or why it may stay outside. Regenerate site counts with `pnpm check:process-launches --write`; classes and reasons are edited by hand.",
+  "classes": {
+    "launch-primitive": {
+      "requires": [
+        "owner",
+        "test"
+      ],
+      "summary": "Implements the shared launch contract; the only place a plain Node call may sit behind the setting-off branch."
+    },
+    "contained-root": {
+      "requires": [
+        "owner",
+        "test",
+        "containedBy"
+      ],
+      "summary": "Starts a root process and hands the launch to the shared primitive (or is given a scoped launch root)."
+    },
+    "contained-descendant": {
+      "requires": [
+        "owner",
+        "test",
+        "containedBy"
+      ],
+      "summary": "Runs only inside a process that is already in an agent scope, so it inherits the scope."
+    },
+    "control-plane-exempt": {
+      "requires": [
+        "owner",
+        "exemption"
+      ],
+      "summary": "Control-plane work that stays in the server cgroup by design. The exemption kind says why."
+    },
+    "test-support": {
+      "requires": [
+        "owner"
+      ],
+      "summary": "Reached only from tests, evals or mock cores; never from a production run."
+    }
+  },
+  "exemptions": {
+    "database-process": "Embedded Postgres, pg_dump and psql.",
+    "systemd-control": "Service manager notifications.",
+    "restart-orchestration": "The server's own restart path.",
+    "host-lookup": "Short fixed-argument lookups of host or process facts.",
+    "operator-cli": "Commands that run in the operator's own shell or browser.",
+    "bounded-host-helper": "A fixed host helper with size and time limits.",
+    "dev-support": "Developer, eval or experimental-lab tooling that runs no agent code."
+  },
+  "files": {
+    "cli/src/client/board-auth.ts": {
+      "class": "control-plane-exempt",
+      "owner": "cli",
+      "exemption": "operator-cli",
+      "reason": "Opens the board sign-in URL in the operator's browser. It runs in the operator's own shell, outside the server.",
+      "sites": {
+        "openUrl|node-builtin:spawn:call": 1
+      }
+    },
+    "cli/src/commands/channels.ts": {
+      "class": "control-plane-exempt",
+      "owner": "cli",
+      "exemption": "operator-cli",
+      "reason": "Runs operator-requested channel setup commands from the operator's shell. It runs in the operator's own shell, outside the server.",
+      "sites": {
+        "<module>|node-builtin:execFile:reference": 1,
+        "defaultRunCommand|node-builtin:execFile:call": 1
+      }
+    },
+    "cli/src/commands/git-workspace.ts": {
+      "class": "control-plane-exempt",
+      "owner": "cli",
+      "exemption": "operator-cli",
+      "reason": "Reads git facts for the operator's current directory. It runs in the operator's own shell, outside the server.",
+      "sites": {
+        "detectGitWorkspaceInfo|node-builtin:execFileSync:call": 4
+      }
+    },
+    "cli/src/commands/install.ts": {
+      "class": "control-plane-exempt",
+      "owner": "cli",
+      "exemption": "operator-cli",
+      "reason": "Runs the operator's install steps from their shell. It runs in the operator's own shell, outside the server.",
+      "sites": {
+        "<module>|node-builtin:execFile:reference": 1,
+        "runCommandWithDiagnostics|node-builtin:execFile:call": 1
+      }
+    },
+    "cli/src/commands/run.ts": {
+      "class": "control-plane-exempt",
+      "owner": "cli",
+      "exemption": "operator-cli",
+      "reason": "Builds workspace dependencies for the operator's dev run. It runs in the operator's own shell, outside the server.",
+      "sites": {
+        "ensureDevWorkspaceBuildDeps|node-builtin:spawnSync:call": 1
+      }
+    },
+    "cli/src/commands/runtime.ts": {
+      "class": "control-plane-exempt",
+      "owner": "cli",
+      "exemption": "operator-cli",
+      "reason": "Installs agent runtimes the operator asks for. It runs in the operator's own shell, outside the server.",
+      "sites": {
+        "setupPiRuntime|node-builtin:spawn:call": 1,
+        "setupCursorRuntime|node-builtin:spawn:call": 1
+      }
+    },
+    "cli/src/commands/update.ts": {
+      "class": "control-plane-exempt",
+      "owner": "cli",
+      "exemption": "operator-cli",
+      "reason": "Runs the operator's package manager to update the install. It runs in the operator's own shell, outside the server.",
+      "sites": {
+        "<module>|node-builtin:execFile:reference": 1,
+        "updateCommand|node-builtin:execFile:reference": 1
+      }
+    },
+    "cli/src/commands/worktree.ts": {
+      "class": "control-plane-exempt",
+      "owner": "cli",
+      "exemption": "operator-cli",
+      "reason": "Runs git and package-manager steps for worktree commands. It runs in the operator's own shell, outside the server.",
+      "sites": {
+        "localBranchExists|node-builtin:execFileSync:call": 1,
+        "detectGitBranchName|node-builtin:execFileSync:call": 1,
+        "validateGitBranchName|node-builtin:execFileSync:call": 1,
+        "ensureRepairTargetWorktree|node-builtin:execFileSync:call": 1,
+        "worktreeMakeCommand|node-builtin:execFileSync:call": 2,
+        "installDependenciesBestEffort|node-builtin:execFileSync:call": 1,
+        "parseGitWorktreeList|node-builtin:execFileSync:call": 1,
+        "branchHasUniqueCommits|node-builtin:execFileSync:call": 1,
+        "branchExistsOnAnyRemote|node-builtin:execFileSync:call": 1,
+        "worktreePathHasUncommittedChanges|node-builtin:execFileSync:call": 1,
+        "worktreeCleanupCommand|node-builtin:execFileSync:call": 4
+      }
+    },
+    "cli/src/config/server-bind.ts": {
+      "class": "control-plane-exempt",
+      "owner": "cli",
+      "exemption": "operator-cli",
+      "reason": "Asks tailscale for the host address when configuring the bind. It runs in the operator's own shell, outside the server.",
+      "sites": {
+        "detectTailnetBindHost|node-builtin:execFileSync:call": 1
+      }
+    },
+    "cli/src/services/service-manager.ts": {
+      "class": "control-plane-exempt",
+      "owner": "cli",
+      "exemption": "operator-cli",
+      "reason": "Runs systemctl and launchctl for the operator's service commands. It runs in the operator's own shell, outside the server.",
+      "sites": {
+        "<module>|node-builtin:execFile:reference": 1,
+        "defaultCommandRunner|node-builtin:execFile:call": 2
+      }
+    },
+    "packages/adapter-utils/src/acpx-engine/execute.ts": {
+      "class": "contained-root",
+      "owner": "process-isolation",
+      "test": "packages/adapter-utils/src/acpx-engine/agent-process-scope.test.ts",
+      "containedBy": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "reason": "The patched acpx spawnAgent hook starts the ACP agent through the shared scoped spawn; the gemini version probe uses execFileAuxiliary.",
+      "sites": {
+        "<module>|sdk-launch:import:acpx/runtime:import": 1,
+        "buildRuntime|sdk-launch:acpx/runtime#createAgentRegistry:call": 1,
+        "describeErrorDiagnostics|sdk-launch:acpx/runtime#isAcpRuntimeError:call": 1,
+        "createAcpxEngineExecutor|sdk-launch:acpx/runtime#createAcpRuntime:reference": 1,
+        "startup|sdk-launch:acpx/runtime#createRuntimeStore:call": 1,
+        "startup|sdk-hook:spawnAgent:reference": 1
+      }
+    },
+    "packages/adapter-utils/src/execution-target.ts": {
+      "class": "contained-descendant",
+      "owner": "process-isolation",
+      "containedBy": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "test": "packages/adapter-utils/src/execution-target.test.ts",
+      "reason": "Generated programs run on the remote target; host-side launches go through runChildProcess.",
+      "sites": {
+        "prepareGitHubExecutionEnvironment|embedded-script:child_process:reference": 1,
+        "getProcessSessionRemoteStreamSource|embedded-script:child_process:reference": 1,
+        "getProcessSessionRemoteEventFileSource|embedded-script:child_process:reference": 1
+      }
+    },
+    "packages/adapter-utils/src/github-launcher.ts": {
+      "class": "contained-descendant",
+      "owner": "process-isolation",
+      "containedBy": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "test": "packages/adapter-utils/src/github-launcher.test.ts",
+      "reason": "Generated launcher text: runs as a child of an already scoped provider root and spawns plain, so descendants inherit the scope.",
+      "sites": {
+        "githubLauncherSource|embedded-script:child_process:reference": 1
+      }
+    },
+    "packages/adapter-utils/src/local-process-sandbox.ts": {
+      "class": "contained-descendant",
+      "owner": "process-isolation",
+      "containedBy": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "test": "packages/adapter-utils/src/local-process-sandbox.test.ts",
+      "reason": "Generated network proxy bridge: runs inside the sandboxed, already scoped command and spawns plain.",
+      "sites": {
+        "createNetworkProxyBridge|embedded-script:child_process:reference": 1
+      }
+    },
+    "packages/adapter-utils/src/process-isolation.ts": {
+      "class": "launch-primitive",
+      "owner": "process-isolation",
+      "test": "packages/adapter-utils/src/process-isolation.test.ts",
+      "reason": "Policy-aware spawn used by the scoped wrappers; the plain branch is the setting-off path.",
+      "sites": {
+        "plain|node-builtin:spawn:call": 1
+      }
+    },
+    "packages/adapter-utils/src/scoped-process.ts": {
+      "class": "launch-primitive",
+      "owner": "process-isolation",
+      "test": "packages/adapter-utils/src/scoped-process.test.ts",
+      "reason": "Shared spawn, execFile and spawnSync wrappers: each launch is handed to the scope helper when the instance setting is on, and is a plain Node call only when it is off.",
+      "sites": {
+        "spawnScoped|node-builtin:spawn:call": 1,
+        "execFileScoped|node-builtin:execFile:reference": 1,
+        "execFileCallbackScoped|node-builtin:execFile:call": 1,
+        "plain|node-builtin:spawnSync:call": 1,
+        "spawnSyncScoped|node-builtin:spawnSync:call": 1,
+        "execFileSyncAuxiliary|node-builtin:execFileSync:call": 1
+      }
+    },
+    "packages/adapter-utils/src/test-support/isolation-fixture.ts": {
+      "class": "test-support",
+      "owner": "process-isolation",
+      "reason": "Live systemd isolation fixture used by tests to read cgroups and stop slices.",
+      "sites": {
+        "prepareLiveIsolation|node-builtin:spawnSync:call": 2,
+        "sliceIsActive|node-builtin:spawnSync:call": 1,
+        "stopUserSlice|node-builtin:spawnSync:call": 1
+      }
+    },
+    "packages/adapter-utils/src/test-support/mcp-isolation-harness.ts": {
+      "class": "test-support",
+      "owner": "process-isolation",
+      "reason": "Test harness that runs a command to prove MCP launches stay in the scope.",
+      "sites": {
+        "runCommand|node-builtin:spawn:call": 1
+      }
+    },
+    "packages/db/src/backup-lib.ts": {
+      "class": "control-plane-exempt",
+      "owner": "db",
+      "exemption": "database-process",
+      "reason": "Runs pg_dump and psql against the Paperclip database; this is control-plane data work and must stay with the server.",
+      "sites": {
+        "runPgDumpBackup|node-builtin:spawn:call": 1,
+        "restoreWithPsql|node-builtin:spawn:call": 1
+      }
+    },
+    "packages/db/src/migration-runtime.ts": {
+      "class": "control-plane-exempt",
+      "owner": "db",
+      "exemption": "database-process",
+      "reason": "Loads and starts the embedded Postgres that the server depends on; it stays in the server cgroup by design.",
+      "sites": {
+        "loadEmbeddedPostgresCtor|sdk-launch:load:embedded-postgres:import": 1,
+        "loadEmbeddedPostgresCtor|sdk-launch:embedded-postgres#*:reference": 1
+      }
+    },
+    "packages/db/src/test-embedded-postgres.ts": {
+      "class": "test-support",
+      "owner": "db",
+      "reason": "Starts a throwaway embedded Postgres for tests; imported only by test files.",
+      "sites": {
+        "loadEmbeddedPostgresCtor|sdk-launch:load:embedded-postgres:import": 1,
+        "loadEmbeddedPostgresCtor|sdk-launch:embedded-postgres#*:reference": 1
+      }
+    },
+    "packages/paperclip-runner/src/control-plane/durable-prp-control-plane.ts": {
+      "class": "contained-root",
+      "owner": "paperclip-runner",
+      "test": "packages/paperclip-runner/src/control-plane/durable-prp-control-plane.test.ts",
+      "containedBy": [
+        "packages/paperclip-runner/src/process-isolation.ts"
+      ],
+      "reason": "spawnRunner is passed the scoped launch root, so each runner process starts inside its own agent scope.",
+      "sites": {
+        "spawnRunner|node-builtin:spawn:reference": 1
+      }
+    },
+    "packages/paperclip-runner/src/drivers/acpx/codex-credentials.ts": {
+      "class": "contained-descendant",
+      "owner": "paperclip-runner",
+      "containedBy": [
+        "packages/paperclip-runner/src/process-isolation.ts"
+      ],
+      "test": "packages/paperclip-runner/src/drivers/acpx/codex-credentials.test.ts",
+      "reason": "Directory sync helper runs in the runner process, which is itself in an agent scope.",
+      "sites": {
+        "runDirectorySyncHelper|node-builtin:spawn:call": 1
+      }
+    },
+    "packages/paperclip-runner/src/drivers/acpx/codex-runtime-adapter.ts": {
+      "class": "contained-root",
+      "owner": "paperclip-runner",
+      "test": "packages/paperclip-runner/src/drivers/acpx/codex-runtime-adapter.test.ts",
+      "containedBy": [
+        "packages/paperclip-runner/src/process-isolation.ts"
+      ],
+      "reason": "The patched acpx spawnAgent hook is set to the scoped launch root, so acpx never uses its own spawn fallback here.",
+      "sites": {
+        "<module>|sdk-launch:import:acpx/runtime:import": 1,
+        "openQualifiedAcpxRuntime|sdk-launch:acpx/runtime#createAgentRegistry:reference": 1,
+        "openQualifiedAcpxRuntime|sdk-launch:acpx/runtime#createRuntimeStore:reference": 1,
+        "openQualifiedAcpxRuntime|sdk-launch:acpx/runtime#createAcpRuntime:reference": 1,
+        "rememberHandshakeHandle|sdk-launch:acpx/runtime#encodeAcpxRuntimeHandleState:call": 1,
+        "openQualifiedAcpxRuntime|sdk-hook:spawnAgent:reference": 1
+      }
+    },
+    "packages/paperclip-runner/src/drivers/acpx/installation-integrity.ts": {
+      "class": "contained-root",
+      "owner": "paperclip-runner",
+      "test": "packages/paperclip-runner/src/drivers/acpx/installation-integrity-scope.test.ts",
+      "containedBy": [
+        "packages/paperclip-runner/src/process-isolation.ts"
+      ],
+      "reason": "The verified ACP guardian is started through the scoped launch root; the embedded guardian program only spawns descendants of that root.",
+      "sites": {
+        "<module>|embedded-script:child_process:reference": 1,
+        "spawn|node-builtin:spawn:reference": 1
+      }
+    },
+    "packages/paperclip-runner/src/drivers/acpx/native-distribution-integrity.ts": {
+      "class": "contained-descendant",
+      "owner": "paperclip-runner",
+      "containedBy": [
+        "packages/paperclip-runner/src/drivers/acpx/installation-integrity.ts"
+      ],
+      "test": "packages/paperclip-runner/src/drivers/acpx/native-distribution-integrity.test.ts",
+      "reason": "Generated native bootstrap runs inside the contained ACP guardian and spawns plain.",
+      "sites": {
+        "nativeBootstrap|embedded-script:child_process:reference": 1
+      }
+    },
+    "packages/paperclip-runner/src/drivers/codex/app-server-transport.ts": {
+      "class": "contained-root",
+      "owner": "paperclip-runner",
+      "test": "packages/paperclip-runner/src/drivers/codex/app-server-transport.test.ts",
+      "containedBy": [
+        "packages/paperclip-runner/src/process-isolation.ts"
+      ],
+      "reason": "The Codex app-server child is started through the scoped launch root when the driver runs directly.",
+      "sites": {
+        "ProcessCodexAppServerTransport.constructor|node-builtin:spawn:reference": 1
+      }
+    },
+    "packages/paperclip-runner/src/drivers/codex/codex-startup-trust.ts": {
+      "class": "contained-descendant",
+      "owner": "paperclip-runner",
+      "containedBy": [
+        "packages/paperclip-runner/src/process-isolation.ts"
+      ],
+      "test": "packages/paperclip-runner/src/drivers/codex/codex-startup-trust.test.ts",
+      "reason": "Git trust setup runs in the runner process, which is itself in an agent scope.",
+      "sites": {
+        "trustCodexStartupRoot|node-builtin:execFileSync:call": 2
+      }
+    },
+    "packages/paperclip-runner/src/drivers/opencode/opencode-server-driver.ts": {
+      "class": "contained-root",
+      "owner": "paperclip-runner",
+      "test": "packages/paperclip-runner/src/drivers/opencode/opencode-server-driver.test.ts",
+      "containedBy": [
+        "packages/paperclip-runner/src/process-isolation.ts"
+      ],
+      "reason": "The OpenCode server child is started through the scoped launch root and keeps its executable descriptor.",
+      "sites": {
+        "startRuntime|node-builtin:spawn:reference": 1
+      }
+    },
+    "packages/paperclip-runner/src/evals/runnerd-artifact.ts": {
+      "class": "control-plane-exempt",
+      "owner": "paperclip-runner",
+      "exemption": "dev-support",
+      "reason": "Offline artifact verification used by evals and builds; not reachable from a run.",
+      "sites": {
+        "<module>|node-builtin:execFile:reference": 1,
+        "readVerifiedBuildMetadata|node-builtin:execFile:call": 1
+      }
+    },
+    "packages/paperclip-runner/src/live/linux-process-start.ts": {
+      "class": "control-plane-exempt",
+      "owner": "paperclip-runner",
+      "exemption": "host-lookup",
+      "reason": "Reads a process start time with ps for identity checks; fixed arguments, no workload.",
+      "sites": {
+        "readLinuxProcessStartedAt|node-builtin:execFileSync:call": 1
+      }
+    },
+    "packages/paperclip-runner/src/live/runnerd-codex-transport.ts": {
+      "class": "control-plane-exempt",
+      "owner": "paperclip-runner",
+      "exemption": "host-lookup",
+      "reason": "Reads a process start time with ps for identity checks; fixed arguments, no workload.",
+      "sites": {
+        "readLocalProcessStartedAt|node-builtin:execFileSync:call": 2
+      }
+    },
+    "packages/paperclip-runner/src/mock-core/local-runner.ts": {
+      "class": "test-support",
+      "owner": "paperclip-runner",
+      "reason": "Mock core controller that starts a local fake runner for tests and demos only.",
+      "sites": {
+        "LocalRunnerController.constructor|node-builtin:spawn:call": 1
+      }
+    },
+    "packages/paperclip-runner/src/process-isolation.ts": {
+      "class": "launch-primitive",
+      "owner": "process-isolation",
+      "test": "packages/paperclip-runner/src/process-isolation.test.ts",
+      "reason": "Runner-side wrapper that starts a runner or provider root through the scope helper when the trusted policy says so.",
+      "sites": {
+        "spawnLaunchRoot|node-builtin:spawn:reference": 1
+      }
+    },
+    "packages/paperclip-runner/src/providers/grok/launcher.cjs": {
+      "class": "contained-descendant",
+      "owner": "paperclip-runner",
+      "containedBy": [
+        "packages/paperclip-runner/src/drivers/acpx/installation-integrity.ts"
+      ],
+      "test": "packages/paperclip-runner/src/drivers/acpx/installation-integrity.test.ts",
+      "reason": "Grok provider launcher: it replaces itself with the provider (execve) inside the contained guardian.",
+      "sites": {
+        "<module>|node-builtin:spawnSync:call": 1,
+        "<module>|process-builtin:process.execve:reference": 1
+      }
+    },
+    "packages/plugins/create-paperclip-plugin/src/index.ts": {
+      "class": "control-plane-exempt",
+      "owner": "plugins",
+      "exemption": "operator-cli",
+      "reason": "Scaffolding tool run by a developer on their own machine to pack a local package.",
+      "sites": {
+        "packLocalPackage|node-builtin:execFileSync:call": 2
+      }
+    },
+    "packages/plugins/examples/plugin-kitchen-sink-example/src/worker.ts": {
+      "class": "contained-descendant",
+      "owner": "plugins",
+      "containedBy": [
+        "server/src/services/plugin-worker-manager.ts"
+      ],
+      "test": "server/src/__tests__/plugin-worker-manager.test.ts",
+      "reason": "Example plugin worker code; runs inside the plugin worker scope.",
+      "sites": {
+        "runCuratedCommand|node-builtin:spawn:call": 1
+      }
+    },
+    "packages/plugins/paperclip-plugin-fake-sandbox/src/plugin.ts": {
+      "class": "contained-descendant",
+      "owner": "plugins",
+      "containedBy": [
+        "server/src/services/plugin-worker-manager.ts"
+      ],
+      "test": "packages/plugins/paperclip-plugin-fake-sandbox/src/plugin.test.ts",
+      "reason": "Plugin worker code for the fake sandbox provider; runs inside the plugin worker scope.",
+      "sites": {
+        "runCommand|node-builtin:spawn:call": 1
+      }
+    },
+    "packages/plugins/plugin-workspace-diff/src/workspace-diff.ts": {
+      "class": "contained-descendant",
+      "owner": "plugins",
+      "containedBy": [
+        "server/src/services/plugin-worker-manager.ts"
+      ],
+      "test": "packages/plugins/plugin-workspace-diff/tests/workspace-diff.spec.ts",
+      "reason": "Plugin worker code: runs git inside the plugin worker, which plugin-worker-manager starts in a scope.",
+      "sites": {
+        "<module>|node-builtin:execFile:reference": 1,
+        "runGit|node-builtin:execFile:call": 1,
+        "readPatchOutput|node-builtin:execFile:call": 1,
+        "resolveVerifiedGitRef|node-builtin:execFile:call": 1,
+        "resolveGitUpstreamRef|node-builtin:execFile:call": 1,
+        "resolveBaseRef|node-builtin:execFile:call": 1
+      }
+    },
+    "packages/plugins/sandbox-providers/daytona/src/file-sync.ts": {
+      "class": "contained-descendant",
+      "owner": "plugins",
+      "containedBy": [
+        "server/src/services/plugin-worker-manager.ts"
+      ],
+      "test": "packages/plugins/sandbox-providers/daytona/src/file-sync.test.ts",
+      "reason": "Plugin worker code: tar helpers run inside the plugin worker scope.",
+      "sites": {
+        "<module>|node-builtin:execFile:reference": 1,
+        "createHostTarball|node-builtin:execFile:call": 1,
+        "assertTarballEntriesConfined|node-builtin:spawn:call": 1,
+        "extractHostTarball|node-builtin:execFile:call": 1
+      }
+    },
+    "packages/plugins/sandbox-providers/exe-dev/src/plugin.ts": {
+      "class": "contained-descendant",
+      "owner": "plugins",
+      "containedBy": [
+        "server/src/services/plugin-worker-manager.ts"
+      ],
+      "test": "packages/plugins/sandbox-providers/exe-dev/src/plugin.test.ts",
+      "reason": "Plugin worker code: the ssh client runs inside the plugin worker scope.",
+      "sites": {
+        "runSshCommand|node-builtin:spawn:call": 1
+      }
+    },
+    "packages/plugins/sandbox-providers/kubernetes/src/file-sync.ts": {
+      "class": "contained-descendant",
+      "owner": "plugins",
+      "containedBy": [
+        "server/src/services/plugin-worker-manager.ts"
+      ],
+      "test": "packages/plugins/sandbox-providers/kubernetes/test/unit/file-sync.test.ts",
+      "reason": "Plugin worker code: tar helpers run inside the plugin worker scope.",
+      "sites": {
+        "<module>|node-builtin:execFile:reference": 1,
+        "createHostTarball|node-builtin:execFile:call": 1,
+        "assertTarballEntriesConfined|node-builtin:execFile:call": 1,
+        "extractHostTarball|node-builtin:execFile:call": 1
+      }
+    },
+    "packages/process-launch/src/capability.ts": {
+      "class": "launch-primitive",
+      "owner": "process-isolation",
+      "test": "packages/process-launch/src/capability.test.ts",
+      "reason": "Capability probe: runs busctl with a bounded timeout to ask the user manager whether scopes can be created; it launches no workload.",
+      "sites": {
+        "runBusctlProcess|node-builtin:execFile:call": 1
+      }
+    },
+    "packages/process-launch/src/launch.ts": {
+      "class": "launch-primitive",
+      "owner": "process-isolation",
+      "test": "packages/process-launch/src/launch.test.ts",
+      "reason": "The process-launch primitive: spawns the paperclip-scope-exec helper that joins a transient scope before it execs the target.",
+      "sites": {
+        "spawnIsolated|node-builtin:spawn:reference": 1
+      }
+    },
+    "packages/process-launch/src/systemd-test-env.ts": {
+      "class": "test-support",
+      "owner": "process-isolation",
+      "reason": "Builds and probes the helper for live systemd tests; imported only by test files.",
+      "sites": {
+        "buildHelper|node-builtin:execFileSync:call": 1,
+        "probe|node-builtin:spawnSync:call": 1,
+        "stop|node-builtin:execFileSync:call": 1
+      }
+    },
+    "packages/shared/src/worktree-port-registry.ts": {
+      "class": "control-plane-exempt",
+      "owner": "server-ops",
+      "exemption": "host-lookup",
+      "reason": "Reads ps to see whether a recorded port owner is still alive; fixed arguments, no workload.",
+      "sites": {
+        "readProcessIdentity|node-builtin:execFileSync:call": 2
+      }
+    },
+    "packages/tailscale-https-broker/src/tailscale-cli.ts": {
+      "class": "control-plane-exempt",
+      "owner": "server-ops",
+      "exemption": "host-lookup",
+      "reason": "Calls the host tailscale CLI with fixed arguments to read or set up tailnet exposure; no agent input reaches the command.",
+      "sites": {
+        "createTailscaleRunner|node-builtin:spawnSync:call": 1
+      }
+    },
+    "server/src/config.ts": {
+      "class": "control-plane-exempt",
+      "owner": "server-ops",
+      "exemption": "host-lookup",
+      "reason": "Asks the tailscale CLI for the host address at startup to choose a bind address; fixed arguments and a short timeout.",
+      "sites": {
+        "detectTailnetBindHost|node-builtin:execFileSync:call": 1
+      }
+    },
+    "server/src/index.ts": {
+      "class": "control-plane-exempt",
+      "owner": "server-ops",
+      "exemption": "operator-cli",
+      "reason": "Opens the board URL in the operator's browser through the open package on a local start; not a workload.",
+      "sites": {
+        "startServerWithDatabaseTeardown|sdk-launch:load:open:import": 1
+      }
+    },
+    "server/src/instrumentation.ts": {
+      "class": "control-plane-exempt",
+      "owner": "server-ops",
+      "exemption": "host-lookup",
+      "reason": "Reads the server's own git revision or branch for display; short fixed-argument lookup.",
+      "sites": {
+        "readGitCommit|node-builtin:execFileSync:call": 1
+      }
+    },
+    "server/src/server-info.ts": {
+      "class": "control-plane-exempt",
+      "owner": "server-ops",
+      "exemption": "host-lookup",
+      "reason": "Reads the server's own git revision or branch for display; short fixed-argument lookup.",
+      "sites": {
+        "defaultGitCommand|node-builtin:execFileSync:call": 1,
+        "defaultGitStatusCommand|node-builtin:execFileSync:call": 1,
+        "defaultGitBranchCommand|node-builtin:execFileSync:call": 1
+      }
+    },
+    "server/src/services/agent-directory-probe.ts": {
+      "class": "contained-root",
+      "owner": "server-runtime",
+      "test": "server/src/__tests__/agent-directory-probe.test.ts",
+      "containedBy": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "reason": "The local agent directory probe runs inside an auxiliary scope when the setting is on and is a plain execFile only when it is off.",
+      "sites": {
+        "observeLocalAgentDirectory|node-builtin:execFile:call": 1
+      }
+    },
+    "server/src/services/connectors/slack/evals/run-regressions.mjs": {
+      "class": "control-plane-exempt",
+      "owner": "connectors",
+      "exemption": "dev-support",
+      "reason": "Offline Slack regression script run by developers; not reachable from the server.",
+      "sites": {
+        "<module>|node-builtin:spawn:call": 1
+      }
+    },
+    "server/src/services/hot-restart.ts": {
+      "class": "control-plane-exempt",
+      "owner": "server-ops",
+      "exemption": "restart-orchestration",
+      "reason": "Runs the operator-approved restart command for the server itself; it must stay outside agent scopes so a restart can finish.",
+      "sites": {
+        "runProcessCommand|node-builtin:execFile:call": 1
+      }
+    },
+    "server/src/services/local-service-supervisor.ts": {
+      "class": "control-plane-exempt",
+      "owner": "server-ops",
+      "exemption": "host-lookup",
+      "reason": "Reads ps and lsof facts to identify a local service that the server already owns; it starts no workload.",
+      "sites": {
+        "<module>|node-builtin:execFile:reference": 1,
+        "isLikelyMatchingCommand|node-builtin:execFile:call": 1,
+        "readLocalServiceProcessGroupId|node-builtin:execFile:call": 1,
+        "isLocalServiceProcessOwnedBy|node-builtin:execFile:call": 1,
+        "readLocalServicePortOwner|node-builtin:execFile:call": 2,
+        "readLocalServiceProcessCwd|node-builtin:execFile:call": 1
+      }
+    },
+    "server/src/services/native-runtime/native-codex-runner.ts": {
+      "class": "contained-root",
+      "owner": "server-runtime",
+      "test": "server/src/services/native-runtime/native-codex-runner.test.ts",
+      "containedBy": [
+        "server/src/services/native-runtime/native-process-isolation.ts"
+      ],
+      "reason": "The native Codex runner is spawned from the launch root built by createNativeLaunchRoots.",
+      "sites": {
+        "executeNativeCodexRunner|node-builtin:spawn:call": 1
+      }
+    },
+    "server/src/services/native-runtime/native-process-isolation.ts": {
+      "class": "launch-primitive",
+      "owner": "process-isolation",
+      "test": "server/src/services/native-runtime/native-process-isolation.test.ts",
+      "reason": "Server-side wrapper that creates the launch roots handed to a native runner coordinator.",
+      "sites": {
+        "createNativeLaunchRoots|node-builtin:spawn:reference": 1
+      }
+    },
+    "server/src/services/native-runtime/native-runner-file-handoff.ts": {
+      "class": "control-plane-exempt",
+      "owner": "server-ops",
+      "exemption": "host-lookup",
+      "reason": "Looks up the path of a file the server opened; short bounded lookup that runs no workload code.",
+      "sites": {
+        "openedFilePath|node-builtin:execFile:call": 1
+      }
+    },
+    "server/src/services/photon/media.ts": {
+      "class": "control-plane-exempt",
+      "owner": "server-ops",
+      "exemption": "bounded-host-helper",
+      "reason": "Converts one HEIF image through a fixed host helper with a size and time limit; no agent-chosen command.",
+      "sites": {
+        "photonHeifPreview|node-builtin:spawn:call": 1
+      }
+    },
+    "server/src/services/plugin-worker-manager.ts": {
+      "class": "contained-root",
+      "owner": "server-runtime",
+      "test": "server/src/__tests__/plugin-worker-manager.test.ts",
+      "containedBy": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "reason": "A plugin worker is forked only when isolation is off; with the setting on it is started through spawnScoped with the IPC descriptor preserved.",
+      "sites": {
+        "spawnProcess|node-builtin:fork:call": 1
+      }
+    },
+    "server/src/services/runtime-exposure/tailscale-hostname.ts": {
+      "class": "control-plane-exempt",
+      "owner": "server-ops",
+      "exemption": "host-lookup",
+      "reason": "Calls the host tailscale CLI with fixed arguments to read or set up tailnet exposure; no agent input reaches the command.",
+      "sites": {
+        "<module>|node-builtin:execFile:reference": 1,
+        "resolveTailscaleDnsName|node-builtin:execFile:call": 1
+      }
+    },
+    "server/src/services/smoke-lab.ts": {
+      "class": "control-plane-exempt",
+      "owner": "server-ops",
+      "exemption": "dev-support",
+      "reason": "Experimental smoke lab (enableSmokeLab, private deployments only) starts its own fixture HTTP sidecar; it runs no agent or adapter code.",
+      "sites": {
+        "startHttpSidecar|node-builtin:spawn:call": 1
+      }
+    },
+    "server/src/services/systemd-notify.ts": {
+      "class": "control-plane-exempt",
+      "owner": "server-ops",
+      "exemption": "systemd-control",
+      "reason": "Sends sd_notify readiness and watchdog messages to the service manager; it is host control, not agent workload.",
+      "sites": {
+        "systemdNotify|node-builtin:execFile:call": 1
+      }
+    },
+    "server/src/version.ts": {
+      "class": "control-plane-exempt",
+      "owner": "server-ops",
+      "exemption": "host-lookup",
+      "reason": "Reads the server's own git revision or branch for display; short fixed-argument lookup.",
+      "sites": {
+        "defaultGitDescribeCommand|node-builtin:execFileSync:call": 1
+      }
+    }
+  },
+  "rust": {
+    "packages/paperclip-runner/runner/crates/runner-core/src/fake_harness.rs": {
+      "class": "test-support",
+      "owner": "paperclip-runner",
+      "reason": "Fake provider harness used by runner tests.",
+      "sites": {
+        "run_fake_harness|rust:Command::new:call": 1
+      }
+    },
+    "packages/paperclip-runner/runner/crates/runner-core/src/process_supervisor.rs": {
+      "class": "contained-root",
+      "owner": "paperclip-runner",
+      "containedBy": [
+        "packages/paperclip-runner/src/process-isolation.ts"
+      ],
+      "test": "packages/paperclip-runner/src/process-isolation.test.ts",
+      "reason": "The runner supervisor builds provider commands inside the runner process, which is itself in an agent scope; each provider keeps its own process group.",
+      "sites": {
+        "spawn_command|rust:Command::new:call": 1,
+        "signal_process_group|rust:Command::new:call": 1
+      }
+    },
+    "packages/process-launch/helper/src/enroll.rs": {
+      "class": "launch-primitive",
+      "owner": "process-isolation",
+      "test": "packages/process-launch/src/enrollment.test.ts",
+      "reason": "The helper's bounded busctl child that creates the transient scope; it runs before the target and is not the target.",
+      "sites": {
+        "spawn_busctl|rust:Command::new:call": 1,
+        "spawn_busctl|rust:CommandExt::pre_exec:call": 1
+      }
+    },
+    "packages/process-launch/helper/src/main.rs": {
+      "class": "launch-primitive",
+      "owner": "process-isolation",
+      "test": "packages/process-launch/src/helper.test.ts",
+      "reason": "The helper's single final exec of the target after the scope is joined or the fallback is chosen.",
+      "sites": {
+        "exec_path|rust:libc::exec:call": 2
+      }
+    }
+  },
+  "generatedLaunchers": {
+    "packages/adapter-utils/src/execution-target.ts": {
+      "class": "contained-descendant",
+      "owner": "process-isolation",
+      "containedBy": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "test": "packages/adapter-utils/src/execution-target.test.ts",
+      "reason": "Generated programs run on the remote target; host-side launches go through runChildProcess.",
+      "programs": [
+        {
+          "in": "prepareGitHubExecutionEnvironment",
+          "sites": {
+            "node-builtin:execFileSync:call": 2
+          }
+        },
+        {
+          "in": "getProcessSessionRemoteStreamSource",
+          "sites": {
+            "node-builtin:spawn:call": 1
+          }
+        },
+        {
+          "in": "getProcessSessionRemoteEventFileSource",
+          "sites": {
+            "node-builtin:spawn:call": 1
+          }
+        }
+      ]
+    },
+    "packages/adapter-utils/src/github-launcher.ts": {
+      "class": "contained-descendant",
+      "owner": "process-isolation",
+      "containedBy": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "test": "packages/adapter-utils/src/github-launcher.test.ts",
+      "reason": "Generated launcher text: runs as a child of an already scoped provider root and spawns plain, so descendants inherit the scope.",
+      "programs": [
+        {
+          "in": "githubLauncherSource",
+          "sites": {
+            "node-builtin:spawn:call": 1,
+            "node-builtin:spawnSync:call": 1
+          }
+        }
+      ]
+    },
+    "packages/adapter-utils/src/local-process-sandbox.ts": {
+      "class": "contained-descendant",
+      "owner": "process-isolation",
+      "containedBy": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "test": "packages/adapter-utils/src/local-process-sandbox.test.ts",
+      "reason": "Generated network proxy bridge: runs inside the sandboxed, already scoped command and spawns plain.",
+      "programs": [
+        {
+          "in": "createNetworkProxyBridge",
+          "sites": {
+            "node-builtin:spawn:call": 1
+          }
+        }
+      ]
+    },
+    "packages/paperclip-runner/src/drivers/acpx/installation-integrity.ts": {
+      "class": "contained-root",
+      "owner": "paperclip-runner",
+      "test": "packages/paperclip-runner/src/drivers/acpx/installation-integrity-scope.test.ts",
+      "containedBy": [
+        "packages/paperclip-runner/src/process-isolation.ts"
+      ],
+      "reason": "The verified ACP guardian is started through the scoped launch root; the embedded guardian program only spawns descendants of that root.",
+      "programs": [
+        {
+          "in": "<module>",
+          "sites": {
+            "node-builtin:spawn:call": 1
+          }
+        }
+      ]
+    },
+    "packages/paperclip-runner/src/drivers/acpx/native-distribution-integrity.ts": {
+      "class": "contained-descendant",
+      "owner": "paperclip-runner",
+      "containedBy": [
+        "packages/paperclip-runner/src/drivers/acpx/installation-integrity.ts"
+      ],
+      "test": "packages/paperclip-runner/src/drivers/acpx/native-distribution-integrity.test.ts",
+      "reason": "Generated native bootstrap runs inside the contained ACP guardian and spawns plain.",
+      "programs": [
+        {
+          "in": "nativeBootstrap",
+          "sites": {
+            "node-builtin:spawn:call": 1
+          }
+        }
+      ]
+    },
+    "packages/paperclip-runner/src/providers/grok/launcher.cjs": {
+      "class": "contained-descendant",
+      "owner": "paperclip-runner",
+      "containedBy": [
+        "packages/paperclip-runner/src/drivers/acpx/installation-integrity.ts"
+      ],
+      "test": "packages/paperclip-runner/src/drivers/acpx/installation-integrity.test.ts",
+      "reason": "Grok provider launcher: it replaces itself with the provider (execve) inside the contained guardian.",
+      "programs": [
+        {
+          "in": "<file>",
+          "sites": {
+            "node-builtin:spawnSync:call": 1,
+            "process-builtin:process.execve:reference": 1
+          }
+        }
+      ]
+    }
+  },
+  "patches": {
+    "patches/acpx@0.12.0.patch": {
+      "class": "contained-root",
+      "owner": "process-isolation",
+      "containedBy": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "test": "scripts/acpx-patch-packaging.test.mjs",
+      "reason": "Adds the spawnAgent hook that lets the host start the agent; the fallback spawn is used only when no hook is given, and both call sites pass the hook.",
+      "added": {
+        "child_process": 4,
+        "spawn": 3,
+        "spawnAgent-hook": 6
+      }
+    },
+    "patches/acpx@0.13.1.patch": {
+      "class": "contained-root",
+      "owner": "process-isolation",
+      "containedBy": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "test": "scripts/acpx-patch-packaging.test.mjs",
+      "reason": "Adds the spawnAgent hook that lets the host start the agent; the fallback spawn is used only when no hook is given.",
+      "added": {
+        "child_process": 2,
+        "spawn": 1,
+        "spawnAgent-hook": 6
+      }
+    },
+    "patches/pi-acp@0.0.33.patch": {
+      "class": "contained-descendant",
+      "owner": "process-isolation",
+      "containedBy": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "test": "scripts/acpx-patch-packaging.test.mjs",
+      "reason": "Spawns the pi child from inside the pi ACP provider, which is already in the agent scope.",
+      "added": {
+        "spawn": 1
+      }
+    }
+  },
+  "matrix": [
+    {
+      "id": "adapter:process",
+      "launch": "shared-launch",
+      "via": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "test": "packages/adapter-utils/src/server-utils.isolation.test.ts",
+      "reason": "The generic process adapter starts its command with runChildProcess, which spawns through the scope helper when the setting is on."
+    },
+    {
+      "id": "adapter:claude_local",
+      "launch": "shared-launch",
+      "via": [
+        "packages/adapter-utils/src/scoped-process.ts",
+        "packages/adapter-utils/src/acpx-engine/execute.ts"
+      ],
+      "test": "packages/adapter-utils/src/server-utils.isolation.test.ts",
+      "reason": "Starts its provider with runChildProcess, which spawns through the scope helper when the instance setting is on. Its ACP engine goes through the acpx spawnAgent hook."
+    },
+    {
+      "id": "adapter:codex_local",
+      "launch": "shared-launch",
+      "via": [
+        "packages/adapter-utils/src/scoped-process.ts",
+        "packages/adapter-utils/src/acpx-engine/execute.ts"
+      ],
+      "test": "packages/adapter-utils/src/server-utils.isolation.test.ts",
+      "reason": "Starts its provider with runChildProcess, which spawns through the scope helper when the instance setting is on. Its ACP engine goes through the acpx spawnAgent hook."
+    },
+    {
+      "id": "adapter:gemini_local",
+      "launch": "shared-launch",
+      "via": [
+        "packages/adapter-utils/src/scoped-process.ts",
+        "packages/adapter-utils/src/acpx-engine/execute.ts"
+      ],
+      "test": "packages/adapter-utils/src/server-utils.isolation.test.ts",
+      "reason": "Starts its provider with runChildProcess, which spawns through the scope helper when the instance setting is on. Its ACP engine goes through the acpx spawnAgent hook."
+    },
+    {
+      "id": "adapter:kimi_local",
+      "launch": "shared-launch",
+      "via": [
+        "packages/adapter-utils/src/acpx-engine/execute.ts"
+      ],
+      "test": "packages/adapter-utils/src/acpx-engine/agent-process-scope.test.ts",
+      "reason": "Runs only through the ACP engine, whose acpx spawnAgent hook uses the shared scoped spawn."
+    },
+    {
+      "id": "adapter:cursor",
+      "launch": "shared-launch",
+      "via": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "test": "packages/adapter-utils/src/server-utils.isolation.test.ts",
+      "reason": "Starts its provider with runChildProcess, which spawns through the scope helper when the instance setting is on."
+    },
+    {
+      "id": "adapter:opencode_local",
+      "launch": "shared-launch",
+      "via": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "test": "packages/adapter-utils/src/server-utils.isolation.test.ts",
+      "reason": "Starts its provider with runChildProcess, which spawns through the scope helper when the instance setting is on."
+    },
+    {
+      "id": "adapter:pi_local",
+      "launch": "shared-launch",
+      "via": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "test": "packages/adapter-utils/src/server-utils.isolation.test.ts",
+      "reason": "Starts its provider with runChildProcess, which spawns through the scope helper when the instance setting is on."
+    },
+    {
+      "id": "adapter:hermes_local",
+      "launch": "shared-launch",
+      "via": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "test": "packages/adapter-utils/src/server-utils.isolation.test.ts",
+      "reason": "Starts its provider with runChildProcess, which spawns through the scope helper when the instance setting is on."
+    },
+    {
+      "id": "adapter:grok_local",
+      "launch": "shared-launch",
+      "via": [
+        "packages/adapter-utils/src/execution-target.ts",
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "test": "packages/adapter-utils/src/server-utils.isolation.test.ts",
+      "reason": "Starts the grok CLI through runAdapterExecutionTargetProcess, which uses runChildProcess for a local target."
+    },
+    {
+      "id": "adapter:paperclip_runner",
+      "launch": "launch-root",
+      "via": [
+        "server/src/services/native-runtime/native-codex-runner.ts",
+        "server/src/services/native-runtime/native-process-isolation.ts"
+      ],
+      "test": "server/src/services/native-runtime/native-process-isolation.test.ts",
+      "reason": "The registry entry only reports that the coordinator is required; native runs start the runner through createNativeLaunchRoots."
+    },
+    {
+      "id": "adapter:http",
+      "launch": "remote-only",
+      "owns": [
+        "server/src/adapters/http/"
+      ],
+      "test": "server/src/adapters/registry.test.ts",
+      "reason": "Calls a remote URL and starts no local process."
+    },
+    {
+      "id": "adapter:cursor_cloud",
+      "launch": "remote-only",
+      "owns": [
+        "packages/adapters/cursor-cloud/"
+      ],
+      "test": "server/src/adapters/registry.test.ts",
+      "reason": "Talks to the Cursor cloud API and starts no local provider."
+    },
+    {
+      "id": "adapter:hermes_gateway",
+      "launch": "remote-only",
+      "owns": [
+        "packages/adapters/hermes-gateway/"
+      ],
+      "test": "server/src/adapters/registry.test.ts",
+      "reason": "Talks to a Hermes gateway over the network and starts no local provider."
+    },
+    {
+      "id": "adapter:openclaw_gateway",
+      "launch": "remote-only",
+      "owns": [
+        "packages/adapters/openclaw-gateway/"
+      ],
+      "test": "server/src/adapters/registry.test.ts",
+      "reason": "Talks to an OpenClaw gateway over the network and starts no local provider."
+    },
+    {
+      "id": "adapter:acpx_local",
+      "launch": "tombstone",
+      "owns": [
+        "packages/adapters/acpx-local/"
+      ],
+      "test": "server/src/adapters/registry.test.ts",
+      "reason": "Retired registry entry that only reports the retirement message; it is not a second launcher."
+    },
+    {
+      "id": "adapter-package:claude-local",
+      "launch": "shared-launch",
+      "via": [
+        "packages/adapter-utils/src/scoped-process.ts",
+        "packages/adapter-utils/src/acpx-engine/execute.ts"
+      ],
+      "test": "packages/adapter-utils/src/server-utils.isolation.test.ts",
+      "reason": "Starts its provider with runChildProcess, which spawns through the scope helper when the instance setting is on."
+    },
+    {
+      "id": "adapter-package:codex-local",
+      "launch": "shared-launch",
+      "via": [
+        "packages/adapter-utils/src/scoped-process.ts",
+        "packages/adapter-utils/src/acpx-engine/execute.ts"
+      ],
+      "test": "packages/adapter-utils/src/server-utils.isolation.test.ts",
+      "reason": "Starts its provider with runChildProcess, which spawns through the scope helper when the instance setting is on."
+    },
+    {
+      "id": "adapter-package:gemini-local",
+      "launch": "shared-launch",
+      "via": [
+        "packages/adapter-utils/src/scoped-process.ts",
+        "packages/adapter-utils/src/acpx-engine/execute.ts"
+      ],
+      "test": "packages/adapter-utils/src/server-utils.isolation.test.ts",
+      "reason": "Starts its provider with runChildProcess, which spawns through the scope helper when the instance setting is on."
+    },
+    {
+      "id": "adapter-package:kimi-local",
+      "launch": "shared-launch",
+      "via": [
+        "packages/adapter-utils/src/acpx-engine/execute.ts"
+      ],
+      "test": "packages/adapter-utils/src/acpx-engine/agent-process-scope.test.ts",
+      "reason": "Runs only through the ACP engine."
+    },
+    {
+      "id": "adapter-package:cursor-local",
+      "launch": "shared-launch",
+      "via": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "test": "packages/adapter-utils/src/server-utils.isolation.test.ts",
+      "reason": "Starts its provider with runChildProcess, which spawns through the scope helper when the instance setting is on."
+    },
+    {
+      "id": "adapter-package:opencode-local",
+      "launch": "shared-launch",
+      "via": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "test": "packages/adapter-utils/src/server-utils.isolation.test.ts",
+      "reason": "Starts its provider with runChildProcess, which spawns through the scope helper when the instance setting is on."
+    },
+    {
+      "id": "adapter-package:pi-local",
+      "launch": "shared-launch",
+      "via": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "test": "packages/adapter-utils/src/server-utils.isolation.test.ts",
+      "reason": "Starts its provider with runChildProcess, which spawns through the scope helper when the instance setting is on."
+    },
+    {
+      "id": "adapter-package:hermes",
+      "launch": "shared-launch",
+      "via": [
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "test": "packages/adapter-utils/src/server-utils.isolation.test.ts",
+      "reason": "Starts its provider with runChildProcess, which spawns through the scope helper when the instance setting is on."
+    },
+    {
+      "id": "adapter-package:grok-local",
+      "launch": "shared-launch",
+      "via": [
+        "packages/adapter-utils/src/execution-target.ts",
+        "packages/adapter-utils/src/scoped-process.ts"
+      ],
+      "test": "packages/adapter-utils/src/server-utils.isolation.test.ts",
+      "reason": "Uses runAdapterExecutionTargetProcess for a local target."
+    },
+    {
+      "id": "adapter-package:cursor-cloud",
+      "launch": "remote-only",
+      "owns": [
+        "packages/adapters/cursor-cloud/"
+      ],
+      "test": "server/src/adapters/registry.test.ts",
+      "reason": "Cursor cloud API client; no local provider."
+    },
+    {
+      "id": "adapter-package:hermes-gateway",
+      "launch": "remote-only",
+      "owns": [
+        "packages/adapters/hermes-gateway/"
+      ],
+      "test": "server/src/adapters/registry.test.ts",
+      "reason": "Hermes gateway client; no local provider."
+    },
+    {
+      "id": "adapter-package:openclaw-gateway",
+      "launch": "remote-only",
+      "owns": [
+        "packages/adapters/openclaw-gateway/"
+      ],
+      "test": "server/src/adapters/registry.test.ts",
+      "reason": "OpenClaw gateway client; no local provider."
+    },
+    {
+      "id": "runner-driver:acpx",
+      "launch": "launch-root",
+      "via": [
+        "packages/paperclip-runner/src/drivers/acpx/codex-runtime-adapter.ts",
+        "packages/paperclip-runner/src/drivers/acpx/installation-integrity.ts"
+      ],
+      "test": "packages/paperclip-runner/src/drivers/acpx/installation-integrity-scope.test.ts",
+      "reason": "The verified guardian is a scoped launch root and the acpx spawnAgent hook is set to it."
+    },
+    {
+      "id": "runner-driver:codex",
+      "launch": "launch-root",
+      "via": [
+        "packages/paperclip-runner/src/drivers/codex/app-server-transport.ts"
+      ],
+      "test": "packages/paperclip-runner/src/drivers/codex/app-server-transport.test.ts",
+      "reason": "The Codex app-server child starts through the scoped launch root."
+    },
+    {
+      "id": "runner-driver:opencode",
+      "launch": "launch-root",
+      "via": [
+        "packages/paperclip-runner/src/drivers/opencode/opencode-server-driver.ts"
+      ],
+      "test": "packages/paperclip-runner/src/drivers/opencode/opencode-server-driver.test.ts",
+      "reason": "The OpenCode server child starts through the scoped launch root."
+    },
+    {
+      "id": "runner-driver:dot",
+      "launch": "launch-root",
+      "via": [
+        "packages/paperclip-runner/src/control-plane/durable-prp-control-plane.ts"
+      ],
+      "test": "packages/paperclip-runner/src/control-plane/durable-prp-control-plane.test.ts",
+      "reason": "The Dot driver starts its runner with spawnRunner, which takes the scoped launch root."
+    },
+    {
+      "id": "runner-driver:claude-managed",
+      "launch": "remote-only",
+      "owns": [
+        "packages/paperclip-runner/src/drivers/claude-managed/"
+      ],
+      "test": "scripts/check-process-launch-coverage.test.mjs",
+      "reason": "Claude managed agents run on Anthropic infrastructure; the driver only prepares an environment and starts no local process."
+    },
+    {
+      "id": "runner-provider:grok",
+      "launch": "launch-root",
+      "via": [
+        "packages/paperclip-runner/src/providers/grok/launcher.cjs"
+      ],
+      "test": "packages/paperclip-runner/src/drivers/acpx/installation-integrity.test.ts",
+      "reason": "The generated grok launcher execs the provider inside the contained ACP guardian."
+    }
+  ],
+  "docs": [
+    {
+      "file": "FORK.md",
+      "mustContain": [
+        "PAPERCLIP_AGENT_PROCESS_ISOLATION",
+        "app-agents.slice",
+        "check:process-launches",
+        "External adapters are covered only if they use the shared launch contract"
+      ]
+    },
+    {
+      "file": "packages/adapters/AUTHORING.md",
+      "mustContain": [
+        "External adapters are covered only if they use the shared launch contract",
+        "runChildProcess",
+        "check:process-launches --external"
+      ]
+    },
+    {
+      "file": "docs/adapters/external-adapters.md",
+      "mustContain": [
+        "External adapters are covered only if they use the shared launch contract",
+        "runChildProcess"
+      ]
+    },
+    {
+      "file": "docs/deploy/agent-process-isolation.md",
+      "mustContain": [
+        "PAPERCLIP_AGENT_PROCESS_ISOLATION",
+        "PAPERCLIP_AGENT_SYSTEMD_SLICE",
+        "agentProcessIsolation",
+        "Rollback"
+      ]
+    },
+    {
+      "file": "docs/deploy/environment-variables.md",
+      "mustContain": [
+        "PAPERCLIP_AGENT_PROCESS_ISOLATION",
+        "PAPERCLIP_AGENT_SYSTEMD_SLICE"
+      ]
+    }
+  ],
+  "wiring": [
+    {
+      "file": ".github/workflows/somnex-ci.yml",
+      "mustContain": "pnpm check:process-launches"
+    },
+    {
+      "file": "package.json",
+      "mustContain": "\"check:process-launches\""
+    }
+  ]
+}

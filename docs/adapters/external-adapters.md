@@ -192,14 +192,12 @@ export async function execute(
     : "Continue your work.";
 
   // 4. Spawn process
-  const result = await runChildProcess(command, {
-    args: [prompt],
+  const result = await runChildProcess(ctx.runId, command, [prompt], {
     cwd,
     env,
-    timeout: timeoutSec * 1000,
-    graceMs: 10_000,
-    onStdout: (chunk) => onLog("stdout", chunk),
-    onStderr: (chunk) => onLog("stderr", chunk),
+    timeoutSec,
+    graceSec: 10,
+    onLog,
   });
 
   // 5. Return structured result
@@ -216,10 +214,21 @@ export async function execute(
 
 | Helper | Purpose |
 |--------|---------|
-| `runChildProcess(command, opts)` | Spawn a child process with timeout, grace period, and streaming callbacks |
+| `runChildProcess(runId, command, args, opts)` | Spawn a child process with timeout, grace period, and streaming callbacks. Starts it in an agent process scope when isolation is on |
 | `buildPaperclipEnv(agent)` | Inject `PAPERCLIP_*` environment variables |
 | `renderTemplate(template, data)` | `{{variable}}` substitution in prompt templates |
 | `asString(v)`, `asNumber(v)`, `asBoolean(v)` | Safe config value extraction |
+
+#### Process launch contract
+
+When the host enables [agent process isolation](/deploy/agent-process-isolation),
+each agent process tree runs in its own systemd user scope.
+External adapters are covered only if they use the shared launch contract, that is,
+if they start their provider with `runChildProcess` (or `spawnScoped` and
+`execFileAuxiliary` for other processes) and pass `ctx.runId`. A provider
+started with `child_process` directly stays in the server cgroup. The rules and
+a checker for your package are in
+[`packages/adapters/AUTHORING.md`](https://github.com/llwt/paperclip/blob/somnex-main/packages/adapters/AUTHORING.md).
 
 ### src/server/test.ts
 

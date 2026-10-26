@@ -6,7 +6,7 @@ transient systemd user scope in a low-weight slice (default
 the target is spawned the ordinary way, once. Plan: SX-2306, "Chosen wrapping
 method" and "Ownership, cancellation and restart".
 
-Nothing in the server uses this package yet, and the default mode is `off`.
+The default mode is `off`. Operator setup and rollback are in `FORK.md`, section "Agent process isolation"; `pnpm check:process-launches` fails CI on a launch that bypasses this package.
 
 ## API
 

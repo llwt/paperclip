@@ -48,6 +48,8 @@
     "check:node-version": "node scripts/check-node-version-policy.mjs",
     "check:no-git-push": "node scripts/check-no-git-push.mjs",
     "check:module-boundaries": "node scripts/check-module-boundaries.mjs",
+    "check:process-launches": "node scripts/check-process-launch-coverage.mjs",
+    "test:process-launch-coverage": "node --test scripts/check-process-launch-coverage.test.mjs",
     "test:check-no-git-push": "node --test scripts/check-no-git-push.test.mjs",
     "test:install-sh-docker": "./scripts/test-install-sh-docker.sh",
     "test:hermes-gateway-smoke": "node --test scripts/smoke/hermes-gateway-smoke.test.mjs",
@@ -98,6 +100,7 @@
     "test:lifecycle-baseline:typecheck": "tsc -p tests/lifecycle-baseline/tsconfig.json"
   },
   "devDependencies": {
+    "@babel/parser": "7.29.8",
     "@playwright/test": "^1.62.1",
     "agentmail": "^0.5.31",
     "cross-env": "^10.1.0",

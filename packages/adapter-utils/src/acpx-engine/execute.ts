@@ -4,8 +4,6 @@ import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
 import { parseFrontmatterMarkdown } from "@paperclipai/shared";
 import { fileURLToPath } from "node:url";
@@ -41,6 +39,7 @@ import {
 import { captureLocalProcess, capturedProcessExited, killCapturedLocalProcess } from "./local-process-control.js";
 import { createAcpxAgentScopeOwner, describeAcpxAgentScope } from "./agent-process-scope.js";
 import { getAgentProcessIsolation } from "../process-isolation.js";
+import { execFileAuxiliary } from "../scoped-process.js";
 import type { DuplexLossReason } from "../duplex-observability.js";
 import { DUPLEX_CHANNEL_LOST_ERROR_CODE } from "../bridge-transport-contract.js";
 import {
@@ -878,7 +877,6 @@ async function resolveBuiltInAgentCommand(input: {
   return { command: resolved, shellCommand: shellQuote(resolved) };
 }
 
-const execFileAsync = promisify(execFile);
 // Gemini CLI renamed --experimental-acp to --acp in 0.33.0. acpx normally
 // rewrites the flag itself, but the agent wrapper script hides the gemini
 // command from acpx's detection, so the engine must downgrade it here.
@@ -926,7 +924,7 @@ async function normalizeGeminiAcpCommandShell(commandShell: string, env: NodeJS.
   if (!tokens) return commandShell;
   let versionParts: number[] | null = null;
   try {
-    const { stdout } = await execFileAsync(tokens[0], ["--version"], {
+    const { stdout } = await execFileAuxiliary(tokens[0], ["--version"], {
       timeout: GEMINI_VERSION_PROBE_TIMEOUT_MS,
       encoding: "utf8",
       env,

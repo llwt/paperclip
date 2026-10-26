@@ -44,6 +44,16 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Fails on any OS-process launch that the manifest does not classify, on
+      # a registered adapter or runner driver without a matrix row, and on
+      # drift in the generated launchers, patched acpx and Rust Command
+      # creation. See FORK.md, "Agent process isolation".
+      - name: Process-launch coverage gate
+        run: pnpm check:process-launches
+
+      - name: Process-launch coverage gate tests
+        run: pnpm test:process-launch-coverage
+
       - name: Typecheck
         run: pnpm typecheck
 

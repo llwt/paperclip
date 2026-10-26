@@ -5,6 +5,51 @@ In-repo notes for adapter authors. The user-facing guide lives at
 this file holds invariants that are easy to violate from inside the adapter
 package itself.
 
+## Process launch contract (agent process isolation)
+
+When `server.agentProcessIsolation.mode` is `systemd`, every agent process tree
+runs in its own systemd user scope under a low-weight slice, and Paperclip
+stops the whole scope on cancel, timeout and restart. See
+[`docs/deploy/agent-process-isolation.md`](../../docs/deploy/agent-process-isolation.md).
+
+External adapters are covered only if they use the shared launch contract.
+An adapter that calls `child_process` itself stays in the server cgroup,
+starts its provider before any scope exists, and can leave descendants behind.
+Use the helpers from `@paperclipai/adapter-utils/server-utils` and
+`@paperclipai/adapter-utils`:
+
+| Need | Use |
+|------|-----|
+| Start the provider of a run and stream its output | `runChildProcess(runId, command, args, { cwd, env, timeoutSec, graceSec, onLog })` |
+| Start a long-lived process you manage yourself | `spawnScoped` |
+| Run a short command and read its output | `execFileAuxiliary` (or `execFileScoped` for a run-owned command) |
+| Synchronous short command | `execFileSyncAuxiliary` or `spawnSyncScoped` |
+
+Rules:
+
+- Pass the run id from `ctx.runId` so the scope is owned by the run.
+- Do not use `detached: true`, `setsid`, `nohup`, `unshare` or `systemd-run`.
+  A launch that leaves the scope cannot be stopped with the run.
+- Do not wrap the provider in your own shell or launcher that starts it a
+  second way. Hand the final command to the helper once.
+- If the host cannot isolate the process, the helper runs it once in the
+  original cgroup and writes a degraded line to the run log. Do not retry.
+
+`packages/adapter-utils/src/test-support/external-adapter-fixture.ts` is a
+conforming adapter. Its test starts it under a real user manager and checks
+that the provider's first action runs inside the slice and that a descendant
+that called `setsid` is stopped when the run times out.
+
+Check a package before you ship it:
+
+```sh
+pnpm check:process-launches --external path/to/my-adapter
+```
+
+The check parses the package source and exits non-zero on any raw launch
+site. It cannot see a dependency that spawns on your behalf, so test that case
+with the fixture above.
+
 ## No-remote-git contract (cross-run persistence)
 
 The local execution-workspace cwd is the only persistence boundary across
