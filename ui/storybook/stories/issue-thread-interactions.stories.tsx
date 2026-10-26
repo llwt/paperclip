@@ -68,6 +68,7 @@ import {
   declinedConnectionIntentInteraction,
   supersededConnectionIntentInteraction,
   expiredConnectionIntentInteraction,
+  pendingClaudeQuotaAcknowledgementInteraction,
   pendingClaudeQuotaSwitchOneTargetInteraction,
   pendingClaudeQuotaSwitchSeveralTargetsInteraction,
   acceptedClaudeQuotaSwitchStaleInteraction,
@@ -1405,7 +1406,7 @@ export const ClaudeQuotaSwitchNoTarget: Story = {
         description="With no compatible account or eligible agent the card stays acknowledgement only."
       >
         <IssueThreadInteractionCard
-          interaction={pendingRequestConfirmationInteraction}
+          interaction={pendingClaudeQuotaAcknowledgementInteraction}
           agentMap={storybookAgentMap}
           currentUserId={issueThreadInteractionFixtureMeta.currentUserId}
           userLabelMap={boardUserLabels}

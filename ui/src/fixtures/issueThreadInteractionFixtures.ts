@@ -1309,7 +1309,31 @@ function createClaudeQuotaSwitchInteraction(
   });
 }
 
-export const pendingClaudeQuotaSwitchOneTargetInteraction = createClaudeQuotaSwitchInteraction([
+export const pendingClaudeQuotaAcknowledgementInteraction = createRequestConfirmationInteraction({
+  id: "interaction-claude-quota-ack",
+  title: "Claude usage limit: Team Max",
+  summary: "Claude usage limit reached on Team Max. Reset: 3:00 PM. Nothing was changed automatically.",
+  resolverPolicy: "human_only",
+  payload: {
+    version: 1,
+    prompt: "Claude usage limit reached on Team Max. Reset: 3:00 PM. Nothing was changed automatically.",
+    detailsMarkdown: [
+      "- Connection: Team Max",
+      "- First seen on agent: Coder 0",
+      "- Reset: 3:00 PM",
+      "",
+      "Other agents that use this connection may be affected. Paperclip did not switch any account, retry or reschedule any work. Held tasks keep their existing recovery time.",
+      "To change an agent's account, open its runtime settings.",
+    ].join("\n"),
+    acceptLabel: "Acknowledge",
+    rejectLabel: "Dismiss",
+    rejectRequiresReason: false,
+    allowDeclineReason: false,
+    supersedeOnUserComment: false,
+  },
+});
+
+export const pendingClaudeQuotaSwitchOneTargetInteraction =createClaudeQuotaSwitchInteraction([
   quotaTarget("Backup Max", "backup-max"),
 ]);
 
