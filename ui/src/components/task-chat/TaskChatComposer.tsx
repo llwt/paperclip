@@ -1192,7 +1192,9 @@ export function TaskChatComposer({
         <section
           className={cn(
             "relative rounded-xl border border-border bg-card p-(--sz-18px) shadow-sm",
-            mobile ? "overflow-visible" : "max-h-(--tc-interaction-card-max-h) overflow-y-auto scrollbar-auto-hide",
+            mobile
+              ? "max-h-(--tc-interaction-card-max-h-mobile) overflow-y-auto overscroll-contain"
+              : "max-h-(--tc-interaction-card-max-h) overflow-y-auto scrollbar-auto-hide",
           )}
           aria-label={takeover.label}
           data-testid="task-chat-composer-takeover"

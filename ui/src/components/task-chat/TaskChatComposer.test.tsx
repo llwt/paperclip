@@ -2147,6 +2147,32 @@ describe("TaskChatComposer", () => {
       expect(editable().textContent).toBe("");
     });
 
+    it.each([
+      [true, "max-h-(--tc-interaction-card-max-h-mobile)", "overscroll-contain"],
+      [false, "max-h-(--tc-interaction-card-max-h)", "scrollbar-auto-hide"],
+    ])("bounds the takeover card height and scrolls it on its own (mobile=%s)", (mobile, maxHeight, extra) => {
+      render(
+        <TaskChatComposer
+          onAdd={vi.fn()}
+          workMode="standard"
+          mobile={mobile}
+          takeover={{
+            id: "question-1",
+            label: "Question",
+            pendingCount: 1,
+            content: <p>Which environment?</p>,
+            onDismiss: vi.fn(),
+            onSkip: vi.fn(),
+          }}
+        />,
+      );
+      const classes = container.querySelector('[data-testid="task-chat-composer-takeover"]')?.classList;
+      expect(classes?.contains(maxHeight)).toBe(true);
+      expect(classes?.contains("overflow-y-auto")).toBe(true);
+      expect(classes?.contains(extra)).toBe(true);
+      expect(classes?.contains("overflow-visible")).toBe(false);
+    });
+
     it("keeps the composer mode shortcut available beneath an open question", () => {
       render(
         <TaskChatComposer
