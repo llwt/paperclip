@@ -347,6 +347,8 @@
   --side-panel-tab-hover-bg: color-mix(in oklab, var(--accent) 58%, transparent);
   --radius-task-composer: 16px;
   --tc-interaction-card-max-h: 50dvh;
+  /* Mobile pending card: viewport minus top bar, composer, nav and safe areas. */
+  --tc-interaction-card-max-h-mobile: max(12rem, calc(100dvh - 22rem - var(--sz-safe-top) - var(--sz-safe-bottom)));
   --shadow-task-composer: 0 2px 8px -2px color-mix(in oklab, var(--foreground) 7%, transparent),
     0 12px 32px -8px color-mix(in oklab, var(--foreground) 12%, transparent);
   --profile-popover-width: 248px;

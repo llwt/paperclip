@@ -38,4 +38,12 @@ describe("task-chat composer styles", () => {
     expect(shadow).toContain("color-mix(in oklab, var(--primary) 16%, transparent)");
     expect(shadow).not.toContain("hsl(var(");
   });
+
+  it("bounds the mobile pending card to the visible viewport", () => {
+    const value = customPropertyValue("--tc-interaction-card-max-h-mobile");
+
+    expect(value).toContain("100dvh");
+    expect(value).toContain("var(--sz-safe-top)");
+    expect(value).toContain("var(--sz-safe-bottom)");
+  });
 });
