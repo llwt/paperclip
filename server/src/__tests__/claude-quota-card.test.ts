@@ -36,6 +36,7 @@ const OPERATOR = "operator-user";
 const MINUTE = 60_000;
 const SECRET = "sk-ant-oat01-SHOULD-NEVER-APPEAR";
 const T0 = new Date("2026-10-26T10:00:00.000Z").getTime();
+const RECONCILE_NOW = new Date(T0 + 60 * 60 * 1000);
 
 describe("resolveClaudeQuotaCardConfig", () => {
   const company = "11111111-1111-4111-8111-111111111111";
@@ -399,8 +400,8 @@ describeEmbeddedPostgres("claudeQuotaCardService", () => {
     const withoutEvidence = await seedRun({ companyId, agentId, offsetMinutes: 1, evidence: null });
     const service = newService(companyId);
 
-    expect(await service.reconcile()).toMatchObject({ scanned: 1, recorded: 1 });
-    expect(await service.reconcile()).toMatchObject({ scanned: 0, recorded: 0 });
+    expect(await service.reconcile({ now: RECONCILE_NOW })).toMatchObject({ scanned: 1, recorded: 1 });
+    expect(await service.reconcile({ now: RECONCILE_NOW })).toMatchObject({ scanned: 0, recorded: 0 });
     expect(await incidents(companyId)).toHaveLength(1);
     expect(await cards(companyId)).toHaveLength(1);
     expect(await receiptOf(withEvidence)).not.toBeNull();
@@ -440,7 +441,7 @@ describeEmbeddedPostgres("claudeQuotaCardService", () => {
     expect(await noOperator.observeFailedRun({ id: runId, companyId })).toMatchObject({ status: "disabled" });
     const invalidOperator = claudeQuotaCardService(db, { config: enabledConfig(other.companyId, "ghost-user") });
     expect(await invalidOperator.observeFailedRun({ id: otherRunId, companyId: other.companyId })).toMatchObject({ status: "disabled", reason: "operator_unavailable" });
-    expect(await disabled.reconcile()).toMatchObject({ scanned: 0 });
+    expect(await disabled.reconcile({ now: RECONCILE_NOW })).toMatchObject({ scanned: 0 });
 
     expect(await db.select().from(heartbeatRuns)).toEqual(before);
     expect(await incidents(companyId)).toHaveLength(0);
@@ -453,7 +454,7 @@ describeEmbeddedPostgres("claudeQuotaCardService", () => {
     const other = await seedCompany();
     const otherRun = await seedRun({ companyId: other.companyId, agentId: other.agentId, offsetMinutes: 0 });
     const service = newService(enabled.companyId);
-    await service.reconcile();
+    await service.reconcile({ now: RECONCILE_NOW });
     expect(await service.observeFailedRun({ id: otherRun, companyId: other.companyId })).toMatchObject({ status: "disabled" });
     expect(await receiptOf(otherRun)).toBeNull();
     expect(await incidents(other.companyId)).toHaveLength(0);
@@ -484,7 +485,7 @@ describeEmbeddedPostgres("claudeQuotaCardService", () => {
     // The retry ran on an own login (no binding), so it carries the first run's snapshot untouched.
     const retryRun = await seedRun({ companyId, agentId, offsetMinutes: 10, evidenceRunId: firstRun });
     expect(await service.observeFailedRun({ id: retryRun, companyId })).toMatchObject({ status: "ignored", reason: "no_eligibility_evidence" });
-    expect(await service.reconcile()).toMatchObject({ recorded: 0 });
+    expect(await service.reconcile({ now: RECONCILE_NOW })).toMatchObject({ recorded: 0 });
     expect(await receiptOf(retryRun)).toBeNull();
     expect(await incidents(companyId)).toHaveLength(1);
     expect(await cards(companyId)).toHaveLength(1);
