@@ -209,7 +209,7 @@ export function InstanceGeneralSettings({ embedded = false }: { embedded?: boole
                       })
                     }
                   >
-                    <div className="text-sm font-medium">{days} days</div>
+                    <div className="text-sm font-medium">{days === 1 ? "1 day" : `${days} days`}</div>
                   </button>
                 );
               })}
