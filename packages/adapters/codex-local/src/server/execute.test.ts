@@ -118,7 +118,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     );
   }
 
-  async function runTeardown(input: { sandboxAuth: string; hostAuth: string; onProviderStopped?: () => Promise<void>; withIdentity?: boolean }) {
+  async function runTeardown(input: { sandboxAuth: string; hostAuth: string; onProviderStopped?: () => Promise<void>; withIdentity?: boolean; env?: Record<string, string> }) {
     const rootDir = await mkdtemp(
       path.join(os.tmpdir(), "paperclip-codex-copyback-e2e-"),
     );
@@ -159,7 +159,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
         engine: "cli",
         // External CODEX_HOME (outside the managed company tree) so no managed
         // seeding rewrites auth.json before teardown; equals the shared host home.
-        env: { CODEX_HOME: sharedHostHome, ...(input.withIdentity ? { MY_SERVICE_TOKEN: "assigned-tool-token" } : {}) },
+        env: { CODEX_HOME: sharedHostHome, ...(input.withIdentity ? { MY_SERVICE_TOKEN: "assigned-tool-token" } : {}), ...input.env },
       },
       context: {
         paperclipWorkspace: {
@@ -204,6 +204,28 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     expect(keys).not.toContain("HOST_DATABASE_PASSWORD");
     expect(commandArgs.join(" ")).not.toContain("assigned-run-token");
     expect(commandArgs.join(" ")).not.toContain("assigned-tool-token");
+  });
+
+  it("keeps the managed GitHub broker capability in the CLI shell allowlist without value leakage or other tokens", async () => {
+    const { commandArgs } = await runTeardown({
+      sandboxAuth: "{}", hostAuth: "{}", withIdentity: true,
+      env: {
+        PAPERCLIP_GITHUB_AUTH_MODE: "managed",
+        PAPERCLIP_GITHUB_BROKER_URL: "https://broker.example.invalid",
+        PAPERCLIP_GITHUB_BROKER_TOKEN: "test-not-a-secret-broker",
+        PAPERCLIP_GITHUB_LAUNCHER_DIR: "/runtime/launcher",
+        GH_TOKEN: "must-not-cross",
+        GITHUB_TOKEN: "must-not-cross",
+      },
+    });
+    const policy = commandArgs.find(arg => arg.startsWith("shell_environment_policy.include_only="));
+    const keys = JSON.parse(policy!.slice(policy!.indexOf("=") + 1));
+    expect(keys).toEqual(expect.arrayContaining([
+      "PAPERCLIP_GITHUB_BROKER_TOKEN", "PAPERCLIP_GITHUB_BROKER_URL", "PAPERCLIP_GITHUB_LAUNCHER_DIR", "PAPERCLIP_GITHUB_AUTH_MODE",
+    ]));
+    expect(keys).not.toContain("GH_TOKEN");
+    expect(keys).not.toContain("GITHUB_TOKEN");
+    expect(commandArgs.join(" ")).not.toContain("test-not-a-secret-broker");
   });
 
   it("collects stopped-provider instruction edits before a throwing remote restore", async () => {

@@ -416,6 +416,8 @@ describe("Codex security configuration", () => {
     expect(serialized).toContain('ZDOTDIR="/runtime/run-B"');
     expect(serialized).toContain('BASH_ENV="/runtime/run-B/.bashrc"');
     expect(serialized).toContain('"PAPERCLIP_GITHUB_BRIDGE_TOKEN"');
+    expect(serialized).toContain('"PAPERCLIP_GITHUB_BROKER_TOKEN"');
+    expect(serialized).toContain('"PAPERCLIP_GITHUB_BROKER_URL"');
     expect(serialized).not.toContain("PAPERCLIP_API_KEY");
     expect(serialized).not.toContain("private-run-capability");
     expect(serialized).not.toContain("private-bridge-capability");
