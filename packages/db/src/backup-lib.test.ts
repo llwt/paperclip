@@ -4,7 +4,7 @@ import path from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { BACKUP_TEMP_SUFFIX, createBufferedTextFileWriter, removeIncompleteBackupFiles, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import { BACKUP_TEMP_SUFFIX, createBufferedTextFileWriter, pruneOldBackups, removeIncompleteBackupFiles, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
@@ -115,6 +115,49 @@ describe("removeIncompleteBackupFiles", () => {
   it("returns no files for a missing directory", () => {
     const dir = createTempDir("paperclip-missing-backups-");
     expect(removeIncompleteBackupFiles(path.join(dir, "missing"), "paperclip")).toEqual([]);
+  });
+});
+
+describe("pruneOldBackups", () => {
+  it("keeps every dump of the last 24 hours with dailyDays 1 and prunes older dailies except weekly/monthly keepers", () => {
+    const backupDir = createTempDir("paperclip-db-prune-daily-1-");
+    const realDateNow = Date.now;
+    const now = Date.UTC(2026, 2, 31, 12, 0, 0);
+    Date.now = () => now;
+    const hour = 60 * 60 * 1000;
+    const make = (name: string, ageMs: number) => {
+      const file = path.join(backupDir, `paperclip-test-${name}.sql.gz`);
+      fs.writeFileSync(file, name);
+      const when = new Date(now - ageMs);
+      fs.utimesSync(file, when, when);
+      return file;
+    };
+
+    try {
+      const lastDay = [1, 2, 6, 12, 23].map((h) => make(`h${h}`, h * hour));
+      // Both fall on a Friday (ISO week 13), so only the newest is kept.
+      const weeklyKeeper = make("w-newest", 4 * 24 * hour);
+      const weeklyDupe = make("w-older", 4.5 * 24 * hour);
+      const monthlyKeeper = make("m-newest", 20 * 24 * hour);
+      const monthlyDupe = make("m-older", 25 * 24 * hour);
+      const tooOld = make("too-old", 400 * 24 * hour);
+
+      const pruned = pruneOldBackups(
+        backupDir,
+        { dailyDays: 1, weeklyWeeks: 1, monthlyMonths: 1 },
+        "paperclip-test",
+      );
+
+      for (const file of lastDay) expect(fs.existsSync(file)).toBe(true);
+      expect(fs.existsSync(weeklyKeeper)).toBe(true);
+      expect(fs.existsSync(weeklyDupe)).toBe(false);
+      expect(fs.existsSync(monthlyKeeper)).toBe(true);
+      expect(fs.existsSync(monthlyDupe)).toBe(false);
+      expect(fs.existsSync(tooOld)).toBe(false);
+      expect(pruned).toBe(3);
+    } finally {
+      Date.now = realDateNow;
+    }
   });
 });
 

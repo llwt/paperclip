@@ -243,6 +243,21 @@ describe("InstanceGeneralSettings operator-hidden sections", () => {
     await vi.waitFor(() => expect(container.textContent).toContain("Backup retention"));
   }
 
+  it("offers 1 day, 3 days, 7 days and 14 days for the daily tier and sends dailyDays 1", async () => {
+    await renderPage(SELF_HOSTED_HEALTH);
+
+    const dailyRow = Array.from(container.querySelectorAll("h3"))
+      .find((h) => h.textContent?.trim() === "Daily")?.parentElement;
+    const buttons = Array.from(dailyRow?.querySelectorAll("button") ?? []);
+    expect(buttons.map((b) => b.textContent?.trim())).toEqual(["1 day", "3 days", "7 days", "14 days"]);
+
+    flushSync(() => buttons[0]?.click());
+    await vi.waitFor(() => expect(mockInstanceSettingsApi.updateGeneral).toHaveBeenCalledOnce());
+    expect(mockInstanceSettingsApi.updateGeneral.mock.calls[0]?.[0]).toEqual({
+      backupRetention: { dailyDays: 1, weeklyWeeks: 4, monthlyMonths: 1 },
+    });
+  });
+
   it("hides an operator-hidden field-backed section and a UI-only section", async () => {
     await renderPage({
       ...SELF_HOSTED_HEALTH,

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  backupRetentionPolicySchema,
   instanceExperimentalSettingsSchema,
   patchInstanceExperimentalSettingsSchema,
 } from "./instance.js";
@@ -198,5 +199,25 @@ describe("instance experimental settings validators", () => {
     ).toEqual({
       enableApps: true,
     });
+  });
+});
+
+describe("backup retention policy validator", () => {
+  it("accepts a 1-day daily tier", () => {
+    expect(
+      backupRetentionPolicySchema.parse({ dailyDays: 1, weeklyWeeks: 4, monthlyMonths: 1 }),
+    ).toEqual({ dailyDays: 1, weeklyWeeks: 4, monthlyMonths: 1 });
+  });
+
+  it("rejects daily values outside the presets", () => {
+    for (const dailyDays of [0, 2, 5, 15]) {
+      expect(
+        backupRetentionPolicySchema.safeParse({ dailyDays, weeklyWeeks: 4, monthlyMonths: 1 }).success,
+      ).toBe(false);
+    }
+  });
+
+  it("keeps the default daily tier at 7 days", () => {
+    expect(backupRetentionPolicySchema.parse({}).dailyDays).toBe(7);
   });
 });

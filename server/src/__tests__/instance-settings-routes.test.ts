@@ -812,6 +812,22 @@ describe("instance settings routes", () => {
       });
     });
 
+    it("accepts a 1-day daily backup retention and rejects unsupported values", async () => {
+      const app = await createApp(adminActor);
+      const backupRetention = { dailyDays: 1, weeklyWeeks: 4, monthlyMonths: 1 };
+
+      const ok = await request(app).patch("/api/instance/settings/general").send({ backupRetention });
+      expect(ok.status).toBe(200);
+      expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({ backupRetention });
+
+      mockInstanceSettingsService.updateGeneral.mockClear();
+      const bad = await request(app)
+        .patch("/api/instance/settings/general")
+        .send({ backupRetention: { ...backupRetention, dailyDays: 2 } });
+      expect(bad.status).toBe(400);
+      expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+    });
+
     it("deep-compares hidden backupRetention echoes instead of rejecting them", async () => {
       process.env.PAPERCLIP_HIDDEN_SETTINGS = "instance.general.backupRetention";
       mockInstanceSettingsService.getGeneral.mockResolvedValue({
