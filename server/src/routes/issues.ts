@@ -14330,7 +14330,14 @@ export function issueRoutes(
       // commits the run is recorded `succeeded` (recordSelfHandoffOutcome).
       const isActorOwnRun = (run: { id: string; agentId?: string | null }) =>
         actor.actorType === "agent" && Boolean(actor.agentId) &&
-        (actor.runId ? run.id === actor.runId : run.agentId === actor.agentId);
+        run.agentId === actor.agentId &&
+        (actor.runId ? run.id === actor.runId : true);
+      // Fork (SX-4277): the run that sent this PATCH is the one named by
+      // X-Paperclip-Run-Id. The header is only trusted when the stored run
+      // belongs to the calling agent (agent keys send it unsigned), so a run id
+      // copied from another agent protects nothing.
+      const isActorIssuingRun = (run: { id: string; agentId?: string | null }) =>
+        Boolean(actor.runId) && isActorOwnRun(run);
       let selfHandoffStop = null as { runId: string; kind: SelfHandoffKind } | null;
       // Fork (SX-2551): armed before cancelRun, so a throw inside it after it
       // published the marked stop event is covered too.
@@ -14345,7 +14352,13 @@ export function issueRoutes(
           issueId: existing.id,
           agentId: existing.assigneeAgentId,
         });
-        const runToStopForReassignment = await resolveActiveIssueRun(existing);
+        const activeRunForReassignment = await resolveActiveIssueRun(existing);
+        // Fork (SX-4277): the run that issued this hand-off is left to finish,
+        // so it can still post its closing comment and follow-up tasks.
+        const runToStopForReassignment =
+          activeRunForReassignment && !isActorIssuingRun(activeRunForReassignment)
+            ? activeRunForReassignment
+            : null;
         if (runToStopForReassignment) {
           const ownRun = isActorOwnRun(runToStopForReassignment);
           if (ownRun) armSelfHandoffStopFallback(runToStopForReassignment.id);
