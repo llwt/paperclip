@@ -22,7 +22,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   };
 });
 
-import { prepareClaudeConfigSeed, prepareSandboxClaudeProbeRuntime } from "./claude-config.js";
+import { prepareClaudeConfigSeed, prepareSandboxClaudeProbeRuntime, resolveStableClaudeMemoryDir } from "./claude-config.js";
 
 describe("prepareClaudeConfigSeed", () => {
   const cleanupDirs: string[] = [];
@@ -220,5 +220,39 @@ describe("prepareSandboxClaudeProbeRuntime managed-config diagnostics", () => {
       errorClass: "Error",
     });
     warnSpy.mockRestore();
+  });
+});
+
+describe("resolveStableClaudeMemoryDir", () => {
+  let root: string;
+  afterEach(async () => {
+    if (root) await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it("returns the durable folder that the temp home's projects entry links to", async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "claude-stable-memory-"));
+    const state = path.join(root, "ai-session-state");
+    const provider = path.join(root, "paperclip-ai-run", "provider");
+    await fs.mkdir(path.join(state, "projects"), { recursive: true });
+    await fs.mkdir(provider, { recursive: true });
+    await fs.symlink(path.join(state, "projects"), path.join(provider, "projects"));
+    expect(await resolveStableClaudeMemoryDir(provider)).toBe(await fs.realpath(state));
+  });
+
+  it("returns null when projects is missing, a plain folder, a dangling link or not named projects", async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "claude-stable-memory-"));
+    const provider = path.join(root, "provider");
+    await fs.mkdir(provider);
+    expect(await resolveStableClaudeMemoryDir("")).toBeNull();
+    expect(await resolveStableClaudeMemoryDir(provider)).toBeNull();
+    await fs.mkdir(path.join(provider, "projects"));
+    expect(await resolveStableClaudeMemoryDir(provider)).toBeNull();
+    await fs.rmdir(path.join(provider, "projects"));
+    await fs.symlink(path.join(root, "missing", "projects"), path.join(provider, "projects"));
+    expect(await resolveStableClaudeMemoryDir(provider)).toBeNull();
+    await fs.rm(path.join(provider, "projects"));
+    await fs.mkdir(path.join(root, "elsewhere"));
+    await fs.symlink(path.join(root, "elsewhere"), path.join(provider, "projects"));
+    expect(await resolveStableClaudeMemoryDir(provider)).toBeNull();
   });
 });

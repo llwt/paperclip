@@ -29,7 +29,7 @@ describe("Claude current instruction location and resume gates", () => {
   let root: string;
   let cwd: string;
   let entry: string;
-  const captured: Array<{ runId: string; args: string[]; prompt: string }> = [];
+  const captured: Array<{ runId: string; args: string[]; prompt: string; env?: Record<string, string> }> = [];
   const logs: string[] = [];
   beforeEach(async () => {
     root = await fs.mkdtemp(path.join(os.tmpdir(), "claude-current-location-"));
@@ -44,7 +44,7 @@ describe("Claude current instruction location and resume gates", () => {
     logs.length = 0;
     runChildProcess.mockReset();
     runChildProcess.mockImplementation(async (runId, _command, args, options) => {
-      captured.push({ runId, args, prompt: options.stdin ?? "" });
+      captured.push({ runId, args, prompt: options.stdin ?? "", env: options.env });
       return success();
     });
   });
@@ -229,5 +229,90 @@ describe("Claude current instruction location and resume gates", () => {
     for (const call of captured.slice(1)) assertLocation(call.prompt, call.runId === "run-1" ? entry : otherEntry);
     expect(await fs.readFile(path.join(path.dirname(entry), "SIBLING.md"), "utf8")).toBe("ALPHA");
     expect(await fs.readFile(path.join(path.dirname(otherEntry), "SIBLING.md"), "utf8")).toBe("BETA");
+  });
+  // SX-4250: Claude Code builds its system prompt from the --append-system-prompt-file
+  // bytes, the tool list (from --mcp-config server names and the CLI flags) and the
+  // auto-memory path under CLAUDE_CODE_REMOTE_MEMORY_DIR or CLAUDE_CONFIG_DIR. The
+  // temp home and the run id change on every run; none of them may reach that prefix.
+  it("gives two fresh managed runs with different run ids and temp homes the same prompt prefix inputs", async () => {
+    const state = path.join(root, "home", "agents", "agent-1", "ai-session-state");
+    const server = { name: "tools", url: "https://tools.example/mcp", connectionId: "connection-1" };
+    const homes: string[] = [];
+    for (const runId of ["run-a", "run-b"]) {
+      const home = await fs.mkdtemp(path.join(root, "paperclip-ai-"));
+      const provider = path.join(home, "provider");
+      await fs.mkdir(provider);
+      for (const name of ["projects", "sessions", "archived_sessions"]) {
+        await fs.mkdir(path.join(state, name), { recursive: true });
+        await fs.symlink(path.join(state, name), path.join(provider, name));
+      }
+      homes.push(home);
+      const next = input({ runId, runtimeMcp: { getServers: () => [{ ...server, token: `token-${runId}` }] } });
+      next.config.managedAiConnection = { connectionId: "ai-connection-1" };
+      next.config.env = { HOME: home, CLAUDE_CONFIG_DIR: provider };
+      await execute(next);
+    }
+    expect(captured).toHaveLength(2);
+    const prefix = async (call: (typeof captured)[number]) => {
+      const args = [...call.args];
+      expect(args).not.toContain("--resume");
+      const mcpIndex = args.indexOf("--mcp-config") + 1;
+      const mcp = JSON.parse(await fs.readFile(args[mcpIndex], "utf8")) as { mcpServers: Record<string, { url: string }> };
+      // The config file path holds the run id and the headers hold the run token;
+      // only server names and URLs decide the tool list.
+      args[mcpIndex] = JSON.stringify(Object.entries(mcp.mcpServers).map(([name, value]) => [name, value.url]));
+      const systemPromptFile = args[args.indexOf("--append-system-prompt-file") + 1];
+      return {
+        args,
+        systemPromptFile: await fs.readFile(systemPromptFile, "utf8"),
+        // Claude Code's rule for the memory path it puts in the system prompt.
+        memoryRoot: call.env?.CLAUDE_CODE_REMOTE_MEMORY_DIR ?? call.env?.CLAUDE_CONFIG_DIR,
+      };
+    };
+    const [first, second] = [await prefix(captured[0]), await prefix(captured[1])];
+    expect(second).toEqual(first);
+    expect(first.memoryRoot).toBe(await fs.realpath(state));
+    for (const [index, call] of captured.entries()) {
+      expect(call.env?.CLAUDE_CONFIG_DIR).toBe(path.join(homes[index], "provider"));
+      expect(JSON.stringify(first)).not.toContain(homes[index]);
+      expect(JSON.stringify(first)).not.toContain(call.runId);
+    }
+  });
+
+  it("leaves the memory dir alone for unmanaged runs and when the operator set it", async () => {
+    await execute(input());
+    expect(captured[0].env?.CLAUDE_CODE_REMOTE_MEMORY_DIR).toBeUndefined();
+    const home = await fs.mkdtemp(path.join(root, "paperclip-ai-"));
+    const state = path.join(root, "state");
+    await fs.mkdir(path.join(state, "projects"), { recursive: true });
+    await fs.mkdir(path.join(home, "provider"));
+    await fs.symlink(path.join(state, "projects"), path.join(home, "provider", "projects"));
+    const next = input();
+    next.config.managedAiConnection = { connectionId: "ai-connection-1" };
+    next.config.env = { HOME: home, CLAUDE_CONFIG_DIR: path.join(home, "provider"), CLAUDE_CODE_REMOTE_MEMORY_DIR: "/operator/memory" };
+    await execute(next);
+    expect(captured[1].env?.CLAUDE_CODE_REMOTE_MEMORY_DIR).toBe("/operator/memory");
+  });
+
+  it("keeps a memory dir the server environment sets", async () => {
+    const home = await fs.mkdtemp(path.join(root, "paperclip-ai-"));
+    const state = path.join(root, "state");
+    await fs.mkdir(path.join(state, "projects"), { recursive: true });
+    await fs.mkdir(path.join(home, "provider"));
+    await fs.symlink(path.join(state, "projects"), path.join(home, "provider", "projects"));
+    const next = input();
+    next.config.managedAiConnection = { connectionId: "ai-connection-1" };
+    next.config.env = { HOME: home, CLAUDE_CONFIG_DIR: path.join(home, "provider") };
+    const previous = process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR;
+    process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR = "/server/memory";
+    try {
+      await execute(next);
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR;
+      else process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR = previous;
+    }
+    // runChildProcess lays the run env over process.env, so the inherited value
+    // reaches Claude only when the run env does not set its own.
+    expect(captured[0].env?.CLAUDE_CODE_REMOTE_MEMORY_DIR).toBeUndefined();
   });
 });
