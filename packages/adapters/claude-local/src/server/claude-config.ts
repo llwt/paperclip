@@ -154,6 +154,30 @@ export function resolveManagedClaudeRuntimeStateDir(
   return path.join(instanceRoot, "companies", companyId, "agents", agentId, "claude-runtime");
 }
 
+/**
+ * Claude Code writes the auto-memory path into the system prompt and builds it
+ * as `<CLAUDE_CODE_REMOTE_MEMORY_DIR or CLAUDE_CONFIG_DIR>/projects/<repo>/memory/`.
+ * A managed AI run gets a new temp CLAUDE_CONFIG_DIR, so that path, and with it
+ * every system prompt byte after it, changed on each run and the prompt cache of
+ * the agent's previous run was never read (SX-4250). The temp home's `projects`
+ * entry already links to the durable per-agent session state. Returns that
+ * state folder, so the run can point CLAUDE_CODE_REMOTE_MEMORY_DIR at it: the
+ * same memory files under a path that stays the same between runs. Null when
+ * `projects` is not such a link.
+ */
+export async function resolveStableClaudeMemoryDir(claudeConfigDir: string): Promise<string | null> {
+  if (!claudeConfigDir) return null;
+  try {
+    const link = path.join(claudeConfigDir, "projects");
+    if (!(await fs.lstat(link)).isSymbolicLink()) return null;
+    const target = await fs.realpath(link);
+    if (path.basename(target) !== "projects" || !(await fs.stat(target)).isDirectory()) return null;
+    return path.dirname(target);
+  } catch {
+    return null;
+  }
+}
+
 export async function writePaperclipClaudeMcpConfig(input: {
   stateDir: string;
   runId: string;

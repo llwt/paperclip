@@ -89,6 +89,7 @@ import {
   prepareClaudeConfigSeed,
   resolveManagedClaudeRuntimeStateDir,
   resolveSharedClaudeConfigDir,
+  resolveStableClaudeMemoryDir,
   writePaperclipClaudeMcpConfig,
 } from "./claude-config.js";
 import {
@@ -610,6 +611,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       "stdout",
       `[paperclip] Confining Claude with ${scopes} scope.\n`,
     );
+  }
+  // Differs from upstream (v2026.1023.0): keep the auto-memory path in the
+  // system prompt the same between runs of this agent, so the next fresh run
+  // reads the prompt cache (SX-4250).
+  if (config.managedAiConnection && !executionTargetIsRemote && !asString(configEnv.CLAUDE_CODE_REMOTE_MEMORY_DIR, "")) {
+    const stableMemoryDir = await resolveStableClaudeMemoryDir(sharedClaudeConfigDir);
+    if (stableMemoryDir) {
+      env.CLAUDE_CODE_REMOTE_MEMORY_DIR = stableMemoryDir;
+      loggedEnv.CLAUDE_CODE_REMOTE_MEMORY_DIR = stableMemoryDir;
+    }
   }
   const useManagedRemoteClaudeConfig =
     executionTargetIsRemote &&
