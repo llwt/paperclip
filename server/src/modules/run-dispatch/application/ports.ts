@@ -42,6 +42,8 @@ export type CancelStaleQueuedRunInput = {
 };
 
 export type DispatchResolvedInteractionInput<T> = CancelStaleQueuedRunInput & {
+  /** "ownership" re-checks only the owner and stage participant; the default re-runs the full staleness gate. */
+  gate?: "full" | "ownership";
   dispatch: (markDispatchStarted: () => void) => Promise<T>;
 };
 

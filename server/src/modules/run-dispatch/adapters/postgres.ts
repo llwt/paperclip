@@ -37,7 +37,7 @@ import {
   getIssueContinuationSummaryDocument,
 } from "../../../services/issue-continuation-summary.js";
 import { parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
-import { decideQueuedRunStaleness, decideScheduledRetryGate } from "../domain/policy.js";
+import { decideDispatchOwnership, decideQueuedRunStaleness, decideScheduledRetryGate } from "../domain/policy.js";
 import type {
   QueuedRunFacts,
   ReviewParticipantFacts,
@@ -1007,6 +1007,27 @@ export function createPostgresRunDispatchAdapter(
     return { issueId, facts, executionBlocker: null, decision: decideQueuedRunStaleness(facts, now) };
   }
 
+  async function decideCurrentRunOwnership(tx: Db, run: HeartbeatRun) {
+    const contextSnapshot = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(contextSnapshot.issueId);
+    if (!issueId) return { issueId: null, decision: { stale: false as const } };
+    const facts = await loadStalenessFacts(
+      {
+        runId: run.id,
+        companyId: run.companyId,
+        agentId: run.agentId,
+        responsibleUserId: run.responsibleUserId,
+        conversationContinuation: false,
+        issueId,
+        contextSnapshot,
+        scheduledRetryReason: run.scheduledRetryReason,
+      },
+      new Date(),
+      tx,
+    );
+    return { issueId, decision: decideDispatchOwnership(facts) };
+  }
+
   /**
    * Keep the existing attempt durable while the previous execution releases
    * ownership. Only an unstarted legacy conversation retry can wait here;
@@ -1113,13 +1134,13 @@ export function createPostgresRunDispatchAdapter(
       if (run.status !== input.expectedStatus || run.resultJson?.cancellation || run.resultJson?.startupCancellation) {
         return { dispatched: false as const, cancellation: { outcome: "lost_race" as const } };
       }
-      const { issueId, decision: initialDecision } = await decideCurrentRunStaleness(
-        tx,
-        run,
-        input.now,
-      );
+      const { issueId, decision: initialDecision } = input.gate === "ownership"
+        ? await decideCurrentRunOwnership(tx, run)
+        : await decideCurrentRunStaleness(tx, run, input.now);
       const decision =
-        !initialDecision.stale && issueId
+        input.gate === "ownership"
+          ? initialDecision
+          : !initialDecision.stale && issueId
           ? await tx
               .select({ executionRunId: issues.executionRunId })
               .from(issues)
