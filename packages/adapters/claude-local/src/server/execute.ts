@@ -614,8 +614,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
   // Differs from upstream (v2026.1023.0): keep the auto-memory path in the
   // system prompt the same between runs of this agent, so the next fresh run
-  // reads the prompt cache (SX-4250).
-  if (config.managedAiConnection && !executionTargetIsRemote && !asString(configEnv.CLAUDE_CODE_REMOTE_MEMORY_DIR, "")) {
+  // reads the prompt cache (SX-4250). A value the operator set, in the agent
+  // config or in the server environment the child inherits, wins.
+  const operatorMemoryDir =
+    asString(configEnv.CLAUDE_CODE_REMOTE_MEMORY_DIR, "") || asString(process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR, "");
+  if (config.managedAiConnection && !executionTargetIsRemote && !operatorMemoryDir) {
     const stableMemoryDir = await resolveStableClaudeMemoryDir(sharedClaudeConfigDir);
     if (stableMemoryDir) {
       env.CLAUDE_CODE_REMOTE_MEMORY_DIR = stableMemoryDir;

@@ -293,4 +293,26 @@ describe("Claude current instruction location and resume gates", () => {
     await execute(next);
     expect(captured[1].env?.CLAUDE_CODE_REMOTE_MEMORY_DIR).toBe("/operator/memory");
   });
+
+  it("keeps a memory dir the server environment sets", async () => {
+    const home = await fs.mkdtemp(path.join(root, "paperclip-ai-"));
+    const state = path.join(root, "state");
+    await fs.mkdir(path.join(state, "projects"), { recursive: true });
+    await fs.mkdir(path.join(home, "provider"));
+    await fs.symlink(path.join(state, "projects"), path.join(home, "provider", "projects"));
+    const next = input();
+    next.config.managedAiConnection = { connectionId: "ai-connection-1" };
+    next.config.env = { HOME: home, CLAUDE_CONFIG_DIR: path.join(home, "provider") };
+    const previous = process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR;
+    process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR = "/server/memory";
+    try {
+      await execute(next);
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR;
+      else process.env.CLAUDE_CODE_REMOTE_MEMORY_DIR = previous;
+    }
+    // runChildProcess lays the run env over process.env, so the inherited value
+    // reaches Claude only when the run env does not set its own.
+    expect(captured[0].env?.CLAUDE_CODE_REMOTE_MEMORY_DIR).toBeUndefined();
+  });
 });
