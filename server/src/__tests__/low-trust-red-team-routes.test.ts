@@ -978,21 +978,19 @@ describeEmbeddedPostgres(
         .send({ status: "in_review", assigneeAgentId: null, assigneeUserId: "board-user", comment: "Ready for human review" });
       expect(handoff.status, JSON.stringify(handoff.body)).toBe(200);
       const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, directRun.id));
-      // The run handed off its own task: stopped as a reassignment, then
-      // recorded as a self hand-off (fork, SX-2509).
-      expect(stopped).toMatchObject({
-        status: "succeeded", errorCode: null,
-        resultJson: expect.objectContaining({
-          selfHandoff: true, reassignmentStopConfirmed: true,
-          selfHandoffStop: expect.objectContaining({ kind: "reassignment", errorCode: "issue_reassigned" }),
-        }),
-      });
+      // The run handed off its own task and is left to finish on its own (SX-4277).
+      expect(stopped).toMatchObject({ status: "running", errorCode: null });
+      expect(stopped.resultJson ?? {}).not.toHaveProperty("selfHandoff");
       const returned = await request(board).patch(`/api/issues/${created.body.id}`)
         .send({ status: "backlog", assigneeAgentId: fixture.agents.lowTrust.id, assigneeUserId: null });
       expect(returned.status, JSON.stringify(returned.body)).toBe(200);
-      // Reassignment back does not revive the cancelled run's human request.
-      const staleRead = await request(directedAgent).get(`/api/issues/${created.body.id}`);
-      expect([403, 404]).toContain(staleRead.status);
+      // Reassignment back does not revive the old human request: the hand-off
+      // cancelled it. The run is still running (SX-4277), so only the board's
+      // fresh assignment above authorizes it again.
+      const [oldRequest] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id));
+      expect(oldRequest).toMatchObject({ status: "cancelled" });
+      const freshRead = await request(directedAgent).get(`/api/issues/${created.body.id}`);
+      expect(freshRead.status, JSON.stringify(freshRead.body)).toBe(200);
 
     });
 

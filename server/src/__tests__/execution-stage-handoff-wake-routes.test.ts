@@ -22,10 +22,11 @@ import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.j
 
 // Fork test (SX-1386): the same hand-off as execution-stage-handoff-wake.test.ts,
 // but the stage decision goes through the real PATCH and comment routes. The
-// PATCH route stops the deciding run itself before the reassignment, then
-// queues the stage wake. When that run has a live process, its environment
-// lease stays held until its executor finishes cleanup, so the wake must wait
-// and then start exactly one run for the next participant.
+// PATCH route no longer stops the deciding run (SX-4277); it queues the stage
+// wake behind that run, which ends on its own. While it is running, and when it
+// has a live process its environment lease stays held until its executor
+// finishes cleanup, the wake must wait and then start exactly one run for the
+// next participant.
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 
@@ -302,11 +303,19 @@ describeEmbeddedPostgres("execution stage hand-off wake through the issue routes
     expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
     const [decidingRun] = await db.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
       .from(heartbeatRuns).where(eq(heartbeatRuns.id, ids.decidingRunId));
-    // PATCH stops its own run before the reassignment and, as a self hand-off
-    // (SX-2509), records it `succeeded`. The comment route does not stop it;
-    // the deciding run ends on its own after its comment.
-    if (route === "patch") {
-      expect(decidingRun).toMatchObject({ status: "succeeded", resultJson: expect.objectContaining({ selfHandoff: true }) });
+    // The PATCH does not stop the deciding run (SX-4277); it ends on its own
+    // after the decision.
+    if (route === "patch") expect(decidingRun).toMatchObject({ status: "running", resultJson: null });
+  }
+
+  // The deciding run ends. Its process is gone, so the saved hand-off starts
+  // on the owner-exit recheck and the queue sweep.
+  async function endDecidingRun(ids: Awaited<ReturnType<typeof seedStage>>, input: { sweep: boolean }) {
+    expect(await heartbeat.cancelRun(ids.decidingRunId, "Stopped after the decision"))
+      .toMatchObject({ status: "cancelled" });
+    if (input.sweep) {
+      await heartbeat.recheckOwnerExitWait(ids.companyId, ids.issueId, new Date());
+      await heartbeat.resumeQueuedRuns();
     }
   }
 
@@ -331,12 +340,10 @@ describeEmbeddedPostgres("execution stage hand-off wake through the issue routes
       }, { timeout: 10_000, interval: 50 });
       expect(await runsFor(ids.nextAgentId, ids.issueId, wakeReason)).toHaveLength(0);
 
-      if (route === "comment") {
-        // The deciding run is interrupted after its decision comment.
-        expect(await heartbeat.cancelRun(ids.decidingRunId, "Stopped after the decision"))
-          .toMatchObject({ status: "cancelled" });
-        expect(await runsFor(ids.nextAgentId, ids.issueId, wakeReason)).toHaveLength(0);
-      }
+      // The deciding run ends after its decision; the held wake waits for the
+      // lease release below.
+      await endDecidingRun(ids, { sweep: false });
+      expect(await runsFor(ids.nextAgentId, ids.issueId, wakeReason)).toHaveLength(0);
       // The stopped run's executor finishes cleanup and releases the lease.
       expect(await heartbeat.sweepEndedTerminalRunLeases()).toMatchObject({ released: 1 });
       await drainHeartbeatRunsToQuiescence(db, heartbeat);
@@ -362,6 +369,18 @@ describeEmbeddedPostgres("execution stage hand-off wake through the issue routes
       }
       await decide(ids, route, transition);
 
+      if (route === "patch") {
+        // The PATCH left the deciding run running; the wake is held behind it
+        // until the run ends on its own.
+        await vi.waitFor(async () => {
+          expect(await wakesFor(ids.nextAgentId, ids.issueId, wakeReason)).toEqual([
+            expect.objectContaining({ status: "deferred_issue_execution", runId: null }),
+          ]);
+        }, { timeout: 10_000, interval: 50 });
+        expect(await runsFor(ids.nextAgentId, ids.issueId, wakeReason)).toHaveLength(0);
+        await endDecidingRun(ids, { sweep: true });
+      }
+
       await vi.waitFor(async () => {
         expect(await runsFor(ids.nextAgentId, ids.issueId, wakeReason)).toHaveLength(1);
       }, { timeout: 10_000, interval: 50 });
@@ -370,8 +389,14 @@ describeEmbeddedPostgres("execution stage hand-off wake through the issue routes
       const runs = await runsFor(ids.nextAgentId, ids.issueId, wakeReason);
       expect(runs).toHaveLength(1);
       const wakes = await wakesFor(ids.nextAgentId, ids.issueId, wakeReason);
-      expect(wakes).toHaveLength(1);
-      expect(wakes[0]).toMatchObject({ runId: runs[0]!.id });
+      if (route === "patch") {
+        // The wake held behind the deciding run is settled with the one run.
+        expect(wakes.filter((wake) => wake.status === "deferred_issue_execution")).toHaveLength(0);
+        expect(wakes.every((wake) => wake.runId === runs[0]!.id)).toBe(true);
+      } else {
+        expect(wakes).toHaveLength(1);
+        expect(wakes[0]).toMatchObject({ runId: runs[0]!.id });
+      }
     },
     30_000,
   );
@@ -384,13 +409,27 @@ describeEmbeddedPostgres("execution stage hand-off wake through the issue routes
     expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
 
     const wakesForIssue = (agentId: string) => db
-      .select({ id: agentWakeupRequests.id, reason: agentWakeupRequests.reason, runId: agentWakeupRequests.runId })
+      .select({
+        id: agentWakeupRequests.id,
+        reason: agentWakeupRequests.reason,
+        status: agentWakeupRequests.status,
+        runId: agentWakeupRequests.runId,
+      })
       .from(agentWakeupRequests)
       .where(and(
         eq(agentWakeupRequests.agentId, agentId),
         sql`${agentWakeupRequests.payload}->>'issueId' = ${ids.issueId}`,
       ));
 
+    // The PATCH left the deciding run running, so the new owner's wake is held
+    // behind it and starts once that run ends on its own.
+    await vi.waitFor(async () => {
+      expect(await wakesForIssue(ids.nextAgentId)).toEqual([
+        expect.objectContaining({ status: "deferred_issue_execution", runId: null }),
+      ]);
+    }, { timeout: 10_000, interval: 50 });
+    expect(await runsFor(ids.nextAgentId, ids.issueId, "execution_changes_requested")).toHaveLength(0);
+    await endDecidingRun(ids, { sweep: true });
     await vi.waitFor(async () => {
       expect(await runsFor(ids.nextAgentId, ids.issueId, "execution_changes_requested")).toHaveLength(1);
     }, { timeout: 10_000, interval: 50 });
@@ -399,7 +438,9 @@ describeEmbeddedPostgres("execution stage hand-off wake through the issue routes
     // A finished test run without a comment gets its own `missing_issue_comment`
     // follow-up, which is not a duplicate of the hand-off wake.
     const wakes = (await wakesForIssue(ids.nextAgentId)).filter((wake) => wake.reason !== "missing_issue_comment");
-    expect(wakes.map((wake) => wake.reason)).toEqual(["execution_changes_requested"]);
+    // The release of the held wake adds a row that coalesces into the same run.
+    expect(wakes.filter((wake) => wake.status === "deferred_issue_execution")).toHaveLength(0);
+    expect(wakes.every((wake) => wake.reason === "issue_execution_deferred")).toBe(true);
     const allRuns = await db
       .select({ id: heartbeatRuns.id })
       .from(heartbeatRuns)
@@ -409,5 +450,6 @@ describeEmbeddedPostgres("execution stage hand-off wake through the issue routes
         sql`${heartbeatRuns.contextSnapshot}->>'wakeReason' <> 'missing_issue_comment'`,
       ));
     expect(allRuns).toHaveLength(1);
+    expect(wakes.every((wake) => wake.runId === allRuns[0]!.id)).toBe(true);
   }, 30_000);
 });
