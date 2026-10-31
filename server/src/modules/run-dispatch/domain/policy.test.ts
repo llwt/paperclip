@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  decideDispatchOwnership,
   decideQueuedRunStaleness,
   decideScheduledRetryGate,
   type QueuedRunFacts,
@@ -474,6 +475,67 @@ describe("decideQueuedRunStaleness", () => {
       isAuthorizedSourceScopedRecovery: true,
     };
     expect(decideQueuedRunStaleness(facts, NOW)).toEqual({ stale: false });
+  });
+});
+
+describe("decideDispatchOwnership", () => {
+  const participantFacts = (agentId: string): ReviewParticipantFacts => ({
+    isInReview: true,
+    hasParticipant: true,
+    participantIsAgent: true,
+    participantAgentId: agentId,
+    currentStageType: "review",
+    currentParticipant: { type: "agent", agentId },
+  });
+
+  it("lets the current assignee start the provider", () => {
+    expect(decideDispatchOwnership(baseStalenessFacts())).toEqual({ stale: false });
+  });
+
+  it("cancels with issue_reassigned when the issue is assigned to another agent", () => {
+    const decision = decideDispatchOwnership({ ...baseStalenessFacts(), issueAssigneeAgentId: "agent-2" });
+    expect(decision).toMatchObject({
+      stale: true,
+      errorCode: "issue_reassigned",
+      details: { issueId: "issue-1", previousAssigneeAgentId: "agent-1", currentAssigneeAgentId: "agent-2" },
+    });
+  });
+
+  it("cancels with issue_reassigned when the current stage participant is another agent", () => {
+    const decision = decideDispatchOwnership({
+      ...baseStalenessFacts(),
+      issueStatus: "in_review",
+      reviewParticipant: participantFacts("agent-2"),
+    });
+    expect(decision).toMatchObject({ stale: true, errorCode: "issue_reassigned" });
+  });
+
+  it("lets the current stage participant start the provider", () => {
+    expect(decideDispatchOwnership({
+      ...baseStalenessFacts(),
+      issueStatus: "in_review",
+      reviewParticipant: participantFacts("agent-1"),
+    })).toEqual({ stale: false });
+  });
+
+  it("does not apply the claim-time status, lock or continuation rules", () => {
+    expect(decideDispatchOwnership({
+      ...baseStalenessFacts(),
+      issueStatus: "done",
+      issueExecutionRunId: "run-2",
+    })).toEqual({ stale: false });
+  });
+
+  it("does not gate runs with no issue", () => {
+    expect(decideDispatchOwnership({ ...baseStalenessFacts(), issueFound: false })).toEqual({ stale: false });
+  });
+
+  it("keeps the existing exemptions for authorized recovery runs", () => {
+    expect(decideDispatchOwnership({
+      ...baseStalenessFacts(),
+      issueAssigneeAgentId: "agent-2",
+      isAuthorizedSourceScopedRecovery: true,
+    })).toEqual({ stale: false });
   });
 });
 

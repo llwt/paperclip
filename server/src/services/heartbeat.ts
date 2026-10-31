@@ -3721,13 +3721,16 @@ export function heartbeatService(
           }
           return { dispatched: false };
         }
-        if (
-          !issueId ||
-          (!isResolvedInteractionContinuationWakeContext(context) &&
-            !["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? ""))
-        ) {
-          return { dispatched: true, resultPromise: dispatch(() => {}) };
-        }
+        if (!issueId) return { dispatched: true, resultPromise: dispatch(() => {}) };
+        // Continuations and replacements re-run the full staleness gate. Every
+        // other issue run re-checks only who owns the issue (fork, SX-4251): the
+        // claim can precede workspace setup by minutes, and a reassignment in
+        // that window must not start the provider on the old owner's prompt.
+        const dispatchGate =
+          isResolvedInteractionContinuationWakeContext(context) ||
+          ["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? "")
+            ? "full"
+            : "ownership";
         await options.beforeResolvedInteractionContinuationDispatchCheck?.({
           runId: run.id,
           issueId,
@@ -3741,6 +3744,7 @@ export function heartbeatService(
           runId: run.id,
           companyId: run.companyId,
           expectedStatus: "running",
+          gate: dispatchGate,
           // Synchronous handoff under the ownership lock; the gate commits
           // without awaiting the adapter's asynchronous bootstrap or finalizer.
           dispatch,

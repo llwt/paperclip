@@ -375,4 +375,39 @@ describeEmbeddedPostgres("execution stage hand-off wake through the issue routes
     },
     30_000,
   );
+
+  it("one PATCH that sets status, assignee and stage together queues exactly one wake for the new owner", async () => {
+    const ids = await seedStage({ transition: "review_to_changes_requested", leaseHeld: false });
+    const res = await request(app(ids.actor))
+      .patch(`/api/issues/${ids.issueId}`)
+      .send({ status: "in_progress", assigneeAgentId: ids.nextAgentId, comment: "Changes needed." });
+    expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
+
+    const wakesForIssue = (agentId: string) => db
+      .select({ id: agentWakeupRequests.id, reason: agentWakeupRequests.reason, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.agentId, agentId),
+        sql`${agentWakeupRequests.payload}->>'issueId' = ${ids.issueId}`,
+      ));
+
+    await vi.waitFor(async () => {
+      expect(await runsFor(ids.nextAgentId, ids.issueId, "execution_changes_requested")).toHaveLength(1);
+    }, { timeout: 10_000, interval: 50 });
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+    // A finished test run without a comment gets its own `missing_issue_comment`
+    // follow-up, which is not a duplicate of the hand-off wake.
+    const wakes = (await wakesForIssue(ids.nextAgentId)).filter((wake) => wake.reason !== "missing_issue_comment");
+    expect(wakes.map((wake) => wake.reason)).toEqual(["execution_changes_requested"]);
+    const allRuns = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.agentId, ids.nextAgentId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${ids.issueId}`,
+        sql`${heartbeatRuns.contextSnapshot}->>'wakeReason' <> 'missing_issue_comment'`,
+      ));
+    expect(allRuns).toHaveLength(1);
+  }, 30_000);
 });

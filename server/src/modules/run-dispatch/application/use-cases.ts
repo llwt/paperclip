@@ -62,6 +62,7 @@ export function createDispatchResolvedInteractionIfCurrent(deps: { writer: RunDi
     runId: string;
     companyId: string;
     expectedStatus: "queued" | "running";
+    gate?: "full" | "ownership";
     dispatch: (markDispatchStarted: () => void) => Promise<T>;
     now?: Date;
   }) => deps.writer.dispatchResolvedInteractionIfCurrent({

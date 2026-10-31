@@ -113,6 +113,7 @@ export type QueuedRunStalenessErrorCode =
   | "issue_dependencies_blocked"
   | "issue_not_found"
   | "issue_assignee_changed"
+  | "issue_reassigned"
   | "issue_terminal_status"
   | "issue_not_in_progress"
   | "issue_execution_lock_changed"
@@ -489,6 +490,46 @@ export function decideScheduledRetryGate(
   }
 
   return { allowed: true };
+}
+
+/**
+ * The last-moment ownership check before the provider handoff (fork, SX-4251).
+ * It reuses the claim-time ownership and review-participant rules, so a run
+ * that passed the claim is cancelled here only when the issue moved to another
+ * owner or stage participant while the workspace was being prepared. Other
+ * staleness rules stay at the claim.
+ */
+export function decideDispatchOwnership(facts: QueuedRunFacts): StalenessDecision {
+  if (!facts.issueFound) return { stale: false };
+  const ownership = decideIssueOwnership({
+    runAgentId: facts.runAgentId,
+    issueAssigneeAgentId: facts.issueAssigneeAgentId,
+    isNonAssigneeWorkspaceBusyRetry: facts.isNonAssigneeWorkspaceBusyRetry,
+    isInteractionWake: facts.isInteractionWake,
+    isCurrentReviewParticipant:
+      facts.reviewParticipant.isInReview &&
+      facts.reviewParticipant.participantIsAgent &&
+      facts.reviewParticipant.participantAgentId === facts.runAgentId,
+    isAuthorizedSourceScopedRecovery: facts.isAuthorizedSourceScopedRecovery,
+  });
+  const participant = decideReviewParticipant({
+    ...facts.reviewParticipant,
+    runAgentId: facts.runAgentId,
+    bypass: facts.wakeCommentIdPresent,
+  });
+  if (ownership === "current_owner" && participant === "ok") return { stale: false };
+  return {
+    stale: true,
+    errorCode: "issue_reassigned",
+    reason: "Cancelled because the issue moved to another owner before the run reached the provider",
+    details: {
+      issueId: facts.issueId,
+      previousAssigneeAgentId: facts.runAgentId,
+      currentAssigneeAgentId: facts.issueAssigneeAgentId,
+      currentStageType: facts.reviewParticipant.currentStageType,
+      currentParticipant: facts.reviewParticipant.currentParticipant,
+    },
+  };
 }
 
 /**
