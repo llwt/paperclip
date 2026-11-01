@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   createExclusiveBackupRunner,
   DEFAULT_DATABASE_BACKUP_TIMEOUT_MINUTES,
+  MAX_DATABASE_BACKUP_TIMEOUT_MS,
   resolveDatabaseBackupTimeoutMs,
 } from "../services/database-backup-runner.js";
 
@@ -20,6 +21,19 @@ describe("resolveDatabaseBackupTimeoutMs", () => {
   it("converts a positive number of minutes", () => {
     expect(resolveDatabaseBackupTimeoutMs("45")).toBe(45 * 60_000);
     expect(resolveDatabaseBackupTimeoutMs("0.5")).toBe(30_000);
+  });
+
+  it("uses the default when the milliseconds exceed the setTimeout limit", () => {
+    expect(resolveDatabaseBackupTimeoutMs("100000")).toBe(defaultMs);
+    expect(resolveDatabaseBackupTimeoutMs("35792")).toBe(defaultMs);
+  });
+
+  it("accepts the largest value setTimeout can hold", () => {
+    expect(MAX_DATABASE_BACKUP_TIMEOUT_MS).toBe(2_147_483_647);
+    expect(resolveDatabaseBackupTimeoutMs("35791")).toBe(35791 * 60_000);
+    expect(resolveDatabaseBackupTimeoutMs(String(MAX_DATABASE_BACKUP_TIMEOUT_MS / 60_000))).toBe(
+      MAX_DATABASE_BACKUP_TIMEOUT_MS,
+    );
   });
 });
 
