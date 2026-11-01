@@ -22,6 +22,7 @@ export {
   type EmbeddedPostgresTestSupport,
 } from "./test-embedded-postgres.js";
 export {
+  DatabaseBackupTimeoutError,
   runDatabaseBackup,
   runDatabaseRestore,
   formatDatabaseBackupResult,
