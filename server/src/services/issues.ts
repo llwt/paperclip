@@ -7496,8 +7496,8 @@ export function issueService(db: Db) {
     });
   }
 
-  async function assertAssignableUser(companyId: string, userId: string) {
-    const membership = await db
+  async function assertAssignableUser(companyId: string, userId: string, dbOrTx: Db | DbTransaction = db) {
+    const membership = await dbOrTx
       .select({ id: companyMemberships.id })
       .from(companyMemberships)
       .where(
@@ -10209,8 +10209,11 @@ export function issueService(db: Db) {
       // A prompt prefix is not a task identity: distinct requests can share it.
       const deduplicateByTitle = allowDuplicate === false && !titleNeedsGeneration;
       issueData.title = resolvedTitle;
+      // A caller that passes its own transaction keeps these reads on it: a
+      // shared-pool read inside an open transaction needs a second
+      // connection and can deadlock the pool under a burst (SX-4385).
       const isolatedWorkspacesEnabled = (
-        await instanceSettings.getExperimental()
+        await (dbOrTx === db ? instanceSettings : instanceSettingsService(dbOrTx as Db)).getExperimental()
       ).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -10221,12 +10224,12 @@ export function issueService(db: Db) {
         throw unprocessable("Issue can only have one assignee");
       }
       if (data.assigneeAgentId) {
-        await assertAssignableAgent(db, companyId, data.assigneeAgentId, {
+        await assertAssignableAgent(dbOrTx as Db, companyId, data.assigneeAgentId, {
           kind: "work",
         });
       }
       if (data.assigneeUserId) {
-        await assertAssignableUser(companyId, data.assigneeUserId);
+        await assertAssignableUser(companyId, data.assigneeUserId, dbOrTx);
       }
       if (
         data.status === "in_progress" &&
