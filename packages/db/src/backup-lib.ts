@@ -31,7 +31,28 @@ export type RunDatabaseBackupOptions = {
   backupEngine?: "auto" | "pg_dump" | "javascript";
   /** Optional durability gate. A rejected archive must not prune history. */
   verifyBeforePrune?: (backupFile: string) => Promise<void>;
+  /** Overall time limit. When it passes, the dump is stopped and the call rejects with DatabaseBackupTimeoutError. */
+  timeoutMs?: number;
 };
+
+export class DatabaseBackupTimeoutError extends Error {
+  readonly timeoutMs: number;
+
+  constructor(timeoutMs: number) {
+    super(`Database backup timed out after ${formatBackupTimeout(timeoutMs)}`);
+    this.name = "DatabaseBackupTimeoutError";
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+function formatBackupTimeout(timeoutMs: number): string {
+  if (timeoutMs >= 60_000) {
+    const minutes = Number((timeoutMs / 60_000).toFixed(2));
+    return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  }
+  if (timeoutMs >= 1000) return `${Number((timeoutMs / 1000).toFixed(2))} seconds`;
+  return `${Math.max(1, Math.round(timeoutMs))} ms`;
+}
 
 export type RunDatabaseBackupResult = {
   backupFile: string;
@@ -74,6 +95,7 @@ const DEFAULT_BACKUP_WRITE_BUFFER_BYTES = 1024 * 1024;
 const BACKUP_DATA_CURSOR_ROWS = 100;
 const BACKUP_CLI_STDERR_BYTES = 64 * 1024;
 const BACKUP_BREAKPOINT_DETECT_BYTES = 64 * 1024;
+const BACKUP_TIMEOUT_SETTLE_MS = 1000;
 export const BACKUP_TEMP_SUFFIX = ".partial";
 
 // Differs from upstream: interrupted dumps must never look like finished backups.
@@ -347,10 +369,19 @@ async function waitForChildExit(child: ReturnType<typeof spawn>, label: string):
   }
 }
 
+function onAbort(signal: AbortSignal, handler: () => void): void {
+  if (signal.aborted) {
+    handler();
+    return;
+  }
+  signal.addEventListener("abort", handler, { once: true });
+}
+
 async function runPgDumpBackup(opts: {
   connectionString: string;
   backupFile: string;
   connectTimeout: number;
+  signal: AbortSignal;
 }): Promise<void> {
   const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
   const child = spawn(
@@ -372,13 +403,18 @@ async function runPgDumpBackup(opts: {
     },
   );
 
+  onAbort(opts.signal, () => {
+    child.kill("SIGKILL");
+  });
+
   if (!child.stdout) {
+    child.kill("SIGKILL");
     throw new Error("pg_dump did not expose stdout");
   }
 
   // Wait for both before cleanup or fallback can reuse the temporary path.
   const results = await Promise.allSettled([
-    pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile)),
+    pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile), { signal: opts.signal }),
     waitForChildExit(child, pgDumpBin),
   ]);
   for (const result of results) {
@@ -559,6 +595,49 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
 }
 
 export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise<RunDatabaseBackupResult> {
+  const timeoutMs = opts.timeoutMs;
+  const controller = new AbortController();
+  const outputFiles: string[] = [];
+  const run = runDatabaseBackupUntilAborted(opts, controller.signal, outputFiles);
+  if (timeoutMs === undefined || !Number.isFinite(timeoutMs) || timeoutMs <= 0) return run;
+
+  let timer: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new DatabaseBackupTimeoutError(timeoutMs);
+      controller.abort(error);
+      // Let the run's own cleanup finish first; if it is stuck, remove the files here.
+      let settleTimer: NodeJS.Timeout | undefined;
+      const settleLimit = new Promise<void>((resolveLimit) => {
+        settleTimer = setTimeout(resolveLimit, BACKUP_TIMEOUT_SETTLE_MS);
+      });
+      void Promise.race([run.then(() => {}, () => {}), settleLimit]).then(() => {
+        clearTimeout(settleTimer);
+        for (const file of outputFiles) {
+          try { unlinkSync(file); } catch { /* already removed */ }
+        }
+        reject(error);
+      });
+    }, timeoutMs);
+  });
+  // The abandoned run can still reject after the timeout wins the race.
+  run.catch(() => {});
+  try {
+    return await Promise.race([run, timedOut]);
+  } catch (error) {
+    // Destroying the connections makes the run fail with a connection error first.
+    if (controller.signal.aborted) throw controller.signal.reason;
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function runDatabaseBackupUntilAborted(
+  opts: RunDatabaseBackupOptions,
+  signal: AbortSignal,
+  outputFiles: string[],
+): Promise<RunDatabaseBackupResult> {
   const filenamePrefix = opts.filenamePrefix ?? "paperclip";
   const retention = opts.retention;
   const connectTimeout = Math.max(1, Math.trunc(opts.connectTimeoutSeconds ?? 5));
@@ -574,6 +653,10 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     sqlClosed = true;
     await sql.end();
   };
+  onAbort(signal, () => {
+    sqlClosed = true;
+    sql.end({ timeout: 0 }).catch(() => {});
+  });
   mkdirSync(opts.backupDir, { recursive: true });
   // Initial and final sleep checks can run within the same second. A failed
   // second checkpoint must never overwrite the first verified recovery point.
@@ -583,7 +666,11 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   // Differs from upstream: publish only a completed gzip by atomic rename.
   const sqlFile = `${backupBase}${BACKUP_TEMP_SUFFIX}`;
   const partialBackupFile = `${backupFile}${BACKUP_TEMP_SUFFIX}`;
+  outputFiles.push(sqlFile, partialBackupFile, backupFile);
   const writer = createBufferedTextFileWriter(sqlFile);
+  onAbort(signal, () => {
+    void writer.abort();
+  });
 
   try {
     if (backupEngine === "pg_dump" || (backupEngine === "auto" && canUsePgDump)) {
@@ -595,12 +682,15 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
           connectionString: opts.connectionString,
           backupFile: partialBackupFile,
           connectTimeout,
+          signal,
         });
         dumped = true;
       } catch (error) {
         if (existsSync(partialBackupFile)) {
           unlinkSync(partialBackupFile);
         }
+        // A timeout must not start the JavaScript fallback.
+        signal.throwIfAborted();
         if (backupEngine === "pg_dump") {
           throw error;
         }
@@ -613,9 +703,11 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         // pg_dump succeeds, archive verification or persistence failures
         // must retain their original error and must not reuse a closed writer.
         await writer.abort();
+        signal.throwIfAborted();
         renameSync(partialBackupFile, backupFile);
         const sizeBytes = statSync(backupFile).size;
         await opts.verifyBeforePrune?.(backupFile);
+        signal.throwIfAborted();
         const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
         return { backupFile, sizeBytes, prunedCount };
       }
@@ -1011,10 +1103,16 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         emit(`COPY ${qualifiedTableName} (${colNames}) FROM stdin;`);
         await writer.writeRaw("\n");
         const copySql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
+        onAbort(signal, () => {
+          copySql.end({ timeout: 0 }).catch(() => {});
+        });
         try {
           const copyStream = await copySql
             .unsafe(`COPY ${qualifiedTableName} (${colNames}) TO STDOUT`)
             .readable();
+          onAbort(signal, () => {
+            copyStream.destroy(signal.reason);
+          });
           for await (const chunk of copyStream) {
             await writer.writeRaw(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
           }
@@ -1096,12 +1194,14 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     // Compress the SQL file with gzip
     const sqlReadStream = createReadStream(sqlFile);
     const gzWriteStream = createWriteStream(partialBackupFile);
-    await pipeline(sqlReadStream, createGzip(), gzWriteStream);
+    await pipeline(sqlReadStream, createGzip(), gzWriteStream, { signal });
     unlinkSync(sqlFile);
 
+    signal.throwIfAborted();
     renameSync(partialBackupFile, backupFile);
     const sizeBytes = statSync(backupFile).size;
     await opts.verifyBeforePrune?.(backupFile);
+    signal.throwIfAborted();
     const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
 
     return {
