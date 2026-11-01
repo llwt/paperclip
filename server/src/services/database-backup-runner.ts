@@ -1,9 +1,13 @@
 export const DEFAULT_DATABASE_BACKUP_TIMEOUT_MINUTES = 30;
 
+// Node's setTimeout treats any delay above 2^31-1 ms (about 35791 minutes) as 1 ms.
+export const MAX_DATABASE_BACKUP_TIMEOUT_MS = 2 ** 31 - 1;
+
 export function resolveDatabaseBackupTimeoutMs(rawMinutes: string | undefined): number {
   const minutes = Number(rawMinutes);
-  const effective = Number.isFinite(minutes) && minutes > 0 ? minutes : DEFAULT_DATABASE_BACKUP_TIMEOUT_MINUTES;
-  return Math.round(effective * 60_000);
+  const ms = Math.round(minutes * 60_000);
+  if (Number.isFinite(minutes) && minutes > 0 && ms <= MAX_DATABASE_BACKUP_TIMEOUT_MS) return ms;
+  return DEFAULT_DATABASE_BACKUP_TIMEOUT_MINUTES * 60_000;
 }
 
 export type RunningDatabaseBackup = {
