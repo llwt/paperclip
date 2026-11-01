@@ -6,7 +6,10 @@ import express from "express";
 import request from "supertest";
 import { inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns } from "@paperclipai/db";
+import {
+  agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueCreateIdempotencyKeys, issues,
+  principalPermissionGrants,
+} from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { errorHandler } from "../middleware/index.js";
@@ -87,11 +90,11 @@ suite("issue create wake burst on a small pool", () => {
     return { companyId, agentId };
   }
 
-  function createApp(companyId: string) {
+  function createApp(companyId: string, actor?: Express.Request["actor"]) {
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
-      req.actor = {
+      req.actor = actor ?? {
         type: "board",
         userId: "board-user",
         companyIds: [companyId],
@@ -133,24 +136,69 @@ suite("issue create wake burst on a small pool", () => {
       }
     })();
 
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const outcome = await Promise.race([
-      burst.then(() => "done" as const),
-      new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), BOUND_MS); }),
-    ]).finally(() => clearTimeout(timer));
-
-    if (outcome === "timeout") {
-      deadlocked = true;
-      // Connections of the pool under test that sit in an open transaction.
-      const stuck = await observer.execute(sql`select count(*)::int as count from pg_stat_activity
-        where datname = current_database() and pid <> pg_backend_pid() and state = 'idle in transaction'`);
-      const idleInTransaction = Number((stuck as unknown as Array<{ count: number }>)[0]?.count ?? 0);
+    if (await timedOut(burst)) {
       expect.fail(
         `pool deadlock: ${BURST} issue creates with wakes did not finish in ${BOUND_MS} ms on a pool of ${POOL_SIZE} ` +
         `(${createdIssueIds.length}/${BURST} creates answered, ${runCount}/${BURST} wakes queued, ` +
-        `${idleInTransaction} connections idle in transaction)`,
+        `${await idleInTransactionCount()} connections idle in transaction)`,
       );
     }
     expect(Date.now() - startedAt).toBeLessThan(BOUND_MS);
   });
+
+  // An agent replay of an idempotency key reuses the existing issue inside
+  // the create transaction, and the route checks the agent may assign it
+  // there. That check must read through the transaction too.
+  it(`answers ${BURST} agent replays of one idempotency key at once within ${BOUND_MS} ms on a pool of ${POOL_SIZE}`, async () => {
+    const { companyId, agentId } = await seed();
+    await observer.insert(companyMemberships).values({
+      companyId, principalType: "agent", principalId: agentId, status: "active", membershipRole: "member",
+    });
+    await observer.insert(principalPermissionGrants).values({
+      companyId, principalType: "agent", principalId: agentId, permissionKey: "tasks:assign", grantedByUserId: "board-user",
+    });
+    const [existing] = await observer.insert(issues).values({
+      companyId, title: "Replayed issue", status: "todo", priority: "medium", assigneeAgentId: agentId,
+    }).returning();
+    const idempotencyKey = "run-1:replayed-issue";
+    await observer.insert(issueCreateIdempotencyKeys).values({ companyId, idempotencyKey, issueId: existing.id });
+    const app = createApp(companyId, { type: "agent", agentId, companyId, source: "agent_key" });
+    const startedAt = Date.now();
+
+    let answered = 0;
+    const replays = Promise.all(Array.from({ length: BURST }, () =>
+      request(app)
+        .post(`/api/companies/${companyId}/issues`)
+        .send({ title: "Replayed issue", status: "todo", assigneeAgentId: agentId, idempotencyKey })
+        .then((res) => { answered += 1; return res; })));
+
+    if (await timedOut(replays)) {
+      expect.fail(
+        `pool deadlock: ${BURST} agent replays did not finish in ${BOUND_MS} ms on a pool of ${POOL_SIZE} ` +
+        `(${answered}/${BURST} answered, ${await idleInTransactionCount()} connections idle in transaction)`,
+      );
+    }
+    for (const res of await replays) {
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body).toMatchObject({ id: existing.id, deduplicated: true, deduplicationReason: "idempotency_key" });
+    }
+    expect(Date.now() - startedAt).toBeLessThan(BOUND_MS);
+  });
+
+  async function timedOut(work: Promise<unknown>) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      work.then(() => "done" as const),
+      new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), BOUND_MS); }),
+    ]).finally(() => clearTimeout(timer));
+    if (outcome === "timeout") deadlocked = true;
+    return outcome === "timeout";
+  }
+
+  // Connections of the pool under test that sit in an open transaction.
+  async function idleInTransactionCount() {
+    const stuck = await observer.execute(sql`select count(*)::int as count from pg_stat_activity
+      where datname = current_database() and pid <> pg_backend_pid() and state = 'idle in transaction'`);
+    return Number((stuck as unknown as Array<{ count: number }>)[0]?.count ?? 0);
+  }
 });
