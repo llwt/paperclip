@@ -168,6 +168,7 @@ import * as serviceIndex from "../services/index.js";
 import {
   accessService,
   agentService,
+  authorizationService,
   budgetService,
   companySkillService,
   companyService,
@@ -486,6 +487,7 @@ type NormalizedExecutionPolicy = NonNullable<
   ReturnType<typeof normalizeIssueExecutionPolicy>
 >;
 type IssueRouteSnapshot = typeof issueRows.$inferSelect;
+type IssueCreateTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type RecoveryRevalidationTrigger =
   "issue_update" | "comment" | "document" | "work_product" | "read_projection";
 type CompanySearchService = {
@@ -4923,9 +4925,13 @@ export function issueRoutes(
     req: Request,
     companyId: string,
     assignmentScope?: TaskAssignmentAuthorizationScope,
+    executor?: Db | IssueCreateTransaction,
   ) {
     assertCompanyAccess(req, companyId);
-    const decision = await access.decide({
+    // Inside an open transaction, authorize on it: a shared-pool read there
+    // needs a second connection and can deadlock the pool (SX-4385).
+    const authorizer = executor && executor !== db ? authorizationService(executor) : access;
+    const decision = await authorizer.decide({
       actor: req.actor,
       action: "tasks:assign",
       resource: {
@@ -4943,7 +4949,11 @@ export function issueRoutes(
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
   }
 
-  async function assertCanReuseCreatedIssue(req: Request, issue: typeof issueRows.$inferSelect) {
+  async function assertCanReuseCreatedIssue(
+    req: Request,
+    issue: typeof issueRows.$inferSelect,
+    executor: Db | IssueCreateTransaction,
+  ) {
     if (req.actor.type !== "agent") return;
     await assertCanAssignTasks(req, issue.companyId, {
       issueId: issue.id,
@@ -4951,7 +4961,7 @@ export function issueRoutes(
       parentIssueId: issue.parentId,
       assigneeAgentId: issue.assigneeAgentId,
       assigneeUserId: issue.assigneeUserId,
-    });
+    }, executor);
   }
 
   function isTaskBridgeKeyActor(req: Request) {
@@ -12439,7 +12449,8 @@ export function issueRoutes(
         actorResponsibleUserId: authenticatedActorResponsibleUserId(req),
         trustExplicitResponsibleUserId: actor.actorType === "user",
         watchdogActorRunId: actor.runId,
-        assertCanReuseIssue: (existing: typeof issueRows.$inferSelect) => assertCanReuseCreatedIssue(req, existing),
+        assertCanReuseIssue: (existing: typeof issueRows.$inferSelect, executor: Db | IssueCreateTransaction) =>
+          assertCanReuseCreatedIssue(req, existing, executor),
         onDeduplicated: (reason: "idempotency_key" | "recent_open_title") => {
           deduplicationReason = reason;
         },
@@ -12812,7 +12823,7 @@ export function issueRoutes(
         actorAgentId: actor.agentId,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
         watchdogActorRunId: actor.runId,
-        assertCanReuseIssue: (existing) => assertCanReuseCreatedIssue(req, existing),
+        assertCanReuseIssue: (existing, executor) => assertCanReuseCreatedIssue(req, existing, executor),
       });
       await externalObjectsSvc.syncIssueSafely(issue.id);
 

@@ -1955,7 +1955,9 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId" | "title" |
   trustExplicitResponsibleUserId?: boolean;
   idempotencyKey?: string | null;
   allowDuplicate?: boolean;
-  assertCanReuseIssue?: (issue: typeof issues.$inferSelect) => Promise<void>;
+  // Runs inside the create transaction when it reuses an issue: it must read
+  // through `executor`, never the shared pool (SX-4385).
+  assertCanReuseIssue?: (issue: typeof issues.$inferSelect, executor: Db | DbTransaction) => Promise<void>;
   onDeduplicated?: (reason: "idempotency_key" | "recent_open_title") => void;
 };
 type IssueChildCreateInput = IssueCreateInput & {
@@ -9691,7 +9693,7 @@ export function issueService(db: Db) {
               "Child creation idempotency key belongs to another parent issue",
             );
           }
-          await data.assertCanReuseIssue?.(existingChild);
+          await data.assertCanReuseIssue?.(existingChild, db);
           data.onDeduplicated?.("idempotency_key");
           const [enriched] = await withIssueLabels(db, [existingChild]);
           const [withRelations] = await withIssueRelationSummaries(
@@ -10328,7 +10330,7 @@ export function issueService(db: Db) {
         }
         if (existingIssue) {
           // A duplicate may have a different scope or assignee than the proposed task.
-          await assertCanReuseIssue?.(existingIssue);
+          await assertCanReuseIssue?.(existingIssue, tx);
           if (idempotencyKey) {
             await tx
               .insert(issueCreateIdempotencyKeys)
