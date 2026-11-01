@@ -168,17 +168,29 @@ function toDeferredWakeCandidate(row: typeof agentWakeupRequests.$inferSelect): 
   };
 }
 
+/** A host port that also receives the release transaction to read through. */
+type WithReleaseTransaction<Port> = Port extends (input: infer Input) => infer Result
+  ? (input: Input, tx: Db) => Result
+  : never;
+
+/**
+ * The host ports as the Postgres adapter receives them. Each also gets the
+ * release transaction and must run every read through it: a read through the
+ * shared pool would wait for a second connection while this transaction
+ * holds one, and a burst of finishing runs then holds every connection
+ * (SX-4422, the deadlock class of the 2026-11-01 outage).
+ */
 export type WakeQueuePostgresAdapterDeps = {
-  resolveResponsibleUserId: WakeQueueHost["resolveResponsibleUserId"];
-  getRoutineEnv: WakeQueueHost["getRoutineEnv"];
-  resolveSessionBeforeForWakeup: WakeQueueHost["resolveSessionBeforeForWakeup"];
+  resolveResponsibleUserId: WithReleaseTransaction<WakeQueueHost["resolveResponsibleUserId"]>;
+  getRoutineEnv: WithReleaseTransaction<WakeQueueHost["getRoutineEnv"]>;
+  resolveSessionBeforeForWakeup: WithReleaseTransaction<WakeQueueHost["resolveSessionBeforeForWakeup"]>;
 };
 
-function buildHost(_tx: Db, deps: WakeQueuePostgresAdapterDeps): WakeQueueHost {
+function buildHost(tx: Db, deps: WakeQueuePostgresAdapterDeps): WakeQueueHost {
   return {
-    resolveResponsibleUserId: deps.resolveResponsibleUserId,
-    getRoutineEnv: deps.getRoutineEnv,
-    resolveSessionBeforeForWakeup: deps.resolveSessionBeforeForWakeup,
+    resolveResponsibleUserId: (input) => deps.resolveResponsibleUserId(input, tx),
+    getRoutineEnv: (input) => deps.getRoutineEnv(input, tx),
+    resolveSessionBeforeForWakeup: (input) => deps.resolveSessionBeforeForWakeup(input, tx),
   };
 }
 

@@ -24,15 +24,17 @@ export type ReleaseTransactionResult = {
 };
 
 /**
- * The three host callbacks the release use case needs. These members do
- * not run on the module's own transaction, which is why two of them take
- * the transaction-scoped issue snapshot instead of an issue id.
+ * The three host callbacks the release use case needs. The use case calls
+ * them while the release transaction is open, so the adapter binds each one
+ * to that transaction: every read they make runs on it, never on a second
+ * pool connection (SX-4422). Two of them also take the transaction-scoped
+ * issue snapshot instead of an issue id, so they never re-read the issue.
  */
 export interface WakeQueueHost {
   /**
    * Takes the transaction-scoped issue snapshot, not an issue id, so this
-   * port never re-reads the issue on a separate connection while the
-   * module's own transaction is open.
+   * port never re-reads the issue; its other reads run on the release
+   * transaction.
    */
   resolveResponsibleUserId(input: {
     companyId: string;
@@ -48,13 +50,14 @@ export interface WakeQueueHost {
   }): Promise<string | null>;
   /**
    * Takes the transaction-scoped issue snapshot, not an issue id, so this
-   * port never re-reads the issue on a separate connection while the
-   * module's own transaction is open.
+   * port never re-reads the issue; its routine reads run on the release
+   * transaction.
    */
   getRoutineEnv(input: {
     companyId: string;
     issue: IssueSnapshot;
   }): Promise<{ routineId: string | null; env: unknown; responsibleUserId: string | null }>;
+  /** Reads the agent, its task session and its runtime state on the release transaction. */
   resolveSessionBeforeForWakeup(input: {
     companyId: string;
     agentId: string;
