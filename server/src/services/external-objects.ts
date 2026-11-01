@@ -49,6 +49,12 @@ export interface ExternalObjectDetector {
     companyId: string;
     urls: ExternalObjectCanonicalUrl[];
     sourceContext: ExternalObjectSourceContext;
+    /**
+     * The handle of the caller's open transaction. A detector that reads the
+     * database must use it: asking the shared pool for a second connection
+     * while the transaction holds one deadlocks the pool under load (SX-4385).
+     */
+    db?: Db;
   }): Promise<ExternalObjectDetection[]> | ExternalObjectDetection[];
 }
 
@@ -175,6 +181,7 @@ export function createExternalObjectDetectorRegistry(detectors: ExternalObjectDe
     companyId: string;
     urls: ExternalObjectCanonicalUrl[];
     sourceContext: ExternalObjectSourceContext;
+    db?: Db;
   }) {
     const claimed = new Set<string>();
     const detections: ExternalObjectDetection[] = [];
@@ -267,7 +274,7 @@ function createPluginProviderDetector(
   return {
     key: "plugin-object-reference-providers",
     async detect(input) {
-      const providers = await readyObjectReferencePlugins(db);
+      const providers = await readyObjectReferencePlugins(input.db ?? db);
       const detections: ExternalObjectDetection[] = [];
 
       for (const provider of providers) {
@@ -458,6 +465,7 @@ export function externalObjectService(
       companyId: input.companyId,
       urls,
       sourceContext: input,
+      db: dbOrTx,
     });
     if (detections.length === 0) return;
 
@@ -521,8 +529,9 @@ export function externalObjectService(
   }
 
   async function syncComment(commentId: string, dbOrTx: any = db) {
+    // Read before the transaction opens: the callback may use the shared pool.
+    if (!(await isEnabled())) return;
     const runSync = async (tx: any) => {
-      if (!(await isEnabled())) return;
       const comment = await tx
         .select({
           id: issueComments.id,
@@ -553,8 +562,9 @@ export function externalObjectService(
   }
 
   async function syncDocument(documentId: string, dbOrTx: any = db) {
+    // Read before the transaction opens: the callback may use the shared pool.
+    if (!(await isEnabled())) return;
     const runSync = async (tx: any) => {
-      if (!(await isEnabled())) return;
       const document = await tx
         .select({
           documentId: documents.id,
