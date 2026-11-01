@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
-import { companies, createDb, externalObjectMentions } from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
+import { companies, createDb, externalObjectMentions, issueComments, issues as issueRows } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -102,5 +102,53 @@ describeEmbeddedPostgres("external objects under a small database pool", () => {
       .from(externalObjectMentions)
       .where(eq(externalObjectMentions.companyId, companyId));
     expect(new Set(mentions.map((row) => row.sourceIssueId)).size).toBe(CONCURRENT_OPERATIONS);
+  });
+
+  it("does not deadlock when concurrent comment syncs check the enabled flag on the shared pool", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await setupDb.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await setupDb.insert(issueRows).values({
+      id: issueId,
+      companyId,
+      identifier: `CMT-${companyId.replace(/-/g, "").slice(0, 8).toUpperCase()}`,
+      title: "Comment sync",
+      status: "todo",
+      priority: "medium",
+    });
+    const commentIds = Array.from({ length: CONCURRENT_OPERATIONS }, () => randomUUID());
+    await setupDb.insert(issueComments).values(commentIds.map((id, index) => ({
+      id,
+      companyId,
+      issueId,
+      body: `Done in https://github.com/acme/app/pull/${index + 100}`,
+    })));
+
+    const smallPoolDb = createDb(tempDb!.connectionString, { maxConnections: POOL_SIZE });
+    // Like the live callers, the enabled flag is read from instance settings
+    // on the shared pool.
+    const externalObjects = externalObjectService(smallPoolDb, {
+      enabled: async () => {
+        await smallPoolDb.execute(sql`select 1`);
+        return true;
+      },
+    });
+
+    const results = await settleWithin(
+      commentIds.map((commentId) => externalObjects.syncComment(commentId)),
+      DEADLOCK_BOUND_MS,
+    );
+    expect(results.filter((result) => result.status === "rejected")).toEqual([]);
+
+    const mentions = await setupDb
+      .select({ sourceRecordId: externalObjectMentions.sourceRecordId })
+      .from(externalObjectMentions)
+      .where(eq(externalObjectMentions.companyId, companyId));
+    expect(new Set(mentions.map((row) => row.sourceRecordId)).size).toBe(CONCURRENT_OPERATIONS);
   });
 });
