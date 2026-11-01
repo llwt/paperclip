@@ -1346,8 +1346,9 @@ export function createHeartbeatRunState(db: Db) {
     agentId: string,
     adapterType: string,
     taskKey: string,
+    executor: Db = db,
   ) {
-    return db
+    return executor
       .select()
       .from(agentTaskSessions)
       .where(
@@ -1621,6 +1622,8 @@ export function createHeartbeatRunState(db: Db) {
     explicitResumeSession: Awaited<
       ReturnType<typeof resolveExplicitResumeSessionOverride>
     > | null;
+    /** The wake transaction, when the caller holds one (SX-4385). */
+    executor?: Db;
   }) {
     if (
       await hasResolvableSessionWorkspaceCwd(
@@ -1637,6 +1640,7 @@ export function createHeartbeatRunState(db: Db) {
       input.agent.id,
       input.agent.adapterType,
       input.taskKey,
+      input.executor,
     );
     const taskSessionParams = normalizeResumeParamsForAdapter(
       input.agent.adapterType,

@@ -1955,7 +1955,9 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId" | "title" |
   trustExplicitResponsibleUserId?: boolean;
   idempotencyKey?: string | null;
   allowDuplicate?: boolean;
-  assertCanReuseIssue?: (issue: typeof issues.$inferSelect) => Promise<void>;
+  // Runs inside the create transaction when it reuses an issue: it must read
+  // through `executor`, never the shared pool (SX-4385).
+  assertCanReuseIssue?: (issue: typeof issues.$inferSelect, executor: Db | DbTransaction) => Promise<void>;
   onDeduplicated?: (reason: "idempotency_key" | "recent_open_title") => void;
 };
 type IssueChildCreateInput = IssueCreateInput & {
@@ -7496,8 +7498,8 @@ export function issueService(db: Db) {
     });
   }
 
-  async function assertAssignableUser(companyId: string, userId: string) {
-    const membership = await db
+  async function assertAssignableUser(companyId: string, userId: string, dbOrTx: Db | DbTransaction = db) {
+    const membership = await dbOrTx
       .select({ id: companyMemberships.id })
       .from(companyMemberships)
       .where(
@@ -9691,7 +9693,7 @@ export function issueService(db: Db) {
               "Child creation idempotency key belongs to another parent issue",
             );
           }
-          await data.assertCanReuseIssue?.(existingChild);
+          await data.assertCanReuseIssue?.(existingChild, db);
           data.onDeduplicated?.("idempotency_key");
           const [enriched] = await withIssueLabels(db, [existingChild]);
           const [withRelations] = await withIssueRelationSummaries(
@@ -10209,8 +10211,11 @@ export function issueService(db: Db) {
       // A prompt prefix is not a task identity: distinct requests can share it.
       const deduplicateByTitle = allowDuplicate === false && !titleNeedsGeneration;
       issueData.title = resolvedTitle;
+      // A caller that passes its own transaction keeps these reads on it: a
+      // shared-pool read inside an open transaction needs a second
+      // connection and can deadlock the pool under a burst (SX-4385).
       const isolatedWorkspacesEnabled = (
-        await instanceSettings.getExperimental()
+        await (dbOrTx === db ? instanceSettings : instanceSettingsService(dbOrTx as Db)).getExperimental()
       ).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -10221,12 +10226,12 @@ export function issueService(db: Db) {
         throw unprocessable("Issue can only have one assignee");
       }
       if (data.assigneeAgentId) {
-        await assertAssignableAgent(db, companyId, data.assigneeAgentId, {
+        await assertAssignableAgent(dbOrTx as Db, companyId, data.assigneeAgentId, {
           kind: "work",
         });
       }
       if (data.assigneeUserId) {
-        await assertAssignableUser(companyId, data.assigneeUserId);
+        await assertAssignableUser(companyId, data.assigneeUserId, dbOrTx);
       }
       if (
         data.status === "in_progress" &&
@@ -10325,7 +10330,7 @@ export function issueService(db: Db) {
         }
         if (existingIssue) {
           // A duplicate may have a different scope or assignee than the proposed task.
-          await assertCanReuseIssue?.(existingIssue);
+          await assertCanReuseIssue?.(existingIssue, tx);
           if (idempotencyKey) {
             await tx
               .insert(issueCreateIdempotencyKeys)
