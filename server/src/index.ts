@@ -34,6 +34,7 @@ import type { Request as ExpressRequest, RequestHandler } from "express";
 import { warnIfUnsupportedNodeVersion } from "@paperclipai/shared/node-version";
 import { and, eq } from "drizzle-orm";
 import { removeIncompleteBackupFiles } from "@paperclipai/db/backup-lib";
+import { createExclusiveBackupRunner, resolveDatabaseBackupTimeoutMs } from "./services/database-backup-runner.js";
 import {
   createDb,
   ensurePostgresDatabase,
@@ -834,74 +835,83 @@ async function startServerWithDatabaseTeardown(
     resolve(config.databaseBackupDir, "db-backup-to-s3.failure"),
     resolve(config.databaseBackupDir, "..", "db-backup-to-s3.failure"),
   ];
-  let databaseBackupInFlight = false;
+  const exclusiveDatabaseBackup = createExclusiveBackupRunner();
+  const databaseBackupTimeoutMs = resolveDatabaseBackupTimeoutMs(process.env.PAPERCLIP_DB_BACKUP_TIMEOUT_MINUTES);
   const idleDatabaseBackupEnabled = config.databaseBackupEnabled
     && process.env.PAPERCLIP_DB_BACKUP_IDLE_CHECKPOINT_ENABLED === "1";
   const runServerDatabaseBackup = async (
     trigger: InstanceDatabaseBackupTrigger,
   ): Promise<InstanceDatabaseBackupRunResult | null> => {
-    if (databaseBackupInFlight) {
+    const outcome = await exclusiveDatabaseBackup.run(trigger, async () => {
+      const finishIdleBackup = beginIdleTrackedWork();
+      const startedAt = new Date();
+      const startedAtMs = Date.now();
+      const label = trigger === "manual" ? "Manual" : trigger === "idle" ? "Pre-sleep" : "Automatic";
+      try {
+        if (trigger === "idle") await markIdleBackupWakeRequired(config.databaseBackupDir);
+        logger.info({ backupDir: config.databaseBackupDir, trigger }, `${label} database backup starting`);
+        // Read retention from Instance Settings (DB) so changes take effect without restart.
+        const generalSettings = await backupSettingsSvc.getGeneral();
+        const retention = generalSettings.backupRetention;
+        const verifyCheckpoint = trigger === "idle" || existsSync(idleBackupWakeMarker(config.databaseBackupDir));
+
+        const result = await runDatabaseBackup({
+          connectionString: activeDatabaseConnectionString,
+          backupDir: config.databaseBackupDir,
+          retention,
+          filenamePrefix: "paperclip",
+          verifyBeforePrune: verifyCheckpoint ? verifyIdleDatabaseBackup : undefined,
+          timeoutMs: databaseBackupTimeoutMs,
+        });
+        if (verifyCheckpoint) {
+          if (trigger !== "idle") await clearIdleBackupWakeRequired(config.databaseBackupDir);
+        }
+        const finishedAt = new Date();
+        const response: InstanceDatabaseBackupRunResult = {
+          ...result,
+          trigger,
+          backupDir: config.databaseBackupDir,
+          retention,
+          startedAt: startedAt.toISOString(),
+          finishedAt: finishedAt.toISOString(),
+          durationMs: Date.now() - startedAtMs,
+        };
+        logger.info(
+          {
+            backupFile: result.backupFile,
+            sizeBytes: result.sizeBytes,
+            prunedCount: result.prunedCount,
+            backupDir: config.databaseBackupDir,
+            retention,
+            trigger,
+            durationMs: response.durationMs,
+          },
+          `${label} database backup complete: ${formatDatabaseBackupResult(result)}`,
+        );
+        return response;
+      } catch (err) {
+        logger.error({ err, backupDir: config.databaseBackupDir, trigger }, `${label} database backup failed`);
+        throw err;
+      } finally {
+        finishIdleBackup();
+      }
+    });
+    if (!outcome.started) {
       const message = "Database backup already in progress";
       if (trigger === "scheduled") {
-        logger.warn("Skipping scheduled database backup because a previous backup is still running");
+        logger.warn(
+          {
+            runningTrigger: outcome.running.trigger,
+            runningStartedAt: outcome.running.startedAt.toISOString(),
+            runningMinutes: outcome.runningMinutes,
+          },
+          `Skipping scheduled database backup because a previous backup is still running (started ${outcome.running.startedAt.toISOString()}, running ${outcome.runningMinutes} min)`,
+        );
         return null;
       }
       throw conflict(message);
     }
-
-    databaseBackupInFlight = true;
-    const finishIdleBackup = beginIdleTrackedWork();
-    const startedAt = new Date();
-    const startedAtMs = Date.now();
-    const label = trigger === "manual" ? "Manual" : trigger === "idle" ? "Pre-sleep" : "Automatic";
-    try {
-      if (trigger === "idle") await markIdleBackupWakeRequired(config.databaseBackupDir);
-      logger.info({ backupDir: config.databaseBackupDir, trigger }, `${label} database backup starting`);
-      // Read retention from Instance Settings (DB) so changes take effect without restart.
-      const generalSettings = await backupSettingsSvc.getGeneral();
-      const retention = generalSettings.backupRetention;
-      const verifyCheckpoint = trigger === "idle" || existsSync(idleBackupWakeMarker(config.databaseBackupDir));
-
-      const result = await runDatabaseBackup({
-        connectionString: activeDatabaseConnectionString,
-        backupDir: config.databaseBackupDir,
-        retention,
-        filenamePrefix: "paperclip",
-        verifyBeforePrune: verifyCheckpoint ? verifyIdleDatabaseBackup : undefined,
-      });
-      if (verifyCheckpoint) {
-        if (trigger !== "idle") await clearIdleBackupWakeRequired(config.databaseBackupDir);
-      }
-      const finishedAt = new Date();
-      const response: InstanceDatabaseBackupRunResult = {
-        ...result,
-        trigger,
-        backupDir: config.databaseBackupDir,
-        retention,
-        startedAt: startedAt.toISOString(),
-        finishedAt: finishedAt.toISOString(),
-        durationMs: Date.now() - startedAtMs,
-      };
-      logger.info(
-        {
-          backupFile: result.backupFile,
-          sizeBytes: result.sizeBytes,
-          prunedCount: result.prunedCount,
-          backupDir: config.databaseBackupDir,
-          retention,
-          trigger,
-          durationMs: response.durationMs,
-        },
-        `${label} database backup complete: ${formatDatabaseBackupResult(result)}`,
-      );
-      return response;
-    } catch (err) {
-      logger.error({ err, backupDir: config.databaseBackupDir, trigger }, `${label} database backup failed`);
-      throw err;
-    } finally {
-      databaseBackupInFlight = false;
-      finishIdleBackup();
-    }
+    return outcome.value;
   };
   const pluginWorkerManager = createPluginWorkerManager();
   const heartbeat = config.heartbeatSchedulerEnabled
